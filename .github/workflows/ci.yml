@@ -13,6 +13,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+      - name: Annotate MSVC diagnostics
+        if: runner.os == 'Windows'
+        run: Write-Output "::add-matcher::.github/msvc.json"
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
       - name: Build
