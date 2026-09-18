@@ -2,8 +2,10 @@ An experiment utilizing Codex, ChatGPT, and OpenAI heavily.
 
 # DXBCSandbox
 
-C11 tools for inspecting Unity shader assets, decoding DXBC, producing HLSL
-and ShaderLab candidates, and checking their compiled output.
+C11 tools for inspecting Unity shader assets, decoding DXBC, and checking
+recompiled output. Currently produces **low-level HLSL**, with ShaderLab
+structure reconstructed from supported serialized metadata. High-level Unity
+shader reconstruction is planned.
 
 ## Build and test
 
