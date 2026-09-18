@@ -1,0 +1,7 @@
+dxbc-sandbox-finite-visual-fixture/v1
+size	2	2
+pass	0
+color_space	linear
+clear	00000000	00000000	00000000	00000000
+require_complete_properties	1
+end

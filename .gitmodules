@@ -1,0 +1,3 @@
+[submodule "external/UnityCommon"]
+	path = external/UnityCommon
+	url = ../UnityCommon

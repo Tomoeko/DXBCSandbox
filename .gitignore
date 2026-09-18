@@ -1,0 +1,18 @@
+# Local builds and runtime outputs
+/build*/
+/CMakeUserPresets.json
+/reports*/
+/recovered*/
+/failed_shaders/
+/shader_includes/
+*.log
+*.dSYM/
+*.profraw
+*.profdata
+*.bndb
+*.bndb.*
+*.plist
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db

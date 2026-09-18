@@ -1,0 +1,84 @@
+An experiment utilizing Codex, ChatGPT, and OpenAI heavily.
+
+# DXBCSandbox
+
+C11 tools for inspecting Unity shader assets, decoding DXBC, producing HLSL
+and ShaderLab candidates, and checking their compiled output.
+
+## Build and test
+
+Requires CMake 3.10+ and a C11 compiler. Initialize the UnityCommon submodule:
+
+```sh
+git submodule update --init --recursive
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The default build does not need Unity. Use `-DBUILD_TESTING=OFF` for tools only.
+With CMake older than 3.20, run `ctest` inside `build` instead of `--test-dir`.
+An existing checkout can be selected with
+`-DDXBCSANDBOX_UNITY_COMMON_DIR=/path/to/UnityCommon`.
+
+## Usage
+
+```sh
+build/dxbc-sandbox list /path/to/assets --format table
+build/dxbc-sandbox extract /path/to/assets --all --out recovered
+build/dxbc-sandbox extract /path/to/assets --name 'Unlit/Color' \
+  --materials --out recovered
+cmake --install build --prefix /path/to/install
+```
+
+Inputs may be UnityFS bundles, SerializedFiles, or player folders. Tree-free
+inputs can use `--schema-registry schemas/unity-2021.3-player-shader.registry`.
+Each command supports `--help`; reports distinguish unsupported data from
+successful extraction. Additional tools inspect schemas, compile profiles,
+player capabilities, OraclePacks, and release-shader certificates.
+
+## Optional Unity verification
+
+The compiler protocol backend currently supports macOS and Unity 2021.3.35f1.
+A private Editor build is supported; executable fingerprints identify the
+selected toolchain and cache entries, without comparison to a stock release.
+
+```sh
+cmake -S . -B build-unity -DCMAKE_BUILD_TYPE=Debug \
+  -DDXBCSANDBOX_BUILD_UNITY_COMPILER=ON \
+  -DDXBCSANDBOX_REGISTER_LIVE_UNITY_TESTS=ON
+cmake --build build-unity --parallel
+DXBC_UNITY_APP=/path/to/Unity.app \
+  ctest --test-dir build-unity --output-on-failure
+DXBC_UNITY_APP=/path/to/Unity.app build-unity/dxbc-compiler-session
+DXBC_UNITY_APP=/path/to/Unity.app build-unity/unity_golden_verifier
+```
+
+Select Unity with `DXBC_UNITY_CONTENTS_PATH`, `DXBC_UNITY_APP`, or
+`UNITY_EDITOR_PATH`. Additional package headers must be supplied through
+`--includes` or a local `shader_includes/` folder under the project root.
+Unity binaries and copied package headers are not included.
+
+The import, bundle, and finite-visual gate commands accept an explicit Editor
+path and use isolated projects. Their installed C# bridges live in
+`share/dxbc-sandbox/unity/Editor`. `quick_test.sh --help` describes bundle-wide
+verification with explicit compile-profile authority. Cached or captured
+OraclePack results are valid only for their recorded inputs and toolchain.
+
+## Limits and layout
+
+- Parsing targets explicitly supported Unity 2021.3 schemas, not every version.
+- HLSL/ShaderLab emission is experimental. Unsupported variants fail closed;
+  hull and domain emission remain unavailable, and geometry support is limited.
+- Readable output is a presentation mode. Recompilation checks require exact
+  mode and matching compiler, platform, keyword, and include authority.
+- Matching DXBC or a finite visual test does not prove universal visual equality
+  or recovery of original source. Regression fixtures are a finite sample.
+- `include/`, `src/`, `resources/`, `schemas/`, and `tests/` hold the public API,
+  implementation, Editor bridges, schemas, and fixtures. Build options and
+  target groups are in `cmake/`; live probes are in `tests/probes/`.
+
+## License
+
+GNU General Public License v3.0 only; see [LICENSE](LICENSE).
+UnityCommon carries its own license and third-party notices.
