@@ -1,4 +1,4 @@
-Special thanks to [@nesrak1](https://github.com/nesrak1) for the idea of [USCSandbox] (https://github.com/nesrak1/USCSandbox) which was a great foundation to start off.
+Special thanks to [@nesrak1](https://github.com/nesrak1) for the idea of [USCSandbox](https://github.com/nesrak1/USCSandbox) which was a great foundation to start off.
 
 An experiment utilizing Codex, ChatGPT, and OpenAI heavily.
 
