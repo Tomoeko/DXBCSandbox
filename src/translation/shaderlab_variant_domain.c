@@ -9,10 +9,10 @@
  * Runtime-selection evidence (UnityPlayer 2021.3.35f1):
  *   keywords::ComputeKeywordMatch
  *   ShaderLab::Program::FindBestMatchingSubProgram
- * The pinned Unity-owned binary ranges and instruction fingerprints in
- * the retained reference fixtures show the exact -16 penalty, strict greater-than winner
- * update, and unsupported-state skip.  The implementation below keeps those
- * details separate from ShaderLab source emission.
+ * Preserve the -16 penalty, strict greater-than winner update, and
+ * unsupported-state skip. Regression coverage lives in
+ * tests/test_shaderlab_variant_domain_units.c. These runtime rules remain
+ * separate from ShaderLab source emission.
  */
 
 bool shaderlab_variant_state_is_canonical(const ShaderLabVariantState* state) {

@@ -77,6 +77,7 @@ OraclePack results are valid only for their recorded inputs and toolchain.
 - `include/`, `src/`, `resources/`, `schemas/`, and `tests/` hold the public API,
   implementation, Editor bridges, schemas, and fixtures. Build options and
   target groups are in `cmake/`; live probes are in `tests/probes/`.
+  Version-specific ABI diagnostics in `tests/abi/` are disabled by default.
 
 ## License
 

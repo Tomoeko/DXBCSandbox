@@ -15,8 +15,8 @@
 #define UNITY_RENDER_TEXTURE_LOCAL_FILE_ID INT64_C(8400000)
 
 /* Unity 2021.3.35f1 authored the exact Windows-player TypeTrees used by this
- * decoder.  The pinned bundle and schema-shape digests are documented in
- * README.md.  A TypeTree-disabled player object is admitted only
+ * decoder. The authority identifiers below name the admitted type layouts.
+ * A TypeTree-disabled player object is admitted only
  * when its complete SerializedFile identity carries the corresponding exact
  * Unity type hash. */
 #define UNITY_TEXTURE2D_LAYOUT_AUTHORITY \

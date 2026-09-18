@@ -40,6 +40,8 @@ function(dxbc_enable_utf8_command_line target)
     endif()
 endfunction()
 
+install(FILES LICENSE DESTINATION share/licenses/DXBCSandbox)
+
 include(cmake/Targets.cmake)
 include(cmake/Unity.cmake)
 if(BUILD_TESTING)
