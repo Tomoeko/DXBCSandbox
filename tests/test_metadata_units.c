@@ -1903,7 +1903,7 @@ int main(void) {
         truthiness_instructions[instruction].operands[1].register_index = 0;
         truthiness_instructions[instruction].operands[1].swizzle_mode = 2;
         truthiness_instructions[instruction].operands[1].swizzle[0] =
-            instruction - 1;
+            (uint8_t)(instruction - 1);
         truthiness_instructions[instruction].operands[2].type =
             OPERAND_TYPE_TEMP;
         truthiness_instructions[instruction].operands[2].register_index = 2;

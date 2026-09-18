@@ -3753,11 +3753,11 @@ static int verify_typed_decomposition_emission(void) {
         init_register_operand(&instructions[component].operands[1],
                               OPERAND_TYPE_TEMP, 1);
         instructions[component].operands[1].swizzle_mode = 2;
-        instructions[component].operands[1].swizzle[0] = component;
+        instructions[component].operands[1].swizzle[0] = (uint8_t)component;
         init_register_operand(&instructions[component].operands[2],
                               OPERAND_TYPE_TEMP, 2);
         instructions[component].operands[2].swizzle_mode = 2;
-        instructions[component].operands[2].swizzle[0] = component;
+        instructions[component].operands[2].swizzle[0] = (uint8_t)component;
         snprintf(instructions[component].original_asm,
                  sizeof(instructions[component].original_asm),
                  "typed_write_%d", component);

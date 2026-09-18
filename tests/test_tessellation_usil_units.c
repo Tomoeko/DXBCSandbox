@@ -27,7 +27,7 @@ typedef int (*StageVerifier)(USILProgram *program);
 
 static int with_stage(const DXBCUSBDTableView *table, const char *name,
                       StageVerifier verifier) {
-  DXBCUSBDRecordView record;
+  DXBCUSBDRecordView record = {0};
   bool found = false;
   for (uint32_t index = 0; index < table->record_count; ++index) {
     CHECK(dxbc_usbd_table_record(table, index, &record));

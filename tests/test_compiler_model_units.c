@@ -69,18 +69,18 @@ static void init_half_vector(DXBCOperand *operand, bool include_w) {
 
 static void set_swizzle(DXBCOperand *operand, int x, int y, int z, int w) {
     operand->swizzle_mode = 1;
-    operand->swizzle[0] = x;
-    operand->swizzle[1] = y;
-    operand->swizzle[2] = z;
-    operand->swizzle[3] = w;
+    operand->swizzle[0] = (uint8_t)x;
+    operand->swizzle[1] = (uint8_t)y;
+    operand->swizzle[2] = (uint8_t)z;
+    operand->swizzle[3] = (uint8_t)w;
 }
 
 static void set_replicate(DXBCOperand *operand, int component) {
     operand->swizzle_mode = 2;
-    operand->swizzle[0] = component;
-    operand->swizzle[1] = component;
-    operand->swizzle[2] = component;
-    operand->swizzle[3] = component;
+    operand->swizzle[0] = (uint8_t)component;
+    operand->swizzle[1] = (uint8_t)component;
+    operand->swizzle[2] = (uint8_t)component;
+    operand->swizzle[3] = (uint8_t)component;
 }
 
 static void init_instruction(USILInstruction *instruction,

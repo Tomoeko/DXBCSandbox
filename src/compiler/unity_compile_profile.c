@@ -295,7 +295,7 @@ UnityCompileProfileStatus unity_compile_profile_parse(
     const char* value = NULL;
     size_t value_size = 0;
     uint64_t number = 0;
-#define PARSE_NUMBER_LINE(key, maximum, destination)                          \
+#define PARSE_NUMBER_LINE(key, maximum, type, destination)                    \
     do {                                                                       \
         if (!take_line(&cursor, end, &line, &line_size) ||                     \
             !line_value(line, line_size, key, &value, &value_size)) {          \
@@ -308,19 +308,19 @@ UnityCompileProfileStatus unity_compile_profile_parse(
                        ? UNITY_COMPILE_PROFILE_VALUE_OUT_OF_RANGE               \
                        : UNITY_COMPILE_PROFILE_INVALID_FORMAT;                  \
         }                                                                      \
-        destination = number;                                                  \
+        destination = (type)number;                                            \
     } while (0)
     PARSE_NUMBER_LINE(
-        "build_platform=", UINT32_MAX, parsed.build_platform);
-    PARSE_NUMBER_LINE("valid_apis=", UINT32_MAX, parsed.valid_apis);
+        "build_platform=", UINT32_MAX, uint32_t, parsed.build_platform);
+    PARSE_NUMBER_LINE("valid_apis=", UINT32_MAX, uint32_t, parsed.valid_apis);
     PARSE_NUMBER_LINE(
         "d3d11_capabilities=",
         (UINT64_C(1) << UNITY_COMPILE_PROFILE_CAPABILITY_COUNT) - UINT64_C(1),
-        parsed.d3d11_capabilities);
+        uint64_t, parsed.d3d11_capabilities);
     PARSE_NUMBER_LINE(
         "glcore_capabilities=",
         (UINT64_C(1) << UNITY_COMPILE_PROFILE_CAPABILITY_COUNT) - UINT64_C(1),
-        parsed.glcore_capabilities);
+        uint64_t, parsed.glcore_capabilities);
 #undef PARSE_NUMBER_LINE
 
     if (!take_line(&cursor, end, &line, &line_size) ||

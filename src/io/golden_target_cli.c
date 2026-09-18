@@ -447,7 +447,7 @@ static bool extract_pass_target(const SerializedShader* shader,
                     selected_index);
             goto cleanup;
         }
-        DXBCContainerView container;
+        DXBCContainerView container = {0};
         bool valid = player.has_player_blob_header && player.bytecode &&
             dxbc_container_view_first(player.bytecode,
                                       player.bytecode_length, &container);
