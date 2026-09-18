@@ -6,6 +6,7 @@
 /failed_shaders/
 /shader_includes/
 /ROADMAP.md
+/AGENTS.md
 *.log
 *.dSYM/
 *.profraw
