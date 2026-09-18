@@ -3954,11 +3954,11 @@ static int verify_recompile_transform_safety_gate(void) {
             init_register_operand(&instructions[lane].operands[1],
                                   OPERAND_TYPE_TEMP, 1);
             instructions[lane].operands[1].swizzle_mode = 2;
-            instructions[lane].operands[1].swizzle[0] = lane;
+            instructions[lane].operands[1].swizzle[0] = (uint8_t)lane;
             init_register_operand(&instructions[lane].operands[2],
                                   OPERAND_TYPE_TEMP, 2);
             instructions[lane].operands[2].swizzle_mode = 2;
-            instructions[lane].operands[2].swizzle[0] = lane;
+            instructions[lane].operands[2].swizzle[0] = (uint8_t)lane;
             snprintf(instructions[lane].original_asm,
                      sizeof(instructions[lane].original_asm),
                      "repeat_writer_%d", lane);
