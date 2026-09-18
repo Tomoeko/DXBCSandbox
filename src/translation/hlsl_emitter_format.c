@@ -532,7 +532,7 @@ static void ResolveScrambledOperand(HLSLEmitterContext* ctx, const DXBCOperand* 
                     local_write_mask |= (16 << P_dst[c]);
                 }
             }
-            local_op.destination_mask = local_write_mask;
+            local_op.destination_mask = (uint8_t)local_write_mask;
         }
     } else {
         if (dst_scrambled) {
@@ -595,7 +595,7 @@ static void ResolveScrambledOperand(HLSLEmitterContext* ctx, const DXBCOperand* 
                     new_swizzle[P_dst[p]] = P_src[phys_comp];
                 }
                 for (int c = 0; c < 4; c++) {
-                    local_op.swizzle[c] = new_swizzle[c];
+                    local_op.swizzle[c] = (uint8_t)new_swizzle[c];
                 }
                 local_op.swizzle_mode = 1;
             }

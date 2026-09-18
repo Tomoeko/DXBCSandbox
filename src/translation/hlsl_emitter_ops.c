@@ -421,12 +421,12 @@ void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst)
     }
 
     bool has_scrambled_op = false;
-    for (int i = 0; i < inst->operand_count; i++) {
-        if (inst->operands[i].type == OPERAND_TYPE_TEMP) {
-            int reg = inst->operands[i].register_index;
+    for (int operand_index = 0; operand_index < inst->operand_count; operand_index++) {
+        if (inst->operands[operand_index].type == OPERAND_TYPE_TEMP) {
+            int reg = inst->operands[operand_index].register_index;
             if (reg >= 0 && reg < ctx->temp_state_count) {
                 int inst_idx = ctx->current_instruction_index;
-                if (i == 0 && inst_writes_to_dest(inst)) {
+                if (operand_index == 0 && inst_writes_to_dest(inst)) {
                     inst_idx = ctx->current_instruction_index + 1;
                 }
                 if (hlsl_readability_transforms_enabled(ctx) &&
@@ -986,22 +986,22 @@ void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst)
       }
       mask_chars[active_count] = '\0';
 
-      bool has_special_dest = false;
+      bool has_split_special_dest = false;
       if (inst->operands[0].type == OPERAND_TYPE_TEMP) {
         int dstRegIdx = inst->operands[0].register_index;
         if (is_register_decomposed(ctx, dstRegIdx)) {
-          has_special_dest = true;
+          has_split_special_dest = true;
         }
         for (int c = 0; c < 4; c++) {
           if (inst->operands[0].destination_mask & (16 << c)) {
             if (ctx->has_deferred_float[dstRegIdx][c] || ctx->has_write_redirect[dstRegIdx][c]) {
-              has_special_dest = true;
+              has_split_special_dest = true;
             }
           }
         }
       }
 
-      if (active_count > 1 && !has_special_dest && inst->operands[0].type == OPERAND_TYPE_OUTPUT) {
+      if (active_count > 1 && !has_split_special_dest && inst->operands[0].type == OPERAND_TYPE_OUTPUT) {
         char dest_base[128] = "";
         format_native_dest_operand_hlsl(ctx, &inst->operands[0], 240, false,
                                         dest_base, sizeof(dest_base));

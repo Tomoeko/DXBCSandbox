@@ -1374,7 +1374,7 @@ ShaderCatalogStatus shader_catalog_build(
         } else {
             ++pending.stats.standalone_serialized_files;
         }
-        UnityInputVisitStats visit_stats;
+        UnityInputVisitStats visit_stats = {0};
         UnityInputStatus visit_status;
         context.saw_graphics_source = false;
         if (options->retain_source_snapshots) {

@@ -2717,7 +2717,7 @@ bool emit_compiler_split_matrix_transform(HLSLEmitterContext *ctx,
         DXBCOperand input = clip[0].operands[1];
         input.swizzle_mode = 1;
         for (int component = 0; component < 4; component++)
-            input.swizzle[component] = component;
+            input.swizzle[component] = (uint8_t)component;
         char input_name[128];
         char clip_output[128];
         format_operand_hlsl(ctx, &input, false, false, HLSL_XYZW_MASK,
@@ -2984,7 +2984,7 @@ bool emit_compiler_screen_position_lowering(HLSLEmitterContext *ctx,
         DXBCOperand output_operand = screen[output_offset].operands[0];
         int output_mask = output_operand.destination_mask;
         if (!compiler_screen_pattern_is_inplace(position->pattern)) {
-            output_operand.destination_mask = full_mask;
+            output_operand.destination_mask = (uint8_t)full_mask;
             output_mask = full_mask;
         }
         char output[128];

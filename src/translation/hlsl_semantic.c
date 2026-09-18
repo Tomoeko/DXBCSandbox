@@ -872,7 +872,7 @@ static void emit_truthiness_condition(HLSLEmitterContext *ctx,
         if (!(lift->data.truthiness.component_mask & (1u << lane))) continue;
         DXBCOperand scalar = *value;
         scalar.swizzle_mode = 2;
-        scalar.swizzle[0] = operand_source_component(value, lane);
+        scalar.swizzle[0] = (uint8_t)operand_source_component(value, lane);
         char source[128];
         format_operand_hlsl(ctx, &scalar, false, false, 16, false, source,
                             sizeof(source));

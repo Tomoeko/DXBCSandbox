@@ -383,7 +383,7 @@ static int test_fail_closed_validation(void) {
           UNITY_MATERIAL_YAML_DUPLICATE_KEY);
     floats[1].name = yaml_string("_NegZero");
 
-    static const char invalid_utf8[] = {(char)0xc3, '(', '\0'};
+    static const char invalid_utf8[] = "\xc3(";
     document.name.bytes = (const uint8_t*)invalid_utf8;
     document.name.size = 2U;
     CHECK(unity_material_yaml_emit(&document, &output) ==

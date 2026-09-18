@@ -26,6 +26,9 @@ include(cmake/Options.cmake)
 add_library(dxbc_build_options INTERFACE)
 if(MSVC)
     target_compile_options(dxbc_build_options INTERFACE /W4 /WX)
+    # Use the portable C library APIs without Microsoft's replacement warnings.
+    target_compile_definitions(dxbc_build_options INTERFACE
+        _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(dxbc_build_options INTERFACE
         -Wall -Wextra -Werror)
