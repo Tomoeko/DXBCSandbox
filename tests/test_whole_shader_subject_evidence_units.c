@@ -60,6 +60,7 @@ static WholeShaderSubjectDescriptor make_descriptor(uint8_t seed) {
         descriptor.verification_scope_digest,
         descriptor.dependency_map_digest,
         descriptor.producer_fingerprint,
+        descriptor.candidate_release_digest,
     };
     for (size_t index = 0U; index < sizeof(fields) / sizeof(fields[0]);
          ++index) {
@@ -122,13 +123,11 @@ static int test_subject_canonical_encoding(void) {
           WHOLE_SHADER_SUBJECT_OK);
     common_sha256_digest_to_hex(golden_digest, golden_hex);
     if (strcmp(golden_hex,
-               "f797faf5ef05fc557e71b20394a09450"
-               "673f25400e4f71aaaf57c71bcec1b483") != 0) {
+               "d80392e9ff8e2a160a9f42c8498803fa27576b963c206970a9a948ad19ea5030") != 0) {
         fprintf(stderr, "Unexpected subject digest: %s\n", golden_hex);
     }
     CHECK(strcmp(golden_hex,
-                 "f797faf5ef05fc557e71b20394a09450"
-                 "673f25400e4f71aaaf57c71bcec1b483") ==
+                 "d80392e9ff8e2a160a9f42c8498803fa27576b963c206970a9a948ad19ea5030") ==
           0);
     whole_shader_subject_serialized_free(bytes);
 
@@ -198,6 +197,9 @@ static int test_subject_canonical_encoding(void) {
     CHECK(expect_subject_near_miss(subject, &near) == 0);
     near = canonical;
     near.producer_fingerprint[8] ^= 1U;
+    CHECK(expect_subject_near_miss(subject, &near) == 0);
+    near = canonical;
+    near.candidate_release_digest[10] ^= 1U;
     CHECK(expect_subject_near_miss(subject, &near) == 0);
 
     WholeShaderSubjectDescriptor split_a = make_descriptor(8U);
@@ -320,12 +322,12 @@ static int test_evidence_is_derived_and_ordered(void) {
           WHOLE_SHADER_EVIDENCE_OK);
     common_sha256_digest_to_hex(golden_digest, golden_hex);
     if (strcmp(golden_hex,
-               "db8ce2916f0aa8cef3e93bdad780b54d9479f559d51bee27c7cc77176e32d0bc") !=
+               "30af4166d917b92f80eeab9776880cf354fb829ba7e9a03673ab72e5b5f8dd81") !=
         0) {
         fprintf(stderr, "unexpected evidence digest: %s\n", golden_hex);
     }
     CHECK(strcmp(golden_hex,
-                 "db8ce2916f0aa8cef3e93bdad780b54d9479f559d51bee27c7cc77176e32d0bc") ==
+                 "30af4166d917b92f80eeab9776880cf354fb829ba7e9a03673ab72e5b5f8dd81") ==
           0);
     whole_shader_evidence_serialized_free(bytes);
 

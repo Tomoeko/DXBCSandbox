@@ -24,6 +24,12 @@ typedef struct {
      * captured bytes and the resolved schema, never catalog display fields. */
     uint8_t payload_digest[COMMON_SHA256_DIGEST_SIZE];
     uint8_t schema_digest[COMMON_SHA256_DIGEST_SIZE];
+    /* Complete captured outer file, not just its SerializedFile member. */
+    uint8_t source_artifact_digest[COMMON_SHA256_DIGEST_SIZE];
+    /* Relocation-stable identity of this exact released object. Binds the
+     * outer artifact, serialized member, payload, schema and coordinates.
+     * Host path and display name are excluded. See the decoder's v1 encoding. */
+    uint8_t release_digest[COMMON_SHA256_DIGEST_SIZE];
 } ShaderCatalogObjectReport;
 
 /* Decode an owned ClassID 48 record from its unique retained input snapshot.

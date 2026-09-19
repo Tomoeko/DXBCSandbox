@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define WHOLE_SHADER_SUBJECT_FORMAT_VERSION 1U
+#define WHOLE_SHADER_SUBJECT_FORMAT_VERSION 2U
 #define WHOLE_SHADER_SUBJECT_DIGEST_SIZE 32U
 #define WHOLE_SHADER_SUBJECT_MAX_STRING_BYTES UINT32_C(1048576)
 #define WHOLE_SHADER_SUBJECT_SHADER_CLASS_ID 48
@@ -52,6 +52,11 @@ typedef struct {
     uint8_t verification_scope_digest[WHOLE_SHADER_SUBJECT_DIGEST_SIZE];
     uint8_t dependency_map_digest[WHOLE_SHADER_SUBJECT_DIGEST_SIZE];
     uint8_t producer_fingerprint[WHOLE_SHADER_SUBJECT_DIGEST_SIZE];
+    /* CapturedShaderRelease.v1 digest from shader_catalog_decode_object() for
+     * the candidate actually built/imported and re-extracted. This binds its
+     * complete outer artifact, member/object coordinates, payload and schema;
+     * source identity alone cannot bind a particular build. Appended in v2. */
+    uint8_t candidate_release_digest[WHOLE_SHADER_SUBJECT_DIGEST_SIZE];
 } WholeShaderSubjectDescriptor;
 
 typedef enum {

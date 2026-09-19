@@ -203,6 +203,8 @@ static bool test_collected_bundle_self_pair(void) {
         const uint8_t zeros[COMMON_SHA256_DIGEST_SIZE] = {0};
         CHECK(memcmp(decoded_report.payload_digest, zeros, sizeof(zeros)) == 0);
         CHECK(memcmp(decoded_report.schema_digest, zeros, sizeof(zeros)) == 0);
+        CHECK(memcmp(decoded_report.source_artifact_digest, zeros, sizeof(zeros)) == 0);
+        CHECK(memcmp(decoded_report.release_digest, zeros, sizeof(zeros)) == 0);
         *mutable_record = copy;
     }
     size_t retained_count = catalog.retained_source_snapshot_count;

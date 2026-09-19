@@ -122,6 +122,12 @@ if(BUILD_TESTING)
     dxbc_add_core_test(test_whole_shader_subject_evidence_units
         tests/test_whole_shader_subject_evidence_units.c
         whole_shader_subject_evidence_units)
+    dxbc_add_core_test(test_release_shader_evidence_units
+        tests/test_release_shader_evidence_units.c release_shader_evidence_units)
+    target_link_libraries(test_release_shader_evidence_units PRIVATE UnityCommon::test_support)
+    target_compile_definitions(test_release_shader_evidence_units PRIVATE
+        DXBC_RELEASE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/release_shader/empty.assets"
+        DXBC_RELEASE_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry")
     if(_dxbc_has_regression_corpus)
         dxbc_add_core_test(test_release_shader_object_certificate_units
             tests/test_release_shader_object_certificate_units.c

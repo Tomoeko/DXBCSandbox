@@ -19,6 +19,39 @@ static bool same_string(const char *left, const char *right) {
     return left && right ? strcmp(left, right) == 0 : left == right;
 }
 
+static void digest_u64(CommonSha256Context *hash, uint64_t value) {
+    uint8_t bytes[8];
+    for (unsigned index = 0U; index < sizeof(bytes); ++index)
+        bytes[index] = (uint8_t)(value >> (index * 8U));
+    common_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+static void release_digest(const ShaderCatalogRecord *record,
+                           ShaderCatalogObjectReport *report) {
+    /* v1 encoding: NUL-terminated domain; four SHA-256 digests; five u64-LE
+     * coordinates (signed pathID converted modulo 2^64); then member and Unity
+     * version as u64-LE byte lengths followed by their non-NUL bytes. */
+    static const char domain[] = "DXBCSandbox.CapturedShaderRelease.v1";
+    CommonSha256Context hash;
+    common_sha256_init(&hash);
+    common_sha256_update(&hash, domain, sizeof(domain));
+    common_sha256_update(&hash, report->source_artifact_digest, COMMON_SHA256_DIGEST_SIZE);
+    common_sha256_update(&hash, record->serialized_digest, COMMON_SHA256_DIGEST_SIZE);
+    common_sha256_update(&hash, report->payload_digest, COMMON_SHA256_DIGEST_SIZE);
+    common_sha256_update(&hash, report->schema_digest, COMMON_SHA256_DIGEST_SIZE);
+    digest_u64(&hash, (uint64_t)record->path_id);
+    digest_u64(&hash, (uint64_t)record->class_id);
+    digest_u64(&hash, record->target_platform);
+    digest_u64(&hash, record->is_bundle_member ? 1U : 0U);
+    digest_u64(&hash, record->member_index);
+    const char *member = record->member_name ? record->member_name : "";
+    digest_u64(&hash, strlen(member));
+    common_sha256_update(&hash, member, strlen(member));
+    digest_u64(&hash, strlen(record->unity_version));
+    common_sha256_update(&hash, record->unity_version, strlen(record->unity_version));
+    common_sha256_final(&hash, report->release_digest);
+}
+
 static bool source_matches_record(const UnitySerializedSource *source,
                                   const ShaderCatalogRecord *record) {
     if (!same_string(source->outer_path, record->outer_path) ||
@@ -121,6 +154,12 @@ ShaderCatalogObjectStatus shader_catalog_decode_object(const ShaderCatalog *cata
     UnityInputVisitStats stats;
     context.report.source_status =
         unity_input_snapshot_visit(snapshot, decode_source, &context, &stats);
+    if (context.report.source_status == UNITY_INPUT_OK) {
+        /* Validate again after decoding. Bind the whole captured file, never
+         * a later read of the pathname or the uncompressed member alone. */
+        context.report.source_status =
+            unity_input_snapshot_digest(snapshot, context.report.source_artifact_digest);
+    }
     ShaderCatalogObjectStatus status;
     if (context.report.source_status != UNITY_INPUT_OK) {
         status = SHADER_CATALOG_OBJECT_SOURCE_UNAVAILABLE;
@@ -131,6 +170,7 @@ ShaderCatalogObjectStatus shader_catalog_decode_object(const ShaderCatalog *cata
     } else if (context.report.object_status != SHADER_OBJECT_OK) {
         status = SHADER_CATALOG_OBJECT_DECODE_FAILED;
     } else {
+        release_digest(record, &context.report);
         shader_object_dispose(destination);
         *destination = context.object;
         shader_object_init(&context.object);
@@ -139,6 +179,8 @@ ShaderCatalogObjectStatus shader_catalog_decode_object(const ShaderCatalog *cata
     if (status != SHADER_CATALOG_OBJECT_OK) {
         memset(context.report.payload_digest, 0, sizeof(context.report.payload_digest));
         memset(context.report.schema_digest, 0, sizeof(context.report.schema_digest));
+        memset(context.report.source_artifact_digest, 0, sizeof(context.report.source_artifact_digest));
+        memset(context.report.release_digest, 0, sizeof(context.report.release_digest));
     }
     *report = context.report;
     shader_object_dispose(&context.object);
