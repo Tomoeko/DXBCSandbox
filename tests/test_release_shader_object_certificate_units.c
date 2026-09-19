@@ -329,6 +329,23 @@ static bool exercise_object_pair(ShaderObject* expected,
     CHECK(report.expected_artifact_count == report.actual_artifact_count);
     CHECK(report.expected_artifact_count == report.matched_artifact_count);
 
+    uint8_t expected_state[COMMON_SHA256_DIGEST_SIZE], actual_state[COMMON_SHA256_DIGEST_SIZE];
+    CHECK(release_shader_render_state_digest(expected, expected_state));
+    CHECK(release_shader_render_state_digest(actual, actual_state));
+    CHECK(memcmp(expected_state, actual_state, sizeof(actual_state)) == 0);
+    TypeTreeValue *state = mutable_child(first_pass(actual), "m_State");
+    TypeTreeValue *depth_test = mutable_child(mutable_child(state, "zTest"), "val");
+    CHECK(depth_test && depth_test->type == VAL_TYPE_FLOAT);
+    const double saved_depth_test = depth_test->float_val;
+    depth_test->float_val = saved_depth_test == 1.0 ? 2.0 : 1.0;
+    CHECK(release_shader_render_state_digest(actual, actual_state));
+    CHECK(memcmp(expected_state, actual_state, sizeof(actual_state)) != 0);
+    CHECK(check_object_report(expected, actual, RELEASE_SHADER_OBJECT_CERTIFICATE_OBJECTS_DIFFER, &report));
+    CHECK(report.fields[RELEASE_SHADER_FIELD_RENDER_STATE] == RELEASE_SHADER_FIELD_MISMATCH);
+    depth_test->float_val = saved_depth_test;
+    CHECK(release_shader_render_state_digest(actual, actual_state));
+    CHECK(memcmp(expected_state, actual_state, sizeof(actual_state)) == 0);
+
     TypeTreeValue* property_name = first_property_name(actual);
     CHECK(property_name && property_name->type == VAL_TYPE_STRING);
     char* saved_name = property_name->string_val;

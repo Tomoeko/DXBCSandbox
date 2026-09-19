@@ -34,10 +34,11 @@ static bool subject_matches(const WholeShaderSubjectDescriptor *subject,
            memcmp(subject->candidate_release_digest, report->candidate.release_digest, 32U) == 0;
 }
 
-static void authority_digest(const ReleaseShaderEvidenceReport *report, uint8_t digest[32]) {
+static void authority_digest(const ReleaseShaderEvidenceReport *report, const char *domain,
+                             uint8_t digest[32]) {
     CommonSha256Context hash;
     common_sha256_init(&hash);
-    common_sha256_update(&hash, producer_domain, sizeof(producer_domain));
+    common_sha256_update(&hash, domain, strlen(domain) + 1U);
     common_sha256_update(&hash, report->target.release_digest, 32U);
     common_sha256_update(&hash, report->candidate.release_digest, 32U);
     common_sha256_final(&hash, digest);
@@ -59,7 +60,7 @@ static WholeShaderEvidenceStatus comparison_evidence(const WholeShaderSubject *s
     descriptor.plane = WHOLE_SHADER_PLANE_REEXTRACTION;
     descriptor.producer = "dxbc-release-byte-bound";
     descriptor.producer_version = 1U;
-    authority_digest(report, descriptor.authority_digest);
+    authority_digest(report, producer_domain, descriptor.authority_digest);
     descriptor.items = items;
     descriptor.item_count = 2U;
     return whole_shader_evidence_create_comparison(out_evidence, subject, &descriptor);
@@ -72,7 +73,7 @@ static WholeShaderEvidenceStatus unavailable_evidence(const WholeShaderSubject *
     descriptor.plane = WHOLE_SHADER_PLANE_REEXTRACTION;
     descriptor.producer = "dxbc-release-byte-bound";
     descriptor.producer_version = 1U;
-    authority_digest(report, descriptor.authority_digest);
+    authority_digest(report, producer_domain, descriptor.authority_digest);
     descriptor.expected_item_count = 2U;
     descriptor.reason_code = (uint32_t)report->canonical.status;
     /* The existing comparator's stable diagnostic names identify missing
@@ -82,11 +83,41 @@ static WholeShaderEvidenceStatus unavailable_evidence(const WholeShaderSubject *
     return whole_shader_evidence_create_unavailable(out_evidence, subject, &descriptor);
 }
 
-ReleaseShaderEvidenceStatus release_shader_make_reextraction_evidence(
-    const ShaderCatalog *target_catalog, const ShaderCatalogRecord *target_record,
-    const ShaderCatalog *candidate_catalog, const ShaderCatalogRecord *candidate_record,
-    const TypeTreeSchemaRegistry *registry, const WholeShaderSubject *subject,
-    WholeShaderEvidence **out_evidence, ReleaseShaderEvidenceReport *report) {
+static WholeShaderEvidenceStatus render_state_evidence(const WholeShaderSubject *subject,
+                                                       const ShaderObject *target,
+                                                       const ShaderObject *candidate,
+                                                       const ReleaseShaderEvidenceReport *report,
+                                                       WholeShaderEvidence **output) {
+    WholeShaderEvidenceComparisonItem item = {0};
+    static const char identity[] = "DXBCSandbox.CompleteOrderedRenderState.v1";
+    common_sha256(identity, sizeof(identity), item.identity_digest);
+    if (report->canonical.fields[RELEASE_SHADER_FIELD_SCHEMA_PROFILE] !=
+            RELEASE_SHADER_FIELD_MATCH ||
+        (report->canonical.fields[RELEASE_SHADER_FIELD_RENDER_STATE] !=
+             RELEASE_SHADER_FIELD_MATCH &&
+         report->canonical.fields[RELEASE_SHADER_FIELD_RENDER_STATE] !=
+             RELEASE_SHADER_FIELD_MISMATCH) ||
+        !release_shader_render_state_digest(target, item.expected_digest) ||
+        !release_shader_render_state_digest(candidate, item.observed_digest))
+        return WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
+    WholeShaderComparisonEvidenceDescriptor descriptor = {
+        .plane = WHOLE_SHADER_PLANE_RENDER_STATE,
+        .producer = "dxbc-release-ordered-state",
+        .producer_version = 1,
+        .items = &item,
+        .item_count = 1,
+    };
+    authority_digest(report, "DXBCSandbox.OrderedState.Authority.v1", descriptor.authority_digest);
+    return whole_shader_evidence_create_comparison(output, subject, &descriptor);
+}
+
+static ReleaseShaderEvidenceStatus
+make_release_evidence(const ShaderCatalog *target_catalog, const ShaderCatalogRecord *target_record,
+                      const ShaderCatalog *candidate_catalog,
+                      const ShaderCatalogRecord *candidate_record,
+                      const TypeTreeSchemaRegistry *registry, const WholeShaderSubject *subject,
+                      WholeShaderEvidence **out_evidence, ReleaseShaderEvidenceReport *report,
+                      WholeShaderVerificationPlane plane) {
     if (out_evidence)
         *out_evidence = NULL;
     if (!report)
@@ -124,7 +155,10 @@ ReleaseShaderEvidenceStatus release_shader_make_reextraction_evidence(
     }
     ReleaseShaderObjectCertificateStatus compared =
         release_shader_object_certify_equal(&target, &candidate, NULL, &report->canonical);
-    if (compared == RELEASE_SHADER_OBJECT_CERTIFICATE_AUTHORITY_UNAVAILABLE) {
+    if (plane == WHOLE_SHADER_PLANE_RENDER_STATE) {
+        report->evidence_status =
+            render_state_evidence(subject, &target, &candidate, report, out_evidence);
+    } else if (compared == RELEASE_SHADER_OBJECT_CERTIFICATE_AUTHORITY_UNAVAILABLE) {
         report->evidence_status = unavailable_evidence(subject, report, out_evidence);
     } else if (compared == RELEASE_SHADER_OBJECT_CERTIFICATE_OK ||
                compared == RELEASE_SHADER_OBJECT_CERTIFICATE_OBJECTS_DIFFER) {
@@ -148,4 +182,24 @@ cleanup:
     shader_object_dispose(&candidate);
     shader_object_dispose(&target);
     return status;
+}
+
+ReleaseShaderEvidenceStatus release_shader_make_reextraction_evidence(
+    const ShaderCatalog *target_catalog, const ShaderCatalogRecord *target_record,
+    const ShaderCatalog *candidate_catalog, const ShaderCatalogRecord *candidate_record,
+    const TypeTreeSchemaRegistry *registry, const WholeShaderSubject *subject,
+    WholeShaderEvidence **out_evidence, ReleaseShaderEvidenceReport *report) {
+    return make_release_evidence(target_catalog, target_record, candidate_catalog, candidate_record,
+                                 registry, subject, out_evidence, report,
+                                 WHOLE_SHADER_PLANE_REEXTRACTION);
+}
+
+ReleaseShaderEvidenceStatus release_shader_make_render_state_evidence(
+    const ShaderCatalog *target_catalog, const ShaderCatalogRecord *target_record,
+    const ShaderCatalog *candidate_catalog, const ShaderCatalogRecord *candidate_record,
+    const TypeTreeSchemaRegistry *registry, const WholeShaderSubject *subject,
+    WholeShaderEvidence **out_evidence, ReleaseShaderEvidenceReport *report) {
+    return make_release_evidence(target_catalog, target_record, candidate_catalog, candidate_record,
+                                 registry, subject, out_evidence, report,
+                                 WHOLE_SHADER_PLANE_RENDER_STATE);
 }

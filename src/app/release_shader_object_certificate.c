@@ -3,6 +3,7 @@
 #include "app/release_shader_object_certificate.h"
 
 #include "io/serialized_shader_profile.h"
+#include "io/typetree_value_digest.h"
 
 #include <limits.h>
 #include <string.h>
@@ -1017,6 +1018,42 @@ static ReleaseShaderObjectFieldStatus compare_compiled_artifacts(
         }
     }
     return RELEASE_SHADER_FIELD_MATCH;
+}
+
+static void state_digest_count(CommonSha256Context *hash, uint64_t value) {
+    uint8_t bytes[8];
+    for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(value >> (i * 8U));
+    common_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+bool release_shader_render_state_digest(const ShaderObject *object,
+                                        uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
+    if (!object || !digest || !object->decoded ||
+        !serialized_shader_profile_validate_value(&object->root, object->profile)) return false;
+    const TypeTreeValue *parsed = required_child(&object->root, "m_ParsedForm");
+    const TypeTreeValue *subshaders = required_array(parsed, "m_SubShaders");
+    if (!array_value_is_valid(subshaders) ||
+        subshaders->array_val.storage != TYPETREE_ARRAY_VALUES) return false;
+    CommonSha256Context hash;
+    common_sha256_init(&hash);
+    static const char domain[] = "DXBCSandbox.OrderedReleaseRenderState.v1";
+    common_sha256_update(&hash, domain, sizeof(domain));
+    state_digest_count(&hash, (uint32_t)subshaders->array_val.count);
+    for (int subshader = 0; subshader < subshaders->array_val.count; ++subshader) {
+        const TypeTreeValue *passes = required_array(
+            &subshaders->array_val.elements[subshader], "m_Passes");
+        if (!array_value_is_valid(passes) ||
+            passes->array_val.storage != TYPETREE_ARRAY_VALUES) return false;
+        state_digest_count(&hash, (uint32_t)passes->array_val.count);
+        for (int pass = 0; pass < passes->array_val.count; ++pass) {
+            const TypeTreeValue *state = required_child(&passes->array_val.elements[pass], "m_State");
+            uint8_t state_digest[COMMON_SHA256_DIGEST_SIZE];
+            if (!typetree_value_digest(state, state_digest)) return false;
+            common_sha256_update(&hash, state_digest, sizeof(state_digest));
+        }
+    }
+    common_sha256_final(&hash, digest);
+    return true;
 }
 
 static void record_value_field(

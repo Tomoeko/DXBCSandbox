@@ -88,6 +88,19 @@ static bool compare_pair(const char *target_path, const char *candidate_path,
           !whole.d3d11_byte_equivalence_certified && !whole.finite_pixel_observations_certified);
     whole_shader_certificate_input_free(input);
     whole_shader_evidence_free(evidence);
+    evidence = NULL;
+    CHECK(release_shader_make_render_state_evidence(&target, target.records, &candidate,
+                                                    candidate.records, registry, subject, &evidence,
+                                                    &report) == RELEASE_SHADER_EVIDENCE_OK);
+    CHECK(whole_shader_evidence_describe(evidence, &summary) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(summary.plane == WHOLE_SHADER_PLANE_RENDER_STATE && summary.expected_item_count == 1U);
+    CHECK(summary.status ==
+          (report.canonical.fields[RELEASE_SHADER_FIELD_RENDER_STATE] == RELEASE_SHADER_FIELD_MATCH
+               ? WHOLE_SHADER_PLANE_PASS
+               : WHOLE_SHADER_PLANE_FAIL));
+    printf("render-state=%s\n", whole_shader_plane_status_name(summary.status));
+    whole_shader_evidence_free(evidence);
+    evidence = NULL;
 
     if (near_misses) {
         for (unsigned mutation = 0U; mutation < 13U; ++mutation) {
@@ -139,6 +152,10 @@ static bool compare_pair(const char *target_path, const char *candidate_path,
             WholeShaderSubject *bad = NULL;
             CHECK(whole_shader_subject_create(&bad, &changed) == WHOLE_SHADER_SUBJECT_OK);
             CHECK(release_shader_make_reextraction_evidence(
+                      &target, target.records, &candidate, candidate.records, registry, bad,
+                      &evidence, &report) == RELEASE_SHADER_EVIDENCE_SUBJECT_MISMATCH);
+            CHECK(evidence == NULL);
+            CHECK(release_shader_make_render_state_evidence(
                       &target, target.records, &candidate, candidate.records, registry, bad,
                       &evidence, &report) == RELEASE_SHADER_EVIDENCE_SUBJECT_MISMATCH);
             CHECK(evidence == NULL);

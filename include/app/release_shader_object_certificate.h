@@ -4,6 +4,7 @@
 #define RELEASE_SHADER_OBJECT_CERTIFICATE_H
 
 #include "io/shader_blob_archive.h"
+#include "common/sha256.h"
 #include "io/shader_object.h"
 
 #include <stdbool.h>
@@ -164,6 +165,14 @@ ReleaseShaderObjectCertificateStatus release_shader_object_certify_equal(
     const ShaderObject* expected, const ShaderObject* actual,
     const ReleaseShaderObjectCertificateOptions* options,
     ReleaseShaderObjectCertificateReport* report);
+
+/* Strict ordered render-state identity for a decoded, profile-validated object.
+ * Includes every subshader/pass count and complete m_State value. Map order
+ * remains identity-bearing, unlike the general canonical comparator. Pairs
+ * with the caller's schema digest; not a runtime or emission certificate.
+ * Failure preserves digest. */
+bool release_shader_render_state_digest(
+    const ShaderObject *object, uint8_t digest[COMMON_SHA256_DIGEST_SIZE]);
 
 const char* release_shader_object_field_name(ReleaseShaderObjectField field);
 const char* release_shader_object_field_status_name(

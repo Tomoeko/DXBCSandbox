@@ -47,4 +47,15 @@ ReleaseShaderEvidenceStatus release_shader_make_reextraction_evidence(
     const TypeTreeSchemaRegistry *registry, const WholeShaderSubject *subject,
     WholeShaderEvidence **out_evidence, ReleaseShaderEvidenceReport *report);
 
+/* Reuses the same capture and subject-binding boundary, but compares the
+ * complete ordered m_State sequence and topology. This is deliberately
+ * stricter than the canonical comparator's map-order normalization. Unresolved
+ * dependencies do not erase available state evidence; the independent
+ * dependency/re-extraction planes still prevent a whole logical claim. */
+ReleaseShaderEvidenceStatus release_shader_make_render_state_evidence(
+    const ShaderCatalog *target_catalog, const ShaderCatalogRecord *target_record,
+    const ShaderCatalog *candidate_catalog, const ShaderCatalogRecord *candidate_record,
+    const TypeTreeSchemaRegistry *registry, const WholeShaderSubject *subject,
+    WholeShaderEvidence **out_evidence, ReleaseShaderEvidenceReport *report);
+
 #endif
