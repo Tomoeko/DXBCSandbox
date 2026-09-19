@@ -21,7 +21,9 @@ typedef struct {
 typedef struct {
     HLSLBlockPhis *block_phis; // Array of Phi lists per basic block (size = block_count)
     int *operand_ssa_vars;     // Flat array mapping (inst, operand, comp) -> ssa_var ID
-    int *ssa_var_defs;         // Array mapping ssa_var ID -> definition instruction index (size = ssa_var_count)
+    /* Instruction definition per SSA variable; phi variables use
+     * HLSL_DEFINITION_AMBIGUOUS instead of impersonating an instruction. */
+    int *ssa_var_defs;
     int instruction_count;
     int ssa_var_count;
 } HLSLSSAGraph;

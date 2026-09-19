@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -249,12 +250,6 @@ static bool is_fixed_cbuffer_multiply_operand(const DXBCOperand *operand) {
     return true;
 }
 
-static int operand_source_component(const DXBCOperand *operand, int lane) {
-    if (operand->swizzle_mode == 2) return operand->swizzle[0];
-    if (operand->swizzle_mode == 1) return operand->swizzle[lane];
-    return lane;
-}
-
 static bool saved_multiply_destination_is_emittable(
     HLSLEmitterContext *ctx, const USILInstruction *instruction) {
     if (!ctx || !instruction || instruction->operand_count < 1 ||
@@ -300,7 +295,7 @@ static bool mad_accumulates_its_destination(const HLSLEmitterContext *ctx,
 
     for (int lane = 0; lane < 4; lane++) {
         if ((destination->destination_mask & (16 << lane)) == 0) continue;
-        if (operand_source_component(accumulator, lane) != lane) return false;
+        if (usil_operand_source_component(accumulator, lane) != lane) return false;
         const int definition =
             hlsl_operand_definition(ctx, mad_index, 3, lane);
         if (definition < mul_index || definition >= mad_index ||

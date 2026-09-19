@@ -1833,10 +1833,12 @@ int main(void) {
     CHECK(analyze_lane_value_types(&provenance_context));
     CHECK(get_lane_value_facts(&provenance_context, 2, 0, 0) ==
           HLSL_VALUE_FLOAT);
+    /* ADD writes/reads xyz only. The untouched input-derived w remains
+     * untyped; a phantom source use must not invent float interpretation. */
     CHECK(get_lane_value_facts(&provenance_context, 2, 0, 3) ==
-          HLSL_VALUE_FLOAT);
-    CHECK((get_operand_value_facts(&provenance_context, 1, 1, 3) &
-           HLSL_VALUE_FLOAT) != 0);
+          HLSL_VALUE_UNKNOWN);
+    CHECK(get_operand_value_facts(&provenance_context, 1, 1, 3) ==
+          HLSL_VALUE_UNKNOWN);
     free_lane_value_types(&provenance_context);
     free_hlsl_use_def_graph(&provenance_context);
     free_component_provenance(&provenance_context);

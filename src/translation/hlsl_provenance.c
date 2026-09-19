@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -42,13 +43,6 @@ static HLSLProvenanceKind classify_instruction(const USILInstruction *inst) {
         default:
             return HLSL_PROVENANCE_ARITHMETIC;
     }
-}
-
-static int source_component(const DXBCOperand *operand, int destination_component) {
-    if (operand->swizzle_mode == 2) return operand->swizzle[0];
-    if (operand->swizzle_mode == 1)
-        return operand->swizzle[destination_component];
-    return destination_component;
 }
 
 static size_t provenance_offset(const HLSLEmitterContext *ctx, int state,
@@ -124,40 +118,50 @@ bool build_component_provenance(HLSLEmitterContext *ctx) {
         memcpy(after, before,
                state_width * sizeof(HLSLComponentProvenance));
         const USILInstruction *inst = &program->instructions[index];
-        if (!inst_writes_to_dest(inst) || inst->operand_count < 1 ||
-            inst->operands[0].type != OPERAND_TYPE_TEMP) {
-            continue;
-        }
-        const DXBCOperand *destination = &inst->operands[0];
-        if (destination->register_index < 0 ||
-            destination->register_index >= ctx->provenance_register_count) {
-            continue;
-        }
-        int mask = destination->destination_mask;
-        if (mask == 0) mask = 16 | 32 | 64 | 128;
-        for (int component = 0; component < 4; component++) {
-            if (!(mask & (16 << component))) continue;
-            HLSLComponentProvenance *value = &after[
-                destination->register_index * 4 + component];
-            value->kind = classify_instruction(inst);
-            value->definition_instruction = index;
-            value->root_instruction = index;
-            value->root_register = destination->register_index;
-            value->root_component = component;
-            value->vector_definition = index;
-            value->vector_mask = (unsigned char)mask;
-            if (inst->opcode == USIL_OP_MOV && inst->operand_count >= 2 &&
-                inst->operands[1].type == OPERAND_TYPE_TEMP) {
-                const DXBCOperand *source = &inst->operands[1];
-                int source_comp = source_component(source, component);
-                const HLSLComponentProvenance *source_value =
-                    get_component_provenance(ctx, index,
-                                             source->register_index,
-                                             source_comp);
-                if (source_value) {
-                    value->root_instruction = source_value->root_instruction;
-                    value->root_register = source_value->root_register;
-                    value->root_component = source_value->root_component;
+        for (int operand_index = 0; operand_index < inst->operand_count;
+             ++operand_index) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(program, inst, operand_index, &use)) {
+                free_component_provenance(ctx);
+                return false;
+            }
+            const DXBCOperand *destination = &inst->operands[operand_index];
+            if (use.use != USIL_OPERAND_USE_DESTINATION ||
+                destination->type != OPERAND_TYPE_TEMP) continue;
+            if (destination->register_index < 0 ||
+                destination->register_index >= ctx->provenance_register_count) {
+                free_component_provenance(ctx);
+                return false;
+            }
+            uint8_t mask = usil_operand_destination_lane_mask(destination);
+            for (int component = 0; component < 4; ++component) {
+                if (!(mask & (1u << component))) continue;
+                HLSLComponentProvenance *value = &after[
+                    destination->register_index * 4 + component];
+                value->kind = classify_instruction(inst);
+                value->definition_instruction = index;
+                value->root_instruction = index;
+                value->root_register = destination->register_index;
+                value->root_component = component;
+                value->vector_definition = index;
+                value->vector_mask = (unsigned char)(mask << 4);
+                /* Negate, abs, saturation and minimum precision change the
+                 * value; their roots cannot be collapsed to a plain copy. */
+                if (inst->opcode == USIL_OP_MOV && !inst->saturate &&
+                    inst->operands[1].type == OPERAND_TYPE_TEMP &&
+                    !inst->operands[1].has_neg && !inst->operands[1].has_abs &&
+                    inst->operands[1].min_precision == 0 &&
+                    destination->min_precision == 0) {
+                    const DXBCOperand *source = &inst->operands[1];
+                    int source_comp = usil_operand_source_component(source, component);
+                    const HLSLComponentProvenance *source_value =
+                        get_component_provenance(ctx, index,
+                                                 source->register_index, source_comp);
+                    if (source_value) {
+                        value->root_instruction = source_value->root_instruction;
+                        value->root_register = source_value->root_register;
+                        value->root_component = source_value->root_component;
+                    }
                 }
             }
         }

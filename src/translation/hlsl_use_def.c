@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 #include <stdlib.h>
 #include <string.h>
 
 static size_t operand_offset(int instruction, int operand, int component) {
     return (((size_t)instruction * DXBC_MAX_OPERANDS + (size_t)operand) * 4u) +
            (size_t)component;
-}
-
-static int source_component(const DXBCOperand *operand, int component) {
-    if (operand->swizzle_mode == 2) return operand->swizzle[0];
-    if (operand->swizzle_mode == 1) return operand->swizzle[component];
-    return component;
 }
 
 bool build_hlsl_use_def_graph(HLSLEmitterContext *ctx) {
@@ -34,28 +29,62 @@ bool build_hlsl_use_def_graph(HLSLEmitterContext *ctx) {
 
     for (int index = 0; index < count; index++) {
         const USILInstruction *inst = &ctx->program->instructions[index];
-        int first_source = inst_writes_to_dest(inst) ? 1 : 0;
-        for (int operand_index = first_source;
-             operand_index < inst->operand_count; operand_index++) {
+        for (int operand_index = 0; operand_index < inst->operand_count;
+             ++operand_index) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(ctx->program, inst, operand_index, &use)) {
+                free_hlsl_use_def_graph(ctx);
+                return false;
+            }
             const DXBCOperand *operand = &inst->operands[operand_index];
-            if (operand->type != OPERAND_TYPE_TEMP) continue;
+            if (use.use != USIL_OPERAND_USE_SOURCE ||
+                operand->type != OPERAND_TYPE_TEMP) continue;
             for (int component = 0; component < 4; component++) {
-                int source = source_component(operand, component);
-                const HLSLComponentProvenance *provenance =
-                    get_component_provenance(ctx, index,
-                                             operand->register_index, source);
+                if (!(use.source_lane_mask & (1u << component))) continue;
+                int source = usil_operand_source_component(operand, component);
+                if (source < 0) {
+                    free_hlsl_use_def_graph(ctx);
+                    return false;
+                }
                 int definition = HLSL_DEFINITION_UNKNOWN;
-                if (provenance && provenance->definition_instruction >= 0) {
-                    definition = provenance->definition_instruction;
-                    if (!instructions_have_unambiguous_path(
-                            ctx, definition, index))
-                        definition = HLSL_DEFINITION_AMBIGUOUS;
+                if (ctx->ssa.operand_ssa_vars) {
+                    definition = hlsl_operand_definition(ctx, index,
+                                                          operand_index, component);
+                } else {
+                    const HLSLComponentProvenance *provenance =
+                        get_component_provenance(ctx, index,
+                                                 operand->register_index, source);
+                    if (provenance && provenance->definition_instruction >= 0) {
+                        definition = provenance->definition_instruction;
+                        if (!instructions_have_unambiguous_path(ctx, definition, index))
+                            definition = HLSL_DEFINITION_AMBIGUOUS;
+                    }
                 }
                 graph->operand_definitions[operand_offset(
                     index, operand_index, component)] = definition;
                 if (definition >= 0)
                     graph->definition_use_counts[
                         (size_t)definition * 4u + (size_t)source]++;
+            }
+        }
+    }
+    /* Phi edges consume their incoming definitions too. Ignoring those
+     * edges would make a branch-local value look dead or single-use. */
+    if (ctx->ssa.block_phis) {
+        for (int block = 0; block < ctx->cfg.block_count; ++block) {
+            const HLSLBlockPhis *phis = &ctx->ssa.block_phis[block];
+            for (int index = 0; index < phis->phi_count; ++index) {
+                const HLSLPhiNode *phi = &phis->phis[index];
+                for (int edge = 0; edge < ctx->cfg.blocks[block].predecessor_count;
+                     ++edge) {
+                    int variable = phi->incoming_vars[edge];
+                    if (variable < 0 || variable >= ctx->ssa.ssa_var_count) continue;
+                    int definition = ctx->ssa.ssa_var_defs[variable];
+                    if (definition >= 0 && definition < count) {
+                        graph->definition_use_counts[(size_t)definition * 4u +
+                                                      (size_t)phi->component]++;
+                    }
+                }
             }
         }
     }
@@ -71,7 +100,10 @@ int hlsl_operand_definition(const HLSLEmitterContext *ctx, int instruction,
         int ssa_var = ctx->ssa.operand_ssa_vars[
             (((size_t)instruction * DXBC_MAX_OPERANDS + (size_t)operand) * 4u) +
             (size_t)component];
-        if (ssa_var >= 0) return ctx->ssa.ssa_var_defs[ssa_var];
+        if (ssa_var >= 0 && ssa_var < ctx->ssa.ssa_var_count)
+            return ctx->ssa.ssa_var_defs[ssa_var];
+        /* Undefined or unused SSA lanes cannot inherit a linear-scan value. */
+        return HLSL_DEFINITION_UNKNOWN;
     }
     if (ctx->use_def.operand_definitions && instruction < ctx->use_def.instruction_count) {
         return ctx->use_def.operand_definitions[

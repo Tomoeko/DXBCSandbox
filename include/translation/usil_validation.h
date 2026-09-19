@@ -21,6 +21,12 @@ typedef struct {
     uint8_t source_lane_mask;
 } USILOperandUseInfo;
 
+/* Resolve a logical source lane to x/y/z/w, or -1 for an invalid swizzle. */
+int usil_operand_source_component(const DXBCOperand *operand, int lane);
+
+/* Exact written lanes, including scalar depth outputs; null writes are zero. */
+uint8_t usil_operand_destination_lane_mask(const DXBCOperand *operand);
+
 /* Validates the exact operand arity for every opcode represented by USIL and
  * proves every source lane from the destination/resource shape. Unknown or
  * underspecified instructions fail closed. */

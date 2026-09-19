@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -530,13 +531,6 @@ static void detect_instruction_annotations(HLSLEmitterContext *ctx) {
     }
 }
 
-static int operand_source_component(const DXBCOperand *operand,
-                                    int component) {
-    if (operand->swizzle_mode == 2) return operand->swizzle[0];
-    if (operand->swizzle_mode == 1) return operand->swizzle[component];
-    return component;
-}
-
 static bool comparison_lane_has_only_movc_predicate_uses(
     const HLSLEmitterContext *ctx, int definition, int lane) {
     const USILInstruction *comparison =
@@ -555,7 +549,7 @@ static bool comparison_lane_has_only_movc_predicate_uses(
                 continue;
             }
             for (int component = 0; component < 4; component++) {
-                if (operand_source_component(source, component) != lane ||
+                if (usil_operand_source_component(source, component) != lane ||
                     hlsl_operand_definition(ctx, index, operand, component) !=
                         definition) {
                     continue;
@@ -718,7 +712,7 @@ bool semantic_truthiness_condition_alias(HLSLEmitterContext *ctx,
     }
     const DXBCOperand *source =
         &ctx->program->instructions[instruction].operands[operand];
-    int lane = operand_source_component(source, component);
+    int lane = usil_operand_source_component(source, component);
     int definition =
         hlsl_operand_definition(ctx, instruction, operand, component);
     if (definition < 0) return false;
@@ -872,7 +866,7 @@ static void emit_truthiness_condition(HLSLEmitterContext *ctx,
         if (!(lift->data.truthiness.component_mask & (1u << lane))) continue;
         DXBCOperand scalar = *value;
         scalar.swizzle_mode = 2;
-        scalar.swizzle[0] = (uint8_t)operand_source_component(value, lane);
+        scalar.swizzle[0] = (uint8_t)usil_operand_source_component(value, lane);
         char source[128];
         format_operand_hlsl(ctx, &scalar, false, false, 16, false, source,
                             sizeof(source));

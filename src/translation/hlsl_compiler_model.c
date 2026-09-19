@@ -21,12 +21,6 @@ static bool compiler_screen_pattern_is_inplace(unsigned char pattern) {
            pattern == HLSL_COMPILER_SCREEN_INPLACE_SCRATCH;
 }
 
-static int compiler_operand_component(const DXBCOperand *operand, int lane) {
-    if (operand->swizzle_mode == 2) return operand->swizzle[0];
-    if (operand->swizzle_mode == 1) return operand->swizzle[lane];
-    return lane;
-}
-
 static bool compiler_plain_operand(const DXBCOperand *operand) {
     return operand && !operand->has_abs && !operand->has_neg &&
            operand->min_precision == 0 && !operand->rel_op0 &&
@@ -54,7 +48,7 @@ static bool compiler_scalar_source(const DXBCOperand *operand,
     return compiler_plain_operand(operand) && operand->type == type &&
            operand->register_index == reg &&
            is_replicate_swizzle(operand) &&
-           compiler_operand_component(operand, 0) == component;
+           usil_operand_source_component(operand, 0) == component;
 }
 
 static bool compiler_vector_source(const DXBCOperand *operand,
@@ -193,7 +187,7 @@ static bool compiler_tangent_frame_matches(
             !is_replicate_swizzle(input_scalars[item]))
             return false;
         input_components[item] =
-            compiler_operand_component(input_scalars[item], 0);
+            usil_operand_source_component(input_scalars[item], 0);
         if (input_components[item] < 0 || input_components[item] > 2 ||
             !compiler_static_cbuffer_row(matrix_rows[item], matrix_buffer,
                                          input_components[item],
@@ -279,13 +273,13 @@ static bool compiler_tangent_frame_matches(
         const int add_normal = (lane + 1) % 3;
         const int add_tangent = (lane + 2) % 3;
         const int mul_normal =
-            compiler_operand_component(cross_mul_normal, lane);
+            usil_operand_source_component(cross_mul_normal, lane);
         const int mul_tangent_physical =
-            compiler_operand_component(cross_mul_tangent, lane);
+            usil_operand_source_component(cross_mul_tangent, lane);
         const int mad_normal =
-            compiler_operand_component(&instruction[7].operands[1], lane);
+            usil_operand_source_component(&instruction[7].operands[1], lane);
         const int mad_tangent_physical =
-            compiler_operand_component(&instruction[7].operands[2], lane);
+            usil_operand_source_component(&instruction[7].operands[2], lane);
         if (mul_normal != previous_normal || mad_normal != add_normal ||
             mul_tangent_physical < 0 || mul_tangent_physical > 2 ||
             mad_tangent_physical < 0 || mad_tangent_physical > 2 ||
@@ -1028,8 +1022,8 @@ static void detect_typed_integer_loop_bounds(HLSLEmitterContext *ctx) {
             !is_replicate_swizzle(bound)) {
             continue;
         }
-        const int counter_lane = compiler_operand_component(counter, 0);
-        const int bound_lane = compiler_operand_component(bound, 0);
+        const int counter_lane = usil_operand_source_component(counter, 0);
+        const int bound_lane = usil_operand_source_component(bound, 0);
         const int counter_reg = counter->register_index;
         const int bound_reg = bound->register_index;
         if (counter_lane < 0 || counter_lane > 3 || bound_lane < 0 ||
@@ -1500,8 +1494,8 @@ static bool compiler_screen_sequence_combined_matches(
         copy_source->type != OPERAND_TYPE_TEMP ||
         copy_source->register_index != clip_reg ||
         copy_source->swizzle_mode != 1 ||
-        compiler_operand_component(copy_source, 2) != 2 ||
-        compiler_operand_component(copy_source, 3) != 3 ||
+        usil_operand_source_component(copy_source, 2) != 2 ||
+        usil_operand_source_component(copy_source, 3) != 3 ||
         !compiler_destination(&instruction[3].operands[0],
                               OPERAND_TYPE_OUTPUT, screen_output,
                               16 | 32) ||
@@ -1511,8 +1505,8 @@ static bool compiler_screen_sequence_combined_matches(
         instruction[3].operands[2].type != OPERAND_TYPE_TEMP ||
         instruction[3].operands[2].register_index != work_reg ||
         instruction[3].operands[2].swizzle_mode != 1 ||
-        compiler_operand_component(&instruction[3].operands[2], 0) != 0 ||
-        compiler_operand_component(&instruction[3].operands[2], 1) != 3)
+        usil_operand_source_component(&instruction[3].operands[2], 0) != 0 ||
+        usil_operand_source_component(&instruction[3].operands[2], 1) != 3)
         return false;
 
     *out_work_reg = work_reg;
@@ -1551,8 +1545,8 @@ static bool compiler_screen_sequence_split_matches(
         instruction[2].operands[1].type != OPERAND_TYPE_TEMP ||
         instruction[2].operands[1].register_index != clip_reg ||
         instruction[2].operands[1].swizzle_mode != 1 ||
-        compiler_operand_component(&instruction[2].operands[1], 0) != 0 ||
-        compiler_operand_component(&instruction[2].operands[1], 2) != 3 ||
+        usil_operand_source_component(&instruction[2].operands[1], 0) != 0 ||
+        usil_operand_source_component(&instruction[2].operands[1], 2) != 3 ||
         !compiler_plain_operand(&instruction[2].operands[2]) ||
         instruction[2].operands[2].type != OPERAND_TYPE_IMMEDIATE32 ||
         instruction[2].operands[2].imm_value_count != 4 ||
@@ -1573,8 +1567,8 @@ static bool compiler_screen_sequence_split_matches(
         copy_source->type != OPERAND_TYPE_TEMP ||
         copy_source->register_index != clip_reg ||
         copy_source->swizzle_mode != 1 ||
-        compiler_operand_component(copy_source, 2) != 2 ||
-        compiler_operand_component(copy_source, 3) != 3 ||
+        usil_operand_source_component(copy_source, 2) != 2 ||
+        usil_operand_source_component(copy_source, 3) != 3 ||
         !compiler_destination(&instruction[4].operands[0],
                               OPERAND_TYPE_OUTPUT, screen_output,
                               16 | 32) ||
@@ -1584,8 +1578,8 @@ static bool compiler_screen_sequence_split_matches(
         instruction[4].operands[2].type != OPERAND_TYPE_TEMP ||
         instruction[4].operands[2].register_index != work_reg ||
         instruction[4].operands[2].swizzle_mode != 1 ||
-        compiler_operand_component(&instruction[4].operands[2], 0) != 0 ||
-        compiler_operand_component(&instruction[4].operands[2], 1) != 3)
+        usil_operand_source_component(&instruction[4].operands[2], 0) != 0 ||
+        usil_operand_source_component(&instruction[4].operands[2], 1) != 3)
         return false;
 
     *out_work_reg = work_reg;
@@ -1614,8 +1608,8 @@ static bool compiler_screen_sequence_inplace_matches(
         instruction[1].operands[1].type != OPERAND_TYPE_TEMP ||
         instruction[1].operands[1].register_index != clip_reg ||
         instruction[1].operands[1].swizzle_mode != 1 ||
-        compiler_operand_component(&instruction[1].operands[1], 0) != 0 ||
-        compiler_operand_component(&instruction[1].operands[1], 2) != 3 ||
+        usil_operand_source_component(&instruction[1].operands[1], 0) != 0 ||
+        usil_operand_source_component(&instruction[1].operands[1], 2) != 3 ||
         !compiler_plain_operand(&instruction[1].operands[2]) ||
         instruction[1].operands[2].type != OPERAND_TYPE_IMMEDIATE32 ||
         instruction[1].operands[2].imm_value_count != 4 ||
@@ -1642,8 +1636,8 @@ static bool compiler_screen_sequence_inplace_matches(
         instruction[3].operands[2].type != OPERAND_TYPE_TEMP ||
         instruction[3].operands[2].register_index != clip_reg ||
         instruction[3].operands[2].swizzle_mode != 1 ||
-        compiler_operand_component(&instruction[3].operands[2], 0) != 0 ||
-        compiler_operand_component(&instruction[3].operands[2], 1) != 3)
+        usil_operand_source_component(&instruction[3].operands[2], 0) != 0 ||
+        usil_operand_source_component(&instruction[3].operands[2], 1) != 3)
         return false;
 
     *out_work_reg = clip_reg;
@@ -1684,8 +1678,8 @@ static bool compiler_screen_sequence_inplace_scratch_matches(
         instruction[1].operands[1].type != OPERAND_TYPE_TEMP ||
         instruction[1].operands[1].register_index != clip_reg ||
         instruction[1].operands[1].swizzle_mode != 1 ||
-        compiler_operand_component(&instruction[1].operands[1], 0) != 0 ||
-        compiler_operand_component(&instruction[1].operands[1], 2) != 3 ||
+        usil_operand_source_component(&instruction[1].operands[1], 0) != 0 ||
+        usil_operand_source_component(&instruction[1].operands[1], 2) != 3 ||
         !compiler_plain_operand(&instruction[1].operands[2]) ||
         instruction[1].operands[2].type != OPERAND_TYPE_IMMEDIATE32 ||
         instruction[1].operands[2].imm_value_count != 4 ||
@@ -1713,8 +1707,8 @@ static bool compiler_screen_sequence_inplace_scratch_matches(
         instruction[3].operands[2].type != OPERAND_TYPE_TEMP ||
         instruction[3].operands[2].register_index != clip_reg ||
         instruction[3].operands[2].swizzle_mode != 1 ||
-        compiler_operand_component(&instruction[3].operands[2], 0) != 0 ||
-        compiler_operand_component(&instruction[3].operands[2], 1) != 3 ||
+        usil_operand_source_component(&instruction[3].operands[2], 0) != 0 ||
+        usil_operand_source_component(&instruction[3].operands[2], 1) != 3 ||
         !compiler_temp_value_is_dead_after(program, start + 4, scratch_reg,
                                            1u << scratch_lane))
         return false;

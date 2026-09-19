@@ -4,7 +4,7 @@
 
 #include <string.h>
 
-static uint8_t destination_lane_mask(const DXBCOperand *destination) {
+uint8_t usil_operand_destination_lane_mask(const DXBCOperand *destination) {
     if (!destination || destination->type == OPERAND_TYPE_NULL) return 0;
     uint8_t mask = (uint8_t)(destination->destination_mask >> 4);
     if (mask == 0 && (destination->type == OPERAND_TYPE_OUTPUT_DEPTH ||
@@ -15,6 +15,16 @@ static uint8_t destination_lane_mask(const DXBCOperand *destination) {
         mask = 1;
     }
     return (uint8_t)(mask & 0x0fu);
+}
+
+int usil_operand_source_component(const DXBCOperand *operand, int lane) {
+    if (!operand || lane < 0 || lane >= 4 || operand->swizzle_mode > 2) {
+        return -1;
+    }
+    int component = lane;
+    if (operand->swizzle_mode == 2) component = operand->swizzle[0];
+    else if (operand->swizzle_mode == 1) component = operand->swizzle[lane];
+    return component < 4 ? component : -1;
 }
 
 static bool texture_dimension_lanes(const USILProgram *program,
@@ -243,7 +253,7 @@ static bool operand_use_unchecked(const USILProgram *program,
             set_use(info, USIL_OPERAND_USE_DESTINATION, 0);
             return true;
         }
-        const uint8_t mask = destination_lane_mask(&instruction->operands[0]);
+        const uint8_t mask = usil_operand_destination_lane_mask(&instruction->operands[0]);
         if (mask == 0) return false;
         set_use(info, USIL_OPERAND_USE_SOURCE, mask);
         return true;
@@ -282,8 +292,8 @@ static bool operand_use_unchecked(const USILProgram *program,
                 return true;
             } else {
                 const uint8_t mask =
-                    destination_lane_mask(&instruction->operands[0]) |
-                    destination_lane_mask(&instruction->operands[1]);
+                    usil_operand_destination_lane_mask(&instruction->operands[0]) |
+                    usil_operand_destination_lane_mask(&instruction->operands[1]);
                 if (mask == 0) return false;
                 set_use(info, USIL_OPERAND_USE_SOURCE, mask);
                 return true;

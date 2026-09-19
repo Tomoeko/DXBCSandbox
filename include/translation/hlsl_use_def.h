@@ -8,6 +8,8 @@
 
 typedef struct HLSLUseDefGraph {
     int *operand_definitions;
+    /* Conservative count per instruction/lane, including incoming phi edges.
+     * Multiple destination operands on one instruction share this count. */
     unsigned int *definition_use_counts;
     int instruction_count;
 } HLSLUseDefGraph;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -38,19 +39,15 @@ unsigned int get_operand_value_facts(const HLSLEmitterContext *ctx,
         operand_fact_offset(instruction, operand, component)];
 }
 
-static int source_component(const DXBCOperand *operand, int destination) {
-    if (operand->swizzle_mode == 2) return operand->swizzle[0];
-    if (operand->swizzle_mode == 1) return operand->swizzle[destination];
-    return destination;
-}
-
 static unsigned int source_facts(const HLSLEmitterContext *ctx, int state,
-                                 const DXBCOperand *operand,
-                                 int destination_component) {
+                                 int operand_index, int component) {
+    const DXBCOperand *operand =
+        &ctx->program->instructions[state].operands[operand_index];
     if (operand->type != OPERAND_TYPE_TEMP) return HLSL_VALUE_UNKNOWN;
-    return get_lane_value_facts(ctx, state, operand->register_index,
-                                source_component(operand,
-                                                 destination_component));
+    int definition = hlsl_operand_definition(ctx, state, operand_index, component);
+    if (definition < 0) return HLSL_VALUE_UNKNOWN;
+    return get_lane_value_facts(ctx, definition + 1, operand->register_index,
+                                usil_operand_source_component(operand, component));
 }
 
 static unsigned int opcode_facts(const USILInstruction *inst) {
@@ -256,9 +253,13 @@ static bool propagate_operand_requirements(HLSLEmitterContext *ctx) {
             const DXBCOperand *operand = &inst->operands[operand_index];
             unsigned int required =
                 expected_operand_facts(inst, operand_index);
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(ctx->program, inst, operand_index, &use) ||
+                use.use != USIL_OPERAND_USE_SOURCE) continue;
             for (int component = 0; component < 4; component++) {
-                int source = source_component(operand, component);
-                unsigned int actual = source_facts(ctx, index, operand,
+                if (!(use.source_lane_mask & (1u << component))) continue;
+                int source = usil_operand_source_component(operand, component);
+                unsigned int actual = source_facts(ctx, index, operand_index,
                                                    component);
                 unsigned char *operand_value =
                     &ctx->value_analysis.operand_facts[operand_fact_offset(
@@ -288,12 +289,10 @@ static bool propagate_operand_requirements(HLSLEmitterContext *ctx) {
             for (int component = 0; component < 4; component++) {
                 if (!(mask & (16 << component))) continue;
                 unsigned int facts = source_facts(
-                    ctx, index, &inst->operands[inst->opcode == USIL_OP_MOV
-                                                    ? 1
-                                                    : 2],
+                    ctx, index, inst->opcode == USIL_OP_MOV ? 1 : 2,
                     component);
                 if (inst->opcode == USIL_OP_MOVC && inst->operand_count >= 4)
-                    facts |= source_facts(ctx, index, &inst->operands[3],
+                    facts |= source_facts(ctx, index, 3,
                                           component);
                 changed |= write_definition_facts(
                     ctx, index, inst->operands[0].register_index, component,
@@ -328,27 +327,33 @@ bool analyze_lane_value_types(HLSLEmitterContext *ctx) {
             fact_offset(ctx, index + 1, 0, 0)];
         memcpy(after, before, width);
         const USILInstruction *inst = &program->instructions[index];
-        if (!inst_writes_to_dest(inst) || inst->operand_count < 1 ||
-            inst->operands[0].type != OPERAND_TYPE_TEMP ||
-            inst->operands[0].register_index < 0 ||
-            inst->operands[0].register_index >=
-                ctx->value_analysis.register_count)
-            continue;
-        int mask = inst->operands[0].destination_mask;
-        if (mask == 0) mask = 16 | 32 | 64 | 128;
-        for (int component = 0; component < 4; component++) {
-            if (!(mask & (16 << component))) continue;
-            unsigned int facts = opcode_facts(inst);
-            if (inst->opcode == USIL_OP_MOV && inst->operand_count >= 2)
-                facts = source_facts(ctx, index, &inst->operands[1],
-                                     component);
-            else if (inst->opcode == USIL_OP_MOVC && inst->operand_count >= 4)
-                facts = source_facts(ctx, index, &inst->operands[2],
-                                     component) |
-                        source_facts(ctx, index, &inst->operands[3],
-                                     component);
-            after[inst->operands[0].register_index * 4 + component] =
-                (unsigned char)facts;
+        for (int operand_index = 0; operand_index < inst->operand_count;
+             ++operand_index) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(program, inst, operand_index, &use)) {
+                free_lane_value_types(ctx);
+                return false;
+            }
+            const DXBCOperand *destination = &inst->operands[operand_index];
+            if (use.use != USIL_OPERAND_USE_DESTINATION ||
+                destination->type != OPERAND_TYPE_TEMP) continue;
+            if (destination->register_index < 0 || destination->register_index >=
+                    ctx->value_analysis.register_count) {
+                free_lane_value_types(ctx);
+                return false;
+            }
+            uint8_t mask = usil_operand_destination_lane_mask(destination);
+            for (int component = 0; component < 4; component++) {
+                if (!(mask & (1u << component))) continue;
+                unsigned int facts = opcode_facts(inst);
+                if (inst->opcode == USIL_OP_MOV)
+                    facts = source_facts(ctx, index, 1, component);
+                else if (inst->opcode == USIL_OP_MOVC)
+                    facts = source_facts(ctx, index, 2, component) |
+                            source_facts(ctx, index, 3, component);
+                after[destination->register_index * 4 + component] =
+                    (unsigned char)facts;
+            }
         }
     }
     int iteration_limit = program->instruction_count + 1;

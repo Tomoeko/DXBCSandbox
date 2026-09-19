@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,19 +11,18 @@ static size_t operand_offset(int instruction, int operand, int component) {
            (size_t)component;
 }
 
-static int source_component(const DXBCOperand *operand, int component) {
-    if (operand->swizzle_mode == 2) return operand->swizzle[0];
-    if (operand->swizzle_mode == 1) return operand->swizzle[component];
-    return component;
-}
-
-static bool instruction_defines_reg_comp(const USILInstruction *inst, int reg, int comp) {
-    if (!inst_writes_to_dest(inst)) return false;
-    const DXBCOperand *dest = &inst->operands[0];
-    if (dest->type != OPERAND_TYPE_TEMP || dest->register_index != reg) return false;
-    int mask = dest->destination_mask;
-    if (mask == 0) mask = 16 | 32 | 64 | 128;
-    return (mask & (16 << comp)) != 0;
+static bool instruction_defines_reg_comp(const USILProgram *program,
+                                          const USILInstruction *inst,
+                                          int reg, int comp) {
+    for (int index = 0; index < inst->operand_count; ++index) {
+        USILOperandUseInfo use;
+        if (!usil_instruction_operand_use(program, inst, index, &use)) return false;
+        const DXBCOperand *dest = &inst->operands[index];
+        if (use.use == USIL_OPERAND_USE_DESTINATION &&
+            dest->type == OPERAND_TYPE_TEMP && dest->register_index == reg &&
+            (usil_operand_destination_lane_mask(dest) & (1u << comp))) return true;
+    }
+    return false;
 }
 
 static bool add_phi_node(HLSLBlockPhis *bp, int reg, int comp,
@@ -118,7 +118,8 @@ static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
 
         int new_var = (*next_ssa_var)++;
         phi->ssa_var = new_var;
-        ssa->ssa_var_defs[new_var] = cfg->blocks[block].first_instruction;
+        /* A merge is not the first executable instruction in its block. */
+        ssa->ssa_var_defs[new_var] = HLSL_DEFINITION_AMBIGUOUS;
 
         if (!append_undo_entry(&undo_log, &undo_count, &undo_capacity,
                                reg, comp, active_version[reg][comp])) {
@@ -135,41 +136,48 @@ static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
         const USILInstruction *inst = &ctx->program->instructions[inst_idx];
 
         // 2a. Rename uses (sources)
-        int first_source = inst_writes_to_dest(inst) ? 1 : 0;
-        for (int op_idx = first_source; op_idx < inst->operand_count; op_idx++) {
+        for (int op_idx = 0; op_idx < inst->operand_count; ++op_idx) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(ctx->program, inst, op_idx, &use)) {
+                goto fail;
+            }
             const DXBCOperand *operand = &inst->operands[op_idx];
-            if (operand->type != OPERAND_TYPE_TEMP) continue;
-
-            for (int comp = 0; comp < 4; comp++) {
-                int source = source_component(operand, comp);
-                int current_var = active_version[operand->register_index][source];
-                ssa->operand_ssa_vars[operand_offset(inst_idx, op_idx, comp)] = current_var;
+            if (operand->type != OPERAND_TYPE_TEMP ||
+                use.use != USIL_OPERAND_USE_SOURCE) continue;
+            int reg = operand->register_index;
+            if (reg < 0 || reg >= ctx->program->temp_count) goto fail;
+            for (int comp = 0; comp < 4; ++comp) {
+                if (!(use.source_lane_mask & (1u << comp))) continue;
+                int source = usil_operand_source_component(operand, comp);
+                if (source < 0) goto fail;
+                ssa->operand_ssa_vars[operand_offset(inst_idx, op_idx, comp)] =
+                    active_version[reg][source];
             }
         }
 
-        // 2b. Rename defs (destinations)
-        if (inst_writes_to_dest(inst)) {
-            const DXBCOperand *operand = &inst->operands[0];
-            if (operand->type == OPERAND_TYPE_TEMP) {
-                int reg = operand->register_index;
-                int mask = operand->destination_mask;
-                if (mask == 0) mask = 16 | 32 | 64 | 128;
-
-                for (int comp = 0; comp < 4; comp++) {
-                    if (mask & (16 << comp)) {
-                        int new_var = (*next_ssa_var)++;
-                        ssa->operand_ssa_vars[operand_offset(inst_idx, 0, comp)] = new_var;
-                        ssa->ssa_var_defs[new_var] = inst_idx;
-
-                        if (!append_undo_entry(
-                                &undo_log, &undo_count, &undo_capacity, reg,
-                                comp, active_version[reg][comp])) {
-                            goto fail;
-                        }
-
-                        active_version[reg][comp] = new_var;
-                    }
+        /* Read every source before writing either result of IMUL/UDIV/SINCOS.
+         * A source may alias one of the destinations. */
+        for (int op_idx = 0; op_idx < inst->operand_count; ++op_idx) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(ctx->program, inst, op_idx, &use)) {
+                goto fail;
+            }
+            const DXBCOperand *operand = &inst->operands[op_idx];
+            if (operand->type != OPERAND_TYPE_TEMP ||
+                use.use != USIL_OPERAND_USE_DESTINATION) continue;
+            int reg = operand->register_index;
+            if (reg < 0 || reg >= ctx->program->temp_count) goto fail;
+            uint8_t mask = usil_operand_destination_lane_mask(operand);
+            for (int comp = 0; comp < 4; ++comp) {
+                if (!(mask & (1u << comp))) continue;
+                int new_var = (*next_ssa_var)++;
+                ssa->operand_ssa_vars[operand_offset(inst_idx, op_idx, comp)] = new_var;
+                ssa->ssa_var_defs[new_var] = inst_idx;
+                if (!append_undo_entry(&undo_log, &undo_count, &undo_capacity,
+                                       reg, comp, active_version[reg][comp])) {
+                    goto fail;
                 }
+                active_version[reg][comp] = new_var;
             }
         }
     }
@@ -328,7 +336,9 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
                 int start = cfg->blocks[b].first_instruction;
                 int end = cfg->blocks[b].last_instruction;
                 for (int inst_idx = start; inst_idx <= end; inst_idx++) {
-                    if (instruction_defines_reg_comp(&ctx->program->instructions[inst_idx], reg, comp)) {
+                    if (instruction_defines_reg_comp(
+                            ctx->program, &ctx->program->instructions[inst_idx],
+                            reg, comp)) {
                         defined = true;
                         break;
                     }

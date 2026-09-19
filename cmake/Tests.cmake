@@ -219,6 +219,8 @@ if(BUILD_TESTING)
         DXBC_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/unlit_color/target.bin"
         DXBC_TEST_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden"
         DXBC_PREVIEW3D_SLICED_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/preview3d_sliced_ps.dxbc.b64")
+    dxbc_add_core_test(test_hlsl_dataflow_units
+        tests/test_hlsl_dataflow_units.c hlsl_dataflow_units)
     dxbc_add_core_test(test_compiler_model_units
         tests/test_compiler_model_units.c compiler_model_units)
     dxbc_add_core_test(test_cbuffer_projection_units
