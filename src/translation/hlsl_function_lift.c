@@ -86,6 +86,8 @@ static bool emit_product(HLSLEmitterContext *ctx, int group, int operation, cons
 }
 
 bool emit_high_level_functions(HLSLEmitterContext *ctx) {
+    if (ctx->unity_uv_helper)
+        return true;
     if (!prepare_functions(ctx))
         return false;
     for (int group = 0; group < 2; ++group) {

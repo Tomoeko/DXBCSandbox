@@ -33,7 +33,7 @@ CliShaderLabLift *cli_shaderlab_lift_create(const CliShaderLabLiftOptions *optio
     lift->broker =
         unity_compiler_broker_create_lazy(options->project_root ? options->project_root : ".",
                                           options->includes ? options->includes : "");
-    const HLSLLiftLimits limits = {1, options->max_compiles, options->max_elapsed_ms};
+    const HLSLLiftLimits limits = {2, options->max_compiles, options->max_elapsed_ms};
     if (lift->broker &&
         unity_compiler_broker_set_expected_valid_apis(lift->broker, profile.valid_apis))
         lift->batch = unity_shaderlab_lift_batch_create(lift->broker, &profile, &limits, records);
@@ -74,7 +74,7 @@ const char *cli_shaderlab_lift_selection(const CliShaderLabLift *lift, size_t re
     const UnityShaderLabLiftArtifact *accepted = unity_shaderlab_lift_accepted(result);
     if (!accepted)
         return "unverified";
-    return accepted == unity_shaderlab_lift_candidate(result) ? "high-level" : "low-level-fallback";
+    return accepted->high_level ? "high-level" : "low-level-fallback";
 }
 
 bool cli_shaderlab_lift_output_verified(const CliShaderLabLift *lift, size_t record,

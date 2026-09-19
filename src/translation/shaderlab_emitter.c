@@ -3,6 +3,7 @@
 #include "translation/shaderlab_emitter.h"
 #include "dxbc/dxbc_parser.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_unity_uv_lift.h"
 #include "translation/usil.h"
 #include <inttypes.h>
 #include <limits.h>
@@ -412,6 +413,7 @@ const char *shaderlab_candidate_status_name(ShaderLabCandidateStatus status) {
   case SHADERLAB_CANDIDATE_STAGE_FAILED: return "stage-failed";
   case SHADERLAB_CANDIDATE_TRAILER_FAILED: return "trailer-failed";
   case SHADERLAB_CANDIDATE_OUTPUT_FAILED: return "output-failed";
+  case SHADERLAB_CANDIDATE_NO_HELPER_PATTERN: return "no-helper-pattern";
   }
   return "unknown";
 }
@@ -432,6 +434,23 @@ const char *shaderlab_candidate_reason_name(
   return shaderlab_candidate_status_name(diagnostic->status);
 }
 
+/* The include policy is known only after each selected body has been decoded.
+ * Insert at the saved pass-header position without a second decode or parser.
+ * Every affected map record is in this pass and follows that position. */
+static bool insert_unity_uv_include(StringBuilder *source, size_t position,
+                                    ShaderLabExpressionSourceMap *map, size_t first_record) {
+    static const char include[] = "            " HLSL_UNITY_UV_INCLUDE_SOURCE;
+    const size_t previous_size = source->len, inserted = sizeof(include) - 1U;
+    if (position > previous_size)
+        return false;
+    sb_append_len(source, include, inserted);
+    if (!sb_ok(source))
+        return false;
+    memmove(source->buf + position + inserted, source->buf + position, previous_size - position);
+    memcpy(source->buf + position, include, inserted);
+    return shaderlab_expression_source_map_offset(map, first_record, inserted);
+}
+
 static bool shaderlab_emit_internal(const SerializedShader *shader,
                                     const char *vertex_hlsl,
                                     const char *fragment_hlsl,
@@ -440,6 +459,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                                     const int *segment_lengths,
                                     int segment_count,
                                     bool require_complete_stages, bool high_level,
+                                    bool unity_uv_helpers,
                                     ShaderLabExpressionSourceMap *source_map,
                                     StringBuilder *sb,
                                     ShaderLabCandidateDiagnostic
@@ -456,6 +476,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                           SHADERLAB_CANDIDATE_INVALID_ARGUMENT, -1, -1, -1);
     return false;
   }
+  bool any_unity_uv = false;
   // 1. Shader Header
   sb_append(sb, "// Auto-generated ShaderLab from DXBCSandbox C-emitter\n");
   sb_append(sb, "Shader ");
@@ -529,7 +550,11 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
     // 4. Passes block
     for (int j = 0; j < sub->pass_count; j++) {
       const SerializedPass *pass = &sub->passes[j];
-      const ShaderLabExpressionMapContext trace = {source_map, i, j};
+      bool pass_unity_uv = false;
+      const size_t pass_first_record = source_map ? source_map->count : 0;
+      const ShaderLabExpressionMapContext trace = {
+          .map = source_map, .subshader_index = i, .pass_index = j,
+          .unity_uv_helpers = unity_uv_helpers, .unity_uv_used = &pass_unity_uv};
 
       // Handle GrabPass or UsePass
       if (pass->pass_type == 2) { // GrabPass
@@ -778,6 +803,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                 "            #define UNIVERSAL_SHADER_VARIABLES_INCLUDED\n");
       sb_append(sb,
                 "            #include \"UnityShaderVariables.cginc\"\n\n");
+      const size_t unity_uv_include_position = sb->len;
       if (pass->has_procedural_instancing_variant) {
         append_indent(sb, 3);
         sb_append(sb, "void dxbc_procedural_setup() {}\n\n");
@@ -893,6 +919,16 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
       append_indent(sb, 3);
       sb_append(sb, "#endif\n\n");
 
+      if (pass_unity_uv) {
+        if (!insert_unity_uv_include(sb, unity_uv_include_position, source_map,
+                                     pass_first_record)) {
+          set_candidate_failure(candidate_diagnostic, SHADERLAB_CANDIDATE_OUTPUT_FAILED,
+                                -1, i, j);
+          shaderlab_variant_plan_free(&pass_variant_plan);
+          return false;
+        }
+        any_unity_uv = true;
+      }
       append_indent(sb, 3);
       sb_append(sb, "ENDHLSL\n");
       append_indent(sb, 2);
@@ -980,6 +1016,11 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                           SHADERLAB_CANDIDATE_OUTPUT_FAILED, -1, -1, -1);
     return false;
   }
+  if (unity_uv_helpers && !any_unity_uv) {
+    set_candidate_failure(candidate_diagnostic, SHADERLAB_CANDIDATE_NO_HELPER_PATTERN,
+                          -1, -1, -1);
+    return false;
+  }
   if (candidate_diagnostic)
     candidate_diagnostic->status = SHADERLAB_CANDIDATE_OK;
   return true;
@@ -989,7 +1030,8 @@ static bool shaderlab_emit_transactional(
     const SerializedShader *shader, const char *vertex_hlsl,
     const char *fragment_hlsl, const BlobEntry *blob_entries, int entry_count,
     uint8_t **segments, const int *segment_lengths, int segment_count,
-    bool require_complete_stages, bool high_level, StringBuilder *output,
+    bool require_complete_stages, bool high_level, bool unity_uv_helpers,
+    StringBuilder *output,
     ShaderLabExpressionSourceMap *source_map,
     ShaderLabCandidateDiagnostic *candidate_diagnostic) {
   shaderlab_expression_source_map_free(source_map);
@@ -1026,7 +1068,7 @@ static bool shaderlab_emit_transactional(
   sb_init_with_capacity(&generated, 16384);
   bool generated_ok = shaderlab_emit_internal(
       shader, vertex_hlsl, fragment_hlsl, blob_entries, entry_count, segments,
-      segment_lengths, segment_count, require_complete_stages, high_level,
+      segment_lengths, segment_count, require_complete_stages, high_level, unity_uv_helpers,
       source_map, &generated, candidate_diagnostic);
   if (generated_ok && source_map) {
     source_map->complete = true;
@@ -1074,13 +1116,13 @@ bool shaderlab_emit_candidate_with_diagnostic(
     ShaderLabCandidateDiagnostic *diagnostic) {
   return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
                                       entry_count, segments, segment_lengths,
-                                      segment_count, true, false, sb, NULL, diagnostic);
+                                      segment_count, true, false, false, sb, NULL, diagnostic);
 }
 
 bool shaderlab_emit_raw(const SerializedShader *shader, const char *vertex_hlsl,
                         const char *fragment_hlsl, StringBuilder *sb) {
   return shaderlab_emit_transactional(shader, vertex_hlsl, fragment_hlsl, NULL,
-                                      0, NULL, NULL, 0, false, false, sb, NULL, NULL);
+                                      0, NULL, NULL, 0, false, false, false, sb, NULL, NULL);
 }
 
 bool shaderlab_emit_high_level_candidate(
@@ -1090,7 +1132,7 @@ bool shaderlab_emit_high_level_candidate(
     ShaderLabCandidateDiagnostic *diagnostic) {
   return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
                                       entry_count, segments, segment_lengths,
-                                      segment_count, true, true, sb, NULL, diagnostic);
+                                      segment_count, true, true, false, sb, NULL, diagnostic);
 }
 
 bool shaderlab_emit_high_level_candidate_with_source_map(
@@ -1100,5 +1142,16 @@ bool shaderlab_emit_high_level_candidate_with_source_map(
     ShaderLabCandidateDiagnostic *diagnostic) {
   return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
                                       entry_count, segments, segment_lengths,
-                                      segment_count, true, true, sb, map, diagnostic);
+                                      segment_count, true, true, false, sb, map, diagnostic);
+}
+
+bool shaderlab_emit_unity_uv_candidate(const SerializedShader *shader,
+                                       const BlobEntry *blob_entries, int entry_count,
+                                       uint8_t **segments, const int *segment_lengths,
+                                       int segment_count, bool high_level, StringBuilder *sb,
+                                       ShaderLabExpressionSourceMap *map,
+                                       ShaderLabCandidateDiagnostic *diagnostic) {
+    return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries, entry_count, segments,
+                                        segment_lengths, segment_count, true, high_level, true, sb,
+                                        map, diagnostic);
 }

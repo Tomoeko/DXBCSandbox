@@ -114,7 +114,7 @@ static void print_usage(FILE* output, const char* program) {
         "  --flat-shaders     place graphics .shader files directly in DIR\n"
         "                     using names derived from Shader \"name\"\n"
         "                     (default: SerializedFile digest subfolders)\n"
-        "  --high-level       verify a bounded expression lift; keep verified\n"
+        "  --high-level       verify bounded high-level lifts; keep verified\n"
         "                     low-level fallback (optional macOS compiler build)\n"
         "  --compile-profile FILE  captured Unity profile required for lifting\n"
         "  --project-root DIR      compiler project root (default: .)\n"

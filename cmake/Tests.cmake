@@ -266,7 +266,8 @@ if(BUILD_TESTING)
         SHADERLAB_EXPRESSION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin"
         SHADERLAB_CONDITIONAL_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/conditional_shaderlab/target.bin"
         SHADERLAB_LOOP_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/counted_loop_shaderlab/target.bin"
-        SHADERLAB_FUNCTION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/function_shaderlab/target.bin")
+        SHADERLAB_FUNCTION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/function_shaderlab/target.bin"
+        SHADERLAB_UNITY_UV_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unity_uv_shaderlab/target.bin")
     dxbc_add_core_test(test_shaderlab_variant_domain_units
         tests/test_shaderlab_variant_domain_units.c
         shaderlab_variant_domain_units)
@@ -464,7 +465,8 @@ if(BUILD_TESTING)
         target_include_directories(test_shaderlab_lift_units PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_compile_definitions(test_shaderlab_lift_units PRIVATE
-            SHADERLAB_EXPRESSION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
+            SHADERLAB_EXPRESSION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin"
+            SHADERLAB_UNITY_UV_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unity_uv_shaderlab/target.bin")
         target_link_libraries(test_shaderlab_lift_units PRIVATE
             unity_compiler_support dxbc_build_options)
         add_test(NAME shaderlab_lift_units COMMAND test_shaderlab_lift_units)

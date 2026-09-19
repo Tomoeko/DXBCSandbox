@@ -7,6 +7,7 @@
 #include "dxbc/dxbc_parser.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_unity_uv_lift.h"
 #include "translation/shaderlab_emitter_internal.h"
 #include "translation/usil.h"
 
@@ -561,6 +562,7 @@ static bool translate_stage_to_hlsl(
     const HLSLEmitNames *names,
     const char *const *reserved_preprocessor_identifiers,
     size_t reserved_preprocessor_identifier_count, bool high_level,
+    bool unity_uv_helpers, bool *unity_uv_used,
     ShaderLabExpressionSourceRecord *record, ShaderLabStageDiagnostic *diagnostic) {
   if (!pass || !out_hlsl || !names || stage_index < 0 || stage_index >= 6 ||
       subprogram_index < 0 ||
@@ -726,6 +728,11 @@ static bool translate_stage_to_hlsl(
   }
   HLSLEmitOptions emit_options = HLSL_EMIT_RECOMPILE_OPTIONS_INIT;
   if (high_level) emit_options.mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+  if (unity_uv_helpers && hlsl_unity_uv_lift_matches(&usil)) {
+    emit_options.unity_uv_helper = HLSL_UNITY_UV_EXTERNAL_INCLUDE;
+    if (unity_uv_used)
+      *unity_uv_used = true;
+  }
   if (record) emit_options.expression_source_map = &record->instructions;
   emit_options.omit_unity_builtin_declarations = true;
   emit_options.reserved_preprocessor_identifiers =
@@ -910,7 +917,7 @@ bool emit_stage_hlsl(const SerializedPass *pass, int stage_index,
             pass, stage_index, variant->subprogram_index, blob_entries,
             entry_count, segments, segment_lengths, segment_count,
             &variant_hlsl, &names,
-            (const char *const *)plan.keywords, plan.keyword_count, false, NULL,
+            (const char *const *)plan.keywords, plan.keyword_count, false, false, NULL, NULL,
             diagnostic)) {
       sb_free(&variant_hlsl);
       sb_free(&stage_output);
@@ -1619,6 +1626,7 @@ bool emit_stage_hlsl_with_variant_plan_mode(
               (const char *const *)
                   variant_plan->shader->keyword_names.keywords,
               (size_t)variant_plan->shader->keyword_names.count, high_level,
+              trace && trace->unity_uv_helpers, trace ? trace->unity_uv_used : NULL,
               source_map ? &record : NULL, diagnostic)) {
         sb_free(&variant_hlsl);
         sb_free(&stage_output);

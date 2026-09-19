@@ -51,8 +51,11 @@ typedef struct {
     bool (*cancelled)(void *context); /* Optional; checked at work boundaries. */
     void *context;
     /* Optional, same immutable compiler controls, but must emit using
-     * HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE. Returning success is still only a
-     * clean compile; the transaction compares the complete output itself. */
+     * HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE. A Unity helper service must establish
+     * its fixed include contract in both callbacks and attest the actual helper
+     * expansion for this exact request; it must return its complete source map.
+     * Returning success is still only a clean compile; the transaction compares
+     * the complete output itself. */
     HLSLLiftStatus (*compile_high_level)(void *context, const USILProgram *program,
                                          uint64_t remaining_ms, HLSLLiftArtifact *artifact);
     bool require_request_identity;

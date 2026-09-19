@@ -2,6 +2,7 @@
 
 #include "compiler/unity_uv_helper.h"
 #include "common/source_scan.h"
+#include "test_unity_uv_fixture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,26 +15,6 @@
             return false;                                                                          \
         }                                                                                          \
     } while (0)
-
-/* Deliberately small authored token fixtures; installed Unity includes are
- * read only by the optional live compiler check, never redistributed here. */
-static const char scalar[] =
-    "inline float2 UnityStereoScreenSpaceUVAdjustInternal(float2 uv, float4 scaleAndOffset) {"
-    "return uv.xy * scaleAndOffset.xy + scaleAndOffset.zw;}\n";
-static const char vector[] =
-    "inline float4 UnityStereoScreenSpaceUVAdjustInternal(float4 uv, float4 scaleAndOffset) {"
-    "return float4(UnityStereoScreenSpaceUVAdjustInternal(uv.xy, scaleAndOffset),"
-    "UnityStereoScreenSpaceUVAdjustInternal(uv.zw, scaleAndOffset));}\n";
-static const char probe[] =
-    "float4 dxbc_unity_uv_contract_probe(float4 dxbc_uv, float4 dxbc_scale_offset) {"
-    "return UnityStereoScreenSpaceUVAdjustInternal(dxbc_uv, dxbc_scale_offset);}\n";
-
-static void expansion_fixture(StringBuilder *source) {
-    sb_init(source);
-    sb_append(source, scalar);
-    sb_append(source, vector);
-    sb_append(source, probe);
-}
 
 static bool expect_status(const StringBuilder *source, UnityUvHelperStatus expected) {
     UnityUvHelperExpansion expansion;
@@ -66,14 +47,14 @@ static bool replace_once(StringBuilder *source, const char *before, const char *
 
 static bool definitions_and_mutations(void) {
     StringBuilder source;
-    expansion_fixture(&source);
+    test_uv_expansion(&source);
     UnityUvHelperExpansion expansion;
     CHECK(unity_uv_helper_validate_expansion((const uint8_t *)source.buf, source.len, &expansion) ==
           UNITY_UV_HELPER_OK);
     CHECK(expansion.definitions[0].begin == 0);
-    CHECK(expansion.definitions[0].end == strlen(scalar) - 1);
-    CHECK(expansion.definitions[1].begin == strlen(scalar));
-    CHECK(expansion.probe.begin == strlen(scalar) + strlen(vector));
+    CHECK(expansion.definitions[0].end == strlen(test_uv_scalar) - 1);
+    CHECK(expansion.definitions[1].begin == strlen(test_uv_scalar));
+    CHECK(expansion.probe.begin == strlen(test_uv_scalar) + strlen(test_uv_vector));
     CHECK(expansion.probe.end == source.len - 1);
     CHECK(replace_once(&source, "return uv.xy", "return /* comment */ uv . xy"));
     CHECK(expect_status(&source, UNITY_UV_HELPER_OK));
@@ -100,15 +81,15 @@ static bool definitions_and_mutations(void) {
         {"return uv.xy", "return 0; /* return uv.xy", UNITY_UV_HELPER_MALFORMED_EXPANSION},
     };
     for (size_t i = 0; i < sizeof(mutations) / sizeof(mutations[0]); ++i) {
-        expansion_fixture(&source);
+        test_uv_expansion(&source);
         CHECK(replace_once(&source, mutations[i].before, mutations[i].after));
         CHECK(expect_status(&source, mutations[i].status));
         sb_free(&source);
     }
     const char *tails[] = {
-        scalar,
-        vector,
-        probe,
+        test_uv_scalar,
+        test_uv_vector,
+        test_uv_probe,
         "float4 UnityStereoScreenSpaceUVAdjustInternal(float4 uv, float4 scaleAndOffset);",
         "half2 UnityStereoScreenSpaceUVAdjustInternal(half2 uv, half4 st) {return uv;}",
         "float4 dxbc_unity_uv_contract_probe(float4 x) {return x;}",
@@ -122,7 +103,7 @@ static bool definitions_and_mutations(void) {
         UNITY_UV_HELPER_MALFORMED_EXPANSION,  UNITY_UV_HELPER_MALFORMED_EXPANSION,
         UNITY_UV_HELPER_MALFORMED_EXPANSION};
     for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); ++i) {
-        expansion_fixture(&source);
+        test_uv_expansion(&source);
         sb_append(&source, tails[i]);
         CHECK(expect_status(&source, statuses[i]));
         sb_free(&source);
@@ -130,11 +111,11 @@ static bool definitions_and_mutations(void) {
     for (int missing = 0; missing < 3; ++missing) {
         sb_init(&source);
         if (missing != 0)
-            sb_append(&source, scalar);
+            sb_append(&source, test_uv_scalar);
         if (missing != 1)
-            sb_append(&source, vector);
+            sb_append(&source, test_uv_vector);
         if (missing != 2)
-            sb_append(&source, probe);
+            sb_append(&source, test_uv_probe);
         CHECK(expect_status(&source, UNITY_UV_HELPER_MISSING_DEFINITION));
         sb_free(&source);
     }
@@ -166,9 +147,9 @@ static bool directives_and_limits(void) {
         StringBuilder source;
         sb_init(&source);
         sb_append(&source, prefixes[i]);
-        sb_append(&source, scalar);
-        sb_append(&source, vector);
-        sb_append(&source, probe);
+        sb_append(&source, test_uv_scalar);
+        sb_append(&source, test_uv_vector);
+        sb_append(&source, test_uv_probe);
         CHECK(expect_status(&source,
                             i < 3 ? UNITY_UV_HELPER_OK : UNITY_UV_HELPER_UNSUPPORTED_DIRECTIVE));
         sb_free(&source);
@@ -183,16 +164,16 @@ static bool directives_and_limits(void) {
                                              &expansion) == UNITY_UV_HELPER_LIMIT_EXCEEDED);
     CHECK(unity_uv_helper_validate_expansion(NULL, 0, NULL) == UNITY_UV_HELPER_INVALID_ARGUMENT);
     StringBuilder source;
-    expansion_fixture(&source);
+    test_uv_expansion(&source);
     sb_append_len(&source, "\0", 1);
     CHECK(expect_status(&source, UNITY_UV_HELPER_MALFORMED_EXPANSION));
     sb_free(&source);
-    expansion_fixture(&source);
+    test_uv_expansion(&source);
     for (size_t i = 0; i < 131072; ++i)
         sb_append(&source, ";");
     CHECK(expect_status(&source, UNITY_UV_HELPER_LIMIT_EXCEEDED));
     sb_free(&source);
-    expansion_fixture(&source);
+    test_uv_expansion(&source);
     for (size_t length = 0; length + 1 < source.len; ++length) {
         CHECK(unity_uv_helper_validate_expansion((const uint8_t *)source.buf, length, &expansion) !=
               UNITY_UV_HELPER_OK);
@@ -210,9 +191,9 @@ static bool directives_and_limits(void) {
     for (size_t i = 0; i < sizeof(splices) / sizeof(splices[0]); ++i) {
         sb_init(&source);
         sb_append(&source, splices[i]);
-        sb_append(&source, scalar);
-        sb_append(&source, vector);
-        sb_append(&source, probe);
+        sb_append(&source, test_uv_scalar);
+        sb_append(&source, test_uv_vector);
+        sb_append(&source, test_uv_probe);
         CHECK(expect_status(&source, UNITY_UV_HELPER_MALFORMED_EXPANSION));
         sb_free(&source);
     }
@@ -341,7 +322,7 @@ static bool fake_compile(void *opaque, const UnityCompilerSnippetCompileRequest 
     if (fixture->mode == REQUEST_DRIFT)
         fixture->environment_digest[0] ^= 1;
     StringBuilder source;
-    expansion_fixture(&source);
+    test_uv_expansion(&source);
     if (fixture->mode == REQUEST_WRONG_DEFINITION)
         CHECK(replace_once(&source, "float2 uv", "half2 uv"));
     response->data = (uint8_t *)source.buf;
@@ -387,39 +368,42 @@ static bool typed_request_authority(void) {
                                             UNITY_UV_HELPER_COMPILER_UNAVAILABLE,
                                             UNITY_UV_HELPER_COMPILER_REJECTED,
                                             UNITY_UV_HELPER_CHANGED_DEFINITION};
-    for (int stage = 0; stage < 2; ++stage)
-        for (int stereo = 0; stereo < 2; ++stereo) {
-            request.shader_type = stage;
-            request.user_keyword_count = stereo;
-            for (size_t mode = 0; mode < sizeof(statuses) / sizeof(statuses[0]); ++mode) {
-                RequestFixture fixture = {
-                    .broker = broker, .expected = request, .mode = (RequestCase)mode};
-                memset(fixture.compiler_digest, 0x35, 32);
-                memset(fixture.environment_digest, 0x53, 32);
-                const UnityUvHelperServices services = {fake_digest, fake_compile, &fixture};
-                UnityCompilerBinaryResponse response;
-                UnityUvHelperEvidence evidence;
-                const UnityUvHelperStatus status = unity_uv_helper_inspect_request(
-                    NULL, &request, &services, &response, &evidence);
-                CHECK(status == statuses[mode]);
-                CHECK(fixture.compiles == 1 && fixture.controls_preserved);
-                CHECK(fixture.digest_calls >= 2 && fixture.digest_calls <= 4);
-                if (status == UNITY_UV_HELPER_OK) {
-                    uint8_t expected[32];
-                    CHECK(canonical_digest(&fixture, &request, expected));
-                    CHECK(!memcmp(expected, evidence.compile_request_digest, 32));
-                    CHECK(!memcmp(response.request_digest, evidence.preprocess_request_digest, 32));
-                    CHECK(response.status.from_cache);
-                } else {
-                    const UnityUvHelperEvidence empty = {0};
-                    CHECK(!memcmp(&evidence, &empty, sizeof(empty)));
+    for (int language = 0; language < 2; ++language)
+        for (int stage = 0; stage < 2; ++stage)
+            for (int stereo = 0; stereo < 2; ++stereo) {
+                contract.language = language ? 3 : 0;
+                request.shader_type = stage;
+                request.user_keyword_count = stereo;
+                for (size_t mode = 0; mode < sizeof(statuses) / sizeof(statuses[0]); ++mode) {
+                    RequestFixture fixture = {
+                        .broker = broker, .expected = request, .mode = (RequestCase)mode};
+                    memset(fixture.compiler_digest, 0x35, 32);
+                    memset(fixture.environment_digest, 0x53, 32);
+                    const UnityUvHelperServices services = {fake_digest, fake_compile, &fixture};
+                    UnityCompilerBinaryResponse response;
+                    UnityUvHelperEvidence evidence;
+                    const UnityUvHelperStatus status = unity_uv_helper_inspect_request(
+                        NULL, &request, &services, &response, &evidence);
+                    CHECK(status == statuses[mode]);
+                    CHECK(fixture.compiles == 1 && fixture.controls_preserved);
+                    CHECK(fixture.digest_calls >= 2 && fixture.digest_calls <= 4);
+                    if (status == UNITY_UV_HELPER_OK) {
+                        uint8_t expected[32];
+                        CHECK(canonical_digest(&fixture, &request, expected));
+                        CHECK(!memcmp(expected, evidence.compile_request_digest, 32));
+                        CHECK(!memcmp(response.request_digest, evidence.preprocess_request_digest,
+                                      32));
+                        CHECK(response.status.from_cache);
+                    } else {
+                        const UnityUvHelperEvidence empty = {0};
+                        CHECK(!memcmp(&evidence, &empty, sizeof(empty)));
+                    }
+                    unity_compiler_binary_response_free(&response);
                 }
-                unity_compiler_binary_response_free(&response);
             }
-        }
     UnityCompilerBinaryResponse response;
     UnityUvHelperEvidence evidence;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         UnityCompilerSnippetCompileRequest invalid = request;
         if (i == 0)
             invalid.preprocess_only = true;
@@ -427,6 +411,8 @@ static bool typed_request_authority(void) {
             invalid.platform = 15;
         if (i == 2)
             invalid.shader_type = 5;
+        if (i == 3)
+            contract.language = 1;
         CHECK(unity_uv_helper_inspect_request(broker, &invalid, NULL, &response, &evidence) ==
               UNITY_UV_HELPER_INVALID_ARGUMENT);
         unity_compiler_binary_response_free(&response);

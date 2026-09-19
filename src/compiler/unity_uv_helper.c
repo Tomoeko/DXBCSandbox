@@ -27,7 +27,7 @@ bool unity_uv_helper_append_probe(StringBuilder *source) {
     if (!source || !sb_ok(source))
         return false;
     sb_append(source, "\nfloat4 " UV_PROBE "(float4 dxbc_uv, float4 dxbc_scale_offset) {\n"
-                      "    return UnityStereoScreenSpaceUVAdjust(dxbc_uv, dxbc_scale_offset);\n"
+                      "    return " HLSL_UNITY_UV_FUNCTION "(dxbc_uv, dxbc_scale_offset);\n"
                       "}\n");
     return sb_ok(source);
 }
@@ -230,7 +230,7 @@ UnityUvHelperStatus unity_uv_helper_inspect_request(
     if (!request || !response || !evidence || !request->snippet_source ||
         request->preprocess_only || request->platform != 4 ||
         (request->shader_type != 0 && request->shader_type != 1) || !request->contract ||
-        request->contract->language != 0 ||
+        (request->contract->language != 0 && request->contract->language != 3) ||
         !unity_compiler_snippet_contract_validate(request->contract) ||
         (!broker && (!services || !services->request_digest || !services->compile)))
         return UNITY_UV_HELPER_INVALID_ARGUMENT;

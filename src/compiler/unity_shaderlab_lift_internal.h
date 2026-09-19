@@ -8,6 +8,8 @@
 struct UnityShaderLabLiftResult {
     UnityShaderLabLiftArtifact baseline;
     UnityShaderLabLiftArtifact candidate;
+    UnityShaderLabLiftArtifact helper_baseline;
+    UnityShaderLabLiftArtifact helper_candidate;
     const UnityShaderLabLiftArtifact *accepted;
     HLSLLiftLimits limits;
     HLSLLiftStats stats;

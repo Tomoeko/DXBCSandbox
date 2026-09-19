@@ -15,7 +15,7 @@
  * It establishes this authored V/F fixture's helper-expansion and byte gates,
  * not a serialized ShaderLab, runtime, pixel or whole-shader certificate. */
 static const char source[] = "Shader \"Hidden/UVHelperContract\" {\n"
-                             "SubShader {\nPass {\nCGPROGRAM\n"
+                             "SubShader {\nPass {\n%sPROGRAM\n"
                              "#pragma vertex vert\n#pragma fragment frag\n#pragma target 4.0\n"
                              "#pragma multi_compile __ UNITY_SINGLE_PASS_STEREO\n"
                              "#include \"UnityCG.cginc\"\n"
@@ -23,7 +23,7 @@ static const char source[] = "Shader \"Hidden/UVHelperContract\" {\n"
                              "return UnityStereoScreenSpaceUVAdjust(uv,st);}\n"
                              "float4 frag(float4 uv:TEXCOORD0,float4 st:TEXCOORD1):SV_Target {"
                              "return UnityStereoScreenSpaceUVAdjust(uv,st);}\n"
-                             "ENDCG\n}}}\n";
+                             "END%s\n}}}\n";
 
 static bool explicit_baseline(const char *snippet, StringBuilder *baseline) {
     const char call[] = "UnityStereoScreenSpaceUVAdjust(uv,st)";
@@ -104,8 +104,8 @@ static bool check_state(UnityCompilerBroker *broker, const PreprocessedSnippet *
     UnityUvHelperEvidence evidence;
     const UnityUvHelperStatus status =
         unity_uv_helper_inspect_request(broker, &request, NULL, &expanded, &evidence);
-    printf("stage=%d stereo=%d flags=%u helper=%s", stage, stereo, request.compiler_flags,
-           unity_uv_helper_status_name(status));
+    printf("language=%d stage=%d stereo=%d flags=%u helper=%s", snippet->contract.language, stage,
+           stereo, request.compiler_flags, unity_uv_helper_status_name(status));
     if (status != UNITY_UV_HELPER_OK || !clean_compile(broker, &request, &candidate) ||
         memcmp(candidate.request_digest, evidence.compile_request_digest, 32))
         goto done;
@@ -145,8 +145,9 @@ static bool check_state(UnityCompilerBroker *broker, const PreprocessedSnippet *
     print_digest("preprocess", evidence.preprocess_request_digest);
     print_digest("expansion", evidence.expansion.expansion_digest);
     print_digest("controls", candidate.controls_digest);
-    printf(" exact_bytes=%zu mutation=%s", candidate_view.size,
-           dxbc_compare_status_name(wrong_status));
+    printf(" exact_bytes=%zu helper_cache=%d candidate_cache=%d baseline_cache=%d mutation=%s",
+           candidate_view.size, expanded.status.from_cache, candidate.status.from_cache,
+           baseline.status.from_cache, dxbc_compare_status_name(wrong_status));
     success = true;
 done:
     printf(" result=%s\n", success ? "pass" : "fail");
@@ -156,6 +157,50 @@ done:
     unity_compiler_binary_response_free(&candidate);
     unity_compiler_binary_response_free(&expanded);
     unity_compile_authority_free(&authority);
+    return success;
+}
+
+static bool check_language(UnityCompilerBroker *broker, const UnityCompileProfile *profile,
+                           const char *directory, bool hlsl) {
+    StringBuilder shader;
+    sb_init(&shader);
+    sb_appendf(&shader, source, hlsl ? "HLSL" : "CG", hlsl ? "HLSL" : "CG");
+    if (!sb_ok(&shader)) {
+        sb_free(&shader);
+        return false;
+    }
+    const UnityCompilerShaderPreprocessRequest request = {
+        .source = shader.buf,
+        .source_directory = directory,
+        .shader_name = "Hidden/UVHelperContract",
+        .caching_preprocessor = true,
+        .build_platform = profile->build_platform,
+        .valid_apis = profile->valid_apis,
+    };
+    UnityCompilerPreprocessResponse response;
+    unity_compiler_preprocess_response_init(&response);
+    StringBuilder baseline;
+    sb_init(&baseline);
+    bool success =
+        unity_compiler_broker_preprocess_contract_response(broker, &request, &response) &&
+        unity_compiler_response_status_is_clean_success(&response.status) &&
+        response.result.snippet_count == 1 && response.result.snippets[0].has_contract &&
+        response.result.snippets[0].contract.language == (hlsl ? 3 : 0);
+    if (success)
+        success = explicit_baseline(response.result.snippets[0].source, &baseline);
+    if (success) {
+        for (int stage = 0; stage < 2; ++stage)
+            for (int stereo = 0; stereo < 2; ++stereo) {
+                const bool passed = check_state(broker, &response.result.snippets[0], profile,
+                                                directory, baseline.buf, stage, stereo != 0);
+                success = passed && success;
+            }
+    }
+    if (!success)
+        fputs("UV helper live contract probe failed\n", stderr);
+    sb_free(&baseline);
+    unity_compiler_preprocess_response_free(&response);
+    sb_free(&shader);
     return success;
 }
 
@@ -172,36 +217,9 @@ int main(int argc, char **argv) {
     UnityCompilerBroker *broker = unity_compiler_broker_create_lazy(argv[2], NULL);
     if (!broker)
         return 2;
-    const UnityCompilerShaderPreprocessRequest request = {
-        .source = source,
-        .source_directory = argv[2],
-        .shader_name = "Hidden/UVHelperContract",
-        .caching_preprocessor = true,
-        .build_platform = profile.build_platform,
-        .valid_apis = profile.valid_apis,
-    };
-    UnityCompilerPreprocessResponse response;
-    unity_compiler_preprocess_response_init(&response);
-    StringBuilder baseline;
-    sb_init(&baseline);
-    bool success =
-        unity_compiler_broker_preprocess_contract_response(broker, &request, &response) &&
-        unity_compiler_response_status_is_clean_success(&response.status) &&
-        response.result.snippet_count == 1 && response.result.snippets[0].has_contract;
-    if (success)
-        success = explicit_baseline(response.result.snippets[0].source, &baseline);
-    if (success) {
-        for (int stage = 0; stage < 2; ++stage)
-            for (int stereo = 0; stereo < 2; ++stereo) {
-                const bool passed = check_state(broker, &response.result.snippets[0], &profile,
-                                                argv[2], baseline.buf, stage, stereo != 0);
-                success = passed && success;
-            }
-    }
-    if (!success)
-        fputs("UV helper live contract probe failed\n", stderr);
-    sb_free(&baseline);
-    unity_compiler_preprocess_response_free(&response);
+    bool success = true;
+    for (int language = 0; language < 2; ++language)
+        success = check_language(broker, &profile, argv[2], language != 0) && success;
     unity_compiler_broker_destroy(broker);
     return success ? 0 : 1;
 }

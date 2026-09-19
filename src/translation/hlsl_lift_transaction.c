@@ -3,6 +3,7 @@
 #include "translation/hlsl_lift_transaction.h"
 #include "translation/hlsl_lift_control.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_unity_uv_lift.h"
 #include "common/sha256.h"
 
 #include <stdlib.h>
@@ -300,8 +301,13 @@ HLSLLiftStatus hlsl_lift_transaction_try_high_level(HLSLLiftTransaction *transac
     HLSLLiftArtifact artifact = {0};
     result->status = verify_program(transaction, transaction->program, &artifact, result, true);
     if (result->status == HLSL_LIFT_VERIFIED) {
-        record_step(transaction, &transaction->high_level_step, HLSL_HIGH_LEVEL_LIFT_ID,
-                    HLSL_HIGH_LEVEL_LIFT_VERSION, -1, NULL, result);
+        const bool unity_uv =
+            artifact.expression_source_map && artifact.expression_source_map->count == 2 &&
+            artifact.expression_source_map->origins[0].kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV;
+        record_step(transaction, &transaction->high_level_step,
+                    unity_uv ? HLSL_UNITY_UV_LIFT_ID : HLSL_HIGH_LEVEL_LIFT_ID,
+                    unity_uv ? HLSL_UNITY_UV_LIFT_VERSION : HLSL_HIGH_LEVEL_LIFT_VERSION, -1, NULL,
+                    result);
         artifact_free(&transaction->accepted);
         transaction->accepted = artifact;
         transaction->high_level = true;

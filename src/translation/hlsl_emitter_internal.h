@@ -4,6 +4,7 @@
 #define HLSL_EMITTER_INTERNAL_H
 
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_unity_uv_lift.h"
 #include "translation/hlsl_compiler_model.h"
 #include "translation/hlsl_cfg.h"
 #include "translation/hlsl_semantic.h"
@@ -251,6 +252,7 @@ typedef struct HLSLEmitterContext {
     const char* const* reserved_preprocessor_identifiers;
     size_t reserved_preprocessor_identifier_count;
     HLSLExpressionSourceMap *expression_source_map;
+    bool unity_uv_helper;
     HLSLFloat4FunctionPlan float4_functions;
     int current_instruction_index;
     bool is_formatting_dest;
@@ -433,7 +435,9 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx);
 void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx);
 /* Shared closed float4 contracts and compiler inverse AST construction. */
 bool hlsl_lift_operand_is_plain(const DXBCOperand *value);
+HLSLEmitReason hlsl_float4_program_contract(const USILProgram *program);
 bool hlsl_float4_program_supported(HLSLEmitterContext *ctx);
+bool emit_unity_uv_lift(HLSLEmitterContext *ctx);
 bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int instruction);
 bool hlsl_float4_append_output(HLSLEmitterContext *ctx, const DXBCOperand *destination);
 ASTExpr *hlsl_float4_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *source);

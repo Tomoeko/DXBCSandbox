@@ -91,7 +91,8 @@ typedef enum {
     SHADERLAB_CANDIDATE_PASS_TARGET_FAILED,
     SHADERLAB_CANDIDATE_STAGE_FAILED,
     SHADERLAB_CANDIDATE_TRAILER_FAILED,
-    SHADERLAB_CANDIDATE_OUTPUT_FAILED
+    SHADERLAB_CANDIDATE_OUTPUT_FAILED,
+    SHADERLAB_CANDIDATE_NO_HELPER_PATTERN
 } ShaderLabCandidateStatus;
 
 typedef struct {
@@ -206,6 +207,18 @@ bool shaderlab_emit_high_level_candidate_with_source_map(
     int entry_count, uint8_t **segments, const int *segment_lengths,
     int segment_count, StringBuilder *sb, ShaderLabExpressionSourceMap *map,
     ShaderLabCandidateDiagnostic *diagnostic);
+
+/* Separate fixed-include UV attempt. Only passes containing a proved packed-UV
+ * body receive UnityCG, hoisted above every stage/variant branch. Both the low
+ * baseline (high_level=false, map=NULL) and high candidate use this same policy.
+ * Other bodies use their ordinary mode. No admitted helper rejects atomically;
+ * actual helper expansion and the complete generated domain still need checking. */
+bool shaderlab_emit_unity_uv_candidate(const SerializedShader *shader,
+                                       const BlobEntry *blob_entries, int entry_count,
+                                       uint8_t **segments, const int *segment_lengths,
+                                       int segment_count, bool high_level, StringBuilder *sb,
+                                       ShaderLabExpressionSourceMap *map,
+                                       ShaderLabCandidateDiagnostic *diagnostic);
 
 /* Non-exact verifier convenience API.  It embeds supplied HLSL and fills an
  * omitted stage with a trivial placeholder so one stage can be compiled in

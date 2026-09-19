@@ -1268,6 +1268,20 @@ static int test_two_stage_symbolic_selectors_are_exhaustive(void) {
   return 0;
 }
 
+static bool emit_test_high_level_candidate(bool unity_uv, const SerializedShader *shader,
+                                           const BlobEntry *entries, int entry_count,
+                                           uint8_t **segments, const int *lengths,
+                                           int segment_count, StringBuilder *output,
+                                           ShaderLabExpressionSourceMap *map,
+                                           ShaderLabCandidateDiagnostic *diagnostic) {
+    return unity_uv
+               ? shaderlab_emit_unity_uv_candidate(shader, entries, entry_count, segments, lengths,
+                                                   segment_count, true, output, map, diagnostic)
+               : shaderlab_emit_high_level_candidate_with_source_map(
+                     shader, entries, entry_count, segments, lengths, segment_count, output, map,
+                     diagnostic);
+}
+
 /* The checked-in target comes from the adjacent authored float4 source.
  * Full-container equality and finite rendering are separate live checks; this
  * test pins candidate selection, metadata reuse, and atomic rejection. */
@@ -1279,10 +1293,12 @@ static int test_high_level_shaderlab_candidate(int shape) {
     {SHADERLAB_EXPRESSION_TEST_FIXTURE, "Experiment/ExpressionFixture", {3, 3}},
     {SHADERLAB_CONDITIONAL_TEST_FIXTURE, "Experiment/ConditionalFixture", {4, 11}},
     {SHADERLAB_LOOP_TEST_FIXTURE, "Experiment/CountedLoopFixture", {4, 12}},
-    {SHADERLAB_FUNCTION_TEST_FIXTURE, "Experiment/FunctionFixture", {4, 6}}
+    {SHADERLAB_FUNCTION_TEST_FIXTURE, "Experiment/FunctionFixture", {4, 6}},
+    {SHADERLAB_UNITY_UV_TEST_FIXTURE, "Experiment/PackedUVFixture", {4, 2}}
   };
   CHECK(shape >= 0 && (size_t)shape < sizeof(fixtures) / sizeof(fixtures[0]));
   const bool conditional = shape == 1, loop = shape == 2, function = shape == 3;
+  const bool unity_uv = shape == 4;
   size_t fixture_size = 0;
   uint8_t *fixture = read_fixture_path(fixtures[shape].path, &fixture_size);
   CHECK(fixture != NULL);
@@ -1337,8 +1353,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
   ShaderLabExpressionSourceMap map = {0};
   const char *prefix = "// caller prefix\n";
   sb_append(&high, prefix);
-  CHECK(shaderlab_emit_high_level_candidate_with_source_map(
-      &shader, entries, 2, segments, segment_lengths, 2, &high, &map, &diagnostic));
+  CHECK(emit_test_high_level_candidate(unity_uv, &shader, entries, 2, segments, segment_lengths, 2, &high, &map, &diagnostic));
   CHECK(shaderlab_expression_source_map_matches_source(&map, &high));
   CHECK(map.count == 2u);
   for (size_t i = 0; i < map.count; ++i) {
@@ -1355,7 +1370,8 @@ static int test_high_level_shaderlab_candidate(int shape) {
       CHECK(origin->source_end <= high.len);
       CHECK(high.buf[origin->source_begin] == '(' ||
             high.buf[origin->source_begin] == ' ' ||
-            origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION);
+            origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION ||
+            origin->kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV);
       if (origin->kind == HLSL_EXPRESSION_ORIGIN_RETURN)
         CHECK(high.buf[origin->source_end - 1] == '\n');
     }
@@ -1363,12 +1379,22 @@ static int test_high_level_shaderlab_candidate(int shape) {
   const HLSLExpressionSourceMap *fragment_map = &map.records[1].instructions;
   const HLSLExpressionOrigin *nested = &fragment_map->origins[0];
   const HLSLExpressionOrigin *outer = &fragment_map->origins[1];
-  if (function) {
+  if (unity_uv) {
+      const char *include = strstr(high.buf, "#include \"UnityCG.cginc\"");
+      const char *call = strstr(high.buf, "UnityStereoScreenSpaceUVAdjust(");
+      CHECK(include && call && include < call);
+      CHECK(count_text(high.buf, "#include \"UnityCG.cginc\"") == 1u);
+      CHECK(nested->kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV);
+      CHECK(high.buf + nested->source_begin == call);
+      CHECK(!nested->definition_begin && !nested->definition_end);
+      CHECK(outer->kind == HLSL_EXPRESSION_ORIGIN_RETURN);
+  } else if (function) {
     CHECK(count_text(high.buf, "float4 dxbc_mul_chain_right(") == 1u);
     CHECK(count_text(high.buf, " = dxbc_mul_chain_right(") == 2u);
     for (size_t i = 0; i < 4; ++i) {
       const HLSLExpressionOrigin *origin = &fragment_map->origins[i];
-      CHECK(origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION);
+      CHECK(origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION ||
+                origin->kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV);
       CHECK(strncmp(high.buf + origin->source_begin, "dxbc_mul_chain_right(", 20) == 0);
       CHECK(origin->definition_begin >= strlen(prefix) &&
             origin->definition_end <= origin->source_begin);
@@ -1439,17 +1465,28 @@ static int test_high_level_shaderlab_candidate(int shape) {
     CHECK(shaderlab_expression_source_map_matches_source(&map, &high));
   }
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_OK);
-  if (!conditional && !loop && !function)
+  if (!conditional && !loop && !function && !unity_uv)
     CHECK(strstr(high.buf, "o0 = (((v1) * (v1.yzwx)) * (v1.zwxy));") != NULL);
   CHECK(strstr(high.buf, "float4 r0") == NULL);
   CHECK(count_text(high.buf, "Single exact planned variant") == 2u);
-  CHECK(shaderlab_emit_candidate_with_diagnostic(
+  CHECK(unity_uv ? shaderlab_emit_unity_uv_candidate(&shader, entries, 2, segments, segment_lengths,
+                                                     2, false, &low, NULL, &diagnostic)
+                 : shaderlab_emit_candidate_with_diagnostic(
       &shader, entries, 2, segments, segment_lengths, 2, &low, &diagnostic));
-  CHECK(strstr(low.buf, "float4 r0") != NULL);
+  CHECK(unity_uv || strstr(low.buf, "float4 r0") != NULL);
+  if (unity_uv) {
+      CHECK(count_text(low.buf, "#include \"UnityCG.cginc\"") == 1u);
+      CHECK(strstr(low.buf, "UnityStereoScreenSpaceUVAdjust(") == NULL);
+  } else {
+      CHECK(strstr(low.buf, "UnityCG.cginc") == NULL);
+      CHECK(!shaderlab_emit_unity_uv_candidate(&shader, entries, 2, segments, segment_lengths, 2,
+                                               false, &repeated, NULL, &diagnostic));
+      CHECK(diagnostic.status == SHADERLAB_CANDIDATE_NO_HELPER_PATTERN);
+      CHECK(repeated.len == 0u);
+  }
   CHECK(strcmp(low.buf, high.buf) != 0);
   sb_append(&repeated, prefix);
-  CHECK(shaderlab_emit_high_level_candidate(
-      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &diagnostic));
+  CHECK(emit_test_high_level_candidate(unity_uv, &shader, entries, 2, segments, segment_lengths, 2, &repeated, NULL, &diagnostic));
   CHECK(strcmp(high.buf, repeated.buf) == 0);
   sb_free(&repeated);
 
@@ -1468,8 +1505,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
     passes[0].subprogram_identities[stage] = tier_identities[stage];
   }
   sb_init(&repeated);
-  CHECK(shaderlab_emit_high_level_candidate_with_source_map(
-      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
+  CHECK(emit_test_high_level_candidate(unity_uv, &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
   CHECK(shaderlab_expression_source_map_matches_source(&map, &repeated));
   CHECK(map.count == 6u);
   for (size_t i = 0; i < map.count; ++i) {
@@ -1478,7 +1514,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
     CHECK(map.records[i].subprogram_index == (int)(i % 3u));
     CHECK(map.records[i].serialized_state == 0u);
     if (i) CHECK(map.records[i].instructions.origins[0].source_begin >
-                 map.records[i - 1].instructions.origins[2].source_end);
+                 map.records[i - 1].instructions.origins[map.records[i - 1].instructions.count - 1u].source_end);
   }
   sb_free(&repeated);
   for (int stage = 0; stage < 2; ++stage) {
@@ -1486,6 +1522,17 @@ static int test_high_level_shaderlab_candidate(int shape) {
     passes[0].subprograms[stage] = &programs[stage];
     passes[0].subprogram_identities[stage] = &identities[stage];
   }
+
+  /* Prelude insertion shifts only this pass's already-emitted ranges. */
+  subshader.pass_count = 2;
+  sb_init(&repeated);
+  sb_append(&repeated, prefix);
+  CHECK(emit_test_high_level_candidate(unity_uv, &shader, entries, 2, segments, segment_lengths, 2,
+                                       &repeated, &map, &diagnostic));
+  CHECK(shaderlab_expression_source_map_matches_source(&map, &repeated));
+  CHECK(map.count == 4u && map.records[2].pass_index == 1);
+  CHECK(count_text(repeated.buf, "#include \"UnityCG.cginc\"") == (unity_uv ? 2u : 0u));
+  sb_free(&repeated);
 
   /* Reject a valid low-level vertex with cbuffer operations in a later pass.
    * The fully emitted first pass must not leak into the caller's fallback. */
@@ -1506,8 +1553,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
   subshader.pass_count = 2;
   sb_init(&repeated);
   sb_append(&repeated, low.buf);
-  CHECK(!shaderlab_emit_high_level_candidate_with_source_map(
-      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &map, &diagnostic));
+  CHECK(!emit_test_high_level_candidate(unity_uv, &shader, entries, 3, segments, segment_lengths, 3, &repeated, &map, &diagnostic));
   CHECK(!map.complete && map.count == 0u && map.records == NULL);
   CHECK(strcmp(repeated.buf, low.buf) == 0);
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
@@ -1539,8 +1585,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
   shader.keyword_flags = feature_flags;
   sb_init(&repeated);
   sb_append(&repeated, low.buf);
-  CHECK(!shaderlab_emit_high_level_candidate_with_source_map(
-      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &map, &diagnostic));
+  CHECK(!emit_test_high_level_candidate(unity_uv, &shader, entries, 3, segments, segment_lengths, 3, &repeated, &map, &diagnostic));
   CHECK(!map.complete && map.count == 0u && map.records == NULL);
   CHECK(strcmp(repeated.buf, low.buf) == 0);
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
@@ -1549,8 +1594,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
   sb_free(&repeated);
   variants[1].blob_index = 0;
   sb_init(&repeated);
-  CHECK(shaderlab_emit_high_level_candidate_with_source_map(
-      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
+  CHECK(emit_test_high_level_candidate(unity_uv, &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
   CHECK(shaderlab_expression_source_map_matches_source(&map, &repeated));
   CHECK(map.count == 3u);
   CHECK(map.records[1].stage_index == 0 && map.records[1].subprogram_index == 1);
@@ -1577,8 +1621,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
   shader.keyword_flags = flags;
   sb_init(&repeated);
   sb_append(&repeated, low.buf);
-  CHECK(!shaderlab_emit_high_level_candidate_with_source_map(
-      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
+  CHECK(!emit_test_high_level_candidate(unity_uv, &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
   CHECK(!map.complete && map.count == 0u && map.records == NULL);
   CHECK(strcmp(repeated.buf, low.buf) == 0);
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
@@ -1915,6 +1958,7 @@ int main(void) {
   CHECK(test_high_level_shaderlab_candidate(1) == 0);
   CHECK(test_high_level_shaderlab_candidate(2) == 0);
   CHECK(test_high_level_shaderlab_candidate(3) == 0);
+  CHECK(test_high_level_shaderlab_candidate(4) == 0);
   CHECK(test_requirements_target_projection() == 0);
   CHECK(test_target_authority_is_strict_and_typed() == 0);
   CHECK(strcmp(shaderlab_stage_status_name(SHADERLAB_STAGE_OUTPUT_FAILED),

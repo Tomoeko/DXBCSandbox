@@ -5,12 +5,13 @@
 
 #include "common/string_builder.h"
 #include "compiler/unity_compiler_broker.h"
+#include "translation/hlsl_unity_uv_lift.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define UNITY_UV_HELPER_LIFT_ID "unity-packed-uv-adjust"
-#define UNITY_UV_HELPER_LIFT_VERSION 1U
+#define UNITY_UV_HELPER_LIFT_ID HLSL_UNITY_UV_LIFT_ID
+#define UNITY_UV_HELPER_LIFT_VERSION HLSL_UNITY_UV_LIFT_VERSION
 #define UNITY_UV_HELPER_EXPANSION_LIMIT (2U * 1024U * 1024U)
 
 typedef enum {
@@ -75,7 +76,7 @@ typedef struct {
     uint8_t preprocess_request_digest[32];
 } UnityUvHelperEvidence;
 
-/* Inspect this exact D3D11 vertex/fragment compile request. Appends only the
+/* Inspect this exact D3D11 vertex/fragment Cg/HLSL compile request. Appends only the
  * probe and sets preprocess_only; flags, keywords, stage and all other controls
  * stay unchanged. Canonical identities are checked before and after the work.
  * The caller owns the returned response (including failure diagnostics) and

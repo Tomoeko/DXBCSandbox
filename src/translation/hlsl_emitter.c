@@ -1610,6 +1610,17 @@ bool hlsl_emit_with_options_diagnostic(
     sb->failed = true;
     return false;
   }
+  if (options && options->unity_uv_helper &&
+      (emit_mode == HLSL_EMIT_MODE_READABLE ||
+       (options->unity_uv_helper != HLSL_UNITY_UV_INCLUDE &&
+        options->unity_uv_helper != HLSL_UNITY_UV_EXTERNAL_INCLUDE) ||
+       !hlsl_unity_uv_lift_matches(program))) {
+      hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
+                            HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
+                            HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+      sb->failed = true;
+      return false;
+  }
   const char* entry_point = (names && names->entry_point && names->entry_point[0]) ? names->entry_point : "main";
   const char* input_struct = (names && names->input_struct && names->input_struct[0]) ? names->input_struct : "appdata";
   const char* output_struct = (names && names->output_struct && names->output_struct[0]) ? names->output_struct : "v2f";
@@ -1649,6 +1660,7 @@ bool hlsl_emit_with_options_diagnostic(
   ctx.reserved_preprocessor_identifier_count =
       options ? options->reserved_preprocessor_identifier_count : 0;
   ctx.expression_source_map = options ? options->expression_source_map : NULL;
+  ctx.unity_uv_helper = options && options->unity_uv_helper;
   ctx.readable_screen_pos_helper = readable_screen_pos_helper;
   ctx.readable_screen_pos_mul_y_idx = -1;
   ctx.readable_screen_pos_mul_xzw_idx = -1;
@@ -1751,6 +1763,16 @@ bool hlsl_emit_with_options_diagnostic(
     }
   }
 
+  if (ctx.unity_uv_helper) {
+      if (ctx.compiler_model.replacement_count || !hlsl_float4_program_supported(&ctx)) {
+          hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED,
+                         HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS,
+                         HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+          goto cleanup;
+      }
+      if (options->unity_uv_helper == HLSL_UNITY_UV_INCLUDE)
+          sb_append(sb, HLSL_UNITY_UV_INCLUDE_SOURCE);
+  }
   emit_comments_and_icb(&ctx);
   if (!sb_ok(sb)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_PROGRAM,

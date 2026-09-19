@@ -5,6 +5,7 @@
 #include "dxbc/usbd.h"
 #include "dxbc/dxbc_hash.h"
 #include "test_shaderlab_fixture.h"
+#include "test_unity_uv_fixture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,8 @@ typedef enum {
     COMPILE_REJECTED,
     COMPILE_MISSING_IDENTITY,
     COMPILE_ZERO_IDENTITY,
+    COMPILE_WRONG_IDENTITY,
+    HELPER_WRONG_DEFINITION,
     COMPILE_WRONG_BYTES,
     COMPILE_INVALID_BYTES,
     COMPILE_CACHE_MISS,
@@ -66,6 +69,7 @@ typedef struct {
 
 typedef struct {
     Fixture *fixture;
+    UnityCompilerBroker *canonical_broker;
     Failure failure;
     size_t fail_preprocess;
     size_t fail_compile;
@@ -80,10 +84,9 @@ typedef struct {
     bool cached;
 } Service;
 
-static int fixture_init(Fixture *fixture) {
+static int fixture_init_path(Fixture *fixture, const char *path) {
     memset(fixture, 0, sizeof(*fixture));
-    CHECK(common_file_read_regular(SHADERLAB_EXPRESSION_TEST_FIXTURE, 1024 * 1024,
-                                   &fixture->bytes) == COMMON_FILE_OK);
+    CHECK(common_file_read_regular(path, 1024 * 1024, &fixture->bytes) == COMMON_FILE_OK);
     DXBCUSBDTableView table;
     CHECK(dxbc_usbd_table_open(&table, fixture->bytes.data, fixture->bytes.size, NULL));
     CHECK(table.record_count == 2);
@@ -131,6 +134,10 @@ static int fixture_init(Fixture *fixture) {
                                                .source_directory = "Assets",
                                                .source_basename = "Expression.shader"};
     return 0;
+}
+
+static int fixture_init(Fixture *fixture) {
+    return fixture_init_path(fixture, SHADERLAB_EXPRESSION_TEST_FIXTURE);
 }
 
 static void fixture_free(Fixture *fixture) {
@@ -181,7 +188,11 @@ static bool preprocess_service(void *opaque, const UnityCompilerShaderPreprocess
      * live checks cover actual canonical wire requests. */
     if (failure != PREPROCESS_ZERO_IDENTITY)
         common_sha256(request->source, strlen(request->source), response->request_digest);
-    memset(response->controls_digest, failure == PREPROCESS_CONTROL_DRIFT ? 9 : 8, 32);
+    memset(response->controls_digest,
+           failure == PREPROCESS_CONTROL_DRIFT                     ? 9
+           : strstr(request->source, "#include \"UnityCG.cginc\"") ? 10
+                                                                   : 8,
+           32);
     response->result.snippet_count =
         service->fixture->subshader.pass_count + (failure == PREPROCESS_EXTRA_SNIPPET);
     response->result.snippets =
@@ -193,6 +204,7 @@ static bool preprocess_service(void *opaque, const UnityCompilerShaderPreprocess
         snippet->source = strdup(request->source);
         snippet->has_contract = true;
         unity_compiler_snippet_contract_init(&snippet->contract);
+        snippet->contract.language = 3;
         snippet->contract.program_types_mask = 3;
         snippet->contract.requirements = 0xe3;
         for (int stage = 0; stage < 2; ++stage)
@@ -204,6 +216,22 @@ static bool preprocess_service(void *opaque, const UnityCompilerShaderPreprocess
             return false;
     }
     return true;
+}
+
+static bool request_digest_service(void *opaque, const UnityCompilerSnippetCompileRequest *request,
+                                   uint8_t digest[32]) {
+    Service *service = opaque;
+    UnityCompilerToolchainProvenance provenance;
+    if (!toolchain_service(service, &provenance))
+        return false;
+    const UnityCompilerOfflineAuthority authority = {provenance.compiler_fingerprint,
+                                                     provenance.environment_fingerprint};
+    uint8_t *transcript = NULL;
+    size_t size = 0;
+    const bool ok = unity_compiler_broker_serialize_compile_request_with_authority(
+        service->canonical_broker, request, &authority, &transcript, &size, digest);
+    free(transcript);
+    return ok;
 }
 
 static bool compile_service(void *opaque, const UnityCompilerSnippetCompileRequest *request,
@@ -245,6 +273,31 @@ static bool compile_service(void *opaque, const UnityCompilerSnippetCompileReque
     memset(response->request_digest, failure == COMPILE_ZERO_IDENTITY ? 0 : (int)service->compiles,
            32);
     memset(response->controls_digest, 7, 32);
+    if (service->canonical_broker && failure != COMPILE_ZERO_IDENTITY) {
+        if (!request_digest_service(service, request, response->request_digest))
+            return false;
+        if (failure == COMPILE_WRONG_IDENTITY)
+            response->request_digest[0] ^= 1;
+    }
+    if (request->preprocess_only) {
+        StringBuilder expansion;
+        test_uv_expansion(&expansion);
+        if (!sb_ok(&expansion)) {
+            sb_free(&expansion);
+            return false;
+        }
+        if (failure == HELPER_WRONG_DEFINITION) {
+            char *operation = strchr(expansion.buf, '+');
+            if (!operation) {
+                sb_free(&expansion);
+                return false;
+            }
+            *operation = '-';
+        }
+        response->size = expansion.len;
+        response->data = (uint8_t *)sb_detach(&expansion);
+        return true;
+    }
     const int stage =
         failure == COMPILE_WRONG_BYTES ? 1 - request->shader_type : request->shader_type;
     const DXBCUSBDRecordView *record = &service->fixture->records[stage];
@@ -263,7 +316,8 @@ static HLSLLiftStatus run(Service *service, HLSLLiftLimits limits,
                                                  .preprocess = preprocess_service,
                                                  .compile = compile_service,
                                                  .toolchain = toolchain_service,
-                                                 .context = service};
+                                                 .context = service,
+                                                 .request_digest = request_digest_service};
     return unity_shaderlab_lift_run(&service->fixture->input, &services, &limits, result);
 }
 
@@ -488,9 +542,129 @@ static int test_admission_and_later_pass(void) {
     return 0;
 }
 
+static int test_unity_uv_transaction(void) {
+    Fixture fixture;
+    CHECK(fixture_init_path(&fixture, SHADERLAB_UNITY_UV_TEST_FIXTURE) == 0);
+    UnityCompilerBroker *broker = unity_compiler_broker_create_lazy(".", "");
+    CHECK(broker);
+    const HLSLLiftLimits limits = {2, 32, 1000};
+    for (int passes = 1; passes <= 2; ++passes) {
+        fixture.subshader.pass_count = passes;
+        Service service = {
+            .fixture = &fixture, .canonical_broker = broker, .now = 10, .cached = true};
+        UnityShaderLabLiftResult *result = NULL;
+        CHECK(run(&service, limits, &result) == HLSL_LIFT_VERIFIED);
+        const UnityShaderLabLiftArtifact *baseline = unity_shaderlab_lift_baseline(result);
+        const UnityShaderLabLiftArtifact *included = unity_shaderlab_lift_helper_baseline(result);
+        const UnityShaderLabLiftArtifact *candidate = unity_shaderlab_lift_helper_candidate(result);
+        CHECK(unity_shaderlab_lift_accepted(result) == candidate);
+        CHECK(unity_shaderlab_lift_candidate(result)->status == HLSL_LIFT_EMISSION_REJECTED);
+        CHECK(baseline->status == HLSL_LIFT_VERIFIED && included->status == HLSL_LIFT_VERIFIED);
+        CHECK(candidate->status == HLSL_LIFT_VERIFIED && candidate->high_level &&
+              candidate->unity_uv_helpers);
+        CHECK(!memcmp(included->preprocessing.controls_digest,
+                      candidate->preprocessing.controls_digest, 32));
+        CHECK(memcmp(baseline->preprocessing.controls_digest,
+                     candidate->preprocessing.controls_digest, 32));
+        CHECK(shaderlab_expression_source_map_matches_source(&candidate->source_map,
+                                                             &candidate->source));
+        for (int p = 0; p < passes; ++p) {
+            const UnityShaderLabLiftPassReport *pass = &candidate->passes[p];
+            CHECK(pass->domain.matched_dxbc_count == 2 && pass->helper_check_count == 2);
+            for (size_t c = 0; c < pass->helper_check_count; ++c) {
+                const UnityShaderLabLiftHelperCheck *check = &pass->helper_checks[c];
+                CHECK(check->status == UNITY_UV_HELPER_OK && check->domain_compile_index == c);
+                CHECK(check->compile_received && check->compile_identity_matched);
+                CHECK(!memcmp(check->evidence.compile_request_digest,
+                              pass->domain.compiler_responses[c].provenance.request_digest, 32));
+                CHECK(check->preprocessing.status.from_cache &&
+                      check->evidence.expansion.probe.end);
+            }
+        }
+        HLSLLiftStats stats;
+        size_t preprocesses;
+        unity_shaderlab_lift_stats(result, &stats, &preprocesses);
+        CHECK(stats.candidates == 2 && stats.accepted == 1 && stats.compiles == (size_t)passes * 8);
+        CHECK(stats.cache_hits == stats.compiles && preprocesses == 3);
+        char *json = unity_shaderlab_lift_format_json(result);
+        CHECK(json && strstr(json, "\"selection\":\"high-level\""));
+        CHECK(strstr(json, "\"unity_helper\":{\"id\":\"unity-packed-uv-adjust\""));
+        CHECK(strstr(json, "\"compile_identity_matched\":true"));
+        CHECK(!strstr(json, fixture.input.source_path));
+        free(json);
+        unity_shaderlab_lift_result_free(result);
+    }
+    fixture.subshader.pass_count = 1;
+    const struct {
+        Failure failure;
+        size_t compile, preprocess;
+        HLSLLiftStatus expected;
+        bool invalidates_baseline;
+    } cases[] = {
+        {HELPER_WRONG_DEFINITION, 5, 0, HLSL_LIFT_PRECONDITION_REJECTED, false},
+        {COMPILE_WRONG_IDENTITY, 5, 0, HLSL_LIFT_AUTHORITY_MISMATCH, false},
+        {COMPILE_WRONG_IDENTITY, 6, 0, HLSL_LIFT_PROVENANCE_MISMATCH, false},
+        {COMPILE_WRONG_BYTES, 6, 0, HLSL_LIFT_DXBC_MISMATCH, false},
+        {COMPILE_WRONG_BYTES, 8, 0, HLSL_LIFT_DXBC_MISMATCH, false},
+        {COMPILE_REJECTED, 3, 0, HLSL_LIFT_COMPILER_REJECTED, false},
+        {COMPILE_TRANSPORT, 5, 0, HLSL_LIFT_COMPILER_UNAVAILABLE, false},
+        {COMPILE_MISSING_IDENTITY, 5, 0, HLSL_LIFT_PROVENANCE_MISMATCH, false},
+        {COMPILE_MISSING_IDENTITY, 6, 0, HLSL_LIFT_PROVENANCE_MISMATCH, false},
+        {COMPILE_CACHE_MISS, 5, 0, HLSL_LIFT_COMPILER_UNAVAILABLE, false},
+        {COMPILE_REJECTED, 5, 0, HLSL_LIFT_COMPILER_REJECTED, false},
+        {PREPROCESS_REJECTED, 0, 2, HLSL_LIFT_COMPILER_REJECTED, false},
+        {PREPROCESS_CONTROL_DRIFT, 0, 3, HLSL_LIFT_AUTHORITY_MISMATCH, false},
+        {COMPILER_DRIFT, 5, 0, HLSL_LIFT_AUTHORITY_MISMATCH, true},
+        {ENVIRONMENT_DRIFT, 5, 0, HLSL_LIFT_AUTHORITY_MISMATCH, true},
+        {SOURCE_REVISION_DRIFT, 6, 0, HLSL_LIFT_AUTHORITY_MISMATCH, true},
+        {PROFILE_DRIFT, 6, 0, HLSL_LIFT_AUTHORITY_MISMATCH, true},
+        {LATE_COMPILE, 5, 0, HLSL_LIFT_BUDGET_EXHAUSTED, false},
+        {CANCEL_COMPILE, 5, 0, HLSL_LIFT_CANCELLED, false},
+        {CLOCK_FAILURE, 6, 0, HLSL_LIFT_CLOCK_UNAVAILABLE, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        Service service = {.fixture = &fixture,
+                           .canonical_broker = broker,
+                           .now = 10,
+                           .failure = cases[i].failure,
+                           .fail_compile = cases[i].compile,
+                           .fail_preprocess = cases[i].preprocess};
+        UnityShaderLabLiftResult *result = NULL;
+        HLSLLiftStatus status = run(&service, limits, &result);
+        if (status != cases[i].expected)
+            fprintf(stderr, "helper failure %zu: %s expected %s\n", i,
+                    hlsl_lift_status_name(status), hlsl_lift_status_name(cases[i].expected));
+        CHECK(status == cases[i].expected);
+        CHECK(unity_shaderlab_lift_baseline(result)->status == HLSL_LIFT_VERIFIED);
+        CHECK(unity_shaderlab_lift_accepted(result) ==
+              (cases[i].invalidates_baseline ? NULL : unity_shaderlab_lift_baseline(result)));
+        CHECK(service.compiles <= (cases[i].compile ? cases[i].compile : 4));
+        unity_shaderlab_lift_result_free(result);
+        fixture.profile.build_platform = 19;
+    }
+    for (size_t maximum = 4; maximum <= 7; ++maximum) {
+        Service service = {.fixture = &fixture, .canonical_broker = broker, .now = 10};
+        UnityShaderLabLiftResult *result = NULL;
+        CHECK(run(&service, (HLSLLiftLimits){2, maximum, 1000}, &result) ==
+              HLSL_LIFT_BUDGET_EXHAUSTED);
+        CHECK(service.compiles == maximum);
+        CHECK(unity_shaderlab_lift_accepted(result) == unity_shaderlab_lift_baseline(result));
+        unity_shaderlab_lift_result_free(result);
+    }
+    Service service = {.fixture = &fixture, .canonical_broker = broker, .now = 10};
+    UnityShaderLabLiftResult *result = NULL;
+    CHECK(run(&service, (HLSLLiftLimits){1, 32, 1000}, &result) == HLSL_LIFT_EMISSION_REJECTED);
+    CHECK(!unity_shaderlab_lift_helper_baseline(result)->attempted && service.compiles == 2);
+    CHECK(unity_shaderlab_lift_accepted(result) == unity_shaderlab_lift_baseline(result));
+    unity_shaderlab_lift_result_free(result);
+    unity_compiler_broker_destroy(broker);
+    fixture_free(&fixture);
+    return 0;
+}
+
 int main(void) {
     if (test_verified_and_fallback() || test_admission_and_later_pass() ||
-        test_unsupported_high_level_retains_baseline())
+        test_unsupported_high_level_retains_baseline() || test_unity_uv_transaction())
         return 1;
     puts("ShaderLab lift admission, full-pass certification and rollback passed.");
     return 0;

@@ -75,7 +75,9 @@ Each accepted candidate must reproduce its entire target DXBC container;
 unsupported candidates retain verified low-level output. Extraction's
 `--high-level` checks every local D3D11 pass/state/tier under the supplied
 profile and records request hashes and instruction spans. Failed baselines
-produce no Shader. These checks do not certify import, external dependencies,
+produce no Shader. A bounded packed-UV helper can use the selected Unity include
+after checking its actual definitions and exact DXBC for every selected variant.
+These checks do not certify import, external dependencies,
 player/runtime selection, or visual equivalence.
 
 The import, bundle, and finite-visual gate commands accept an explicit Editor

@@ -54,26 +54,31 @@ static int vector_definition(const HLSLEmitterContext *ctx, int instruction, int
     return definition;
 }
 
-bool hlsl_float4_program_supported(HLSLEmitterContext *ctx) {
-    const USILProgram *program = ctx->program;
+HLSLEmitReason hlsl_float4_program_contract(const USILProgram *program) {
     if (program->instruction_count < 1 ||
         program->instruction_count > EXPRESSION_INSTRUCTION_LIMIT ||
         (program->shader_model_major != 4 && program->shader_model_major != 5) ||
         program->cbuffer_count || program->texture_count || program->sampler_count ||
         program->uav_count || program->icb_value_count || program->indexable_temp_count ||
-        program->index_range_count || program->patch_constant_count || ctx->use_uint_temps ||
+        program->index_range_count || program->patch_constant_count ||
         (program->has_global_flags && program->global_flags != 1u))
-        return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+        return HLSL_EMIT_REASON_UNSUPPORTED_FEATURE;
     for (int kind = 0; kind < 2; ++kind) {
         const DXBCSignatureElement *signature = kind ? program->outputs : program->inputs;
         int count = kind ? program->output_count : program->input_count;
         for (int index = 0; index < count; ++index) {
             if (signature[index].component_type != 3 || signature[index].mask != 15 ||
                 signature[index].min_precision)
-                return reject(ctx, -1, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+                return HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT;
         }
     }
-    return true;
+    return HLSL_EMIT_REASON_NONE;
+}
+
+bool hlsl_float4_program_supported(HLSLEmitterContext *ctx) {
+    const HLSLEmitReason reason = ctx->use_uint_temps ? HLSL_EMIT_REASON_UNSUPPORTED_FEATURE
+                                                      : hlsl_float4_program_contract(ctx->program);
+    return reason == HLSL_EMIT_REASON_NONE || reject(ctx, -1, reason);
 }
 
 bool hlsl_lift_operand_is_plain(const DXBCOperand *value) {
@@ -316,6 +321,8 @@ void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx) {
 }
 
 bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
+    if (ctx->unity_uv_helper)
+        return emit_unity_uv_lift(ctx);
     for (int index = 0; index < ctx->program->instruction_count; ++index)
         if (ctx->program->instructions[index].opcode == USIL_OP_IF ||
             ctx->program->instructions[index].opcode == USIL_OP_LOOP)
@@ -427,6 +434,10 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
         if (origin->destination_lanes != lanes)
             return false;
         switch (origin->kind) {
+        case HLSL_EXPRESSION_ORIGIN_UNITY_UV:
+            if (index != 0 || !hlsl_unity_uv_lift_matches(program))
+                return false;
+            break;
         case HLSL_EXPRESSION_ORIGIN_FUNCTION:
             if (inst->opcode != USIL_OP_MUL || lanes != 15 ||
                 inst->operands[0].type != OPERAND_TYPE_TEMP)
@@ -488,6 +499,8 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
         return "loop-control";
     case HLSL_EXPRESSION_ORIGIN_FUNCTION:
         return "function";
+    case HLSL_EXPRESSION_ORIGIN_UNITY_UV:
+        return HLSL_UNITY_UV_LIFT_ID;
     default:
         return "unmapped";
     }
@@ -496,7 +509,7 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
 bool hlsl_expression_origin_has_span(HLSLExpressionOriginKind kind) {
     return kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION || kind == HLSL_EXPRESSION_ORIGIN_RETURN ||
            kind == HLSL_EXPRESSION_ORIGIN_CONTROL || kind == HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL ||
-           kind == HLSL_EXPRESSION_ORIGIN_FUNCTION;
+           kind == HLSL_EXPRESSION_ORIGIN_FUNCTION || kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV;
 }
 
 bool hlsl_expression_origin_ranges_valid(const HLSLExpressionOrigin *origin, size_t source_length) {

@@ -78,8 +78,8 @@ static HLSLLiftStatus work_status(LiftContext *context) {
     return status;
 }
 
-static bool compile(void *opaque, const UnityCompilerSnippetCompileRequest *request,
-                    UnityCompilerBinaryResponse *response) {
+static bool compile_raw(void *opaque, const UnityCompilerSnippetCompileRequest *request,
+                        UnityCompilerBinaryResponse *response) {
     LiftContext *context = opaque;
     if (work_status(context) != HLSL_LIFT_VERIFIED)
         return false;
@@ -106,6 +106,104 @@ static bool compile(void *opaque, const UnityCompilerSnippetCompileRequest *requ
     return received;
 }
 
+typedef struct {
+    LiftContext *lift;
+    UnityShaderLabLiftPassReport *report;
+    bool inspect_helper;
+} PassCompileContext;
+
+static bool helper_request_digest(void *opaque, const UnityCompilerSnippetCompileRequest *request,
+                                  uint8_t digest[32]) {
+    LiftContext *context = opaque;
+    if (work_status(context) != HLSL_LIFT_VERIFIED)
+        return false;
+    bool ok;
+    if (context->services.request_digest) {
+        ok = context->services.request_digest(context->services.context, request, digest);
+    } else {
+        uint8_t *transcript = NULL;
+        size_t size = 0;
+        ok = unity_compiler_broker_serialize_compile_request(context->input->broker, request,
+                                                             &transcript, &size, digest);
+        free(transcript);
+    }
+    return work_status(context) == HLSL_LIFT_VERIFIED && ok;
+}
+
+static HLSLLiftStatus helper_status(UnityUvHelperStatus status) {
+    switch (status) {
+    case UNITY_UV_HELPER_OK:
+        return HLSL_LIFT_VERIFIED;
+    case UNITY_UV_HELPER_COMPILER_UNAVAILABLE:
+        return HLSL_LIFT_COMPILER_UNAVAILABLE;
+    case UNITY_UV_HELPER_COMPILER_REJECTED:
+        return HLSL_LIFT_COMPILER_REJECTED;
+    case UNITY_UV_HELPER_OUT_OF_MEMORY:
+        return HLSL_LIFT_OUT_OF_MEMORY;
+    case UNITY_UV_HELPER_AUTHORITY_MISMATCH:
+        return HLSL_LIFT_AUTHORITY_MISMATCH;
+    default:
+        return HLSL_LIFT_PRECONDITION_REJECTED;
+    }
+}
+
+static bool compile_pass(void *opaque, const UnityCompilerSnippetCompileRequest *request,
+                         UnityCompilerBinaryResponse *response) {
+    PassCompileContext *pass = opaque;
+    LiftContext *context = pass->lift;
+    if (!pass->inspect_helper)
+        return compile_raw(context, request, response);
+    if (work_status(context) != HLSL_LIFT_VERIFIED)
+        return false;
+    UnityShaderLabLiftPassReport *report = pass->report;
+    if (report->helper_check_count >= SIZE_MAX / sizeof(*report->helper_checks) - 1U) {
+        context->control.status = HLSL_LIFT_OUT_OF_MEMORY;
+        return false;
+    }
+    UnityShaderLabLiftHelperCheck *checks =
+        realloc(report->helper_checks, (report->helper_check_count + 1U) * sizeof(*checks));
+    if (!checks) {
+        context->control.status = HLSL_LIFT_OUT_OF_MEMORY;
+        return false;
+    }
+    report->helper_checks = checks;
+    UnityShaderLabLiftHelperCheck *check = &checks[report->helper_check_count++];
+    memset(check, 0, sizeof(*check));
+    check->domain_compile_index = report->domain.compile_attempt_count - 1U;
+    const UnityUvHelperServices services = {
+        .request_digest = helper_request_digest, .compile = compile_raw, .context = context};
+    check->status = unity_uv_helper_inspect_request(context->input->broker, request, &services,
+                                                    &check->preprocessing, &check->evidence);
+    if (work_status(context) != HLSL_LIFT_VERIFIED)
+        return false;
+    if (check->status != UNITY_UV_HELPER_OK) {
+        context->control.status = helper_status(check->status);
+        return false;
+    }
+    check->compile_received = compile_raw(context, request, response);
+    check->compile_identity_matched =
+        check->compile_received && response->has_request_identity &&
+        memcmp(response->request_digest, check->evidence.compile_request_digest, 32) == 0;
+    if (check->compile_received && !check->compile_identity_matched &&
+        work_status(context) == HLSL_LIFT_VERIFIED)
+        context->control.status = HLSL_LIFT_PROVENANCE_MISMATCH;
+    return check->compile_identity_matched;
+}
+
+static bool pass_uses_helper(const UnityShaderLabLiftArtifact *artifact,
+                             const UnityShaderLabLiftPassReport *pass) {
+    for (size_t i = 0; i < artifact->source_map.count; ++i) {
+        const ShaderLabExpressionSourceRecord *record = &artifact->source_map.records[i];
+        if (record->subshader_index != pass->subshader_index ||
+            record->pass_index != pass->pass_index)
+            continue;
+        for (size_t j = 0; j < record->instructions.count; ++j)
+            if (record->instructions.origins[j].kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV)
+                return true;
+    }
+    return false;
+}
+
 static HLSLLiftStatus domain_status(UnityGeneratedDomainStatus status) {
     switch (status) {
     case UNITY_GENERATED_DOMAIN_OK:
@@ -130,7 +228,7 @@ static HLSLLiftStatus domain_status(UnityGeneratedDomainStatus status) {
 }
 
 static HLSLLiftStatus preprocess(LiftContext *context, UnityShaderLabLiftArtifact *artifact,
-                                 bool high_level) {
+                                 const UnityShaderLabLiftArtifact *baseline) {
     HLSLLiftStatus status = work_status(context);
     if (status != HLSL_LIFT_VERIFIED)
         return status;
@@ -161,8 +259,8 @@ static HLSLLiftStatus preprocess(LiftContext *context, UnityShaderLabLiftArtifac
     if (!response->has_request_identity || !has_digest(response->request_digest) ||
         !has_digest(response->controls_digest))
         return HLSL_LIFT_PROVENANCE_MISMATCH;
-    if (high_level && memcmp(response->controls_digest,
-                             context->result->baseline.preprocessing.controls_digest, 32) != 0)
+    if (baseline &&
+        memcmp(response->controls_digest, baseline->preprocessing.controls_digest, 32) != 0)
         return HLSL_LIFT_AUTHORITY_MISMATCH;
     return HLSL_LIFT_VERIFIED;
 }
@@ -213,6 +311,11 @@ static HLSLLiftStatus certify_pass(LiftContext *context, UnityShaderLabLiftArtif
     if (status == HLSL_LIFT_VERIFIED && report->plan_status != SHADERLAB_VARIANT_PLAN_OK)
         status = HLSL_LIFT_PRECONDITION_REJECTED;
     if (status == HLSL_LIFT_VERIFIED) {
+        PassCompileContext compile_context = {.lift = context,
+                                              .report = report,
+                                              .inspect_helper = artifact->unity_uv_helpers &&
+                                                                artifact->high_level &&
+                                                                pass_uses_helper(artifact, report)};
         const UnityGeneratedDomainCertificationInput certification = {
             .shader = input->shader,
             .pass = pass,
@@ -223,8 +326,8 @@ static HLSLLiftStatus certify_pass(LiftContext *context, UnityShaderLabLiftArtif
             .source_directory = input->source_directory,
             .source_basename = input->source_basename,
             .pass_name = pass->name ? pass->name : "",
-            .compile_callback = compile,
-            .compile_context = context,
+            .compile_callback = compile_pass,
+            .compile_context = &compile_context,
             .retain_compile_provenance = true,
         };
         report->certification_attempted = true;
@@ -239,7 +342,10 @@ static HLSLLiftStatus certify_pass(LiftContext *context, UnityShaderLabLiftArtif
 }
 
 static HLSLLiftStatus attempt(LiftContext *context, UnityShaderLabLiftArtifact *artifact,
-                              bool high_level) {
+                              bool high_level, bool unity_uv_helpers,
+                              const UnityShaderLabLiftArtifact *baseline) {
+    artifact->high_level = high_level;
+    artifact->unity_uv_helpers = unity_uv_helpers;
     artifact->attempted = true;
     HLSLLiftStatus status = work_status(context);
     if (status != HLSL_LIFT_VERIFIED)
@@ -251,14 +357,19 @@ static HLSLLiftStatus attempt(LiftContext *context, UnityShaderLabLiftArtifact *
     const ShaderBlobArchive *archive = input->archive;
     artifact->emission_attempted = true;
     const bool emitted =
-        high_level ? shaderlab_emit_high_level_candidate_with_source_map(
-                         input->shader, archive->entries, archive->entry_count, archive->segments,
-                         archive->segment_lengths, archive->segment_count, &artifact->source,
-                         &artifact->source_map, &artifact->emission_diagnostic)
-                   : shaderlab_emit_candidate_with_diagnostic(
-                         input->shader, archive->entries, archive->entry_count, archive->segments,
-                         archive->segment_lengths, archive->segment_count, &artifact->source,
-                         &artifact->emission_diagnostic);
+        unity_uv_helpers
+            ? shaderlab_emit_unity_uv_candidate(
+                  input->shader, archive->entries, archive->entry_count, archive->segments,
+                  archive->segment_lengths, archive->segment_count, high_level, &artifact->source,
+                  high_level ? &artifact->source_map : NULL, &artifact->emission_diagnostic)
+        : high_level ? shaderlab_emit_high_level_candidate_with_source_map(
+                           input->shader, archive->entries, archive->entry_count, archive->segments,
+                           archive->segment_lengths, archive->segment_count, &artifact->source,
+                           &artifact->source_map, &artifact->emission_diagnostic)
+                     : shaderlab_emit_candidate_with_diagnostic(
+                           input->shader, archive->entries, archive->entry_count, archive->segments,
+                           archive->segment_lengths, archive->segment_count, &artifact->source,
+                           &artifact->emission_diagnostic);
     status = work_status(context);
     if (status != HLSL_LIFT_VERIFIED)
         return status;
@@ -267,7 +378,7 @@ static HLSLLiftStatus attempt(LiftContext *context, UnityShaderLabLiftArtifact *
     if (high_level &&
         !shaderlab_expression_source_map_matches_source(&artifact->source_map, &artifact->source))
         return HLSL_LIFT_PROVENANCE_MISMATCH;
-    status = preprocess(context, artifact, high_level);
+    status = preprocess(context, artifact, baseline);
     if (status != HLSL_LIFT_VERIFIED)
         return status;
     for (size_t p = 0; p < artifact->pass_count; ++p) {
@@ -314,6 +425,8 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
     result->limits = *limits;
     artifact_init(&result->baseline);
     artifact_init(&result->candidate);
+    artifact_init(&result->helper_baseline);
+    artifact_init(&result->helper_candidate);
     HLSLLiftStatus status = hlsl_lift_control_begin(
         &context.control, context.services.monotonic_ms, context.services.cancelled,
         context.services.context, limits->max_elapsed_ms);
@@ -339,7 +452,7 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
         common_sha256(input->source_basename, strlen(input->source_basename),
                       result->source_basename_digest);
         result->authority_pinned = true;
-        status = attempt(&context, &result->baseline, false);
+        status = attempt(&context, &result->baseline, false, false, NULL);
     }
     result->baseline.status = status;
     if (status != HLSL_LIFT_VERIFIED)
@@ -349,17 +462,42 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
         result->candidate.status = HLSL_LIFT_BUDGET_EXHAUSTED;
     } else {
         result->stats.candidates = 1;
-        result->candidate.status = attempt(&context, &result->candidate, true);
+        result->candidate.status =
+            attempt(&context, &result->candidate, true, false, &result->baseline);
     }
     if (result->candidate.status == HLSL_LIFT_VERIFIED) {
         result->accepted = &result->candidate;
         result->stats.accepted = 1;
     }
+    status = result->candidate.status;
+    /* Ordinary emission failure can expose a supported helper family. Compiler,
+     * authority and budget failures are not reasons to start another attempt. */
+    if (status == HLSL_LIFT_EMISSION_REJECTED && limits->max_candidates >= 2) {
+        status = work_status(&context);
+        if (status != HLSL_LIFT_VERIFIED) {
+            result->helper_baseline.status = status;
+            if (context.authority_changed) result->accepted = NULL;
+            return status;
+        }
+        ++result->stats.candidates;
+        result->helper_baseline.status =
+            attempt(&context, &result->helper_baseline, false, true, NULL);
+        status = result->helper_baseline.status;
+        if (status == HLSL_LIFT_VERIFIED) {
+            result->helper_candidate.status =
+                attempt(&context, &result->helper_candidate, true, true, &result->helper_baseline);
+            status = result->helper_candidate.status;
+            if (status == HLSL_LIFT_VERIFIED) {
+                result->accepted = &result->helper_candidate;
+                result->stats.accepted = 1;
+            }
+        }
+    }
     /* Keep the earlier evidence for review, but do not publish a fallback
      * against an environment that changed after its verification. */
     if (context.authority_changed)
         result->accepted = NULL;
-    return result->candidate.status;
+    return status;
 }
 
 const UnityShaderLabLiftArtifact *
@@ -370,6 +508,16 @@ unity_shaderlab_lift_baseline(const UnityShaderLabLiftResult *result) {
 const UnityShaderLabLiftArtifact *
 unity_shaderlab_lift_candidate(const UnityShaderLabLiftResult *result) {
     return result ? &result->candidate : NULL;
+}
+
+const UnityShaderLabLiftArtifact *
+unity_shaderlab_lift_helper_baseline(const UnityShaderLabLiftResult *result) {
+    return result ? &result->helper_baseline : NULL;
+}
+
+const UnityShaderLabLiftArtifact *
+unity_shaderlab_lift_helper_candidate(const UnityShaderLabLiftResult *result) {
+    return result ? &result->helper_candidate : NULL;
 }
 
 const UnityShaderLabLiftArtifact *
@@ -386,8 +534,13 @@ void unity_shaderlab_lift_stats(const UnityShaderLabLiftResult *result, HLSLLift
 }
 
 static void artifact_free(UnityShaderLabLiftArtifact *artifact) {
-    for (size_t p = 0; p < artifact->pass_count; ++p)
-        unity_generated_domain_report_free(&artifact->passes[p].domain);
+    for (size_t p = 0; p < artifact->pass_count; ++p) {
+        UnityShaderLabLiftPassReport *pass = &artifact->passes[p];
+        unity_generated_domain_report_free(&pass->domain);
+        for (size_t i = 0; i < pass->helper_check_count; ++i)
+            unity_compiler_binary_response_free(&pass->helper_checks[i].preprocessing);
+        free(pass->helper_checks);
+    }
     free(artifact->passes);
     unity_compiler_preprocess_response_free(&artifact->preprocessing);
     shaderlab_expression_source_map_free(&artifact->source_map);
@@ -398,6 +551,8 @@ void unity_shaderlab_lift_result_free(UnityShaderLabLiftResult *result) {
     if (result) {
         artifact_free(&result->baseline);
         artifact_free(&result->candidate);
+        artifact_free(&result->helper_baseline);
+        artifact_free(&result->helper_candidate);
         free(result);
     }
 }

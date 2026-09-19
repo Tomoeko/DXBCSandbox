@@ -27,7 +27,8 @@ typedef enum {
     HLSL_EXPRESSION_ORIGIN_RETURN,
     HLSL_EXPRESSION_ORIGIN_CONTROL,
     HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL,
-    HLSL_EXPRESSION_ORIGIN_FUNCTION
+    HLSL_EXPRESSION_ORIGIN_FUNCTION,
+    HLSL_EXPRESSION_ORIGIN_UNITY_UV
 } HLSLExpressionOriginKind;
 
 typedef struct {
@@ -51,6 +52,8 @@ typedef struct {
  * the LOOP/UGE/BREAKC/IADD induction shares its for-header span. Other
  * declarations/ABI tokens are not instruction-owned spans. FUNCTION maps both
  * the call site and the instruction's operation in a shared helper definition.
+ * UNITY_UV maps the call whose external definition belongs to a separately
+ * retained compiler-expansion contract, so definition_begin/end stay zero.
  * This is provenance, never an independent correctness certificate. */
 typedef struct HLSLExpressionSourceMap {
     HLSLExpressionOrigin origins[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
@@ -109,6 +112,12 @@ typedef enum HLSLEmitMode {
     HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE = 2
 } HLSLEmitMode;
 
+typedef enum {
+    HLSL_UNITY_UV_DISABLED = 0,
+    HLSL_UNITY_UV_INCLUDE,
+    HLSL_UNITY_UV_EXTERNAL_INCLUDE
+} HLSLUnityUvPolicy;
+
 typedef struct HLSLEmitOptions {
     HLSLEmitMode mode;
 
@@ -133,6 +142,13 @@ typedef struct HLSLEmitOptions {
     /* Optional caller-owned output, HIGH_LEVEL_CANDIDATE only. Cleared on
      * entry and failure; complete only after successful emission. */
     HLSLExpressionSourceMap *expression_source_map;
+    /* Explicit fixed-include attempt for hlsl_unity_uv_lift_matches() only.
+     * RECOMPILE emits the baseline plus UnityCG; HIGH_LEVEL_CANDIDATE emits
+     * its packed-UV call under the same prelude. Unmatched programs and
+     * READABLE reject. The caller must attest actual expanded definitions and
+     * compare the full container before accepting either form. EXTERNAL_INCLUDE
+     * delegates the same prelude to the enclosing ShaderLab pass. Default off. */
+    HLSLUnityUvPolicy unity_uv_helper;
 } HLSLEmitOptions;
 
 /* Stable, allocation-free failure authority for HLSL emission.  Diagnostics
@@ -263,10 +279,12 @@ const char* hlsl_emit_metadata_source_name(HLSLEmitMetadataSource source);
 const char* hlsl_emit_metadata_kind_name(HLSLEmitMetadataKind kind);
 const char* hlsl_emit_opcode_name(int opcode);
 
-#define HLSL_EMIT_RECOMPILE_OPTIONS_INIT {HLSL_EMIT_MODE_RECOMPILE, NULL, false, NULL, 0, NULL}
+#define HLSL_EMIT_RECOMPILE_OPTIONS_INIT                                                           \
+    {HLSL_EMIT_MODE_RECOMPILE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED}
 #define HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT                                                          \
-    {HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE, NULL, false, NULL, 0, NULL}
-#define HLSL_EMIT_READABLE_OPTIONS_INIT {HLSL_EMIT_MODE_READABLE, NULL, false, NULL, 0, NULL}
+    {HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED}
+#define HLSL_EMIT_READABLE_OPTIONS_INIT                                                            \
+    {HLSL_EMIT_MODE_READABLE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED}
 
 // Translates a USIL program and appends recompilable HLSL to the string builder.
 // Semantic reconstruction is disabled. Returns true on success. Pass NULL for

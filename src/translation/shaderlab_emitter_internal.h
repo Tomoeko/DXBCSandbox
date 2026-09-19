@@ -87,6 +87,8 @@ typedef struct {
     ShaderLabExpressionSourceMap *map;
     int subshader_index;
     int pass_index;
+    bool unity_uv_helpers;
+    bool *unity_uv_used; /* Per-pass accumulation, including baseline emission. */
 } ShaderLabExpressionMapContext;
 
 bool shaderlab_expression_source_map_append(

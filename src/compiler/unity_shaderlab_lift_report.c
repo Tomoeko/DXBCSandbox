@@ -150,13 +150,48 @@ static void source_map(StringBuilder *out, const ShaderLabExpressionSourceMap *m
     sb_append(out, "]}");
 }
 
+static void helper_checks(StringBuilder *out, const UnityShaderLabLiftPassReport *pass) {
+    sb_append_char(out, '[');
+    for (size_t i = 0; i < pass->helper_check_count; ++i) {
+        const UnityShaderLabLiftHelperCheck *check = &pass->helper_checks[i];
+        if (i)
+            sb_append_char(out, ',');
+        const bool valid = check->status == UNITY_UV_HELPER_OK;
+        sb_appendf(out, "{\"domain_compile_index\":%zu,\"status\":\"%s\",",
+                   check->domain_compile_index, unity_uv_helper_status_name(check->status));
+        digest(out, "compile_request_sha256", check->evidence.compile_request_digest, valid);
+        sb_append_char(out, ',');
+        digest(out, "preprocess_request_sha256", check->evidence.preprocess_request_digest, valid);
+        sb_append_char(out, ',');
+        digest(out, "expansion_sha256", check->evidence.expansion.expansion_digest, valid);
+        sb_append(out, ",\"definition_ranges\":[");
+        if (valid) {
+            const UnityUvHelperExpansion *expansion = &check->evidence.expansion;
+            sb_appendf(out, "[%zu,%zu],[%zu,%zu],[%zu,%zu]", expansion->definitions[0].begin,
+                       expansion->definitions[0].end, expansion->definitions[1].begin,
+                       expansion->definitions[1].end, expansion->probe.begin, expansion->probe.end);
+        }
+        sb_appendf(out,
+                   "],\"compile_received\":%s,\"compile_identity_matched\":%s,"
+                   "\"response\":",
+                   boolean(check->compile_received), boolean(check->compile_identity_matched));
+        response_status(out, &check->preprocessing.status);
+        sb_append_char(out, '}');
+    }
+    sb_append_char(out, ']');
+}
+
 static void artifact(StringBuilder *out, const UnityShaderLabLiftArtifact *value) {
     uint8_t source_digest[32];
     const bool has_source = value->source.buf && value->source.len && sb_ok(&value->source);
     if (has_source)
         common_sha256(value->source.buf, value->source.len, source_digest);
-    sb_appendf(out, "{\"attempted\":%s,\"status\":\"%s\",\"source_bytes\":%zu,",
-               boolean(value->attempted), hlsl_lift_status_name(value->status), value->source.len);
+    sb_appendf(out,
+               "{\"attempted\":%s,\"high_level\":%s,\"unity_uv_helpers\":%s,"
+               "\"status\":\"%s\",\"source_bytes\":%zu,",
+               boolean(value->attempted), boolean(value->high_level),
+               boolean(value->unity_uv_helpers), hlsl_lift_status_name(value->status),
+               value->source.len);
     digest(out, "source_sha256", source_digest, has_source);
     sb_appendf(
         out, ",\"emission_attempted\":%s,\"emission_reason\":", boolean(value->emission_attempted));
@@ -197,6 +232,8 @@ static void artifact(StringBuilder *out, const UnityShaderLabLiftArtifact *value
             domain_report(out, &pass->domain);
         else
             sb_append(out, "null");
+        sb_append(out, ",\"helper_checks\":");
+        helper_checks(out, pass);
         sb_append_char(out, '}');
     }
     sb_append(out, "],\"source_map\":");
@@ -209,9 +246,9 @@ char *unity_shaderlab_lift_format_json(const UnityShaderLabLiftResult *result) {
         return NULL;
     StringBuilder out;
     sb_init(&out);
-    const char *selection = !result->accepted                        ? "unverified"
-                            : result->accepted == &result->candidate ? "high-level"
-                                                                     : "low-level-fallback";
+    const char *selection = !result->accepted              ? "unverified"
+                            : result->accepted->high_level ? "high-level"
+                                                           : "low-level-fallback";
     sb_appendf(&out,
                "{\"schema\":\"dxbc-shaderlab-lift-v1\","
                "\"scope\":\"generated-local-d3d11-program-domain\","
@@ -244,6 +281,12 @@ char *unity_shaderlab_lift_format_json(const UnityShaderLabLiftResult *result) {
     artifact(&out, &result->baseline);
     sb_append(&out, ",\"candidate\":");
     artifact(&out, &result->candidate);
+    sb_appendf(&out, ",\"unity_helper\":{\"id\":\"%s\",\"version\":%u,\"baseline\":",
+               UNITY_UV_HELPER_LIFT_ID, UNITY_UV_HELPER_LIFT_VERSION);
+    artifact(&out, &result->helper_baseline);
+    sb_append(&out, ",\"candidate\":");
+    artifact(&out, &result->helper_candidate);
+    sb_append_char(&out, '}');
     sb_append(&out, "}\n");
     if (!sb_ok(&out)) {
         sb_free(&out);

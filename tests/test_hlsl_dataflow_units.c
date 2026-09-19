@@ -1781,6 +1781,160 @@ static bool check_function_emission(void) {
     return true;
 }
 
+static bool check_unity_uv_emission(void) {
+    USILInstruction instructions[2] = {0};
+    instructions[0].opcode = USIL_OP_MAD;
+    instructions[0].operand_count = 4;
+    instructions[0].operands[0] = emission_reg(OPERAND_TYPE_OUTPUT, 0);
+    instructions[0].operands[1] = emission_reg(OPERAND_TYPE_INPUT, 0);
+    instructions[0].operands[2] = emission_reg(OPERAND_TYPE_INPUT, 1);
+    instructions[0].operands[3] = emission_reg(OPERAND_TYPE_INPUT, 1);
+    for (int lane = 0; lane < 4; ++lane) {
+        instructions[0].operands[2].swizzle[lane] = (uint8_t)(lane % 2);
+        instructions[0].operands[3].swizzle[lane] = (uint8_t)(2 + lane % 2);
+    }
+    instructions[0].source_instruction_index = 11;
+    instructions[1].opcode = USIL_OP_RET;
+    instructions[1].source_instruction_index = 12;
+    DXBCSignatureElement inputs[2] = {
+        {.semantic_name = "TEXCOORD", .component_type = 3, .mask = 15, .rw_mask = 15},
+        {.semantic_name = "TEXCOORD",
+         .semantic_index = 1,
+         .register_id = 1,
+         .component_type = 3,
+         .mask = 15,
+         .rw_mask = 15},
+    };
+    DXBCSignatureElement output = {
+        .semantic_name = "SV_Target", .component_type = 3, .system_value = 64, .mask = 15};
+    USILProgram program = {.shader_type_model = "ps_5_0",
+                           .instructions = instructions,
+                           .instruction_count = 2,
+                           .instruction_alloc = 2,
+                           .inputs = inputs,
+                           .input_count = 2,
+                           .input_alloc = 2,
+                           .outputs = &output,
+                           .output_count = 1,
+                           .output_alloc = 1,
+                           .has_stage_contract = true,
+                           .program_type = DXBC_PROGRAM_TYPE_PIXEL,
+                           .shader_model_major = 5};
+    CHECK(hlsl_unity_uv_lift_matches(&program));
+    StringBuilder ordinary, baseline, candidate;
+    sb_init(&ordinary);
+    sb_init(&baseline);
+    sb_init(&candidate);
+    CHECK(hlsl_emit(&program, &ordinary, NULL, NULL, NULL));
+    CHECK(!strstr(ordinary.buf, "UnityCG") && !strstr(ordinary.buf, HLSL_UNITY_UV_FUNCTION));
+    HLSLEmitOptions options = HLSL_EMIT_RECOMPILE_OPTIONS_INIT;
+    options.unity_uv_helper = HLSL_UNITY_UV_INCLUDE;
+    CHECK(hlsl_emit_with_options(&program, &baseline, NULL, NULL, NULL, &options));
+    CHECK(strstr(baseline.buf, "#include \"UnityCG.cginc\"") &&
+          !strstr(baseline.buf, HLSL_UNITY_UV_FUNCTION));
+    options.mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+    HLSLExpressionSourceMap map;
+    options.expression_source_map = &map;
+    CHECK(hlsl_emit_with_options(&program, &candidate, NULL, NULL, NULL, &options));
+    CHECK(strstr(candidate.buf, "#include \"UnityCG.cginc\""));
+    CHECK(strstr(candidate.buf, "o0 = " HLSL_UNITY_UV_FUNCTION "((v0), (v1));"));
+    CHECK(map.complete && map.count == 2 && map.origins[0].destination_lanes == 15);
+    CHECK(map.origins[0].kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV &&
+          map.origins[0].source_instruction_index == 11);
+    CHECK(map.origins[1].kind == HLSL_EXPRESSION_ORIGIN_RETURN);
+    CHECK(!map.origins[0].definition_begin && !map.origins[0].definition_end);
+    CHECK(hlsl_expression_source_map_matches(&map, &program, candidate.buf));
+    const HLSLExpressionSourceMap valid = map;
+    map.origins[0].definition_end = map.origins[0].source_begin;
+    CHECK(!hlsl_expression_source_map_matches(&map, &program, candidate.buf));
+    map = valid;
+    map.origins[0].kind = HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+    CHECK(!hlsl_expression_source_map_matches(&map, &program, candidate.buf));
+    sb_free(&candidate);
+    /* A plain high-level request must not opt itself into a Unity include. */
+    options.unity_uv_helper = HLSL_UNITY_UV_DISABLED;
+    sb_init(&candidate);
+    CHECK(!hlsl_emit_with_options(&program, &candidate, NULL, NULL, NULL, &options));
+    CHECK(!map.complete && !strstr(candidate.buf, "UnityCG"));
+    sb_free(&candidate);
+    options.unity_uv_helper = HLSL_UNITY_UV_INCLUDE;
+    const char *collision = HLSL_UNITY_UV_FUNCTION;
+    options.reserved_preprocessor_identifiers = &collision;
+    options.reserved_preprocessor_identifier_count = 1;
+    sb_init(&candidate);
+    CHECK(!hlsl_emit_with_options(&program, &candidate, NULL, NULL, NULL, &options));
+    CHECK(!map.complete);
+    sb_free(&candidate);
+    options.reserved_preprocessor_identifiers = NULL;
+    options.reserved_preprocessor_identifier_count = 0;
+    for (int operand = 1; operand < 4; ++operand) {
+        for (int lane = 0; lane < 4; ++lane) {
+            instructions[0].operands[operand].swizzle[lane] ^= 1;
+            CHECK(!hlsl_unity_uv_lift_matches(&program));
+            sb_init(&candidate);
+            CHECK(!hlsl_emit_with_options(&program, &candidate, NULL, NULL, NULL, &options));
+            CHECK(!map.complete);
+            sb_free(&candidate);
+            instructions[0].operands[operand].swizzle[lane] ^= 1;
+        }
+    }
+    for (int mutation = 0; mutation < 12; ++mutation) {
+        USILProgram changed = program;
+        USILInstruction changed_instructions[2];
+        memcpy(changed_instructions, instructions, sizeof(instructions));
+        changed.instructions = changed_instructions;
+        switch (mutation) {
+        case 0:
+            changed_instructions[0].precise_mask = 1;
+            break;
+        case 1:
+            changed_instructions[0].saturate = true;
+            break;
+        case 2:
+            changed_instructions[0].operands[2].min_precision = 1;
+            break;
+        case 3:
+            changed_instructions[0].operands[3].has_neg = true;
+            break;
+        case 4:
+            changed_instructions[0].operands[3].register_index = 0;
+            break;
+        case 5:
+            changed_instructions[0].operands[0].destination_mask = 0x30;
+            break;
+        case 6:
+            changed_instructions[0].operands[1].register_index_dim = 2;
+            break;
+        case 7:
+            changed_instructions[0].operands[1].index_values[0] = 1;
+            break;
+        case 8:
+            changed.cbuffer_count = 1;
+            break;
+        case 9:
+            changed.has_global_flags = true;
+            changed.global_flags = 0;
+            break;
+        case 10:
+            changed.has_stage_contract = false;
+            break;
+        case 11:
+            changed.program_type = DXBC_PROGRAM_TYPE_GEOMETRY;
+            break;
+        }
+        CHECK(!hlsl_unity_uv_lift_matches(&changed));
+    }
+    CHECK(hlsl_unity_uv_lift_matches(&program));
+    options.mode = HLSL_EMIT_MODE_READABLE;
+    options.expression_source_map = NULL;
+    sb_init(&candidate);
+    CHECK(!hlsl_emit_with_options(&program, &candidate, NULL, NULL, NULL, &options));
+    sb_free(&candidate);
+    sb_free(&baseline);
+    sb_free(&ordinary);
+    return true;
+}
+
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
@@ -1789,7 +1943,7 @@ int main(void) {
         !check_long_dominator_chain() || !check_copy_candidates() || !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
         !check_expression_emission() || !check_conditional_emission() ||
-        !check_counted_loop_emission() || !check_function_emission())
+        !check_counted_loop_emission() || !check_function_emission() || !check_unity_uv_emission())
         return 1;
     puts("HLSL dataflow contracts passed");
     return 0;
