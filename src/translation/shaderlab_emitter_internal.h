@@ -83,6 +83,18 @@ bool emit_stage_hlsl_with_variant_plan(
     StringBuilder* sb,
     ShaderLabStageDiagnostic* diagnostic);
 
+bool emit_stage_hlsl_with_variant_plan_mode(
+    const ShaderLabVariantPlan* variant_plan,
+    int stage_index,
+    const BlobEntry* blob_entries,
+    int entry_count,
+    uint8_t** segments,
+    const int* segment_lengths,
+    int segment_count,
+    bool high_level,
+    StringBuilder* sb,
+    ShaderLabStageDiagnostic* diagnostic);
+
 /* Deterministic tier-routing test hook used by focused plan tests. */
 int shaderlab_stage_planned_subprogram_index(
     const ShaderLabVariantPlan* plan,

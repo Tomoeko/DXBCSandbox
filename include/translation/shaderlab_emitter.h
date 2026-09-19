@@ -148,6 +148,22 @@ bool shaderlab_emit_candidate_with_diagnostic(
     ShaderLabCandidateDiagnostic* diagnostic
 );
 
+/* Opt-in high-level candidate: every selected D3D11 variant must satisfy
+ * HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE. Unsupported stages fail atomically;
+ * no presentation fallback or placeholder is introduced. Metadata, variant
+ * selection and declarations share the normal candidate pipeline. The caller
+ * must verify the complete generated domain before accepting this source and
+ * retain its verified low-level candidate on any failure. */
+bool shaderlab_emit_high_level_candidate(
+    const SerializedShader* shader,
+    const BlobEntry* blob_entries,
+    int entry_count,
+    uint8_t** segments,
+    const int* segment_lengths,
+    int segment_count,
+    StringBuilder* sb,
+    ShaderLabCandidateDiagnostic* diagnostic);
+
 /* Non-exact verifier convenience API.  It embeds supplied HLSL and fills an
  * omitted stage with a trivial placeholder so one stage can be compiled in
  * isolation.  Production candidate reconstruction must use

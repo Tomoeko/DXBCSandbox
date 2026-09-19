@@ -439,7 +439,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                                     int entry_count, uint8_t **segments,
                                     const int *segment_lengths,
                                     int segment_count,
-                                    bool require_complete_stages,
+                                    bool require_complete_stages, bool high_level,
                                     StringBuilder *sb,
                                     ShaderLabCandidateDiagnostic
                                         *candidate_diagnostic) {
@@ -786,9 +786,9 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
       sb_append(sb, "#if defined(VERTEX) || defined(SHADER_STAGE_VERTEX)\n");
       if (require_complete_stages) {
         ShaderLabStageDiagnostic diagnostic;
-        if (!emit_stage_hlsl_with_variant_plan(
+        if (!emit_stage_hlsl_with_variant_plan_mode(
                 &pass_variant_plan, 0, blob_entries, entry_count, segments,
-                segment_lengths, segment_count, sb, &diagnostic)) {
+                segment_lengths, segment_count, high_level, sb, &diagnostic)) {
           set_candidate_stage_failure(candidate_diagnostic, i, j,
                                       &diagnostic);
           report_candidate_stage_failure(&diagnostic);
@@ -808,9 +808,9 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         sb_append(sb, "#if defined(HULL) || defined(SHADER_STAGE_HULL)\n");
         if (require_complete_stages) {
           ShaderLabStageDiagnostic diagnostic;
-          if (!emit_stage_hlsl_with_variant_plan(
+          if (!emit_stage_hlsl_with_variant_plan_mode(
                   &pass_variant_plan, 3, blob_entries, entry_count, segments,
-                  segment_lengths, segment_count, sb, &diagnostic)) {
+                  segment_lengths, segment_count, high_level, sb, &diagnostic)) {
             set_candidate_stage_failure(candidate_diagnostic, i, j,
                                         &diagnostic);
             report_candidate_stage_failure(&diagnostic);
@@ -829,9 +829,9 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         sb_append(sb, "#if defined(DOMAIN) || defined(SHADER_STAGE_DOMAIN)\n");
         if (require_complete_stages) {
           ShaderLabStageDiagnostic diagnostic;
-          if (!emit_stage_hlsl_with_variant_plan(
+          if (!emit_stage_hlsl_with_variant_plan_mode(
                   &pass_variant_plan, 4, blob_entries, entry_count, segments,
-                  segment_lengths, segment_count, sb, &diagnostic)) {
+                  segment_lengths, segment_count, high_level, sb, &diagnostic)) {
             set_candidate_stage_failure(candidate_diagnostic, i, j,
                                         &diagnostic);
             report_candidate_stage_failure(&diagnostic);
@@ -851,9 +851,9 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                   "#if defined(GEOMETRY) || defined(SHADER_STAGE_GEOMETRY)\n");
         if (require_complete_stages) {
           ShaderLabStageDiagnostic diagnostic;
-          if (!emit_stage_hlsl_with_variant_plan(
+          if (!emit_stage_hlsl_with_variant_plan_mode(
                   &pass_variant_plan, 2, blob_entries, entry_count, segments,
-                  segment_lengths, segment_count, sb, &diagnostic)) {
+                  segment_lengths, segment_count, high_level, sb, &diagnostic)) {
             set_candidate_stage_failure(candidate_diagnostic, i, j,
                                         &diagnostic);
             report_candidate_stage_failure(&diagnostic);
@@ -871,9 +871,9 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                 "#if defined(FRAGMENT) || defined(SHADER_STAGE_FRAGMENT)\n");
       if (require_complete_stages) {
         ShaderLabStageDiagnostic diagnostic;
-        if (!emit_stage_hlsl_with_variant_plan(
+        if (!emit_stage_hlsl_with_variant_plan_mode(
                 &pass_variant_plan, 1, blob_entries, entry_count, segments,
-                segment_lengths, segment_count, sb, &diagnostic)) {
+                segment_lengths, segment_count, high_level, sb, &diagnostic)) {
           set_candidate_stage_failure(candidate_diagnostic, i, j,
                                       &diagnostic);
           report_candidate_stage_failure(&diagnostic);
@@ -982,7 +982,7 @@ static bool shaderlab_emit_transactional(
     const SerializedShader *shader, const char *vertex_hlsl,
     const char *fragment_hlsl, const BlobEntry *blob_entries, int entry_count,
     uint8_t **segments, const int *segment_lengths, int segment_count,
-    bool require_complete_stages, StringBuilder *output,
+    bool require_complete_stages, bool high_level, StringBuilder *output,
     ShaderLabCandidateDiagnostic *candidate_diagnostic) {
   if (candidate_diagnostic) {
     memset(candidate_diagnostic, 0, sizeof(*candidate_diagnostic));
@@ -1017,8 +1017,8 @@ static bool shaderlab_emit_transactional(
   sb_init_with_capacity(&generated, 16384);
   const bool generated_ok = shaderlab_emit_internal(
       shader, vertex_hlsl, fragment_hlsl, blob_entries, entry_count, segments,
-      segment_lengths, segment_count, require_complete_stages, &generated,
-      candidate_diagnostic);
+      segment_lengths, segment_count, require_complete_stages, high_level,
+      &generated, candidate_diagnostic);
   if (generated_ok) sb_append_len(output, generated.buf, generated.len);
   const bool success = generated_ok && sb_ok(output);
   if (generated_ok && !success) {
@@ -1045,11 +1045,21 @@ bool shaderlab_emit_candidate_with_diagnostic(
     ShaderLabCandidateDiagnostic *diagnostic) {
   return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
                                       entry_count, segments, segment_lengths,
-                                      segment_count, true, sb, diagnostic);
+                                      segment_count, true, false, sb, diagnostic);
 }
 
 bool shaderlab_emit_raw(const SerializedShader *shader, const char *vertex_hlsl,
                         const char *fragment_hlsl, StringBuilder *sb) {
   return shaderlab_emit_transactional(shader, vertex_hlsl, fragment_hlsl, NULL,
-                                      0, NULL, NULL, 0, false, sb, NULL);
+                                      0, NULL, NULL, 0, false, false, sb, NULL);
+}
+
+bool shaderlab_emit_high_level_candidate(
+    const SerializedShader *shader, const BlobEntry *blob_entries,
+    int entry_count, uint8_t **segments, const int *segment_lengths,
+    int segment_count, StringBuilder *sb,
+    ShaderLabCandidateDiagnostic *diagnostic) {
+  return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
+                                      entry_count, segments, segment_lengths,
+                                      segment_count, true, true, sb, diagnostic);
 }

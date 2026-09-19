@@ -560,7 +560,7 @@ static bool translate_stage_to_hlsl(
     const int *segment_lengths, int segment_count, StringBuilder *out_hlsl,
     const HLSLEmitNames *names,
     const char *const *reserved_preprocessor_identifiers,
-    size_t reserved_preprocessor_identifier_count,
+    size_t reserved_preprocessor_identifier_count, bool high_level,
     ShaderLabStageDiagnostic *diagnostic) {
   if (!pass || !out_hlsl || !names || stage_index < 0 || stage_index >= 6 ||
       subprogram_index < 0 ||
@@ -725,6 +725,7 @@ static bool translate_stage_to_hlsl(
     goto cleanup;
   }
   HLSLEmitOptions emit_options = HLSL_EMIT_RECOMPILE_OPTIONS_INIT;
+  if (high_level) emit_options.mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
   emit_options.omit_unity_builtin_declarations = true;
   emit_options.reserved_preprocessor_identifiers =
       reserved_preprocessor_identifiers;
@@ -887,7 +888,7 @@ bool emit_stage_hlsl(const SerializedPass *pass, int stage_index,
             pass, stage_index, variant->subprogram_index, blob_entries,
             entry_count, segments, segment_lengths, segment_count,
             &variant_hlsl, &names,
-            (const char *const *)plan.keywords, plan.keyword_count,
+            (const char *const *)plan.keywords, plan.keyword_count, false,
             diagnostic)) {
       sb_free(&variant_hlsl);
       sb_free(&stage_output);
@@ -1396,11 +1397,11 @@ static void emit_planned_manifest(
     sb_appendf(output, " generated-aliases=%zu\n", alias_count);
 }
 
-bool emit_stage_hlsl_with_variant_plan(
+bool emit_stage_hlsl_with_variant_plan_mode(
     const ShaderLabVariantPlan *variant_plan, int stage_index,
     const BlobEntry *blob_entries, int entry_count, uint8_t **segments,
-    const int *segment_lengths, int segment_count, StringBuilder *output,
-    ShaderLabStageDiagnostic *diagnostic) {
+    const int *segment_lengths, int segment_count, bool high_level,
+    StringBuilder *output, ShaderLabStageDiagnostic *diagnostic) {
   set_diagnostic(diagnostic, SHADERLAB_STAGE_INVALID_ARGUMENT, stage_index, -1,
                  -1);
   if (!variant_plan || !variant_plan->pass || !variant_plan->shader ||
@@ -1582,7 +1583,7 @@ bool emit_stage_hlsl_with_variant_plan(
               &variant_hlsl, &names,
               (const char *const *)
                   variant_plan->shader->keyword_names.keywords,
-              (size_t)variant_plan->shader->keyword_names.count,
+              (size_t)variant_plan->shader->keyword_names.count, high_level,
               diagnostic)) {
         sb_free(&variant_hlsl);
         sb_free(&stage_output);
@@ -1658,4 +1659,14 @@ bool emit_stage_hlsl_with_variant_plan(
                          : SHADERLAB_STAGE_OUTPUT_FAILED,
                  stage_index, -1, -1);
   return success;
+}
+
+bool emit_stage_hlsl_with_variant_plan(
+    const ShaderLabVariantPlan *variant_plan, int stage_index,
+    const BlobEntry *blob_entries, int entry_count, uint8_t **segments,
+    const int *segment_lengths, int segment_count, StringBuilder *output,
+    ShaderLabStageDiagnostic *diagnostic) {
+  return emit_stage_hlsl_with_variant_plan_mode(
+      variant_plan, stage_index, blob_entries, entry_count, segments,
+      segment_lengths, segment_count, false, output, diagnostic);
 }

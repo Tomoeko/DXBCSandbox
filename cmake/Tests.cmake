@@ -247,7 +247,8 @@ if(BUILD_TESTING)
     dxbc_add_core_test(test_shaderlab_stage_units
         tests/test_shaderlab_stage_units.c shaderlab_stage_units)
     target_compile_definitions(test_shaderlab_stage_units PRIVATE
-        SHADERLAB_STAGE_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/unlit_color/target.bin")
+        SHADERLAB_STAGE_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/unlit_color/target.bin"
+        SHADERLAB_EXPRESSION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
     dxbc_add_core_test(test_shaderlab_variant_domain_units
         tests/test_shaderlab_variant_domain_units.c
         shaderlab_variant_domain_units)

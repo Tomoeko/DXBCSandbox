@@ -52,8 +52,8 @@ static void write_u32_le(uint8_t *bytes, size_t *cursor, uint32_t value) {
   bytes[(*cursor)++] = (uint8_t)(value >> 24);
 }
 
-static uint8_t *read_fixture(size_t *out_size) {
-  FILE *file = fopen(SHADERLAB_STAGE_TEST_FIXTURE, "rb");
+static uint8_t *read_fixture_path(const char *path, size_t *out_size) {
+  FILE *file = fopen(path, "rb");
   if (!file || fseek(file, 0, SEEK_END) != 0) return NULL;
   const long length = ftell(file);
   if (length <= 0 || fseek(file, 0, SEEK_SET) != 0) {
@@ -69,6 +69,10 @@ static uint8_t *read_fixture(size_t *out_size) {
   fclose(file);
   *out_size = (size_t)length;
   return bytes;
+}
+
+static uint8_t *read_fixture(size_t *out_size) {
+  return read_fixture_path(SHADERLAB_STAGE_TEST_FIXTURE, out_size);
 }
 
 static const uint8_t *find_first_dxbc(const uint8_t *bytes, size_t size,
@@ -1310,6 +1314,169 @@ static int test_two_stage_symbolic_selectors_are_exhaustive(void) {
   return 0;
 }
 
+/* The checked-in target comes from the adjacent authored float4 source.
+ * Full-container equality and finite rendering are separate live checks; this
+ * test pins candidate selection, metadata reuse, and atomic rejection. */
+static int test_high_level_shaderlab_candidate(void) {
+  size_t fixture_size = 0;
+  uint8_t *fixture = read_fixture_path(SHADERLAB_EXPRESSION_TEST_FIXTURE,
+                                      &fixture_size);
+  CHECK(fixture != NULL);
+  uint8_t *segments[3] = {NULL, NULL, NULL};
+  int segment_lengths[3] = {0, 0, 0};
+  BlobEntry entries[3];
+  size_t cursor = 0;
+  for (int stage = 0; stage < 2; ++stage) {
+    size_t dxbc_size = 0;
+    const uint8_t *dxbc = find_first_dxbc(fixture + cursor,
+                                         fixture_size - cursor, &dxbc_size);
+    CHECK(dxbc != NULL);
+    cursor = (size_t)(dxbc - fixture) + dxbc_size;
+    size_t blob_size = 0;
+    segments[stage] = build_variant_blob(dxbc, dxbc_size, stage ? 17 : 15,
+                                         NULL, &blob_size);
+    CHECK(segments[stage] != NULL && blob_size <= INT32_MAX);
+    segment_lengths[stage] = (int)blob_size;
+    entries[stage] = (BlobEntry){0, (int32_t)blob_size, stage};
+  }
+
+  SerializedPass passes[2];
+  SerializedSubProgram programs[2];
+  SerializedSubProgramIdentity identities[2];
+  int platform;
+  initialize_pass(&passes[0], programs, identities, 2, &platform);
+  programs[1].program_type = 17;
+  passes[0].subprogram_count[0] = 1;
+  passes[0].program_mask |= UINT32_C(1) <<
+                            (UNITY_SERIALIZED_STAGE_FRAGMENT + 1u);
+  passes[0].subprogram_count[1] = 1;
+  passes[0].subprograms[1] = &programs[1];
+  passes[0].subprogram_identities[1] = &identities[1];
+  passes[1] = passes[0];
+  SerializedSubShader subshader = {0};
+  subshader.pass_count = 1;
+  subshader.passes = passes;
+  SerializedShader shader = {0};
+  shader.name = "Experiment/ExpressionFixture";
+  shader.subshader_count = 1;
+  shader.subshaders = &subshader;
+
+  StringBuilder high;
+  StringBuilder low;
+  StringBuilder repeated;
+  sb_init(&high);
+  sb_init(&low);
+  sb_init(&repeated);
+  ShaderLabCandidateDiagnostic diagnostic;
+  CHECK(shaderlab_emit_high_level_candidate(
+      &shader, entries, 2, segments, segment_lengths, 2, &high, &diagnostic));
+  CHECK(diagnostic.status == SHADERLAB_CANDIDATE_OK);
+  CHECK(strstr(high.buf, "o0 = (((v1) * (v1.yzwx)) * (v1.zwxy));") != NULL);
+  CHECK(strstr(high.buf, "float4 r0") == NULL);
+  CHECK(count_text(high.buf, "Single exact planned variant") == 2u);
+  CHECK(shaderlab_emit_candidate_with_diagnostic(
+      &shader, entries, 2, segments, segment_lengths, 2, &low, &diagnostic));
+  CHECK(strstr(low.buf, "float4 r0") != NULL);
+  CHECK(strcmp(low.buf, high.buf) != 0);
+  CHECK(shaderlab_emit_high_level_candidate(
+      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &diagnostic));
+  CHECK(strcmp(high.buf, repeated.buf) == 0);
+  sb_free(&repeated);
+
+  /* Reject a valid low-level vertex with cbuffer operations in a later pass.
+   * The fully emitted first pass must not leak into the caller's fallback. */
+  size_t unsupported_size = 0;
+  uint8_t *unsupported = read_fixture(&unsupported_size);
+  CHECK(unsupported != NULL);
+  size_t dxbc_size = 0;
+  const uint8_t *dxbc = find_first_dxbc(unsupported, unsupported_size, &dxbc_size);
+  CHECK(dxbc != NULL);
+  size_t blob_size = 0;
+  segments[2] = build_variant_blob(dxbc, dxbc_size, 15, NULL, &blob_size);
+  CHECK(segments[2] != NULL && blob_size <= INT32_MAX);
+  segment_lengths[2] = (int)blob_size;
+  entries[2] = (BlobEntry){0, (int32_t)blob_size, 2};
+  SerializedSubProgram unsupported_program = programs[0];
+  unsupported_program.blob_index = 2;
+  passes[1].subprograms[0] = &unsupported_program;
+  subshader.pass_count = 2;
+  sb_init(&repeated);
+  sb_append(&repeated, low.buf);
+  CHECK(!shaderlab_emit_high_level_candidate(
+      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &diagnostic));
+  CHECK(strcmp(repeated.buf, low.buf) == 0);
+  CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
+  CHECK(diagnostic.subshader_index == 0 && diagnostic.pass_index == 1);
+  CHECK(diagnostic.stage.stage_index == 0);
+  CHECK(diagnostic.stage.status == SHADERLAB_STAGE_HLSL_EMISSION_FAILED);
+  sb_free(&repeated);
+
+  /* Reject a later variant as well as a later pass. Every generated branch
+   * must meet the high-level contract, including a feature-disabled default. */
+  subshader.pass_count = 1;
+  SerializedSubProgram variants[] = {programs[0], unsupported_program};
+  SerializedSubProgramIdentity variant_identities[] = {identities[0], identities[0]};
+  char *feature_names[] = {"FEATURE"};
+  uint8_t feature_flags[] = {0};
+  int feature_index = 0;
+  uint16_t keyword_mask = 0;
+  variants[1].local_keyword_count = 1;
+  variants[1].local_keywords = feature_names;
+  variant_identities[1].local_keyword_index_count = 1;
+  variant_identities[1].local_keyword_indices = &feature_index;
+  passes[0].subprogram_count[0] = 2;
+  passes[0].subprograms[0] = variants;
+  passes[0].subprogram_identities[0] = variant_identities;
+  passes[0].serialized_keyword_state_mask_count = 1;
+  passes[0].serialized_keyword_state_mask = &keyword_mask;
+  shader.keyword_names.count = 1;
+  shader.keyword_names.keywords = feature_names;
+  shader.keyword_flags = feature_flags;
+  sb_init(&repeated);
+  sb_append(&repeated, low.buf);
+  CHECK(!shaderlab_emit_high_level_candidate(
+      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &diagnostic));
+  CHECK(strcmp(repeated.buf, low.buf) == 0);
+  CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
+  CHECK(diagnostic.stage.subprogram_index == 1);
+  CHECK(diagnostic.stage.status == SHADERLAB_STAGE_HLSL_EMISSION_FAILED);
+  sb_free(&repeated);
+  variants[1].blob_index = 0;
+  sb_init(&repeated);
+  CHECK(shaderlab_emit_high_level_candidate(
+      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &diagnostic));
+  CHECK(count_text(repeated.buf, "// DXBCSandbox-VariantPlan stage=vertex") == 2u);
+  CHECK(strstr(repeated.buf, "#pragma multi_compile_vertex __ FEATURE") != NULL);
+  sb_free(&repeated);
+  passes[0].subprogram_count[0] = 1;
+  passes[0].subprograms[0] = programs;
+  passes[0].subprogram_identities[0] = identities;
+  passes[0].serialized_keyword_state_mask_count = 0;
+  passes[0].serialized_keyword_state_mask = NULL;
+
+  /* A macro collision in the complete shader keyword universe invalidates a
+   * candidate even when that keyword is absent in the currently selected row. */
+  char *keywords[] = {"v1"};
+  uint8_t flags[] = {0};
+  shader.keyword_names.count = 1;
+  shader.keyword_names.keywords = keywords;
+  shader.keyword_flags = flags;
+  sb_init(&repeated);
+  sb_append(&repeated, low.buf);
+  CHECK(!shaderlab_emit_high_level_candidate(
+      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &diagnostic));
+  CHECK(strcmp(repeated.buf, low.buf) == 0);
+  CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
+  CHECK(diagnostic.stage.status == SHADERLAB_STAGE_HLSL_EMISSION_FAILED);
+  sb_free(&repeated);
+  sb_free(&low);
+  sb_free(&high);
+  for (size_t i = 0; i < 3; ++i) free(segments[i]);
+  free(unsupported);
+  free(fixture);
+  return 0;
+}
+
 static int test_requirements_target_projection(void) {
   static const struct {
     uint64_t requirements;
@@ -1628,6 +1795,7 @@ int main(void) {
   CHECK(test_canonical_exact_predicates() == 0);
   CHECK(test_sparse_shaped_planned_stage_aliases() == 0);
   CHECK(test_two_stage_symbolic_selectors_are_exhaustive() == 0);
+  CHECK(test_high_level_shaderlab_candidate() == 0);
   CHECK(test_requirements_target_projection() == 0);
   CHECK(test_target_authority_is_strict_and_typed() == 0);
   CHECK(strcmp(shaderlab_stage_status_name(SHADERLAB_STAGE_OUTPUT_FAILED),
