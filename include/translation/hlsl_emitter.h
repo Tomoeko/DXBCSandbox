@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 1U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 2U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 64
 
 typedef enum {
@@ -24,7 +24,8 @@ typedef enum {
     HLSL_EXPRESSION_ORIGIN_EXPRESSION,
     HLSL_EXPRESSION_ORIGIN_DEAD,
     HLSL_EXPRESSION_ORIGIN_NOP,
-    HLSL_EXPRESSION_ORIGIN_RETURN
+    HLSL_EXPRESSION_ORIGIN_RETURN,
+    HLSL_EXPRESSION_ORIGIN_CONTROL
 } HLSLExpressionOriginKind;
 
 typedef struct {
@@ -39,7 +40,9 @@ typedef struct {
 /* One record per decoded instruction for the bounded float4 lift. Nested
  * expressions have nested spans; elided MOVs may share their producer's span.
  * Dead pure expressions and NOPs have no span. RETURN covers the generated
- * return block. Declarations/ABI tokens are not instruction-owned spans.
+ * return block. CONTROL owns structured syntax and its proved phi declarations
+ * and edge assignments. Other declarations/ABI tokens are not instruction-owned
+ * spans.
  * This is provenance, never an independent correctness certificate. */
 typedef struct HLSLExpressionSourceMap {
     HLSLExpressionOrigin origins[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
@@ -52,6 +55,7 @@ typedef struct HLSLExpressionSourceMap {
 bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                                         const USILProgram *program, const char *source);
 const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind);
+bool hlsl_expression_origin_has_span(HLSLExpressionOriginKind kind);
 
 typedef enum HLSLEmitMode {
     /* Emit from the decoded instruction stream without source-level semantic
@@ -63,12 +67,16 @@ typedef enum HLSLEmitMode {
      * with higher-level Unity/source constructs to improve readability. */
     HLSL_EMIT_MODE_READABLE = 1,
 
-    /* Verification-eligible candidate, never a certificate by itself. v1
-     * admits at most 64 straight-line SM4/5 vertex/pixel instructions using
-     * full float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP.
+    /* Verification-eligible candidate, never a certificate by itself. v2
+     * retains v1's at most 64 SM4/5 vertex/pixel instructions using full
+     * float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP. It also
+     * admits structured IF/ELSE/ENDIF with scalar input/temp bit conditions,
+     * proved single-entry joins, and explicit complete float4 phi assignments
+     * (at most 128 named values). Output writes must dominate the final RET.
+     * Early exits, loops and unresolved or partial phi inputs reject.
      * No buffers/resources/effects/precision controls or partial definitions.
-     * Single-use SSA expressions are nested once; shared values have typed
-     * deterministic names. Unsupported input fails instead of silently using
+     * Straight-line single-use expressions are nested once; shared values have
+     * typed deterministic names. Unsupported input fails instead of silently using
      * presentation recognizers. Reuses compiler inverse operand/MAD spelling;
      * this is not permission to reorder floating-point operations on its own.
      * Supply the complete reserved macro universe. Compile and compare under

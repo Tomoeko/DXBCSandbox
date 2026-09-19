@@ -414,6 +414,17 @@ bool hlsl_volume_slice_sampling_lift_matches(const USILProgram* program);
 void emit_exact_structural_helpers(HLSLEmitterContext* ctx);
 void emit_instructions(HLSLEmitterContext* ctx);
 bool emit_high_level_expressions(HLSLEmitterContext* ctx);
+bool emit_high_level_conditionals(HLSLEmitterContext *ctx);
+void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx);
+/* Shared closed float4 contracts and compiler inverse AST construction. */
+bool hlsl_float4_program_supported(HLSLEmitterContext *ctx);
+bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int instruction);
+bool hlsl_float4_append_output(HLSLEmitterContext *ctx, const DXBCOperand *destination);
+ASTExpr *hlsl_float4_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *source);
+/* Consumes both children on success and failure. MOV expects a NULL right. */
+ASTExpr *hlsl_float4_operation(HLSLEmitterContext *ctx, int instruction, ASTExpr *left,
+                              ASTExpr *right);
+
 bool hlsl_expression_identifiers_available(HLSLEmitterContext* ctx, size_t source_start);
 void emit_return_block(HLSLEmitterContext* ctx);
 

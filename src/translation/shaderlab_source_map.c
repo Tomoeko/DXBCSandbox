@@ -46,8 +46,7 @@ bool shaderlab_expression_source_map_offset(ShaderLabExpressionSourceMap *map, s
             return false;
         for (size_t j = 0; j < instructions->count; ++j) {
             HLSLExpressionOrigin *origin = &instructions->origins[j];
-            if (origin->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
-                origin->kind != HLSL_EXPRESSION_ORIGIN_RETURN)
+            if (!hlsl_expression_origin_has_span(origin->kind))
                 continue;
             if (origin->source_begin > origin->source_end || origin->source_end > SIZE_MAX - offset)
                 return false;
@@ -84,6 +83,7 @@ bool shaderlab_expression_source_map_matches_source(const ShaderLabExpressionSou
             switch (origin->kind) {
             case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
             case HLSL_EXPRESSION_ORIGIN_RETURN:
+            case HLSL_EXPRESSION_ORIGIN_CONTROL:
                 if (origin->source_begin >= origin->source_end || origin->source_end > source->len)
                     return false;
                 break;

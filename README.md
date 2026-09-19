@@ -69,7 +69,8 @@ external headers. Macro-expanded include names and implicit Surface Shader
 generation currently return `include-authority-unavailable`.
 
 `unity_golden_verifier --high-level --report results.jsonl` tests an opt-in
-float4 expression lift for bounded straight-line vertex/fragment programs.
+float4 expression lift for bounded vertex/fragment programs and structured
+conditionals.
 Each accepted candidate must reproduce its entire target DXBC container;
 unsupported candidates retain verified low-level output. Extraction's
 `--high-level` checks every local D3D11 pass/state/tier under the supplied

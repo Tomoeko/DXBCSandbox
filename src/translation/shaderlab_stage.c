@@ -843,8 +843,7 @@ static void append_indented_source(StringBuilder *output,
      * starts at that same boundary follow it. Keep those affinities distinct. */
     for (size_t i = 0; map && i < original.count; ++i) {
       const HLSLExpressionOrigin *origin = &original.origins[i];
-      if (origin->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
-          origin->kind != HLSL_EXPRESSION_ORIGIN_RETURN) continue;
+      if (!hlsl_expression_origin_has_span(origin->kind)) continue;
       if (origin->source_begin >= line_begin && origin->source_begin < line_end)
         map->origins[i].source_begin = output_begin + (origin->source_begin - line_begin);
       if (origin->source_end > line_begin && origin->source_end <= line_end)

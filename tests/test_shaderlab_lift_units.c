@@ -306,7 +306,7 @@ static int test_verified_and_fallback(void) {
         CHECK(strstr(json, "\"scope\":\"generated-local-d3d11-program-domain\""));
         CHECK(strstr(json, "\"instructions\":[{"));
         CHECK(strstr(json, "\"recorded\":true,\"response_received\":true"));
-        CHECK(strstr(json, "\"lift\":{\"id\":\"float4-expressions\",\"version\":1}"));
+        CHECK(strstr(json, "\"lift\":{\"id\":\"float4-expressions\",\"version\":2}"));
         CHECK(!strstr(json, fixture.shader.name) && !strstr(json, fixture.input.source_path));
         CHECK(!strstr(json, fixture.input.source_directory) &&
               !strstr(json, fixture.input.source_basename) &&

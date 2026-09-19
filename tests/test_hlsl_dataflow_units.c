@@ -1345,6 +1345,160 @@ static bool check_expression_emission(void) {
     return true;
 }
 
+static bool check_conditional_emission(void) {
+    USILInstruction instructions[12] = {0};
+    USILInstruction condition = {
+        .opcode = USIL_OP_IF, .operand_count = 1, .condition_test = DXBC_INSTRUCTION_TEST_NONZERO};
+    condition.operands[0] = emission_reg(OPERAND_TYPE_INPUT, 1);
+    condition.operands[0].swizzle_mode = 2;
+    USILInstruction multiply = {.opcode = USIL_OP_MUL, .operand_count = 3};
+    multiply.operands[0] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    multiply.operands[1] = multiply.operands[2] = emission_reg(OPERAND_TYPE_INPUT, 0);
+    for (int lane = 0; lane < 4; ++lane)
+        multiply.operands[2].swizzle[lane] = (uint8_t)((lane + 1) % 4);
+    instructions[0] = condition;
+    instructions[1] = multiply;
+    instructions[2].opcode = USIL_OP_ELSE;
+    instructions[3] = multiply;
+    instructions[3].operands[2].swizzle[0] = 3;
+    instructions[4].opcode = USIL_OP_ENDIF;
+    instructions[5] = multiply;
+    instructions[5].operands[0] = emission_reg(OPERAND_TYPE_OUTPUT, 0);
+    instructions[5].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    instructions[6].opcode = USIL_OP_RET;
+    USILInstruction output = instructions[5];
+    DXBCSignatureElement inputs[2] = {
+        {.semantic_name = "TEXCOORD", .component_type = 3, .mask = 15, .rw_mask = 15},
+        {.semantic_name = "TEXCOORD",
+         .semantic_index = 1,
+         .register_id = 1,
+         .component_type = 3,
+         .mask = 15,
+         .rw_mask = 1}};
+    DXBCSignatureElement signature = {
+        .semantic_name = "SV_Target", .component_type = 3, .system_value = 64, .mask = 15};
+    USILProgram program = {.shader_type_model = "ps_5_0",
+                           .instructions = instructions,
+                           .instruction_count = 7,
+                           .instruction_alloc = 12,
+                           .temp_count = 2,
+                           .inputs = inputs,
+                           .input_count = 2,
+                           .input_alloc = 2,
+                           .outputs = &signature,
+                           .output_count = 1,
+                           .output_alloc = 1,
+                           .has_stage_contract = true,
+                           .program_type = DXBC_PROGRAM_TYPE_PIXEL,
+                           .shader_model_major = 5};
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLExpressionSourceMap map;
+    HLSLEmitDiagnostic diagnostic;
+    options.expression_source_map = &map;
+    StringBuilder source;
+    sb_init(&source);
+    bool emitted = hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
+                                                     &diagnostic);
+    if (!emitted)
+        fprintf(stderr, "Conditional emission: %s at instruction %d, phase %d\n",
+                hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index,
+                (int)diagnostic.phase);
+    CHECK(emitted);
+    CHECK(strstr(source.buf, "float4 dxbc_merge_i5_r0;"));
+    CHECK(strstr(source.buf, "dxbc_merge_i5_r0 = dxbc_value_i1;"));
+    CHECK(strstr(source.buf, "dxbc_merge_i5_r0 = dxbc_value_i3;"));
+    CHECK(strstr(source.buf, "[branch] if (asuint((v1.x)))"));
+    CHECK(!strstr(source.buf, "float4 r") && !strstr(source.buf, "u_xlat_temp"));
+    CHECK(hlsl_expression_source_map_matches(&map, &program, source.buf));
+    for (int index = 0; index < 7; index += 2) {
+        if (index == 6)
+            break;
+        CHECK(map.origins[index].kind == HLSL_EXPRESSION_ORIGIN_CONTROL);
+        CHECK(map.origins[index].destination_lanes == 0);
+        CHECK(map.origins[index].source_begin < map.origins[index].source_end);
+    }
+    map.origins[0].kind = HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+    CHECK(!hlsl_expression_source_map_matches(&map, &program, source.buf));
+    sb_free(&source);
+    const char *reserved = "dxbc_merge_i5_r0";
+    options.reserved_preprocessor_identifiers = &reserved;
+    options.reserved_preprocessor_identifier_count = 1;
+    sb_init(&source);
+    CHECK(!hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
+                                             &diagnostic));
+    CHECK(diagnostic.reason == HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY && !map.complete);
+    sb_free(&source);
+    options.reserved_preprocessor_identifiers = NULL;
+    options.reserved_preprocessor_identifier_count = 0;
+    for (int mutation = 0; mutation < 7; ++mutation) {
+        USILInstruction saved = instructions[1];
+        if (mutation == 0)
+            instructions[1].operands[0].destination_mask = 0x70;
+        if (mutation == 1)
+            instructions[1].precise_mask = 1;
+        if (mutation == 2)
+            instructions[1] = (USILInstruction){.opcode = USIL_OP_NOP};
+        if (mutation == 3)
+            instructions[1] = (USILInstruction){.opcode = USIL_OP_RET};
+        if (mutation == 4)
+            instructions[1].operands[0] = emission_reg(OPERAND_TYPE_OUTPUT, 0);
+        if (mutation == 5)
+            instructions[1].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 1);
+        if (mutation == 6) {
+            instructions[1].opcode = USIL_OP_DERIV_RTX;
+            instructions[1].operand_count = 2;
+        }
+        sb_init(&source);
+        CHECK(!hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+        CHECK(!map.complete && map.count == 0);
+        sb_free(&source);
+        instructions[1] = saved;
+    }
+    /* Resolve an inner phi as an outer incoming vector, retaining lexical
+     * scope and all four lanes rather than using a guessed register value. */
+    instructions[1] = condition;
+    instructions[2] = multiply;
+    instructions[3] = (USILInstruction){.opcode = USIL_OP_ELSE};
+    instructions[4] = multiply;
+    instructions[5] = (USILInstruction){.opcode = USIL_OP_ENDIF};
+    instructions[6] = (USILInstruction){.opcode = USIL_OP_ELSE};
+    instructions[7] = multiply;
+    instructions[8] = (USILInstruction){.opcode = USIL_OP_ENDIF};
+    instructions[9] = output;
+    instructions[10] = (USILInstruction){.opcode = USIL_OP_RET};
+    program.instruction_count = 11;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strstr(source.buf, "dxbc_merge_i9_r0 = dxbc_merge_i6_r0;"));
+    CHECK(hlsl_expression_source_map_matches(&map, &program, source.buf));
+    sb_free(&source);
+
+    instructions[0] = move(emission_reg(OPERAND_TYPE_TEMP, 0), emission_reg(OPERAND_TYPE_INPUT, 0));
+    instructions[1] = condition;
+    instructions[1].operands[0] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    instructions[1].operands[0].swizzle_mode = 2;
+    instructions[1].operands[0].swizzle[0] = 2;
+    instructions[1].condition_test = DXBC_INSTRUCTION_TEST_ZERO;
+    instructions[2] = multiply;
+    instructions[3] = (USILInstruction){.opcode = USIL_OP_ENDIF};
+    instructions[4] = output;
+    instructions[5] = (USILInstruction){.opcode = USIL_OP_RET};
+    program.instruction_count = 6;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strstr(source.buf, "[branch] if (!asuint(dxbc_value_i0.z))"));
+    CHECK(strstr(source.buf, "dxbc_merge_i4_r0 = dxbc_value_i0;"));
+    CHECK(strstr(source.buf, "dxbc_merge_i4_r0 = dxbc_value_i2;"));
+    sb_free(&source);
+    /* A dead unpruned phi has an undefined false arm. It stays un-emitted. */
+    instructions[2].operands[0] = emission_reg(OPERAND_TYPE_TEMP, 1);
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(!strstr(source.buf, "dxbc_merge"));
+    sb_free(&source);
+    return true;
+}
+
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
@@ -1352,7 +1506,7 @@ int main(void) {
         !check_control_region_proofs() || !check_exhaustive_postdominance() ||
         !check_long_dominator_chain() || !check_copy_candidates() || !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
-        !check_expression_emission())
+        !check_expression_emission() || !check_conditional_emission())
         return 1;
     puts("HLSL dataflow contracts passed");
     return 0;

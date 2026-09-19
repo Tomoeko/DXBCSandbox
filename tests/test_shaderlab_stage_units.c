@@ -1269,9 +1269,10 @@ static int test_two_stage_symbolic_selectors_are_exhaustive(void) {
 /* The checked-in target comes from the adjacent authored float4 source.
  * Full-container equality and finite rendering are separate live checks; this
  * test pins candidate selection, metadata reuse, and atomic rejection. */
-static int test_high_level_shaderlab_candidate(void) {
+static int test_high_level_shaderlab_candidate(bool conditional) {
   size_t fixture_size = 0;
-  uint8_t *fixture = read_fixture_path(SHADERLAB_EXPRESSION_TEST_FIXTURE,
+  uint8_t *fixture = read_fixture_path(conditional ? SHADERLAB_CONDITIONAL_TEST_FIXTURE :
+                                                    SHADERLAB_EXPRESSION_TEST_FIXTURE,
                                       &fixture_size);
   CHECK(fixture != NULL);
   uint8_t *segments[3] = {NULL, NULL, NULL};
@@ -1311,7 +1312,7 @@ static int test_high_level_shaderlab_candidate(void) {
   subshader.pass_count = 1;
   subshader.passes = passes;
   SerializedShader shader = {0};
-  shader.name = "Experiment/ExpressionFixture";
+  shader.name = conditional ? "Experiment/ConditionalFixture" : "Experiment/ExpressionFixture";
   shader.subshader_count = 1;
   shader.subshaders = &subshader;
 
@@ -1334,7 +1335,8 @@ static int test_high_level_shaderlab_candidate(void) {
     CHECK(record->subshader_index == 0 && record->pass_index == 0);
     CHECK(record->stage_index == (int)i && record->subprogram_index == 0);
     CHECK(record->blob_index == (int)i && record->hardware_tier_group == 3);
-    CHECK(record->serialized_state == 0 && record->instructions.count == 3u);
+    CHECK(record->serialized_state == 0 &&
+          record->instructions.count == (conditional ? (i ? 11u : 4u) : 3u));
     CHECK(memcmp(record->target_digest, target_digests[i], sizeof(record->target_digest)) == 0);
     for (size_t j = 0; j < record->instructions.count; ++j) {
       const HLSLExpressionOrigin *origin = &record->instructions.origins[j];
@@ -1349,12 +1351,29 @@ static int test_high_level_shaderlab_candidate(void) {
   const HLSLExpressionSourceMap *fragment_map = &map.records[1].instructions;
   const HLSLExpressionOrigin *nested = &fragment_map->origins[0];
   const HLSLExpressionOrigin *outer = &fragment_map->origins[1];
-  CHECK(nested->source_begin > outer->source_begin);
-  CHECK(nested->source_end < outer->source_end);
-  CHECK(outer->source_end - outer->source_begin == strlen("(((v1) * (v1.yzwx)) * (v1.zwxy))"));
-  CHECK(memcmp(high.buf + outer->source_begin,
-               "(((v1) * (v1.yzwx)) * (v1.zwxy))",
-               outer->source_end - outer->source_begin) == 0);
+  if (conditional) {
+    CHECK(nested->kind == HLSL_EXPRESSION_ORIGIN_CONTROL);
+    CHECK(count_text(high.buf, "[branch] if (") == 2u);
+    CHECK(strstr(high.buf, "dxbc_merge_i9_r0 = dxbc_merge_i6_r0;") != NULL);
+    for (size_t index = 0; index < fragment_map->count; ++index) {
+      const HLSLExpressionOrigin *origin = &fragment_map->origins[index];
+      if (origin->kind == HLSL_EXPRESSION_ORIGIN_CONTROL) {
+        CHECK(origin->destination_lanes == 0);
+        CHECK(high.buf[origin->source_end - 1] == '\n');
+        const char *token = index == 0u || index == 1u ? "[branch] if (" :
+                            index == 3u || index == 6u ? "} else {" : "}";
+        const char *found = strstr(high.buf + origin->source_begin, token);
+        CHECK(found && (size_t)(found - high.buf) + strlen(token) <= origin->source_end);
+      }
+    }
+  } else {
+    CHECK(nested->source_begin > outer->source_begin);
+    CHECK(nested->source_end < outer->source_end);
+    CHECK(outer->source_end - outer->source_begin == strlen("(((v1) * (v1.yzwx)) * (v1.zwxy))"));
+    CHECK(memcmp(high.buf + outer->source_begin,
+                 "(((v1) * (v1.yzwx)) * (v1.zwxy))",
+                 outer->source_end - outer->source_begin) == 0);
+  }
   for (int mutation = 0; mutation < 8; ++mutation) {
     ShaderLabExpressionSourceRecord saved = map.records[0];
     const size_t saved_size = map.source_size;
@@ -1376,7 +1395,8 @@ static int test_high_level_shaderlab_candidate(void) {
     CHECK(shaderlab_expression_source_map_matches_source(&map, &high));
   }
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_OK);
-  CHECK(strstr(high.buf, "o0 = (((v1) * (v1.yzwx)) * (v1.zwxy));") != NULL);
+  if (!conditional)
+    CHECK(strstr(high.buf, "o0 = (((v1) * (v1.yzwx)) * (v1.zwxy));") != NULL);
   CHECK(strstr(high.buf, "float4 r0") == NULL);
   CHECK(count_text(high.buf, "Single exact planned variant") == 2u);
   CHECK(shaderlab_emit_candidate_with_diagnostic(
@@ -1847,7 +1867,8 @@ int main(void) {
   CHECK(test_canonical_exact_predicates() == 0);
   CHECK(test_sparse_shaped_planned_stage_aliases() == 0);
   CHECK(test_two_stage_symbolic_selectors_are_exhaustive() == 0);
-  CHECK(test_high_level_shaderlab_candidate() == 0);
+  CHECK(test_high_level_shaderlab_candidate(false) == 0);
+  CHECK(test_high_level_shaderlab_candidate(true) == 0);
   CHECK(test_requirements_target_projection() == 0);
   CHECK(test_target_authority_is_strict_and_typed() == 0);
   CHECK(strcmp(shaderlab_stage_status_name(SHADERLAB_STAGE_OUTPUT_FAILED),

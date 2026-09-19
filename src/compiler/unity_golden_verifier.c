@@ -1527,8 +1527,7 @@ static char *emit_stage_with_options(const USILProgram *program, const GoldenSta
         HLSLExpressionSourceMap *map = options->expression_source_map;
         for (size_t index = 0; index < map->count; ++index) {
             HLSLExpressionOrigin *origin = &map->origins[index];
-            if (origin->kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION ||
-                origin->kind == HLSL_EXPRESSION_ORIGIN_RETURN) {
+            if (hlsl_expression_origin_has_span(origin->kind)) {
                 origin->source_begin += source_offset;
                 origin->source_end += source_offset;
             }
@@ -2392,10 +2391,13 @@ static HLSLLiftStatus compile_live_lift_fixture_mode(void *context, const USILPr
         return compile_lift_mode(&fixture->compiler, program, remaining_ms, artifact, high_level);
     /* Deliberately inject a bad rewrite after the planner. Compile the changed
      * source honestly; the transaction must reject the resulting DXBC. */
-    USILInstruction instructions[4];
-    if (program->instruction_count != 4) return HLSL_LIFT_INVALID_ARGUMENT;
-    memcpy(instructions, program->instructions, sizeof(instructions));
-    for (int index = 0; index < 4; ++index) {
+    USILInstruction instructions[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
+    if (program->instruction_count < 1 ||
+        program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT)
+        return HLSL_LIFT_INVALID_ARGUMENT;
+    memcpy(instructions, program->instructions,
+           (size_t)program->instruction_count * sizeof(*instructions));
+    for (int index = 0; index < program->instruction_count; ++index) {
         if (instructions[index].opcode == USIL_OP_MUL) {
             instructions[index].opcode = USIL_OP_ADD;
             break;
@@ -2590,8 +2592,32 @@ cleanup:
     return succeeded;
 }
 
-static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, bool shared,
-                                        bool partial) {
+static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, int shape,
+                                        FILE *report) {
+    static const struct {
+        const char *name;
+        const char *body;
+        bool shared, partial, conditional;
+    } fixtures[] = {
+        {"nested", "float4 product = value * value.wzyx; return product * value.zwxy;",
+         false, false, false},
+        {"shared", "float4 product = value * value.yzwx; return product + product.zwxy;",
+         true, false, false},
+        {"partial", "float4 product = value * value.wzyx; return product + product.zwxy;",
+         true, true, false},
+        {"branch", "float4 result; [branch] if (asuint(flags.x)) result = value * value.yzwx; "
+         "else result = value * value.zwxy; return result * value;", true, false, true},
+        {"zero-branch", "float4 result = value; [branch] if (!asuint(flags.x)) "
+         "result = value * value.yzwx; return result * value;", true, false, true},
+        {"nested-branch", "float4 result; [branch] if (asuint(flags.x)) { "
+         "[branch] if(asuint(flags.y)) result = value * value.yzwx; "
+         "else result = value * value.wxyz; } else result = value * value.zwxy; "
+         "return result * value;", true, false, true}
+    };
+    if (shape < 0 || (size_t)shape >= sizeof(fixtures) / sizeof(fixtures[0]))
+        return false;
+    const bool shared = fixtures[shape].shared, partial = fixtures[shape].partial;
+    const bool conditional = fixtures[shape].conditional;
     bool succeeded = false;
     USILProgram program = {0};
     uint8_t *bytes = NULL;
@@ -2602,11 +2628,12 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     StringBuilder seed;
     sb_init(&seed);
     sb_append(&seed, "#pragma vertex main\n#pragma fragment main\n");
-    sb_appendf(&seed, "float4 main(float4 value : %s) : %s {\n",
-               stage == 0 ? "POSITION" : "TEXCOORD0", stage == 0 ? "SV_POSITION" : "SV_Target");
-    sb_appendf(&seed, "float4 product = value * value.%s;\n", shared && !partial ? "yzwx" : "wzyx");
-    sb_append(&seed,
-              shared ? "return product + product.zwxy;\n}\n" : "return product * value.zwxy;\n}\n");
+    sb_appendf(&seed, "float4 main(float4 value : %s%s) : %s {\n",
+               stage == 0 ? "POSITION" : "TEXCOORD0",
+               conditional ? ", float4 flags : TEXCOORD1" : "",
+               stage == 0 ? "SV_POSITION" : "SV_Target");
+    sb_append(&seed, fixtures[shape].body);
+    sb_append(&seed, "\n}\n");
     SELF_CHECK(sb_ok(&seed));
     bytes = unity_compiler_broker_compile(broker, seed.buf, "ExpressionFixture", stage, 4, 0, NULL,
                                           0, NULL, 0, &byte_count, &error);
@@ -2621,11 +2648,11 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     SELF_CHECK(reconstructed && program.temp_count > 0);
     GoldenFlags flags = {.shader_name = "ExpressionFixture"};
     CompileJob job = {.stage = &k_stages[stage]};
-    GoldenLiftCompiler compiler = {.broker = broker, .flags = &flags, .job = &job};
-    HLSLLiftServices services = {.compile = compile_lift,
+    LiveLiftFixture fixture = {.compiler = {.broker = broker, .flags = &flags, .job = &job}};
+    HLSLLiftServices services = {.compile = compile_live_lift_fixture,
                                  .monotonic_ms = lift_monotonic_ms,
-                                 .context = &compiler,
-                                 .compile_high_level = compile_high_level,
+                                 .context = &fixture,
+                                 .compile_high_level = compile_live_high_level_fixture,
                                  .require_request_identity = true,
                                  .require_expression_source_map = true};
     HLSLLiftResult result;
@@ -2645,6 +2672,21 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
                    hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
         flags.shader_name = "ExpressionFixture";
     }
+    if (conditional) {
+        const char *baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
+        fixture.corrupt_candidate = true;
+        SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+                   HLSL_LIFT_DXBC_MISMATCH);
+        SELF_CHECK(hlsl_lift_transaction_artifact(transaction)->source == baseline_source &&
+                   hlsl_lift_transaction_step_count(transaction) == 0);
+        fixture.corrupt_candidate = false;
+        fixture.corrupt_source_map = true;
+        SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+                   HLSL_LIFT_PROVENANCE_MISMATCH);
+        SELF_CHECK(!result.compared &&
+                   hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
+        fixture.corrupt_source_map = false;
+    }
     HLSLLiftStatus status = hlsl_lift_transaction_try_high_level(transaction, &result);
     if (partial) {
         SELF_CHECK(status == HLSL_LIFT_EMISSION_REJECTED);
@@ -2657,13 +2699,20 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     }
     if (status != HLSL_LIFT_VERIFIED)
         fprintf(stderr, "%s %s expression: %s\n", k_stages[stage].name,
-                shared ? "shared" : "nested", hlsl_lift_status_name(status));
+                fixtures[shape].name, hlsl_lift_status_name(status));
     SELF_CHECK(status == HLSL_LIFT_VERIFIED);
     const char *accepted = hlsl_lift_transaction_artifact(transaction)->source;
     SELF_CHECK(!strstr(accepted, "float4 r") && !strstr(accepted, "u_xlat_temp"));
     SELF_CHECK(shared == (strstr(accepted, "const float4 dxbc_value_") != NULL));
+    if (conditional) {
+        SELF_CHECK(strstr(accepted, "float4 dxbc_merge_") && strstr(accepted, "[branch] if ("));
+        char case_hash[65];
+        hash_hex(seed.buf, seed.len, case_hash);
+        report_lift(report, case_hash, 0, 0, &result, 2);
+        report_lift_steps(report, case_hash, 0, transaction);
+    }
     printf("%s: decoded %s expression reproduced complete target DXBC\n", k_stages[stage].name,
-           shared ? "shared" : "nested");
+           fixtures[shape].name);
     succeeded = true;
 cleanup:
     if (!succeeded && error)
@@ -2726,18 +2775,15 @@ int main(int argc, char** argv) {
     if (options.self_test_lifts) {
         if (report)
             fputs("{\"event\":\"run\",\"schema\":\"dxbc-lift-journal-v1\","
-                  "\"scope\":\"controlled-copy-result-transactions\"}\n", report);
+                  "\"scope\":\"controlled-lift-transactions\"}\n", report);
         bool passed =
             run_live_lift_fixture(broker, 0, false, report) &&
             run_live_lift_fixture(broker, 1, false, report) &&
             run_live_lift_fixture(broker, 0, true, report) &&
-            run_live_lift_fixture(broker, 1, true, report) &&
-            run_live_expression_fixture(broker, 0, false, false) &&
-            run_live_expression_fixture(broker, 1, false, false) &&
-            run_live_expression_fixture(broker, 0, true, false) &&
-            run_live_expression_fixture(broker, 1, true, false) &&
-            run_live_expression_fixture(broker, 0, true, true) &&
-            run_live_expression_fixture(broker, 1, true, true);
+            run_live_lift_fixture(broker, 1, true, report);
+        for (int shape = 0; passed && shape < 6; ++shape)
+            for (int stage = 0; passed && stage < 2; ++stage)
+                passed = run_live_expression_fixture(broker, stage, shape, report);
         if (report)
             fprintf(report, "{\"event\":\"end\",\"passed\":%s}\n", passed ? "true" : "false");
         passed = close_report(report) && passed;

@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+#include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Reuse the full-vector expression contract, CFG and lane SSA. This pass
+ * gives each instruction result an immutable value and each live phi one
+ * explicitly assigned float4. It does not speculate expressions across an
+ * arm, duplicate work, or assume an undefined incoming lane has a value. */
+enum { CONDITIONAL_VALUE_LIMIT = HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT * 2 };
+
+typedef struct {
+    int instruction; /* -1 for a phi vector. */
+    int block;
+    int register_index;
+    const HLSLPhiNode *lanes[4];
+    int incoming[2];
+    unsigned resolution; /* 0 unseen, 1 visiting, 2 proven/live. */
+    char name[48];
+} ConditionalValue;
+
+typedef struct {
+    ConditionalValue values[CONDITIONAL_VALUE_LIMIT];
+    int value_count;
+    int instruction_value[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
+    int join_if[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
+    HLSLIfRegion regions[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
+    int *ssa_value;
+    int *ssa_lane;
+} ConditionalPlan;
+
+static bool reject(HLSLEmitterContext *ctx, int instruction, HLSLEmitReason reason) {
+    hlsl_emit_fail_instruction(ctx, HLSL_EMIT_STATUS_UNSUPPORTED, reason, instruction, -1);
+    return false;
+}
+
+static int operand_variable(const HLSLEmitterContext *ctx, int instruction, int operand, int lane) {
+    return ctx->ssa
+        .operand_ssa_vars[((size_t)instruction * DXBC_MAX_OPERANDS + (size_t)operand) * 4u +
+                          (size_t)lane];
+}
+
+static bool map_variable(const HLSLEmitterContext *ctx, ConditionalPlan *plan, int variable,
+                         int value, int lane) {
+    if (variable < 0 || variable >= ctx->ssa.ssa_var_count || plan->ssa_value[variable] != -1)
+        return false;
+    plan->ssa_value[variable] = value;
+    plan->ssa_lane[variable] = lane;
+    return true;
+}
+
+static bool resolve_value(HLSLEmitterContext *ctx, ConditionalPlan *plan, int index, int depth) {
+    if (index < 0 || index >= plan->value_count || depth > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT)
+        return false;
+    ConditionalValue *value = &plan->values[index];
+    if (value->resolution == 2)
+        return true;
+    if (value->resolution == 1)
+        return false;
+    value->resolution = 1;
+    if (value->instruction < 0) {
+        const HLSLBasicBlock *block = &ctx->cfg.blocks[value->block];
+        if (block->predecessor_count != 2 || plan->join_if[value->block] < 0)
+            return false;
+        for (int edge = 0; edge < 2; ++edge) {
+            int incoming = -1;
+            for (int lane = 0; lane < 4; ++lane) {
+                const HLSLPhiNode *phi = value->lanes[lane];
+                if (!phi || phi->incoming_blocks[edge] != block->predecessors[edge])
+                    return false;
+                int variable = phi->incoming_vars[edge];
+                if (variable < 0 || variable >= ctx->ssa.ssa_var_count ||
+                    plan->ssa_lane[variable] != lane || plan->ssa_value[variable] < 0)
+                    return false;
+                int source = plan->ssa_value[variable];
+                if ((lane && incoming != source) ||
+                    !hlsl_cfg_dominates(&ctx->cfg, plan->values[source].block,
+                                        block->predecessors[edge]))
+                    return false;
+                incoming = source;
+            }
+            if (!resolve_value(ctx, plan, incoming, depth + 1))
+                return false;
+            value->incoming[edge] = incoming;
+        }
+    }
+    value->resolution = 2;
+    return true;
+}
+
+static int source_value(HLSLEmitterContext *ctx, ConditionalPlan *plan, int instruction,
+                        int operand, int lanes) {
+    const DXBCOperand *source = &ctx->program->instructions[instruction].operands[operand];
+    int result = -1;
+    for (int lane = 0; lane < lanes; ++lane) {
+        int variable = operand_variable(ctx, instruction, operand, lane);
+        if (variable < 0 || variable >= ctx->ssa.ssa_var_count || plan->ssa_value[variable] < 0 ||
+            plan->ssa_lane[variable] != usil_operand_source_component(source, lane))
+            return -1;
+        int value = plan->ssa_value[variable];
+        if ((lane && result != value) ||
+            !hlsl_cfg_dominates(&ctx->cfg, plan->values[value].block,
+                                ctx->cfg.instruction_block[instruction]))
+            return -1;
+        result = value;
+    }
+    return resolve_value(ctx, plan, result, 0) ? result : -1;
+}
+
+static bool build_plan(HLSLEmitterContext *ctx, ConditionalPlan *plan) {
+    if (!hlsl_float4_program_supported(ctx))
+        return false;
+    const USILProgram *program = ctx->program;
+    if (!ctx->ssa.operand_ssa_vars || !ctx->ssa.block_phis || ctx->ssa.ssa_var_count < 0 ||
+        ctx->cfg.block_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+        dxbc_size_multiply_overflows((size_t)ctx->ssa.ssa_var_count, sizeof(int)))
+        return reject(ctx, -1, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    const size_t variables = ctx->ssa.ssa_var_count ? (size_t)ctx->ssa.ssa_var_count : 1u;
+    plan->ssa_value = malloc(variables * sizeof(int));
+    plan->ssa_lane = malloc(variables * sizeof(int));
+    if (!plan->ssa_value || !plan->ssa_lane)
+        return false;
+    for (size_t index = 0; index < variables; ++index)
+        plan->ssa_value[index] = plan->ssa_lane[index] = -1;
+    for (int index = 0; index < HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT; ++index)
+        plan->instruction_value[index] = plan->join_if[index] = -1;
+    if (program->instructions[program->instruction_count - 1].opcode != USIL_OP_RET)
+        return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+    const int return_block = ctx->cfg.instruction_block[program->instruction_count - 1];
+    bool outputs[HLSL_SM5_IO_REGISTER_COUNT] = {0};
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILInstruction *inst = &program->instructions[index];
+        if (inst->precise_mask || inst->saturate)
+            return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+        if (inst->opcode == USIL_OP_RET) {
+            if (index + 1 != program->instruction_count)
+                return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+            continue;
+        }
+        if (inst->opcode == USIL_OP_NOP || inst->opcode == USIL_OP_ELSE ||
+            inst->opcode == USIL_OP_ENDIF)
+            continue;
+        if (inst->opcode == USIL_OP_IF) {
+            if (!hlsl_cfg_if_region(ctx, index, &plan->regions[index]))
+                return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            int join = plan->regions[index].join_block;
+            if (plan->join_if[join] >= 0)
+                return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            plan->join_if[join] = index;
+            const DXBCOperand *condition = &inst->operands[0];
+            if ((condition->type != OPERAND_TYPE_INPUT && condition->type != OPERAND_TYPE_TEMP) ||
+                condition->min_precision || condition->has_abs || condition->has_neg ||
+                condition->rel_op0 || condition->rel_op1 || condition->rel_op2 ||
+                condition->extended_token_count)
+                return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+            continue;
+        }
+        if (!hlsl_float4_instruction_supported(ctx, index))
+            return false;
+        const DXBCOperand *dest = &inst->operands[0];
+        const int block = ctx->cfg.instruction_block[index];
+        if (dest->type == OPERAND_TYPE_OUTPUT) {
+            /* Until output SSA is modeled, require every output write to be
+             * unconditional. No initialized placeholder can stand in for a
+             * branch that leaves an original output lane undefined. */
+            if (dest->register_index < 0 || dest->register_index >= HLSL_SM5_IO_REGISTER_COUNT ||
+                !hlsl_cfg_dominates(&ctx->cfg, block, return_block))
+                return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            outputs[dest->register_index] = true;
+            continue;
+        }
+        int value_index = plan->value_count++;
+        ConditionalValue *value = &plan->values[value_index];
+        value->instruction = index;
+        value->block = block;
+        value->register_index = dest->register_index;
+        snprintf(value->name, sizeof(value->name), "dxbc_value_i%d", index);
+        plan->instruction_value[index] = value_index;
+        for (int lane = 0; lane < 4; ++lane)
+            if (!map_variable(ctx, plan, operand_variable(ctx, index, 0, lane), value_index, lane))
+                return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    }
+    for (int index = 0; index < program->output_count; ++index)
+        if (program->outputs[index].register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
+            !outputs[program->outputs[index].register_id])
+            return reject(ctx, -1, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    for (int block = 0; block < ctx->cfg.block_count; ++block) {
+        const HLSLBlockPhis *phis = &ctx->ssa.block_phis[block];
+        const int first_value = plan->value_count;
+        for (int item = 0; item < phis->phi_count; ++item) {
+            const HLSLPhiNode *phi = &phis->phis[item];
+            int value_index = first_value;
+            while (value_index < plan->value_count &&
+                   plan->values[value_index].register_index != phi->register_index)
+                ++value_index;
+            if (value_index == plan->value_count) {
+                if (value_index == CONDITIONAL_VALUE_LIMIT)
+                    return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+                ++plan->value_count;
+                ConditionalValue *value = &plan->values[value_index];
+                value->instruction = -1;
+                value->block = block;
+                value->register_index = phi->register_index;
+                snprintf(value->name, sizeof(value->name), "dxbc_merge_i%d_r%d",
+                         ctx->cfg.blocks[block].first_instruction, phi->register_index);
+            }
+            ConditionalValue *value = &plan->values[value_index];
+            if (phi->component < 0 || phi->component >= 4 || value->lanes[phi->component] ||
+                !map_variable(ctx, plan, phi->ssa_var, value_index, phi->component))
+                return reject(ctx, -1, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            value->lanes[phi->component] = phi;
+        }
+    }
+    /* Resolve only actually read phi vectors. Unpruned SSA can contain a dead
+     * merge with an undefined arm; it must not invent a declaration or value. */
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILInstruction *inst = &program->instructions[index];
+        const int first = inst->opcode == USIL_OP_IF ? 0 : 1;
+        for (int operand = first; operand < inst->operand_count; ++operand)
+            if (inst->operands[operand].type == OPERAND_TYPE_TEMP &&
+                source_value(ctx, plan, index, operand, first ? 4 : 1) < 0)
+                return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    }
+    return true;
+}
+
+static ASTExpr *source_expression(HLSLEmitterContext *ctx, ConditionalPlan *plan, int index,
+                                  int operand, int lanes) {
+    const DXBCOperand *source = &ctx->program->instructions[index].operands[operand];
+    if (source->type != OPERAND_TYPE_TEMP) {
+        if (lanes == 4)
+            return hlsl_float4_source_atom(ctx, source);
+        StringBuilder text;
+        sb_init(&text);
+        bool formatted = format_operand_hlsl_sb(ctx, source, false, false, 0x10, true, &text);
+        ASTExpr *value = formatted && sb_ok(&text) ? ast_create_emitter_operand(text.buf) : NULL;
+        sb_free(&text);
+        return value;
+    }
+    int value_index = source_value(ctx, plan, index, operand, lanes);
+    if (value_index < 0)
+        return NULL;
+    ASTExpr *value = ast_create_var(-1, source->register_index, OPERAND_TYPE_TEMP,
+                                    plan->values[value_index].name);
+    int components[4];
+    bool identity = lanes == 4;
+    for (int lane = 0; lane < lanes; ++lane) {
+        components[lane] = usil_operand_source_component(source, lane);
+        identity = identity && components[lane] == lane;
+    }
+    if (identity)
+        return value;
+    ASTExpr *selected = ast_create_swizzle(value, components, lanes);
+    if (!selected)
+        ast_free_expr(value);
+    return selected;
+}
+
+static bool emit_phi_edge(HLSLEmitterContext *ctx, const ConditionalPlan *plan, int join,
+                          int predecessor) {
+    const HLSLBasicBlock *block = &ctx->cfg.blocks[join];
+    int edge = 0;
+    while (edge < block->predecessor_count && block->predecessors[edge] != predecessor)
+        ++edge;
+    if (edge == block->predecessor_count)
+        return false;
+    for (int index = 0; index < plan->value_count; ++index) {
+        const ConditionalValue *value = &plan->values[index];
+        if (value->instruction >= 0 || value->block != join || value->resolution != 2)
+            continue;
+        if (edge >= 2)
+            return false;
+        sb_append_spaces(ctx->sb, ctx->indent);
+        sb_appendf(ctx->sb, "%s = %s;\n", value->name, plan->values[value->incoming[edge]].name);
+    }
+    return sb_ok(ctx->sb);
+}
+
+bool emit_high_level_conditionals(HLSLEmitterContext *ctx) {
+    ConditionalPlan plan = {0};
+    bool success = false;
+    const int initial_indent = ctx->indent;
+    if (!build_plan(ctx, &plan))
+        goto cleanup;
+    hlsl_expression_source_map_begin(ctx);
+    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+        const USILInstruction *inst = &ctx->program->instructions[index];
+        ctx->current_instruction_index = index;
+        if (inst->opcode == USIL_OP_NOP || inst->opcode == USIL_OP_RET)
+            continue;
+        size_t begin = ctx->sb->len, end = begin;
+        if (inst->opcode == USIL_OP_IF) {
+            const HLSLIfRegion *region = &plan.regions[index];
+            for (int item = 0; item < plan.value_count; ++item) {
+                const ConditionalValue *value = &plan.values[item];
+                if (value->instruction < 0 && value->block == region->join_block &&
+                    value->resolution == 2) {
+                    sb_append_spaces(ctx->sb, ctx->indent);
+                    sb_appendf(ctx->sb, "float4 %s;\n", value->name);
+                }
+            }
+            ASTExpr *condition = source_expression(ctx, &plan, index, 0, 1);
+            ASTExpr *bits = ast_create_bitcast(AST_SCALAR_UINT32, condition);
+            if (!bits) {
+                ast_free_expr(condition);
+                goto cleanup;
+            }
+            sb_append_spaces(ctx->sb, ctx->indent);
+            sb_append(ctx->sb, inst->condition_test == DXBC_INSTRUCTION_TEST_NONZERO
+                                   ? "[branch] if ("
+                                   : "[branch] if (!");
+            ast_format_expr(bits, ctx->sb);
+            ast_free_expr(bits);
+            sb_append(ctx->sb, ") {\n");
+            ctx->indent += 4;
+        } else if (inst->opcode == USIL_OP_ELSE || inst->opcode == USIL_OP_ENDIF) {
+            const HLSLInstructionFlow *flow = &ctx->cfg.instruction_flow[index];
+            const int header = inst->opcode == USIL_OP_ENDIF
+                                   ? flow->jump_scope
+                                   : ctx->cfg.instruction_flow[flow->end].jump_scope;
+            const HLSLIfRegion *region = &plan.regions[header];
+            if (!emit_phi_edge(ctx, &plan, region->join_block, ctx->cfg.instruction_block[index]))
+                goto cleanup;
+            ctx->indent -= 4;
+            sb_append_spaces(ctx->sb, ctx->indent);
+            if (inst->opcode == USIL_OP_ELSE) {
+                sb_append(ctx->sb, "} else {\n");
+                ctx->indent += 4;
+            } else if (region->else_instruction < 0) {
+                sb_append(ctx->sb, "} else {\n");
+                ctx->indent += 4;
+                if (!emit_phi_edge(ctx, &plan, region->join_block, region->header_block))
+                    goto cleanup;
+                ctx->indent -= 4;
+                sb_append_spaces(ctx->sb, ctx->indent);
+                sb_append(ctx->sb, "}\n");
+            } else {
+                sb_append(ctx->sb, "}\n");
+            }
+        } else {
+            ASTExpr *left = source_expression(ctx, &plan, index, 1, 4);
+            ASTExpr *right =
+                inst->opcode == USIL_OP_MOV ? NULL : source_expression(ctx, &plan, index, 2, 4);
+            ASTExpr *expression = hlsl_float4_operation(ctx, index, left, right);
+            if (!expression)
+                goto cleanup;
+            sb_append_spaces(ctx->sb, ctx->indent);
+            const DXBCOperand *destination = &inst->operands[0];
+            if (destination->type == OPERAND_TYPE_TEMP) {
+                sb_appendf(ctx->sb, "const float4 %s",
+                           plan.values[plan.instruction_value[index]].name);
+            } else if (!hlsl_float4_append_output(ctx, destination)) {
+                ast_free_expr(expression);
+                goto cleanup;
+            }
+            sb_append(ctx->sb, " = ");
+            begin = ctx->sb->len;
+            ast_format_expr(expression, ctx->sb);
+            end = ctx->sb->len;
+            ast_free_expr(expression);
+            sb_append(ctx->sb, ";\n");
+        }
+        if (ctx->expression_source_map) {
+            HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[index];
+            origin->kind = inst->opcode == USIL_OP_IF || inst->opcode == USIL_OP_ELSE ||
+                                   inst->opcode == USIL_OP_ENDIF
+                               ? HLSL_EXPRESSION_ORIGIN_CONTROL
+                               : HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+            origin->source_begin = begin;
+            origin->source_end = end > begin ? end : ctx->sb->len;
+        }
+        if (!sb_ok(ctx->sb))
+            goto cleanup;
+    }
+    success = ctx->indent == initial_indent && sb_ok(ctx->sb);
+cleanup:
+    ctx->indent = initial_indent;
+    free(plan.ssa_value);
+    free(plan.ssa_lane);
+    return success;
+}
