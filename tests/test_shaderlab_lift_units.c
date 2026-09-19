@@ -284,6 +284,24 @@ static int test_verified_and_fallback(void) {
         unity_shaderlab_lift_stats(result, &stats, &preprocesses);
         CHECK(stats.candidates == 1 && stats.accepted == 1 && stats.compiles == (size_t)passes * 4);
         CHECK(stats.cache_hits == stats.compiles && preprocesses == 2);
+        char *json = unity_shaderlab_lift_format_json(result);
+        char *repeated = unity_shaderlab_lift_format_json(result);
+        CHECK(json && repeated && strcmp(json, repeated) == 0);
+        CHECK(strstr(json, "\"selection\":\"high-level\""));
+        CHECK(strstr(json, "\"scope\":\"generated-local-d3d11-program-domain\""));
+        CHECK(strstr(json, "\"instructions\":[{"));
+        CHECK(strstr(json, "\"recorded\":true,\"response_received\":true"));
+        CHECK(strstr(json, "\"lift\":{\"id\":\"float4-expressions\",\"version\":1}"));
+        CHECK(!strstr(json, fixture.shader.name) && !strstr(json, fixture.input.source_path));
+        CHECK(!strstr(json, fixture.input.source_directory) &&
+              !strstr(json, fixture.input.source_basename) &&
+              !strstr(json, fixture.profile.provenance));
+        char digest[65];
+        common_sha256_digest_to_hex(candidate->source_map.source_digest, digest);
+        CHECK(strstr(json, digest));
+        CHECK(json[strlen(json) - 1] == '\n');
+        free(json);
+        free(repeated);
         unity_shaderlab_lift_result_free(result);
     }
     fixture.subshader.pass_count = 1;
@@ -330,6 +348,15 @@ static int test_verified_and_fallback(void) {
         CHECK(unity_shaderlab_lift_accepted(result) == unity_shaderlab_lift_baseline(result));
         CHECK(unity_shaderlab_lift_baseline(result)->status == HLSL_LIFT_VERIFIED);
         CHECK(unity_shaderlab_lift_candidate(result)->status == status);
+        char *json = unity_shaderlab_lift_format_json(result);
+        CHECK(json && strstr(json, "\"selection\":\"low-level-fallback\""));
+        CHECK(strstr(json, hlsl_lift_status_name(status)));
+        if (failures[i].failure == PREPROCESS_TRANSPORT)
+            CHECK(!unity_shaderlab_lift_candidate(result)->preprocess_received &&
+                  strstr(json, "\"preprocessing\":{\"attempted\":true,\"received\":false"));
+        if (status == HLSL_LIFT_DXBC_MISMATCH)
+            CHECK(strstr(json, "\"dxbc_mismatch\":{") && strstr(json, "\"byte_offset\":"));
+        free(json);
         CHECK(service.preprocesses == 2 && service.compiles == (failures[i].preprocess ? 2 : 4));
         unity_shaderlab_lift_result_free(result);
         fixture.profile.build_platform = 19;
@@ -420,11 +447,17 @@ static int test_admission_and_later_pass(void) {
     service = (Service){.fixture = &fixture, .now = 10};
     CHECK(run(&service, (HLSLLiftLimits){1, 16, 1000}, &result) == HLSL_LIFT_PRECONDITION_REJECTED);
     CHECK(!unity_shaderlab_lift_accepted(result) && service.preprocesses == 0);
+    char *json = unity_shaderlab_lift_format_json(result);
+    CHECK(json && strstr(json, "\"selection\":\"unverified\""));
+    CHECK(strstr(json, "\"source_sha256\":null") && strstr(json, "\"response\":null"));
+    CHECK(strstr(json, "\"emission_attempted\":false,\"emission_reason\":null"));
+    free(json);
     unity_shaderlab_lift_result_free(result);
     fixture_free(&fixture);
     CHECK(unity_shaderlab_lift_run(NULL, NULL, NULL, &result) == HLSL_LIFT_INVALID_ARGUMENT);
     CHECK(result == NULL && unity_shaderlab_lift_accepted(NULL) == NULL);
     unity_shaderlab_lift_result_free(NULL);
+    CHECK(unity_shaderlab_lift_format_json(NULL) == NULL);
     return 0;
 }
 

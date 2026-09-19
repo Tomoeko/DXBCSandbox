@@ -45,6 +45,7 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         src/compiler/unity_generated_domain_certifier.c
         src/compiler/unity_shaderlab_mapping.c
         src/compiler/unity_shaderlab_lift.c
+        src/compiler/unity_shaderlab_lift_report.c
     )
 
     add_library(unity_compiler_support STATIC ${COMPILER_SOURCES})

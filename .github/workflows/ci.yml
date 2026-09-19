@@ -17,7 +17,9 @@ jobs:
         if: runner.os == 'Windows'
         run: Write-Output "::add-matcher::.github/msvc.json"
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DDXBCSANDBOX_BUILD_UNITY_COMPILER=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Test

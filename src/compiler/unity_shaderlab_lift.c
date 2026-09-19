@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-#include "compiler/unity_shaderlab_lift.h"
+#include "compiler/unity_shaderlab_lift_internal.h"
 #include "compiler/unity_shaderlab_mapping.h"
 #include "translation/hlsl_lift_control.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-struct UnityShaderLabLiftResult {
-    UnityShaderLabLiftArtifact baseline;
-    UnityShaderLabLiftArtifact candidate;
-    const UnityShaderLabLiftArtifact *accepted;
-    HLSLLiftStats stats;
-    size_t preprocess_requests;
-};
 
 typedef struct {
     const UnityShaderLabLiftInput *input;
@@ -151,6 +143,7 @@ static HLSLLiftStatus preprocess(LiftContext *context, UnityShaderLabLiftArtifac
         context->services.preprocess
             ? context->services.preprocess(context->services.context, &request, response)
             : unity_compiler_broker_preprocess_contract_response(input->broker, &request, response);
+    artifact->preprocess_received = received;
     status = work_status(context);
     if (status != HLSL_LIFT_VERIFIED)
         return status;
@@ -249,6 +242,7 @@ static HLSLLiftStatus attempt(LiftContext *context, UnityShaderLabLiftArtifact *
     if (status != HLSL_LIFT_VERIFIED)
         return status;
     const ShaderBlobArchive *archive = input->archive;
+    artifact->emission_attempted = true;
     const bool emitted =
         high_level ? shaderlab_emit_high_level_candidate_with_source_map(
                          input->shader, archive->entries, archive->entry_count, archive->segments,
@@ -310,6 +304,7 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
         return HLSL_LIFT_OUT_OF_MEMORY;
     *out_result = result;
     context.result = result;
+    result->limits = *limits;
     artifact_init(&result->baseline);
     artifact_init(&result->candidate);
     HLSLLiftStatus status = hlsl_lift_control_begin(
@@ -327,6 +322,15 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
     if (status == HLSL_LIFT_VERIFIED) {
         memcpy(context.compiler_digest, provenance.compiler_fingerprint, 32);
         memcpy(context.environment_digest, provenance.environment_fingerprint, 32);
+        memcpy(result->compiler_digest, context.compiler_digest, 32);
+        memcpy(result->environment_digest, context.environment_digest, 32);
+        memcpy(result->profile_digest, context.profile_digest, 32);
+        common_sha256(input->source_path, strlen(input->source_path), result->source_path_digest);
+        common_sha256(input->source_directory, strlen(input->source_directory),
+                      result->source_directory_digest);
+        common_sha256(input->source_basename, strlen(input->source_basename),
+                      result->source_basename_digest);
+        result->authority_pinned = true;
         status = attempt(&context, &result->baseline, false);
     }
     result->baseline.status = status;

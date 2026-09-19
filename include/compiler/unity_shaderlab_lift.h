@@ -51,10 +51,12 @@ typedef struct {
 typedef struct {
     bool attempted;
     HLSLLiftStatus status;
+    bool emission_attempted;
     ShaderLabCandidateDiagnostic emission_diagnostic;
     StringBuilder source;
     ShaderLabExpressionSourceMap source_map;
     bool preprocess_attempted;
+    bool preprocess_received;
     UnityCompilerPreprocessResponse preprocessing;
     UnityShaderLabLiftPassReport *passes;
     size_t pass_count;
@@ -86,6 +88,7 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
                                         const HLSLLiftLimits *limits,
                                         UnityShaderLabLiftResult **out_result);
 
+/* All views are borrowed and must remain unmodified until result_free(). */
 const UnityShaderLabLiftArtifact *
 unity_shaderlab_lift_baseline(const UnityShaderLabLiftResult *result);
 const UnityShaderLabLiftArtifact *
@@ -95,5 +98,10 @@ unity_shaderlab_lift_accepted(const UnityShaderLabLiftResult *result);
 void unity_shaderlab_lift_stats(const UnityShaderLabLiftResult *result, HLSLLiftStats *stats,
                                 size_t *preprocess_requests);
 void unity_shaderlab_lift_result_free(UnityShaderLabLiftResult *result);
+
+/* Deterministic malloc-owned JSON with source/target/request digests and spans.
+ * Omits source text, names, paths and raw compiler diagnostics. This is a
+ * rendering of the typed result, never an independent certificate. */
+char *unity_shaderlab_lift_format_json(const UnityShaderLabLiftResult *result);
 
 #endif
