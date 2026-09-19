@@ -35,6 +35,7 @@ typedef enum {
     COMPILE_CACHE_MISS,
     COMPILER_DRIFT,
     ENVIRONMENT_DRIFT,
+    SOURCE_REVISION_DRIFT,
     PROFILE_DRIFT,
     LATE_PREPROCESS,
     LATE_COMPILE,
@@ -73,6 +74,7 @@ typedef struct {
     bool clock_failed;
     bool compiler_drift;
     bool environment_drift;
+    bool source_revision_drift;
     bool cached;
 } Service;
 
@@ -147,6 +149,7 @@ static bool toolchain_service(void *opaque, UnityCompilerToolchainProvenance *pr
     Service *service = opaque;
     memset(provenance->compiler_fingerprint, service->compiler_drift ? 2 : 1, 32);
     memset(provenance->environment_fingerprint, service->environment_drift ? 4 : 3, 32);
+    provenance->source_authority_revision = service->source_revision_drift ? 2 : 1;
     return true;
 }
 
@@ -218,6 +221,8 @@ static bool compile_service(void *opaque, const UnityCompilerSnippetCompileReque
         service->compiler_drift = true;
     if (failure == ENVIRONMENT_DRIFT)
         service->environment_drift = true;
+    if (failure == SOURCE_REVISION_DRIFT)
+        service->source_revision_drift = true;
     if (failure == PROFILE_DRIFT)
         service->fixture->profile.build_platform++;
     if (failure == COMPILE_TRANSPORT)
@@ -325,6 +330,7 @@ static int test_verified_and_fallback(void) {
         {COMPILE_CACHE_MISS, HLSL_LIFT_COMPILER_UNAVAILABLE, false},
         {COMPILER_DRIFT, HLSL_LIFT_AUTHORITY_MISMATCH, false},
         {ENVIRONMENT_DRIFT, HLSL_LIFT_AUTHORITY_MISMATCH, false},
+        {SOURCE_REVISION_DRIFT, HLSL_LIFT_AUTHORITY_MISMATCH, false},
         {PROFILE_DRIFT, HLSL_LIFT_AUTHORITY_MISMATCH, false},
         {LATE_PREPROCESS, HLSL_LIFT_BUDGET_EXHAUSTED, true},
         {LATE_COMPILE, HLSL_LIFT_BUDGET_EXHAUSTED, false},
@@ -345,11 +351,17 @@ static int test_verified_and_fallback(void) {
             fprintf(stderr, "failure=%d actual=%s expected=%s\n", failures[i].failure,
                     hlsl_lift_status_name(status), hlsl_lift_status_name(failures[i].expected));
         CHECK(status == failures[i].expected);
-        CHECK(unity_shaderlab_lift_accepted(result) == unity_shaderlab_lift_baseline(result));
+        const bool authority_changed = failures[i].failure == COMPILER_DRIFT ||
+                                       failures[i].failure == ENVIRONMENT_DRIFT ||
+                                       failures[i].failure == SOURCE_REVISION_DRIFT ||
+                                       failures[i].failure == PROFILE_DRIFT;
+        CHECK(unity_shaderlab_lift_accepted(result) ==
+              (authority_changed ? NULL : unity_shaderlab_lift_baseline(result)));
         CHECK(unity_shaderlab_lift_baseline(result)->status == HLSL_LIFT_VERIFIED);
         CHECK(unity_shaderlab_lift_candidate(result)->status == status);
         char *json = unity_shaderlab_lift_format_json(result);
-        CHECK(json && strstr(json, "\"selection\":\"low-level-fallback\""));
+        CHECK(json && strstr(json, authority_changed ? "\"selection\":\"unverified\""
+                                                    : "\"selection\":\"low-level-fallback\""));
         CHECK(strstr(json, hlsl_lift_status_name(status)));
         if (failures[i].failure == PREPROCESS_TRANSPORT)
             CHECK(!unity_shaderlab_lift_candidate(result)->preprocess_received &&

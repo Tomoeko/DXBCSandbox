@@ -76,12 +76,18 @@ typedef struct {
     uint32_t expected_valid_apis;
     bool expected_valid_apis_ready;
     struct UscCacheToolchainLease* cache_toolchain_lease;
+    struct UscCacheToolchainLease* cache_source_lease;
+    char* cache_source_root;
+    uint8_t cache_source_environment[32];
+    uint64_t source_authority_revision;
 } UnityCompilerChannel;
 
 #define UNITY_COMPILER_FINGERPRINT_SIZE 32
 
-/* Borrowed, fixed-size content authority supplied by a validated offline
- * source such as OraclePack v4.  No local toolchain state is inferred. */
+/* Borrowed content authority supplied by a validated offline record. The
+ * environment digest must be the request-specific value, including its source
+ * search tree; configuration-only provenance is insufficient to reproduce a
+ * live request identity. No local state is inferred or refreshed. */
 typedef struct {
     const uint8_t* compiler_fingerprint;
     const uint8_t* environment_fingerprint;
@@ -184,6 +190,9 @@ typedef struct {
     const char* dxcompiler_path;
     uint8_t compiler_fingerprint[UNITY_COMPILER_FINGERPRINT_SIZE];
     uint8_t environment_fingerprint[UNITY_COMPILER_FINGERPRINT_SIZE];
+    /* In-process revision for a request-specific include snapshot. Zero for
+     * configuration-only provenance. Not a persistent content identity. */
+    uint64_t source_authority_revision;
 } UnityCompilerToolchainProvenance;
 
 typedef struct {
@@ -622,6 +631,15 @@ uint8_t* unity_compiler_binary_response_take_clean_data(
  */
 bool unity_compiler_get_toolchain_provenance(
     UnityCompilerChannel* channel,
+    UnityCompilerToolchainProvenance* out_provenance);
+
+/* Request authority also covers the complete implicit source search tree.
+ * Relative roots resolve in the compiler process's inherited working
+ * directory. Refreshing a changed tree recycles USC's in-memory include cache.
+ * A multi-request transaction must pin both fingerprints and the revision. */
+bool unity_compiler_get_source_provenance(
+    UnityCompilerChannel* channel,
+    const char* source_root,
     UnityCompilerToolchainProvenance* out_provenance);
 
 /*

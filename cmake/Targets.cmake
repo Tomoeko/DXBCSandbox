@@ -111,11 +111,15 @@ target_link_libraries(dxbc_core
     PRIVATE dxbc_build_options)
 
 if(DXBCSANDBOX_BUILD_ASSET_CLI)
-    add_executable(dxbc_sandbox_cli src/cli/dxbc_sandbox_cli.c)
+    set(_dxbc_asset_cli_library dxbc_core)
+    if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
+        set(_dxbc_asset_cli_library unity_compiler_support)
+    endif()
+    add_executable(dxbc_sandbox_cli src/cli/dxbc_sandbox_cli.c src/cli/shaderlab_lift_cli.c)
     set_target_properties(dxbc_sandbox_cli PROPERTIES
         OUTPUT_NAME "dxbc-sandbox")
     target_link_libraries(dxbc_sandbox_cli PRIVATE
-        dxbc_core dxbc_build_options)
+        ${_dxbc_asset_cli_library} dxbc_build_options)
 
     add_executable(player_build_settings_cli
         src/cli/player_build_settings_cli.c)
@@ -133,10 +137,10 @@ if(DXBCSANDBOX_BUILD_ASSET_CLI)
 
     # Preserve the historical executable name and one-input positional mode
     # while routing it through the same catalog and batch implementation.
-    add_executable(asset_client_cli src/cli/dxbc_sandbox_cli.c)
+    add_executable(asset_client_cli src/cli/dxbc_sandbox_cli.c src/cli/shaderlab_lift_cli.c)
     target_compile_definitions(asset_client_cli PRIVATE
         DXBCSANDBOX_LEGACY_ASSET_CLI=1)
-    target_link_libraries(asset_client_cli PRIVATE dxbc_core dxbc_build_options)
+    target_link_libraries(asset_client_cli PRIVATE ${_dxbc_asset_cli_library} dxbc_build_options)
 
     dxbc_enable_utf8_command_line(dxbc_sandbox_cli)
     dxbc_enable_utf8_command_line(asset_client_cli)

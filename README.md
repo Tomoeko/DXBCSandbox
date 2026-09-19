@@ -56,6 +56,8 @@ DXBC_UNITY_APP=/path/to/Unity.app \
   ctest --test-dir build-unity --output-on-failure
 DXBC_UNITY_APP=/path/to/Unity.app build-unity/dxbc-compiler-session
 DXBC_UNITY_APP=/path/to/Unity.app build-unity/unity_golden_verifier
+build-unity/dxbc-sandbox extract /path/to/assets --kind graphics --all \
+  --high-level --compile-profile captured.profile --out recovered --format json
 ```
 
 Select Unity with `DXBC_UNITY_CONTENTS_PATH`, `DXBC_UNITY_APP`, or
@@ -66,8 +68,11 @@ Unity binaries and copied package headers are not included.
 `unity_golden_verifier --high-level --report results.jsonl` tests an opt-in
 float4 expression lift for bounded straight-line vertex/fragment programs.
 Each accepted candidate must reproduce its entire target DXBC container;
-unsupported candidates retain verified low-level output. This does not yet
-certify complete high-level ShaderLab output.
+unsupported candidates retain verified low-level output. Extraction's
+`--high-level` checks every local D3D11 pass/state/tier under the supplied
+profile and records request hashes and instruction spans. Failed baselines
+produce no Shader. These checks do not certify import, external dependencies,
+player/runtime selection, or visual equivalence.
 
 The import, bundle, and finite-visual gate commands accept an explicit Editor
 path and use isolated projects. Their installed C# bridges live in

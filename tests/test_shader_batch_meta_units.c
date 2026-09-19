@@ -195,6 +195,38 @@ cleanup:
     return status;
 }
 
+typedef struct {
+    size_t record_index;
+    size_t calls;
+    int failure_mode;
+    size_t source_size;
+    uint8_t source_digest[COMMON_SHA256_DIGEST_SIZE];
+} CandidateSelector;
+
+static bool select_test_candidate(void *opaque, const ShaderBatchCandidateInput *input,
+                                  StringBuilder *source, ShaderLabCandidateDiagnostic *diagnostic) {
+    CandidateSelector *selector = opaque;
+    ++selector->calls;
+    if (input->catalog_record_index != selector->record_index || !input->object || !input->archive ||
+        !input->source_directory || !input->source_basename || !input->source_path || source->len ||
+        strcmp(input->source_basename, "Hidden_SeparableBlur.shader") != 0 ||
+        !strstr(input->source_path, input->source_directory)) return false;
+    if (selector->failure_mode == 1) {
+        sb_append(source, "partial failed selection");
+        return false;
+    }
+    if (selector->failure_mode == 2) return true; /* Empty success must fail closed. */
+    const ShaderBlobArchive *archive = input->archive;
+    if (!shaderlab_emit_candidate_with_diagnostic(
+            &input->object->shader, archive->entries, archive->entry_count, archive->segments,
+            archive->segment_lengths, archive->segment_count, source, diagnostic)) return false;
+    /* No final newline: the batch must publish precisely the selected bytes. */
+    sb_append(source, "// selected candidate terminator");
+    selector->source_size = source->len;
+    common_sha256(source->buf, source->len, selector->source_digest);
+    return sb_ok(source);
+}
+
 int main(void) {
     int status = 0;
     TypeTreeSchemaRegistry registry;
@@ -289,6 +321,42 @@ int main(void) {
     free(flat_meta_path);
     flat_meta_path = NULL;
     free(flat_shader_path);
+    flat_shader_path = NULL;
+
+    CandidateSelector selector = {.record_index = chosen};
+    flat_options.select_candidate = select_test_candidate;
+    flat_options.candidate_context = &selector;
+    for (int failure = 1; failure <= 2; ++failure) {
+        selector.failure_mode = failure;
+        CHECK(shader_batch_extract_ex(&catalog, selected, &registry, flat_output_root,
+                                      &flat_options, &batch) == SHADER_BATCH_OK);
+        CHECK(batch.stats.failed == 1 && !shader_batch_is_complete(&batch));
+        CHECK(batch.records[chosen].failure == SHADER_BATCH_FAILURE_CANDIDATE_SELECTION);
+        CHECK(!batch.records[chosen].shader_publish_attempted &&
+              !batch.records[chosen].publication_authorized && !batch.records[chosen].output_path);
+        shader_batch_result_dispose(&batch);
+    }
+    selector.failure_mode = 0;
+    CHECK(shader_batch_extract_ex(&catalog, selected, &registry, flat_output_root,
+                                  &flat_options, &batch) == SHADER_BATCH_OK);
+    flat_root_created = true;
+    CHECK(selector.calls == 3 && shader_batch_is_complete(&batch));
+    CHECK(batch.records[chosen].published_shader_size == selector.source_size);
+    CHECK(memcmp(batch.records[chosen].published_shader_digest, selector.source_digest,
+                 sizeof(selector.source_digest)) == 0);
+    flat_shader_path = duplicate_string(batch.records[chosen].output_path);
+    flat_meta_path = duplicate_string(batch.records[chosen].output_meta_path);
+    CHECK(flat_shader_path && flat_meta_path);
+    CHECK(common_file_read_regular(flat_shader_path, SIZE_MAX, &actual_meta) == COMMON_FILE_OK);
+    CHECK(actual_meta.size == selector.source_size && actual_meta.data[actual_meta.size - 1] != '\n');
+    common_file_bytes_dispose(&actual_meta);
+    shader_batch_result_dispose(&batch);
+    CHECK(remove(flat_meta_path) == 0 && remove(flat_shader_path) == 0);
+    CHECK(TEST_RMDIR(flat_output_root) == 0);
+    flat_root_created = false;
+    free(flat_meta_path);
+    free(flat_shader_path);
+    flat_meta_path = NULL;
     flat_shader_path = NULL;
 
     ShaderBatchOptions batch_options;

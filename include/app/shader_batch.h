@@ -39,6 +39,7 @@ typedef enum {
     SHADER_BATCH_FAILURE_OUTPUT_IO,
     SHADER_BATCH_FAILURE_ASSET_GUID,
     SHADER_BATCH_FAILURE_SHADER_META_EMISSION,
+    SHADER_BATCH_FAILURE_CANDIDATE_SELECTION,
 } ShaderBatchFailure;
 
 /* Exact per-member ledger for a variable-size ClassID 72 package. Aggregate
@@ -135,6 +136,26 @@ typedef enum {
     SHADER_BATCH_ALLOCATION_FAILED,
 } ShaderBatchStatus;
 
+/* A trusted candidate selector can replace the default emitter while reusing
+ * catalog identity leases, structural admission and atomic publication. It must
+ * preserve the fail-closed ShaderLab metadata contract. The callback receives
+ * an empty builder and borrowed inputs valid only for this call. It owns its
+ * verification evidence separately, indexed by catalog_record_index. Returning
+ * true does not itself create any compiler or whole-shader certificate.
+ * Successful bytes are published verbatim, including their final newline. */
+typedef struct {
+    size_t catalog_record_index;
+    const ShaderObject *object;
+    const ShaderBlobArchive *archive;
+    const char *source_path;
+    const char *source_directory;
+    const char *source_basename;
+} ShaderBatchCandidateInput;
+
+typedef bool (*ShaderBatchCandidateSelector)(
+    void *context, const ShaderBatchCandidateInput *input, StringBuilder *source,
+    ShaderLabCandidateDiagnostic *diagnostic);
+
 typedef struct {
     /* Emit a deterministic ShaderImporter .meta next to each selected
      * graphics .shader. Required by associated Material export. */
@@ -149,6 +170,8 @@ typedef struct {
      * dependency pass must validate and close every retained snapshot before
      * exposing generated references. */
     bool defer_source_snapshot_close;
+    ShaderBatchCandidateSelector select_candidate; /* NULL uses the normal emitter. */
+    void *candidate_context;
 } ShaderBatchOptions;
 
 void shader_batch_options_default(ShaderBatchOptions* options);

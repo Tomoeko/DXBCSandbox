@@ -1253,10 +1253,20 @@ static bool configure_toolchain_paths(UnityCompilerChannel* channel) {
 
 static void invalidate_compiler_channel(UnityCompilerChannel* channel);
 
+static void discard_source_authority(UnityCompilerChannel* channel) {
+    usc_cache_toolchain_lease_destroy(channel->cache_source_lease);
+    channel->cache_source_lease = NULL;
+    free(channel->cache_source_root);
+    channel->cache_source_root = NULL;
+    memset(channel->cache_source_environment, 0, sizeof(channel->cache_source_environment));
+    ++channel->source_authority_revision;
+}
+
 static void discard_toolchain_authority(UnityCompilerChannel* channel,
                                         bool invalidate_process) {
     if (!channel) return;
     if (invalidate_process) invalidate_compiler_channel(channel);
+    discard_source_authority(channel);
     usc_cache_toolchain_lease_destroy(channel->cache_toolchain_lease);
     channel->cache_toolchain_lease = NULL;
     channel->cache_compiler_ready = false;
@@ -1330,7 +1340,9 @@ static bool capture_or_validate_toolchain_authority(
 static bool validate_existing_toolchain_authority(
     UnityCompilerChannel* channel) {
     if (!channel || !channel->cache_toolchain_lease) return false;
-    if (usc_cache_toolchain_lease_validate(channel->cache_toolchain_lease)) {
+    if (usc_cache_toolchain_lease_validate(channel->cache_toolchain_lease) &&
+        (!channel->cache_source_lease ||
+         usc_cache_toolchain_lease_validate(channel->cache_source_lease))) {
         return !channel->session_capabilities_failed;
     }
     discard_toolchain_authority(channel, true);
@@ -1350,6 +1362,76 @@ static bool get_toolchain_fingerprints(
            USC_CACHE_DIGEST_SIZE);
     memcpy(environment_fingerprint, channel->cache_environment_fingerprint,
            USC_CACHE_DIGEST_SIZE);
+    return true;
+}
+
+static char* request_search_root(const char* path, bool is_file) {
+    if (!path) return NULL;
+    char* normalized = strdup(path);
+    if (!normalized) return NULL;
+    for (char* c = normalized; *c; ++c)
+        if (*c == '\\') *c = '/';
+    if (is_file) {
+        char* separator = strrchr(normalized, '/');
+        if (!separator) normalized[0] = '\0';
+        else separator[separator == normalized ? 1 : 0] = '\0';
+    }
+    if (normalized[0] == '/') return normalized;
+    char* working_directory = getcwd(NULL, 0);
+    if (!working_directory) {
+        free(normalized);
+        return NULL;
+    }
+    if (!normalized[0] || strcmp(normalized, ".") == 0) {
+        free(normalized);
+        return working_directory;
+    }
+    size_t directory_size = strlen(working_directory), path_size = strlen(normalized);
+    char* absolute = NULL;
+    if (directory_size <= SIZE_MAX - path_size - 2U) {
+        absolute = malloc(directory_size + path_size + 2U);
+        if (absolute)
+            snprintf(absolute, directory_size + path_size + 2U, "%s/%s",
+                     working_directory, normalized);
+    }
+    free(normalized);
+    free(working_directory);
+    return absolute;
+}
+
+static bool get_request_fingerprints(
+    UnityCompilerChannel* channel, const char* source_path, bool is_file,
+    uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
+    uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE]) {
+    if (!get_toolchain_fingerprints(channel, compiler_fingerprint, environment_fingerprint))
+        return false;
+    char* root = request_search_root(source_path, is_file);
+    if (!root) return false;
+    if (channel->cache_source_lease) {
+        const bool valid = usc_cache_toolchain_lease_validate(channel->cache_source_lease);
+        if (valid && strcmp(root, channel->cache_source_root) == 0) {
+            memcpy(environment_fingerprint, channel->cache_source_environment,
+                   USC_CACHE_DIGEST_SIZE);
+            free(root);
+            return true;
+        }
+        /* Refresh only between requests; in-flight acceptance validates the
+         * captured lease. Switching roots drops the previous lease, whose
+         * headers may change while another root is active. Recycle USC's own
+         * include cache on either change instead of retaining stale contents. */
+        invalidate_compiler_channel(channel);
+        discard_source_authority(channel);
+    }
+    const char* roots[] = {root};
+    if (!usc_cache_search_roots_lease_create(roots, 1U, environment_fingerprint,
+                                            environment_fingerprint,
+                                            &channel->cache_source_lease)) {
+        free(root);
+        return false;
+    }
+    channel->cache_source_root = root;
+    memcpy(channel->cache_source_environment, environment_fingerprint, USC_CACHE_DIGEST_SIZE);
+    ++channel->source_authority_revision;
     return true;
 }
 
@@ -2464,8 +2546,9 @@ bool unity_compiler_preprocess_contract_response(
     uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE];
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE];
     UnityCompilerPreprocessRequest request;
-    if (!get_toolchain_fingerprints(channel, compiler_fingerprint,
-                                    environment_fingerprint) ||
+    if (!input_request ||
+        !get_request_fingerprints(channel, input_request->file_path, true,
+                                  compiler_fingerprint, environment_fingerprint) ||
         !preprocess_request_to_wire(
             channel, input_request, environment_fingerprint,
             include_paths, &request)) {
@@ -2656,10 +2739,10 @@ bool unity_compiler_preprocess_contract_response(
             if (count < 0 || count > max_response_count) {
                 goto preprocess_parse_failure;
             }
-            /* Dependency paths are consumed exactly but are not a second
-             * source of artifact identity: the serialized preprocess result
-             * contains the emitted snippets/blob, while the request identity
-             * hashes all resolved include trees and toolchain inputs. */
+            /* Consume the complete protocol record. Request identities cover
+             * configured trees and the implicit source search tree. These
+             * callbacks alone are not proof of a complete transitive closure:
+             * includes can resolve outside those roots. */
             for (int i = 0; i < count; i++) {
                 char* dependency = read_string(fd);
                 if (!dependency) goto preprocess_parse_failure;
@@ -2965,8 +3048,8 @@ static bool unity_compiler_compile_request_response_internal(
     }
     uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE];
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE];
-    if (!get_toolchain_fingerprints(channel, compiler_fingerprint,
-                                    environment_fingerprint)) {
+    if (!get_request_fingerprints(channel, input_request->source_directory, false,
+                                  compiler_fingerprint, environment_fingerprint)) {
         return false;
     }
     UnityCompilerCompileRequest request = *input_request;
@@ -3370,6 +3453,21 @@ bool unity_compiler_get_toolchain_provenance(
     return true;
 }
 
+bool unity_compiler_get_source_provenance(
+    UnityCompilerChannel* channel, const char* source_root,
+    UnityCompilerToolchainProvenance* out_provenance) {
+    if (!out_provenance) return false;
+    UnityCompilerToolchainProvenance provenance;
+    if (!unity_compiler_get_toolchain_provenance(channel, &provenance) ||
+        !get_request_fingerprints(channel, source_root, false,
+                                  provenance.compiler_fingerprint,
+                                  provenance.environment_fingerprint))
+        return false;
+    provenance.source_authority_revision = channel->source_authority_revision;
+    *out_provenance = provenance;
+    return true;
+}
+
 bool unity_compiler_serialize_preprocess_request(
     UnityCompilerChannel* channel,
     const UnityCompilerShaderPreprocessRequest* request,
@@ -3383,7 +3481,10 @@ bool unity_compiler_serialize_preprocess_request(
     *out_transcript_size = 0U;
     memset(out_request_digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
     UnityCompilerToolchainProvenance provenance;
-    if (!unity_compiler_get_toolchain_provenance(channel, &provenance)) {
+    if (!request ||
+        !get_request_fingerprints(channel, request->file_path, true,
+                                  provenance.compiler_fingerprint,
+                                  provenance.environment_fingerprint)) {
         return false;
     }
     if (!serialize_preprocess_request_authority(
@@ -3447,7 +3548,8 @@ bool unity_compiler_serialize_compile_request(
     *out_transcript_size = 0;
     memset(out_request_digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
     UnityCompilerToolchainProvenance provenance;
-    if (!unity_compiler_get_toolchain_provenance(channel, &provenance)) {
+    if (!request ||
+        !unity_compiler_get_source_provenance(channel, request->source_directory, &provenance)) {
         return false;
     }
     if (!serialize_compile_request_authority(
@@ -3864,6 +3966,7 @@ bool unity_compiler_recycle_process(UnityCompilerChannel* channel) {
 void unity_compiler_shutdown(UnityCompilerChannel* channel) {
     if (!channel) return;
     unity_compiler_stop_process(channel);
+    discard_source_authority(channel);
     usc_cache_toolchain_lease_destroy(channel->cache_toolchain_lease);
     channel->cache_toolchain_lease = NULL;
     free(channel->project_root);

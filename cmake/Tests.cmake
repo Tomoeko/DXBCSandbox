@@ -133,8 +133,15 @@ if(BUILD_TESTING)
     endif()
 
     if(DXBCSANDBOX_BUILD_ASSET_CLI)
-        dxbc_add_core_test(test_cli_extract_report_units
-            tests/test_cli_extract_report_units.c cli_extract_report_units)
+        add_executable(test_cli_extract_report_units
+            tests/test_cli_extract_report_units.c src/cli/shaderlab_lift_cli.c)
+        target_include_directories(test_cli_extract_report_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_cli_extract_report_units PRIVATE
+            ${_dxbc_asset_cli_library} dxbc_build_options)
+        add_test(NAME cli_extract_report_units COMMAND test_cli_extract_report_units)
+        if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
+            target_compile_definitions(test_cli_extract_report_units PRIVATE DXBCSANDBOX_CLI_UNITY_COMPILER=1)
+        endif()
         add_test(NAME shader_cli_help
             COMMAND dxbc_sandbox_cli --help)
         add_test(NAME player_build_settings_cli_help

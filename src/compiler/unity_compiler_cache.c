@@ -564,7 +564,7 @@ static bool encode_compile_request(
     CompileRequestSink* sink, const UnityCompilerCompileRequest* request,
     const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE]) {
     static const uint8_t schema[] =
-        "DXBCSandbox.UnityCompiler.compileSnippet.cache.v6";
+        "DXBCSandbox.UnityCompiler.compileSnippet.cache.v7";
     if (!sink || !request || !compiler_fingerprint) return false;
     compile_request_sink_buffer(sink, schema, sizeof(schema) - 1U);
     compile_request_sink_buffer(sink, compiler_fingerprint,
@@ -655,7 +655,7 @@ static bool encode_preprocess_request(
     const UnityCompilerPreprocessRequest* request,
     const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE]) {
     static const uint8_t schema[] =
-        "DXBCSandbox.UnityCompiler.preprocess.cache.v5";
+        "DXBCSandbox.UnityCompiler.preprocess.cache.v6";
     if (!sink || !request || !compiler_fingerprint) return false;
     compile_request_sink_buffer(sink, schema, sizeof(schema) - 1U);
     compile_request_sink_buffer(sink, compiler_fingerprint,
@@ -1516,6 +1516,48 @@ bool usc_cache_toolchain_lease_create(
         usc_cache_toolchain_lease_destroy(lease);
         return false;
     }
+    *out_lease = lease;
+    return true;
+}
+
+bool usc_cache_search_roots_lease_create(
+    const char* const* roots,
+    size_t root_count,
+    const uint8_t environment_digest[USC_CACHE_DIGEST_SIZE],
+    uint8_t request_environment_digest[USC_CACHE_DIGEST_SIZE],
+    UscCacheToolchainLease** out_lease) {
+    if (!request_environment_digest || !out_lease) return false;
+    /* Permit in-place extension of the environment digest. */
+    uint8_t base_digest[USC_CACHE_DIGEST_SIZE] = {0};
+    if (environment_digest)
+        memcpy(base_digest, environment_digest, sizeof(base_digest));
+    memset(request_environment_digest, 0, USC_CACHE_DIGEST_SIZE);
+    *out_lease = NULL;
+    if (!environment_digest || !roots || root_count == 0U || root_count > 64U)
+        return false;
+    for (size_t i = 0; i < root_count; ++i)
+        if (!roots[i] || roots[i][0] != '/') return false;
+    UscCacheToolchainLease* lease = calloc(1, sizeof(*lease));
+    if (!lease) return false;
+    CacheTreeState state = {.lease = lease};
+    Sha256Context context;
+    sha256_init(&context);
+    static const uint8_t schema[] =
+        "DXBCSandbox.UnityCompiler.request-environment.v1";
+    digest_buffer(&context, schema, sizeof(schema) - 1U);
+    digest_buffer(&context, base_digest, sizeof(base_digest));
+    digest_u64(&context, (uint64_t)root_count);
+    bool ok = true;
+    for (size_t i = 0; ok && i < root_count; ++i)
+        ok = digest_environment_root(&context, "search-root", roots[i], &state);
+    free(state.ancestors);
+    ok = ok && state.ancestor_count == 0U &&
+         usc_cache_toolchain_lease_validate(lease);
+    if (!ok) {
+        usc_cache_toolchain_lease_destroy(lease);
+        return false;
+    }
+    sha256_final(&context, request_environment_digest);
     *out_lease = lease;
     return true;
 }

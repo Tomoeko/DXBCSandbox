@@ -5,6 +5,7 @@
 #endif
 
 #include "app/shader_batch.h"
+#include "shaderlab_lift_cli.h"
 #include "app/shader_catalog.h"
 #include "app/material_batch.h"
 #include "app/native_texture_batch.h"
@@ -68,6 +69,8 @@ typedef struct {
     bool show_sources;
     bool export_materials;
     bool flat_shaders;
+    CliShaderLabLiftOptions lift;
+    bool lift_limits_set;
     const char* output_directory;
     const char* schema_registry;
     const char* report_path;
@@ -111,6 +114,13 @@ static void print_usage(FILE* output, const char* program) {
         "  --flat-shaders     place graphics .shader files directly in DIR\n"
         "                     using names derived from Shader \"name\"\n"
         "                     (default: SerializedFile digest subfolders)\n"
+        "  --high-level       verify a bounded expression lift; keep verified\n"
+        "                     low-level fallback (optional macOS compiler build)\n"
+        "  --compile-profile FILE  captured Unity profile required for lifting\n"
+        "  --project-root DIR      compiler project root (default: .)\n"
+        "  --includes DIR          additional compiler include authority\n"
+        "  --lift-max-compiles N   per-shader compile limit (default: 4096)\n"
+        "  --lift-timeout-ms N     per-shader acceptance deadline (default: 120000)\n"
         "  --materials        also export every Material whose exact m_Shader\n"
         "                     PPtr resolves to a selected graphics Shader\n"
         "                     and exact Unity-native Texture2D/RenderTexture\n"
@@ -264,6 +274,8 @@ static bool parse_cli(int argc, char** argv, CliOptions* options,
     options->format = CLI_FORMAT_TABLE;
     options->shader_kind = CLI_SHADER_KIND_ALL;
     options->recursive = true;
+    options->lift.max_compiles = 4096;
+    options->lift.max_elapsed_ms = 120000;
     *help_requested = false;
     if (argc < 2) return false;
 
@@ -318,6 +330,26 @@ static bool parse_cli(int argc, char** argv, CliOptions* options,
             options->all = true;
         } else if (!positional_only && strcmp(argument, "--sources") == 0) {
             options->show_sources = true;
+        } else if (!positional_only && strcmp(argument, "--high-level") == 0) {
+            options->lift.enabled = true;
+        } else if (!positional_only && strcmp(argument, "--compile-profile") == 0) {
+            if (!option_value(argc, argv, &i, argument, &options->lift.profile_path)) return false;
+        } else if (!positional_only && strcmp(argument, "--project-root") == 0) {
+            if (!option_value(argc, argv, &i, argument, &options->lift.project_root)) return false;
+        } else if (!positional_only && strcmp(argument, "--includes") == 0) {
+            if (!option_value(argc, argv, &i, argument, &options->lift.includes)) return false;
+        } else if (!positional_only &&
+                   (strcmp(argument, "--lift-max-compiles") == 0 ||
+                    strcmp(argument, "--lift-timeout-ms") == 0)) {
+            const char *text = NULL;
+            size_t value;
+            if (!option_value(argc, argv, &i, argument, &text) || !parse_positive_size(text, &value)) {
+                fprintf(stderr, "Error: %s requires a positive integer.\n", argument);
+                return false;
+            }
+            if (strcmp(argument, "--lift-max-compiles") == 0) options->lift.max_compiles = value;
+            else options->lift.max_elapsed_ms = (uint64_t)value;
+            options->lift_limits_set = true;
         } else if (!positional_only && strcmp(argument, "--materials") == 0) {
             options->export_materials = true;
         } else if (!positional_only &&
@@ -474,6 +506,20 @@ static bool parse_cli(int argc, char** argv, CliOptions* options,
     if (options->command == CLI_COMMAND_LIST && options->flat_shaders) {
         fprintf(stderr,
                 "Error: --flat-shaders is valid only with extract.\n");
+        return false;
+    }
+    if (options->lift.enabled) {
+        if (options->command != CLI_COMMAND_EXTRACT || !options->lift.profile_path) {
+            fputs("Error: --high-level requires extract and --compile-profile FILE.\n", stderr);
+            return false;
+        }
+        if (!cli_shaderlab_lift_supported()) {
+            fputs("Error: --high-level requires a macOS build with DXBCSANDBOX_BUILD_UNITY_COMPILER=ON.\n", stderr);
+            return false;
+        }
+    } else if (options->lift.profile_path || options->lift.project_root || options->lift.includes ||
+               options->lift_limits_set) {
+        fputs("Error: compiler profile, paths and lift limits require --high-level.\n", stderr);
         return false;
     }
     if (options->command == CLI_COMMAND_EXTRACT) {
@@ -2690,6 +2736,33 @@ static bool append_compute_publication_json(
     return sb_ok(output);
 }
 
+typedef struct {
+    size_t requested;
+    size_t high_level;
+    size_t fallback;
+    size_t unverified;
+    size_t not_run;
+    size_t published_verified;
+} CliLiftCoverage;
+
+static CliLiftCoverage lift_coverage(const ShaderCatalog *catalog, const bool *selected,
+                                     const ShaderBatchResult *batch, const CliShaderLabLift *lift) {
+    CliLiftCoverage coverage = {0};
+    if (!lift) return coverage;
+    for (size_t i = 0; i < catalog->record_count; ++i) {
+        if (!selected[i]) continue;
+        ++coverage.requested;
+        const char *selection = cli_shaderlab_lift_selection(lift, i);
+        if (strcmp(selection, "high-level") == 0) ++coverage.high_level;
+        else if (strcmp(selection, "low-level-fallback") == 0) ++coverage.fallback;
+        else if (strcmp(selection, "unverified") == 0) ++coverage.unverified;
+        else ++coverage.not_run;
+        if (cli_shaderlab_lift_output_verified(lift, i, &batch->records[i]))
+            ++coverage.published_verified;
+    }
+    return coverage;
+}
+
 static bool render_extract_json(const ShaderCatalog* catalog,
                                 const bool* selected,
                                 const ShaderBatchResult* batch,
@@ -2699,7 +2772,8 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                                 const char* registry_path,
                                 const char* registry_digest,
                                 StringBuilder* output,
-                                bool* out_texture_batch_complete) {
+                                bool* out_texture_batch_complete,
+                                const CliShaderLabLift *lift) {
     if (!out_texture_batch_complete) return false;
     *out_texture_batch_complete = false;
     bool* texture_publications = NULL;
@@ -2765,7 +2839,8 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                    ? (exact_compute_packages == selected_compute
                           ? "exact-compute-package"
                           : "unpublished-compute-package")
-                   : "uncertified-shaderlab-candidate");
+                   : (lift ? "shaderlab-with-local-domain-reports"
+                                      : "uncertified-shaderlab-candidate"));
     sb_append(output,
               "{\"report_schema\":\"dxbc-sandbox-report\","
               "\"report_version\":7,\"command\":\"extract\","
@@ -2775,6 +2850,14 @@ static bool render_extract_json(const ShaderCatalog* catalog,
               ","
               "\"artifact_kind\":");
     sb_json_string(output, artifact_kind);
+    if (lift) {
+        const CliLiftCoverage coverage = lift_coverage(catalog, selected, batch, lift);
+        sb_appendf(output, ",\"lifting\":{\"requested\":%zu,\"high_level_candidates\":%zu,"
+                           "\"low_level_fallback_candidates\":%zu,\"unverified\":%zu,"
+                           "\"not_run\":%zu,\"published_local_domain_verified\":%zu}",
+                   coverage.requested, coverage.high_level, coverage.fallback,
+                   coverage.unverified, coverage.not_run, coverage.published_verified);
+    }
     sb_append(output, ","
               "\"complete\":");
     sb_append(output, complete ? "true," : "false,");
@@ -2791,23 +2874,23 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                           ? "true," : "false,");
     sb_append(output, "\"certification\":{\"status\":");
     sb_json_string(output,
-        structurally_covered != 0U
+        lift ? "structural-with-local-domain-reports" : structurally_covered != 0U
             ? (exact_compute_packages != 0U ? "mixed" : "structural-only")
             : (exact_compute_packages != 0U
                    ? "binary-exact-source-fail-closed" : "not-run"));
     sb_append(output, ",\"scope\":");
     sb_json_string(output,
-        structurally_covered != 0U
+        lift ? "per-record-local-d3d11-programs-and-serialized-structure" : structurally_covered != 0U
             ? (exact_compute_packages != 0U
                    ? "mixed-graphics-structure-and-compute-binary"
                    : "serialized-d3d11-shaderlab-structure")
             : (exact_compute_packages != 0U
                    ? "serialized-compute-binary-authority" : "not-run"));
-    sb_append(output,
-              ",\"d3d11\":\"not-run\","
-              "\"glsl\":\"not-run\","
-              "\"variant_selection\":\"not-run\","
-              "\"pipeline_state\":");
+    sb_append(output, ",\"d3d11\":");
+    sb_json_string(output, lift ? "see-local-domain-records" : "not-run");
+    sb_append(output, ",\"glsl\":\"not-run\",\"variant_selection\":");
+    sb_json_string(output, lift ? "see-local-domain-records" : "not-run");
+    sb_append(output, ",\"pipeline_state\":");
     sb_json_string(output, structural_failures != 0U
         ? "structural-coverage-failed"
         : (structurally_covered != 0U
@@ -2931,12 +3014,23 @@ static bool render_extract_json(const ShaderCatalog* catalog,
         }
         append_candidate_diagnostic_json(output, result);
         append_structural_diagnostic_json(output, result);
+        const bool lifted_output_verified = cli_shaderlab_lift_output_verified(lift, i, result);
+        if (lift) {
+            sb_append(output, ",\"lift\":");
+            if (!cli_shaderlab_lift_append_json(lift, i, output)) {
+                free(texture_publications);
+                return false;
+            }
+            sb_append(output, ",\"published_local_domain_verified\":");
+            sb_append(output, lifted_output_verified ? "true" : "false");
+        }
         sb_append(output, ",\"artifact_kind\":");
         sb_json_string(output, record->class_id == 72
             ? (result->publication_authorized
                    ? "exact-compute-package"
                    : "unpublished-compute-package")
-            : "uncertified-shaderlab-candidate");
+            : (lifted_output_verified ? "local-domain-verified-shaderlab-candidate"
+                                      : "uncertified-shaderlab-candidate"));
         sb_append(output, ",\"certification_status\":");
         if (record->class_id == 72 &&
             result->compute_artifact_status == COMPUTE_SHADER_ARTIFACT_OK &&
@@ -2946,6 +3040,8 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                    result->compute_artifact_status ==
                        COMPUTE_SHADER_ARTIFACT_OK) {
             sb_json_string(output, "failed-closed");
+        } else if (lifted_output_verified && record_has_structural_certificate(result)) {
+            sb_json_string(output, "local-domain-and-structural");
         } else {
             sb_json_string(output, record_has_structural_certificate(result)
                 ? "structural-only"
@@ -2990,12 +3086,14 @@ static bool render_extract_table(const ShaderCatalog* catalog,
                                  const char* registry_path,
                                  const char* registry_digest,
                                  StringBuilder* output,
-                                 bool* out_texture_batch_complete) {
+                                 bool* out_texture_batch_complete,
+                                const CliShaderLabLift *lift) {
     if (!out_texture_batch_complete) return false;
     const bool texture_batch_complete =
         !textures || native_texture_batch_is_complete(textures);
     *out_texture_batch_complete = texture_batch_complete;
-    sb_append(output, "#\tKIND\tSTATUS\tSHADER\tOUTPUT/FAILURE\n");
+    sb_append(output, lift ? "#\tKIND\tSTATUS\tSHADER\tOUTPUT/FAILURE\tLIFT\n"
+                           : "#\tKIND\tSTATUS\tSHADER\tOUTPUT/FAILURE\n");
     size_t view_index = 0U;
     for (size_t i = 0U; i < catalog->record_count; ++i) {
         if (record_matches_kind(&catalog->records[i], selection_kind)) {
@@ -3028,6 +3126,12 @@ static bool render_extract_table(const ShaderCatalog* catalog,
                         result->compute_object_status));
             }
         }
+        if (lift) {
+            sb_append_char(output, '\t');
+            sb_append(output, cli_shaderlab_lift_selection(lift, i));
+            if (!cli_shaderlab_lift_output_verified(lift, i, result))
+                sb_append(output, " (unpublished or unverified)");
+        }
         sb_append_char(output, '\n');
     }
     append_native_texture_batch_table(
@@ -3059,7 +3163,18 @@ static bool render_extract_table(const ShaderCatalog* catalog,
                 (!materials || material_batch_texture_dependencies_are_closed(
                                   materials)) ? "yes" : "no",
         shader_catalog_is_complete(catalog) ? "yes" : "no");
-    if (selection_kind == CLI_SHADER_KIND_COMPUTE) {
+    if (lift) {
+        const CliLiftCoverage coverage = lift_coverage(catalog, selected, batch, lift);
+        sb_appendf(output, "Lifting: requested=%zu high-level=%zu low-level-fallback=%zu "
+                           "unverified=%zu not-run=%zu published-local-domain-verified=%zu\n",
+                   coverage.requested, coverage.high_level, coverage.fallback,
+                   coverage.unverified, coverage.not_run, coverage.published_verified);
+        sb_append(output,
+            "Artifacts: selected high-level or low-level fallback candidates. Published outputs "
+            "passed serialized structural coverage and their complete local D3D11 program domains. "
+            "Import, external dependencies, player/runtime selection and visual equivalence are "
+            "not certified by this command. Use JSON for per-request evidence.\n");
+    } else if (selection_kind == CLI_SHADER_KIND_COMPUTE) {
         sb_append(output,
             "Artifacts: exact serialized compute manifests and compiled "
             "program bytes. Embedded DXBC is also extracted when present; "
@@ -3253,6 +3368,18 @@ static int dxbc_sandbox_main(int argc, char** argv) {
     StringBuilder report;
     sb_init_with_capacity(&report, 16384U);
     int exit_code = selection_blocked_by_incomplete_catalog ? 1 : 0;
+    CliShaderLabLift *lift = NULL;
+    if (options.lift.enabled) {
+        for (size_t i = 0; i < catalog.record_count; ++i) {
+            if (selected[i] && catalog.records[i].class_id != 48) {
+                fputs("Error: --high-level supports graphics Shader selections; use --kind graphics.\n", stderr);
+                exit_code = 2;
+                goto output_cleanup;
+            }
+        }
+        lift = cli_shaderlab_lift_create(&options.lift, catalog.record_count);
+        if (!lift) { exit_code = 1; goto output_cleanup; }
+    }
     if (options.command == CLI_COMMAND_LIST) {
         bool rendered = options.format == CLI_FORMAT_JSON
             ? render_list_json(&catalog, selected, options.shader_kind,
@@ -3319,6 +3446,7 @@ static int dxbc_sandbox_main(int argc, char** argv) {
         batch_options.emit_shader_meta = options.export_materials;
         batch_options.flat_graphics_output = options.flat_shaders;
         batch_options.defer_source_snapshot_close = false;
+        cli_shaderlab_lift_attach(lift, &batch_options);
         ShaderBatchStatus batch_status = shader_batch_extract_ex(
             &catalog, selected, &registry, options.output_directory,
             &batch_options, &batch);
@@ -3369,14 +3497,14 @@ static int dxbc_sandbox_main(int argc, char** argv) {
                                       registry_path,
                                       registry_digest,
                                       &report,
-                                      &texture_batch_render_complete)
+                                      &texture_batch_render_complete, lift)
                 : render_extract_table(&catalog, selected, &batch,
                                        material_report, texture_report,
                                        options.shader_kind,
                                        options.show_sources, registry_path,
                                        registry_digest,
                                        &report,
-                                       &texture_batch_render_complete);
+                                       &texture_batch_render_complete, lift);
             const bool texture_batch_exit_complete =
                 !options.export_materials ||
                 native_texture_batch_is_complete(&texture_batch);
@@ -3419,6 +3547,8 @@ static int dxbc_sandbox_main(int argc, char** argv) {
         exit_code = 1;
     }
 
+output_cleanup:
+    cli_shaderlab_lift_free(lift);
     sb_free(&report);
     free(selected);
     free(registry_path);

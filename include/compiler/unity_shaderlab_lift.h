@@ -79,8 +79,9 @@ typedef struct UnityShaderLabLiftResult UnityShaderLabLiftResult;
  * The returned evidence covers generated local D3D11 program domains only,
  * not external UsePass/dependencies, import, render state, or whole-shader
  * logical/visual equivalence. Late, cancelled or unproven output is never
- * returned by accepted(). A baseline accepted before a later failure remains
- * available with its original authority and scope. Compile request digests can
+ * returned by accepted(). A baseline accepted before a later candidate failure
+ * remains available unless the pinned compiler, includes, or profile changed.
+ * Both artifacts retain their original evidence for review. Compile request digests can
  * differ between forms because preprocessed contracts carry source hashes and
  * line locations; each complete contract is independently attested. */
 HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,

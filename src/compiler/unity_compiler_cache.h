@@ -123,8 +123,8 @@ bool usc_cache_serialize_preprocess_request(
     size_t* out_size);
 
 /*
- * Fingerprints all include and toolchain inputs visible to this client
- * configuration.  Every regular file is hashed regardless of extension: the
+ * Fingerprints the configured include and toolchain roots. Request-specific
+ * source search roots are captured separately.  Every regular file is hashed regardless of extension: the
  * shader preprocessor can include arbitrary names.  Symlink spelling and the
  * complete compiler-visible target tree both contribute.  Broken links,
  * directory cycles, unsupported special nodes, and detected concurrent
@@ -153,6 +153,20 @@ bool usc_cache_toolchain_lease_create(
     const UscCacheToolchainPaths* paths,
     uint8_t compiler_digest[USC_CACHE_DIGEST_SIZE],
     uint8_t environment_digest[USC_CACHE_DIGEST_SIZE],
+    UscCacheToolchainLease** out_lease);
+
+/* Extend a configured environment with an ordered set of request-specific
+ * include search roots. Roots must be absolute: the caller resolves them in
+ * the compiler's working directory, without changing their symlink spelling.
+ * Missing roots participate in the digest and lease, so adding a previously
+ * absent shadow header cannot reuse the old request. This snapshots complete
+ * trees, not an inferred include closure; paths reached outside these roots
+ * need their own authority. Ownership and validation match toolchain leases. */
+bool usc_cache_search_roots_lease_create(
+    const char* const* roots,
+    size_t root_count,
+    const uint8_t environment_digest[USC_CACHE_DIGEST_SIZE],
+    uint8_t request_environment_digest[USC_CACHE_DIGEST_SIZE],
     UscCacheToolchainLease** out_lease);
 
 bool usc_cache_toolchain_lease_validate(

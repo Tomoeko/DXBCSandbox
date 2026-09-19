@@ -42,6 +42,33 @@ int main(void) {
     CHECK(strcmp(parsed_options.output_directory, "flat-output") == 0);
     cli_options_dispose(&parsed_options);
 
+    char *lift_arguments[] = {
+        (char *)"dxbc-sandbox", (char *)"extract", (char *)"fixture.assets",
+        (char *)"--all", (char *)"--out", (char *)"lift-output",
+        (char *)"--high-level", (char *)"--compile-profile", (char *)"captured.profile",
+        (char *)"--lift-max-compiles", (char *)"17", (char *)"--lift-timeout-ms", (char *)"1200",
+    };
+    CHECK(parse_cli(13, lift_arguments, &parsed_options, &help_requested) == cli_shaderlab_lift_supported());
+    if (cli_shaderlab_lift_supported()) {
+        CHECK(parsed_options.lift.enabled && parsed_options.lift.max_compiles == 17 &&
+              parsed_options.lift.max_elapsed_ms == 1200);
+        CHECK(strcmp(parsed_options.lift.profile_path, "captured.profile") == 0);
+    }
+    cli_options_dispose(&parsed_options);
+    lift_arguments[10] = (char *)"0";
+    CHECK(!parse_cli(13, lift_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+    lift_arguments[10] = (char *)"17";
+    CHECK(!parse_cli(7, lift_arguments, &parsed_options, &help_requested)); /* Missing profile. */
+    cli_options_dispose(&parsed_options);
+    lift_arguments[6] = (char *)"--sources";
+    CHECK(!parse_cli(13, lift_arguments, &parsed_options, &help_requested)); /* Orphan controls. */
+    cli_options_dispose(&parsed_options);
+    lift_arguments[6] = (char *)"--high-level";
+    lift_arguments[12] = (char *)"184467440737095516160";
+    CHECK(!parse_cli(13, lift_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+
     ShaderCatalogRecord catalog_records[2];
     memset(catalog_records, 0, sizeof(catalog_records));
     memcpy(catalog_records[0].occurrence_id, "compute-id",
@@ -120,7 +147,7 @@ int main(void) {
 
     CHECK(render_extract_json(
         &catalog, selected, &batch, NULL, NULL, CLI_SHADER_KIND_ALL,
-        NULL, NULL, &report, &texture_batch_complete));
+        NULL, NULL, &report, &texture_batch_complete, NULL));
     CHECK(texture_batch_complete);
     CHECK(strstr(report.buf, "\"report_version\":7") != NULL);
     CHECK(strstr(
@@ -158,7 +185,7 @@ int main(void) {
     CHECK(render_extract_json(
         &catalog, compute_only_selected, &batch, NULL, NULL,
         CLI_SHADER_KIND_COMPUTE, NULL, NULL, &report,
-        &texture_batch_complete));
+        &texture_batch_complete, NULL));
     CHECK(texture_batch_complete);
     CHECK(strstr(
         report.buf,
@@ -186,7 +213,7 @@ int main(void) {
     CHECK(render_extract_json(
         &catalog, compute_only_selected, &batch, NULL, &textures,
         CLI_SHADER_KIND_COMPUTE, NULL, NULL, &report,
-        &texture_batch_complete));
+        &texture_batch_complete, NULL));
     CHECK(!texture_batch_complete);
     CHECK(strstr(
         report.buf,

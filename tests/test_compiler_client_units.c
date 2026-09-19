@@ -482,6 +482,15 @@ static int run_fake_compiler(
                 break;
             }
             int path_matches = fake_shader_path_matches(basename, directory);
+            if (strcmp(source, "mutate-source-root") == 0) {
+                char path[PATH_MAX];
+                if (snprintf(path, sizeof(path), "%s/late.data", directory) <= 0)
+                    break;
+                FILE* mutation = fopen(path, "wb");
+                if (!mutation) break;
+                fputs("changed during compile", mutation);
+                fclose(mutation);
+            }
             if (strcmp(source, "reflection-records") == 0) {
                 static const char* records[] = {
                     "input: 1 2",
@@ -728,6 +737,81 @@ static char* make_long_shader_name(const char* prefix, size_t size) {
     memset(name + prefix_size, 'x', size - prefix_size);
     name[size] = '\0';
     return name;
+}
+
+static int verify_source_root_cache(
+    UnityCompilerChannel* channel,
+    const UnityCompilerSnippetCompileRequest* template_request,
+    const UnityCompilerShaderPreprocessRequest* template_preprocess) {
+    char directory[] = "/tmp/dxbc-source-authority.XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    char file_path[PATH_MAX], header[PATH_MAX];
+    CHECK(snprintf(file_path, sizeof(file_path), "%s/Fixture.shader", directory) > 0);
+    CHECK(snprintf(header, sizeof(header), "%s/UnityShaderVariables.cginc", directory) > 0);
+    UnityCompilerSnippetCompileRequest request = *template_request;
+    request.source_directory = directory;
+    request.snippet_source = "source-authority-fixture";
+    UnityCompilerShaderPreprocessRequest preprocess = *template_preprocess;
+    preprocess.file_path = file_path;
+    preprocess.shader_name = "preprocess-success";
+    uint8_t original_compile[32], original_preprocess[32];
+    UnityCompilerToolchainProvenance original;
+    CHECK(unity_compiler_get_source_provenance(channel, directory, &original));
+    for (int warm = 0; warm < 2; ++warm) {
+        UnityCompilerBinaryResponse binary;
+        CHECK(unity_compiler_compile_contract_response(channel, &request, &binary));
+        CHECK(binary.status.compiler_success && binary.status.from_cache == (warm != 0));
+        if (!warm) memcpy(original_compile, binary.request_digest, 32);
+        else CHECK(memcmp(original_compile, binary.request_digest, 32) == 0);
+        unity_compiler_binary_response_free(&binary);
+        UnityCompilerPreprocessResponse response;
+        CHECK(unity_compiler_preprocess_contract_response(channel, &preprocess, &response));
+        CHECK(response.status.compiler_success && response.status.from_cache == (warm != 0));
+        if (!warm) memcpy(original_preprocess, response.request_digest, 32);
+        else CHECK(memcmp(original_preprocess, response.request_digest, 32) == 0);
+        unity_compiler_preprocess_response_free(&response);
+    }
+    const pid_t original_pid = channel->process_id;
+    CHECK(original_pid > 0);
+    CHECK(write_file(header, "#error shadow\n", 14));
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    UnityCompilerBinaryResponse binary;
+    CHECK(unity_compiler_compile_contract_response(channel, &request, &binary));
+    CHECK(binary.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS);
+    CHECK(memcmp(original_compile, binary.request_digest, 32) != 0);
+    CHECK(channel->process_id == 0 && channel->socket_fd == -1);
+    unity_compiler_binary_response_free(&binary);
+    UnityCompilerPreprocessResponse response;
+    CHECK(unity_compiler_preprocess_contract_response(channel, &preprocess, &response));
+    CHECK(response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS);
+    CHECK(memcmp(original_preprocess, response.request_digest, 32) != 0);
+    unity_compiler_preprocess_response_free(&response);
+    UnityCompilerToolchainProvenance changed;
+    CHECK(unity_compiler_get_source_provenance(channel, directory, &changed));
+    CHECK(original.source_authority_revision != changed.source_authority_revision);
+    CHECK(memcmp(original.environment_fingerprint, changed.environment_fingerprint, 32) != 0);
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
+    CHECK(unity_compiler_compile_contract_response(channel, &request, &binary));
+    CHECK(binary.status.compiler_success && !binary.status.from_cache);
+    const UnityCompilerOfflineAuthority authority = {
+        changed.compiler_fingerprint, changed.environment_fingerprint};
+    uint8_t* transcript = NULL;
+    size_t transcript_size = 0;
+    uint8_t offline_digest[32];
+    CHECK(unity_compiler_serialize_compile_request_with_authority(
+        &request, &authority, &transcript, &transcript_size, offline_digest));
+    CHECK(memcmp(binary.request_digest, offline_digest, 32) == 0);
+    free(transcript);
+    unity_compiler_binary_response_free(&binary);
+    CHECK(channel->process_id > 0 && channel->process_id != original_pid);
+    /* The fake compiler mutates the captured tree before returning success.
+     * That successful wire response must not be accepted or cached. */
+    request.snippet_source = "mutate-source-root";
+    CHECK(!unity_compiler_compile_contract_response(channel, &request, &binary));
+    CHECK(binary.data == NULL && channel->process_id == 0);
+    unity_compiler_binary_response_free(&binary);
+    remove_tree(directory);
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -2529,8 +2613,10 @@ int main(int argc, char** argv) {
     fixture_text = unity_compiler_preprocess_expanded(
         &fixture_channel, "verify-long-expanded-path", long_assets_name,
         0, 4, 0U, NULL, 0, NULL, 0);
-    CHECK(fixture_text && strcmp(fixture_text, "expanded fixture") == 0);
-    free(fixture_text);
+    /* A wire string can exceed filesystem limits, but an implicit include
+     * root that cannot be snapshotted is not compiler authority. Never shorten
+     * that path to an apparently valid directory. */
+    CHECK(fixture_text == NULL);
     free(long_assets_name);
 
     size_t fixture_binary_size = 0U;
@@ -2549,10 +2635,9 @@ int main(int argc, char** argv) {
     fixture_binary = unity_compiler_compile(
         &fixture_channel, "verify-long-compile-path", long_package_name,
         0, 4, 0U, NULL, 0, NULL, 0, &fixture_binary_size, &fixture_error);
-    CHECK(fixture_binary && fixture_binary_size ==
-                                sizeof("expanded fixture") - 1U);
-    CHECK(fixture_error == NULL);
-    free(fixture_binary);
+    CHECK(fixture_binary == NULL && fixture_binary_size == 0U);
+    free(fixture_error);
+    fixture_error = NULL;
     free(long_package_name);
 
     UnityCompilerSnippetCompileRequest diagnosed_compile_request = {
@@ -2881,6 +2966,9 @@ int main(int argc, char** argv) {
           legacy_response.status.diagnostic_count == 1U);
     CHECK(strstr(legacy_response.status.diagnostics[0].message,
                  "fixture compile error"));
+    /* The legacy source root differs from the preceding typed request. */
+    healthy_pid = fixture_channel.process_id;
+    CHECK(healthy_pid > 0);
     unity_compiler_binary_response_free(&legacy_response);
     CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
     CHECK(unity_compiler_compile_response(
@@ -2927,6 +3015,8 @@ int main(int argc, char** argv) {
     CHECK(fixture_text && strcmp(fixture_text, "fake disassembly") == 0);
     free(fixture_text);
 
+    CHECK(verify_source_root_cache(&fixture_channel, &informational_compile_request,
+                                   &fixture_preprocess) == 0);
     fixture_text = unity_compiler_disassemble(
         &fixture_channel, "ignore-shutdown", 4, 0, NULL, 0U);
     CHECK(fixture_text && strcmp(fixture_text, "fake disassembly") == 0);

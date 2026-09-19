@@ -446,6 +446,7 @@ bool unity_compiler_broker_deserialize_preprocess_result(
 typedef struct {
     UnityCompilerBroker* broker;
     const UnityCompilerSnippetCompileRequest* request;
+    const uint8_t* key;
 } ContractCompileContext;
 
 static uint8_t* execute_contract_compile(void* opaque, size_t* out_size,
@@ -456,8 +457,19 @@ static uint8_t* execute_contract_compile(void* opaque, size_t* out_size,
     atomic_fetch_add_explicit(&broker->executed_requests, 1,
                               memory_order_relaxed);
     const pid_t process_before = broker->channel.process_id;
-    uint8_t* result = unity_compiler_compile_contract(
-        &broker->channel, context->request, out_size, out_error);
+    UnityCompilerBinaryResponse response;
+    const bool received = unity_compiler_compile_contract_response(
+        &broker->channel, context->request, &response);
+    uint8_t* result = NULL;
+    if (received && response.has_request_identity &&
+        memcmp(context->key, response.request_digest, USC_SINGLE_FLIGHT_KEY_SIZE) == 0) {
+        result = unity_compiler_binary_response_take_clean_data(&response, out_size, out_error);
+    } else {
+        unity_compiler_binary_response_free(&response);
+        if (out_error)
+            *out_error = strdup(received ? "Compiler request authority changed before execution"
+                                        : "UnityShaderCompiler transport or protocol failure");
+    }
     finish_protocol_transaction_locked(
         broker, process_before, context->request->snippet_source);
     pthread_mutex_unlock(&broker->protocol_mutex);
@@ -484,7 +496,6 @@ uint8_t* unity_compiler_broker_compile_contract(
                               memory_order_relaxed);
     atomic_fetch_add_explicit(&broker->compile_requests, 1,
                               memory_order_relaxed);
-    ContractCompileContext context = {broker, request};
     uint8_t key[USC_SINGLE_FLIGHT_KEY_SIZE];
     if (!canonical_contract_compile_key(broker, request, key)) {
         if (out_error) {
@@ -493,6 +504,7 @@ uint8_t* unity_compiler_broker_compile_contract(
         }
         return NULL;
     }
+    ContractCompileContext context = {broker, request, key};
     bool joined = false;
     uint8_t* result = usc_single_flight_execute(
         broker->compile_single_flight, key, execute_contract_compile,
@@ -500,6 +512,17 @@ uint8_t* unity_compiler_broker_compile_contract(
     if (joined) {
         atomic_fetch_add_explicit(&broker->coalesced_compile_requests, 1,
                                   memory_order_relaxed);
+    }
+    uint8_t current_key[USC_SINGLE_FLIGHT_KEY_SIZE];
+    if (result && (!canonical_contract_compile_key(broker, request, current_key) ||
+                   memcmp(key, current_key, sizeof(key)) != 0)) {
+        free(result);
+        result = NULL;
+        *out_size = 0;
+        if (out_error) {
+            free(*out_error);
+            *out_error = strdup("Compiler request authority changed before acceptance");
+        }
     }
     return result;
 }
@@ -544,6 +567,17 @@ bool unity_compiler_broker_get_toolchain_provenance(
     pthread_mutex_lock(&broker->protocol_mutex);
     bool result = unity_compiler_get_toolchain_provenance(
         &broker->channel, out_provenance);
+    pthread_mutex_unlock(&broker->protocol_mutex);
+    return result;
+}
+
+bool unity_compiler_broker_get_source_provenance(
+    UnityCompilerBroker* broker, const char* source_root,
+    UnityCompilerToolchainProvenance* out_provenance) {
+    if (!broker || !out_provenance) return false;
+    pthread_mutex_lock(&broker->protocol_mutex);
+    const bool result = unity_compiler_get_source_provenance(
+        &broker->channel, source_root, out_provenance);
     pthread_mutex_unlock(&broker->protocol_mutex);
     return result;
 }

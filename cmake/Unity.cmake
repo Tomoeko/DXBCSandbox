@@ -46,6 +46,7 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         src/compiler/unity_shaderlab_mapping.c
         src/compiler/unity_shaderlab_lift.c
         src/compiler/unity_shaderlab_lift_report.c
+        src/compiler/unity_shaderlab_lift_batch.c
     )
 
     add_library(unity_compiler_support STATIC ${COMPILER_SOURCES})
@@ -57,6 +58,12 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
     target_link_libraries(unity_compiler_support
         PUBLIC dxbc_core dxbc_compile_profile Threads::Threads
         PRIVATE dxbc_build_options)
+
+    if(DXBCSANDBOX_BUILD_ASSET_CLI)
+        foreach(_dxbc_asset_cli dxbc_sandbox_cli asset_client_cli)
+            target_compile_definitions(${_dxbc_asset_cli} PRIVATE DXBCSANDBOX_CLI_UNITY_COMPILER=1)
+        endforeach()
+    endif()
 
     # C-only replacement for the historical Python golden runner. One broker
     # and one persistent UnityShaderCompiler process serve the whole corpus.
@@ -181,4 +188,3 @@ if(DXBCSANDBOX_BUILD_WINDOWS_D3D_TEST)
     target_link_libraries(test_hlsl_compile PRIVATE
         dxbc_core dxbc_build_options)
 endif()
-

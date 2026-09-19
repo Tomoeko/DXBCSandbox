@@ -131,6 +131,10 @@ bool unity_compiler_broker_get_toolchain_provenance(
     UnityCompilerBroker* broker,
     UnityCompilerToolchainProvenance* out_provenance);
 
+bool unity_compiler_broker_get_source_provenance(
+    UnityCompilerBroker* broker, const char* source_root,
+    UnityCompilerToolchainProvenance* out_provenance);
+
 /* Serialized access to the typed initializeCompiler authority.  Snapshot is
  * process-free; capture may initialize the broker's one shared compiler once
  * and is disabled by cache-only mode when no record has been captured. */

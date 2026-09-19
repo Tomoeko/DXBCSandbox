@@ -257,6 +257,66 @@ static bool verify_environment_fingerprint_hardening(
     return true;
 }
 
+static bool verify_request_search_roots(const char* temporary_dir) {
+    char root[PATH_MAX], header[PATH_MAX], alias[PATH_MAX], absent[PATH_MAX];
+    CHECK(snprintf(root, sizeof(root), "%s/source", temporary_dir) > 0);
+    CHECK(snprintf(header, sizeof(header), "%s/UnityShaderVariables.cginc", root) > 0);
+    CHECK(snprintf(alias, sizeof(alias), "%s/source-alias", temporary_dir) > 0);
+    CHECK(snprintf(absent, sizeof(absent), "%s/future-source", temporary_dir) > 0);
+    CHECK(mkdir(root, 0700) == 0);
+    const char* roots[] = {root, absent};
+    uint8_t base[32] = {1}, first[32], second[32];
+    UscCacheToolchainLease* lease = NULL;
+    CHECK(usc_cache_search_roots_lease_create(roots, 2, base, first, &lease));
+    CHECK(usc_cache_toolchain_lease_validate(lease));
+    /* A newly added source-local header invalidates an otherwise unchanged
+     * configured Unity include environment. */
+    CHECK(write_file(header, "#error shadow\n", 14));
+    CHECK(!usc_cache_toolchain_lease_validate(lease));
+    usc_cache_toolchain_lease_destroy(lease);
+    CHECK(usc_cache_search_roots_lease_create(roots, 2, base, second, &lease));
+    CHECK(memcmp(first, second, 32) != 0);
+    memcpy(first, second, 32);
+    CHECK(write_file(header, "#error change\n", 14));
+    CHECK(!usc_cache_toolchain_lease_validate(lease));
+    usc_cache_toolchain_lease_destroy(lease);
+    CHECK(usc_cache_search_roots_lease_create(roots, 2, base, second, &lease));
+    CHECK(memcmp(first, second, 32) != 0);
+    memcpy(first, second, 32);
+    CHECK(mkdir(absent, 0700) == 0);
+    CHECK(!usc_cache_toolchain_lease_validate(lease));
+    usc_cache_toolchain_lease_destroy(lease);
+    CHECK(usc_cache_search_roots_lease_create(roots, 2, base, second, &lease));
+    CHECK(memcmp(first, second, 32) != 0);
+    memcpy(first, second, 32);
+    usc_cache_toolchain_lease_destroy(lease);
+    /* Stable snapshots are deterministic, including in-place extension. */
+    memcpy(second, base, 32);
+    CHECK(usc_cache_search_roots_lease_create(roots, 2, second, second, &lease));
+    CHECK(memcmp(first, second, 32) == 0);
+    usc_cache_toolchain_lease_destroy(lease);
+    const char* reversed[] = {absent, root};
+    CHECK(usc_cache_search_roots_lease_create(reversed, 2, base, second, &lease));
+    CHECK(memcmp(first, second, 32) != 0);
+    usc_cache_toolchain_lease_destroy(lease);
+    CHECK(symlink("source", alias) == 0);
+    const char* linked[] = {alias};
+    CHECK(usc_cache_search_roots_lease_create(linked, 1, base, first, &lease));
+    CHECK(unlink(alias) == 0 && symlink("future-source", alias) == 0);
+    CHECK(!usc_cache_toolchain_lease_validate(lease));
+    usc_cache_toolchain_lease_destroy(lease);
+    CHECK(usc_cache_search_roots_lease_create(linked, 1, base, second, &lease));
+    CHECK(memcmp(first, second, 32) != 0);
+    usc_cache_toolchain_lease_destroy(lease);
+    const char* relative[] = {"source"};
+    lease = (UscCacheToolchainLease*)(uintptr_t)1;
+    CHECK(!usc_cache_search_roots_lease_create(relative, 1, base, second, &lease));
+    CHECK(lease == NULL);
+    uint8_t zero[32] = {0};
+    CHECK(memcmp(second, zero, 32) == 0);
+    return true;
+}
+
 static void cache_entry_path(
     const char* cache_dir,
     const uint8_t digest[USC_CACHE_DIGEST_SIZE],
@@ -416,7 +476,8 @@ static bool run_all_tests(void) {
     char* temporary_dir = mkdtemp(temporary_template);
     CHECK(temporary_dir != NULL);
     bool ok = verify_collision_safe_publication(temporary_dir) &&
-              verify_environment_fingerprint_hardening(temporary_dir);
+              verify_environment_fingerprint_hardening(temporary_dir) &&
+              verify_request_search_roots(temporary_dir);
     remove_tree(temporary_dir);
     CHECK(ok);
     return true;

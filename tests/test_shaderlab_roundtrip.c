@@ -99,7 +99,6 @@ typedef struct {
     bool strict_hits;
     bool capture_failed;
     bool ready;
-    bool live_authority_checked;
     bool live_authority_matches;
     uint8_t compiler_fingerprint[ORACLE_PACK_DIGEST_SIZE];
     uint8_t environment_fingerprint[ORACLE_PACK_DIGEST_SIZE];
@@ -1854,20 +1853,16 @@ static bool oracle_authority_matches_provenance(
                sizeof(g_oracle.environment_fingerprint)) == 0;
 }
 
-/* Frozen replay does not inspect the local Unity installation.  A non-strict
- * miss is the only point at which local compiler authority becomes relevant;
- * validate it lazily before allowing the broker to execute the request. */
+/* Strict frozen lookup never inspects Unity. Live fallback must revalidate
+ * configured authority for every operation; request transcripts additionally
+ * bind the current implicit include search tree. */
 static bool oracle_validate_live_authority(UnityCompilerBroker* broker) {
     if (!broker) return false;
     pthread_mutex_lock(&g_oracle.mutex);
-    if (!g_oracle.live_authority_checked) {
-        UnityCompilerToolchainProvenance provenance;
-        g_oracle.live_authority_matches =
-            unity_compiler_broker_get_toolchain_provenance(
-                broker, &provenance) &&
-            oracle_authority_matches_provenance(&provenance);
-        g_oracle.live_authority_checked = true;
-    }
+    UnityCompilerToolchainProvenance provenance;
+    g_oracle.live_authority_matches =
+        unity_compiler_broker_get_toolchain_provenance(broker, &provenance) &&
+        oracle_authority_matches_provenance(&provenance);
     bool matches = g_oracle.live_authority_matches;
     pthread_mutex_unlock(&g_oracle.mutex);
     return matches;
@@ -1962,7 +1957,6 @@ static bool verification_oracle_initialize(
                    provenance.environment_fingerprint,
                    sizeof(g_oracle.environment_fingerprint));
         }
-        g_oracle.live_authority_checked = true;
         g_oracle.live_authority_matches = true;
         OraclePackAuthorityInput authority = oracle_pack_authority_input();
         OraclePackStatus status = oracle_pack_writer_create(
@@ -2021,7 +2015,6 @@ static void verification_oracle_dispose(void) {
     g_oracle.capture_writer = NULL;
     g_oracle.frozen_pack = NULL;
     g_oracle.ready = false;
-    g_oracle.live_authority_checked = false;
     g_oracle.live_authority_matches = false;
     memset(g_oracle.compiler_fingerprint, 0,
            sizeof(g_oracle.compiler_fingerprint));
@@ -3134,9 +3127,12 @@ static bool oracle_preprocess_or_lookup(
     size_t transcript_size = 0U;
     uint8_t request_digest[ORACLE_PACK_DIGEST_SIZE];
     UnityCompilerOfflineAuthority authority = oracle_compiler_authority();
-    if (!unity_compiler_broker_serialize_preprocess_request_with_authority(
-            broker, request, &authority, &transcript, &transcript_size,
-            request_digest) || !transcript || transcript_size == 0U) {
+    const bool serialized = g_oracle.strict_hits
+        ? unity_compiler_broker_serialize_preprocess_request_with_authority(
+              broker, request, &authority, &transcript, &transcript_size, request_digest)
+        : unity_compiler_broker_serialize_preprocess_request(
+              broker, request, &transcript, &transcript_size, request_digest);
+    if (!serialized || !transcript || transcript_size == 0U) {
         free(transcript);
         oracle_note_authority_failure();
         fprintf(stderr, "Preprocess authority request could not be "
@@ -3234,6 +3230,20 @@ static bool oracle_preprocess_or_lookup(
     }
     if (!broker_preprocess_clean(
             broker, request, &diagnostic_context, out_result)) {
+        free(transcript);
+        return false;
+    }
+    uint8_t* current_transcript = NULL;
+    size_t current_transcript_size = 0;
+    uint8_t current_digest[ORACLE_PACK_DIGEST_SIZE];
+    const bool request_unchanged = unity_compiler_broker_serialize_preprocess_request(
+        broker, request, &current_transcript, &current_transcript_size, current_digest) &&
+        memcmp(request_digest, current_digest, sizeof(current_digest)) == 0;
+    free(current_transcript);
+    if (!request_unchanged) {
+        oracle_note_authority_failure();
+        unity_compiler_free_preprocess(out_result);
+        memset(out_result, 0, sizeof(*out_result));
         free(transcript);
         return false;
     }
@@ -3386,10 +3396,13 @@ static uint8_t* oracle_compile_or_lookup(
     size_t transcript_size = 0;
     uint8_t request_digest[ORACLE_PACK_DIGEST_SIZE];
     UnityCompilerOfflineAuthority authority = oracle_compiler_authority();
-    if (!unity_compiler_broker_serialize_compile_request_with_authority(
-            broker, &invocation->request, &authority, &transcript,
-            &transcript_size, request_digest) || !transcript ||
-        transcript_size == 0U) {
+    const bool serialized = g_oracle.strict_hits
+        ? unity_compiler_broker_serialize_compile_request_with_authority(
+              broker, &invocation->request, &authority, &transcript,
+              &transcript_size, request_digest)
+        : unity_compiler_broker_serialize_compile_request(
+              broker, &invocation->request, &transcript, &transcript_size, request_digest);
+    if (!serialized || !transcript || transcript_size == 0U) {
         free(transcript);
         oracle_variant_authority_failure(path_id, stage, sub_idx,
                                          report_pass_idx);
@@ -3489,6 +3502,22 @@ static uint8_t* oracle_compile_or_lookup(
     uint8_t* result = broker_compile_clean(
         broker, &invocation->request, &diagnostic_context,
         out_size, out_error);
+    if (result) {
+        uint8_t* current_transcript = NULL;
+        size_t current_transcript_size = 0;
+        uint8_t current_digest[ORACLE_PACK_DIGEST_SIZE];
+        const bool request_unchanged = unity_compiler_broker_serialize_compile_request(
+            broker, &invocation->request, &current_transcript, &current_transcript_size,
+            current_digest) && memcmp(request_digest, current_digest, sizeof(current_digest)) == 0;
+        free(current_transcript);
+        if (!request_unchanged) {
+            oracle_variant_authority_failure(path_id, stage, sub_idx, report_pass_idx);
+            free(result);
+            result = NULL;
+            *out_size = 0;
+            set_owned_error(out_error, "compiler request authority changed during oracle capture");
+        }
+    }
     if (result) {
         pthread_mutex_lock(&g_oracle.mutex);
         g_oracle.broker_fallbacks++;

@@ -51,6 +51,8 @@ typedef struct {
     bool flat_graphics_output;
     bool defer_source_snapshot_close;
     bool allocation_failed;
+    ShaderBatchCandidateSelector select_candidate;
+    void *candidate_context;
     /* The source is borrowed from the exact still-open file identity which
      * the catalog already hashed. */
     bool source_digest_prevalidated;
@@ -265,53 +267,60 @@ static bool stage_candidate(
     }
 
     StringBuilder shaderlab;
+    StringBuilder meta;
     sb_init_with_capacity(&shaderlab, 16384U);
-    bool emitted = shaderlab_emit_candidate_with_diagnostic(
-        &object->shader, archive->entries, archive->entry_count,
-        archive->segments, archive->segment_lengths,
-        archive->segment_count, &shaderlab, &result->candidate_diagnostic);
-    if (emitted) {
-        sb_append_char(&shaderlab, '\n');
-        emitted = sb_ok(&shaderlab);
-        if (!emitted) {
-            result->candidate_diagnostic.status =
-                SHADERLAB_CANDIDATE_OUTPUT_FAILED;
-        }
-    }
-    if (!emitted) {
-        sb_free(&shaderlab);
-        result->failure = SHADER_BATCH_FAILURE_CANDIDATE_EMISSION;
-        return false;
-    }
-    if (shaderlab_structural_certify(
-            object, &result->structural_diagnostic) !=
-        SHADERLAB_STRUCTURE_OK) {
-        sb_free(&shaderlab);
-        result->failure = SHADER_BATCH_FAILURE_STRUCTURAL_COVERAGE;
-        return false;
-    }
-
+    sb_init(&meta);
     staged.directory_path = context->flat_graphics_output
         ? duplicate_path(context->output_directory)
         : common_output_join_path(
               context->output_directory,
               catalog_record->serialized_digest_hex);
     if (!staged.directory_path) {
-        sb_free(&shaderlab);
         result->failure = SHADER_BATCH_FAILURE_OUTPUT_DIRECTORY;
-        return false;
+        goto stage_done;
     }
     staged.output_path = common_output_join_path(
         staged.directory_path, artifact);
     if (!staged.output_path) {
-        sb_free(&shaderlab);
-        staged_shader_publication_dispose(&staged);
         result->failure = SHADER_BATCH_FAILURE_OUTPUT_NAME;
-        return false;
+        goto stage_done;
     }
 
-    StringBuilder meta;
-    sb_init(&meta);
+    bool emitted;
+    if (context->select_candidate) {
+        const ShaderBatchCandidateInput input = {
+            .catalog_record_index = record_index,
+            .object = object,
+            .archive = archive,
+            .source_path = staged.output_path,
+            .source_directory = staged.directory_path,
+            .source_basename = artifact,
+        };
+        emitted = context->select_candidate(context->candidate_context, &input, &shaderlab,
+                                             &result->candidate_diagnostic) &&
+                  sb_ok(&shaderlab) && shaderlab.len != 0;
+    } else {
+        emitted = shaderlab_emit_candidate_with_diagnostic(
+            &object->shader, archive->entries, archive->entry_count,
+            archive->segments, archive->segment_lengths,
+            archive->segment_count, &shaderlab, &result->candidate_diagnostic);
+        if (emitted) {
+            sb_append_char(&shaderlab, '\n');
+            emitted = sb_ok(&shaderlab);
+            if (!emitted)
+                result->candidate_diagnostic.status = SHADERLAB_CANDIDATE_OUTPUT_FAILED;
+        }
+    }
+    if (!emitted) {
+        result->failure = context->select_candidate
+            ? SHADER_BATCH_FAILURE_CANDIDATE_SELECTION : SHADER_BATCH_FAILURE_CANDIDATE_EMISSION;
+        goto stage_done;
+    }
+    if (shaderlab_structural_certify(object, &result->structural_diagnostic) != SHADERLAB_STRUCTURE_OK) {
+        result->failure = SHADER_BATCH_FAILURE_STRUCTURAL_COVERAGE;
+        goto stage_done;
+    }
+
     if (staged.emit_shader_meta) {
         uint8_t identity[COMMON_SHA256_DIGEST_SIZE + 8U];
         memcpy(identity, catalog_record->serialized_digest,
@@ -1057,6 +1066,8 @@ ShaderBatchStatus shader_batch_extract_ex(
         .output_directory = output_directory,
         .result = &pending,
         .emit_shader_meta = options->emit_shader_meta,
+        .select_candidate = options->select_candidate,
+        .candidate_context = options->candidate_context,
         .flat_graphics_output = options->flat_graphics_output,
         .defer_source_snapshot_close =
             options->defer_source_snapshot_close,
@@ -1317,6 +1328,8 @@ const char* shader_batch_failure_name(ShaderBatchFailure failure) {
         case SHADER_BATCH_FAILURE_D3D11_ARCHIVE: return "d3d11-archive";
         case SHADER_BATCH_FAILURE_COMPUTE_ARTIFACT_BUILD:
             return "compute-artifact-build";
+        case SHADER_BATCH_FAILURE_CANDIDATE_SELECTION:
+            return "candidate-selection-failed";
         case SHADER_BATCH_FAILURE_CANDIDATE_EMISSION:
             return "candidate-emission";
         case SHADER_BATCH_FAILURE_STRUCTURAL_COVERAGE:

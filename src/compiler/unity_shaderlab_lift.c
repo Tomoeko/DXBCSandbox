@@ -17,6 +17,8 @@ typedef struct {
     uint8_t compiler_digest[32];
     uint8_t environment_digest[32];
     uint8_t profile_digest[32];
+    uint64_t source_authority_revision;
+    bool authority_changed;
 } LiftContext;
 
 static bool monotonic_ms(void *context, uint64_t *milliseconds) {
@@ -48,7 +50,8 @@ static bool toolchain(LiftContext *context, UnityCompilerToolchainProvenance *pr
     const bool received =
         context->services.toolchain
             ? context->services.toolchain(context->services.context, provenance)
-            : unity_compiler_broker_get_toolchain_provenance(context->input->broker, provenance);
+            : unity_compiler_broker_get_source_provenance(
+                  context->input->broker, context->input->source_directory, provenance);
     return received && has_digest(provenance->compiler_fingerprint) &&
            has_digest(provenance->environment_fingerprint);
 }
@@ -63,8 +66,10 @@ static HLSLLiftStatus work_status(LiftContext *context) {
                 UNITY_COMPILE_PROFILE_OK ||
             memcmp(profile_digest, context->profile_digest, 32) != 0 ||
             memcmp(current.compiler_fingerprint, context->compiler_digest, 32) != 0 ||
-            memcmp(current.environment_fingerprint, context->environment_digest, 32) != 0) {
+            memcmp(current.environment_fingerprint, context->environment_digest, 32) != 0 ||
+            current.source_authority_revision != context->source_authority_revision) {
             context->control.status = HLSL_LIFT_AUTHORITY_MISMATCH;
+            context->authority_changed = true;
         }
         /* Fingerprinting is also work and must finish within the deadline. */
         status = hlsl_lift_control_check(&context->control);
@@ -322,6 +327,7 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
     if (status == HLSL_LIFT_VERIFIED) {
         memcpy(context.compiler_digest, provenance.compiler_fingerprint, 32);
         memcpy(context.environment_digest, provenance.environment_fingerprint, 32);
+        context.source_authority_revision = provenance.source_authority_revision;
         memcpy(result->compiler_digest, context.compiler_digest, 32);
         memcpy(result->environment_digest, context.environment_digest, 32);
         memcpy(result->profile_digest, context.profile_digest, 32);
@@ -347,6 +353,10 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
         result->accepted = &result->candidate;
         result->stats.accepted = 1;
     }
+    /* Keep the earlier evidence for review, but do not publish a fallback
+     * against an environment that changed after its verification. */
+    if (context.authority_changed)
+        result->accepted = NULL;
     return result->candidate.status;
 }
 
