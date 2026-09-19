@@ -69,6 +69,15 @@ static WholeShaderSubjectStatus capture_subject(UnityShaderLabLiftCapture *captu
     common_sha256_final(&hash, descriptor.compiler_session_digest);
     static const char scope[] = "DXBCSandbox.AllEmittedLocalD3D11Passes.FullGeneratedDomain.v1";
     common_sha256(scope, sizeof(scope), descriptor.verification_scope_digest);
+    if (capture->authority.dependencies.status == UNITY_SHADER_DEPENDENCIES_OK) {
+        static const char dependencies[] = "DXBCSandbox.CapturedLift.DependencyMap.v1";
+        common_sha256_init(&hash);
+        common_sha256_update(&hash, dependencies, sizeof(dependencies));
+        common_sha256_update(&hash, capture->authority.dependencies.digest, 32);
+        common_sha256_update(&hash, capture->authority.accepted_source_digest, 32);
+        common_sha256_update(&hash, descriptor.compiler_session_digest, 32);
+        common_sha256_final(&hash, descriptor.dependency_map_digest);
+    }
     return whole_shader_subject_create(&capture->subject, &descriptor);
 }
 
@@ -87,7 +96,6 @@ static bool subject_matches_capture(const UnityShaderLabLiftCapture *capture,
         whole_shader_subject_describe(subject, &actual) != WHOLE_SHADER_SUBJECT_OK)
         return false;
     memcpy(expected.player_profile_digest, actual.player_profile_digest, 32);
-    memcpy(expected.dependency_map_digest, actual.dependency_map_digest, 32);
     memcpy(expected.producer_fingerprint, actual.producer_fingerprint, 32);
     memcpy(expected.candidate_release_digest, actual.candidate_release_digest, 32);
     WholeShaderSubject *bound = NULL;
@@ -271,6 +279,22 @@ static WholeShaderEvidenceStatus structure_unavailable(const UnityShaderLabLiftC
     return whole_shader_evidence_create_unavailable(output, subject, &descriptor);
 }
 
+static bool capture_candidate(const ShaderCatalog *catalog, const ShaderCatalogRecord *record,
+                              const TypeTreeSchemaRegistry *registry,
+                              const WholeShaderSubject *subject, ShaderObject *candidate,
+                              ShaderCatalogObjectReport *report,
+                              ShaderCatalogObjectStatus *source_status) {
+    *source_status = shader_catalog_decode_object(catalog, record, registry, candidate, report);
+    if (*source_status != SHADER_CATALOG_OBJECT_OK)
+        return false;
+    WholeShaderSubjectDescriptor descriptor;
+    return whole_shader_subject_describe(subject, &descriptor) == WHOLE_SHADER_SUBJECT_OK &&
+           memcmp(descriptor.candidate_release_digest, report->release_digest, 32) == 0 &&
+           strcmp(descriptor.candidate_logical_name, candidate->shader.name) == 0 &&
+           strcmp(descriptor.unity_version, record->unity_version) == 0 &&
+           descriptor.serialized_target_platform == record->target_platform;
+}
+
 WholeShaderEvidenceStatus unity_shaderlab_lift_capture_structural_evidence(
     const UnityShaderLabLiftCapture *capture, const ShaderCatalog *candidate_catalog,
     const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
@@ -296,16 +320,8 @@ WholeShaderEvidenceStatus unity_shaderlab_lift_capture_structural_evidence(
     sb_init(&source);
     ShaderLabExpressionSourceMap map = {0};
     WholeShaderEvidenceStatus status = WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
-    report->source_status = shader_catalog_decode_object(candidate_catalog, candidate_record,
-                                                         registry, &candidate, &report->candidate);
-    if (report->source_status != SHADER_CATALOG_OBJECT_OK)
-        goto cleanup;
-    WholeShaderSubjectDescriptor descriptor;
-    if (whole_shader_subject_describe(subject, &descriptor) != WHOLE_SHADER_SUBJECT_OK ||
-        memcmp(descriptor.candidate_release_digest, report->candidate.release_digest, 32) != 0 ||
-        strcmp(descriptor.candidate_logical_name, candidate.shader.name) != 0 ||
-        strcmp(descriptor.unity_version, candidate_record->unity_version) != 0 ||
-        descriptor.serialized_target_platform != candidate_record->target_platform)
+    if (!capture_candidate(candidate_catalog, candidate_record, registry, subject, &candidate,
+                           &report->candidate, &report->source_status))
         goto cleanup;
     if (!capture->authority.structural_digest_valid) {
         status = structure_unavailable(capture, subject, &report->candidate, 1,
@@ -369,6 +385,79 @@ cleanup:
     return status;
 }
 
+WholeShaderEvidenceStatus unity_shaderlab_lift_capture_dependency_evidence(
+    const UnityShaderLabLiftCapture *capture, const ShaderCatalog *candidate_catalog,
+    const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
+    const WholeShaderSubject *subject, WholeShaderEvidence **output,
+    UnityShaderDependencyEvidenceReport *report) {
+    if (output)
+        *output = NULL;
+    if (!report)
+        return WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
+    memset(report, 0, sizeof(*report));
+    report->source_status = SHADER_CATALOG_OBJECT_INVALID_ARGUMENT;
+    report->target_dependencies.status = UNITY_SHADER_DEPENDENCIES_INVALID_ARGUMENT;
+    report->candidate_dependencies.status = UNITY_SHADER_DEPENDENCIES_INVALID_ARGUMENT;
+    if (!output || !capture || !candidate_catalog || !candidate_record ||
+        !subject_matches_capture(capture, subject))
+        return WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
+    report->target_dependencies = capture->authority.dependencies;
+    ShaderObject candidate;
+    shader_object_init(&candidate);
+    WholeShaderEvidenceStatus status = WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
+    if (!capture_candidate(candidate_catalog, candidate_record, registry, subject, &candidate,
+                           &report->candidate, &report->source_status))
+        goto cleanup;
+    (void)unity_shader_dependency_closure(&candidate, &report->candidate_dependencies);
+    uint8_t authority[32];
+    CommonSha256Context hash;
+    common_sha256_init(&hash);
+    static const char domain[] = "DXBCSandbox.CapturedLift.DependencyAuthority.v1";
+    common_sha256_update(&hash, domain, sizeof(domain));
+    common_sha256_update(&hash, capture->authority.target.release_digest, 32);
+    common_sha256_update(&hash, report->candidate.release_digest, 32);
+    common_sha256_update(&hash, capture->authority.accepted_source_digest, 32);
+    common_sha256_update(&hash, capture->authority.compiler_digest, 32);
+    common_sha256_update(&hash, capture->authority.environment_digest, 32);
+    common_sha256_final(&hash, authority);
+    if (report->target_dependencies.status != UNITY_SHADER_DEPENDENCIES_OK ||
+        report->candidate_dependencies.status != UNITY_SHADER_DEPENDENCIES_OK) {
+        const UnityShaderDependencyStatus missing =
+            report->target_dependencies.status != UNITY_SHADER_DEPENDENCIES_OK
+                ? report->target_dependencies.status
+                : report->candidate_dependencies.status;
+        WholeShaderNonpassEvidenceDescriptor descriptor = {
+            .plane = WHOLE_SHADER_PLANE_DEPENDENCY_CLOSURE,
+            .producer = "dxbc-captured-resource-free-vf-closure",
+            .producer_version = 1,
+            .expected_item_count = 1,
+            .reason_code = (uint32_t)missing,
+        };
+        memcpy(descriptor.authority_digest, authority, 32);
+        const char *reason = unity_shader_dependency_status_name(missing);
+        common_sha256(reason, strlen(reason), descriptor.reason_digest);
+        status = whole_shader_evidence_create_unavailable(output, subject, &descriptor);
+    } else {
+        WholeShaderEvidenceComparisonItem item = {0};
+        static const char identity[] = "DXBCSandbox.ResourceFreeVF.RuntimeDependencies.v1";
+        common_sha256(identity, sizeof(identity), item.identity_digest);
+        memcpy(item.expected_digest, report->target_dependencies.digest, 32);
+        memcpy(item.observed_digest, report->candidate_dependencies.digest, 32);
+        WholeShaderComparisonEvidenceDescriptor descriptor = {
+            .plane = WHOLE_SHADER_PLANE_DEPENDENCY_CLOSURE,
+            .producer = "dxbc-captured-resource-free-vf-closure",
+            .producer_version = 1,
+            .items = &item,
+            .item_count = 1,
+        };
+        memcpy(descriptor.authority_digest, authority, 32);
+        status = whole_shader_evidence_create_comparison(output, subject, &descriptor);
+    }
+cleanup:
+    shader_object_dispose(&candidate);
+    return status;
+}
+
 UnityShaderLabLiftCaptureStatus
 unity_shaderlab_lift_capture(const UnityShaderLabLiftCaptureInput *input,
                              UnityShaderLabLiftCapture **output,
@@ -382,6 +471,7 @@ unity_shaderlab_lift_capture(const UnityShaderLabLiftCaptureInput *input,
     report->archive_status = SHADER_OBJECT_NOT_DECODED;
     report->lift_status = HLSL_LIFT_INVALID_ARGUMENT;
     (void)shaderlab_structural_certify(NULL, &report->structure);
+    report->dependencies.status = UNITY_SHADER_DEPENDENCIES_INVALID_ARGUMENT;
     if (!input || !output || !input->catalog || !input->record || !input->broker ||
         !input->limits || !unity_compile_profile_validate(input->profile) || !input->source_path ||
         !input->source_path[0] || !input->source_directory || !input->source_directory[0] ||
@@ -438,6 +528,7 @@ unity_shaderlab_lift_capture(const UnityShaderLabLiftCaptureInput *input,
         report->structure.status == SHADERLAB_STRUCTURE_OK &&
         typetree_value_digest(typetree_find_child(&target.root, "m_ParsedForm"),
                               report->structural_digest);
+    (void)unity_shader_dependency_closure(&target, &report->dependencies);
     capture->authority = *report;
     const WholeShaderSubjectStatus subject_status =
         capture_subject(capture, input->record, &target, &profile);

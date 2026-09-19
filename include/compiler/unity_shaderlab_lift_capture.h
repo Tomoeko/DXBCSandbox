@@ -5,6 +5,7 @@
 #include "app/shader_catalog_object.h"
 #include "app/whole_shader_evidence.h"
 #include "compiler/unity_shaderlab_lift.h"
+#include "compiler/unity_shader_dependency_closure.h"
 #include "translation/shaderlab_structural_certificate.h"
 
 typedef struct UnityShaderLabLiftCapture UnityShaderLabLiftCapture;
@@ -44,6 +45,7 @@ typedef struct {
     ShaderLabStructuralDiagnostic structure;
     bool structural_digest_valid;
     uint8_t structural_digest[32];
+    UnityShaderDependencyReport dependencies;
 } UnityShaderLabLiftCaptureReport;
 
 /* Execute the production lift against an owned captured catalog record. The
@@ -60,8 +62,9 @@ unity_shaderlab_lift_capture(const UnityShaderLabLiftCaptureInput *input,
 const UnityShaderLabLiftResult *
 unity_shaderlab_lift_capture_result(const UnityShaderLabLiftCapture *capture);
 /* Copy the actual target/source/profile/session/scope bindings. String views
- * are owned by capture. Player, dependencies, producer and candidate release
- * remain zero for the coordinator to fill from their own authorities. Scope
+ * are owned by capture. The admitted dependency map binds actual target
+ * inventory plus accepted-source/compiler/include authority. Player, producer
+ * and candidate release remain zero for the coordinator to fill from their own authorities. Scope
  * is every emitted local D3D11 pass and its full generated compile domain. */
 bool unity_shaderlab_lift_capture_subject(const UnityShaderLabLiftCapture *capture,
                                           WholeShaderSubjectDescriptor *descriptor);
@@ -69,7 +72,7 @@ bool unity_shaderlab_lift_capture_subject(const UnityShaderLabLiftCapture *captu
 /* Produce VARIANT_DOMAIN, FULL_DXBC, COMPILER_DIAGNOSTICS or REFLECTION_BINDING
  * using retained primary compile results and shared ordered compile-item identities. Subject fields
  * owned by this capture must match exactly. Other evidence planes must bind
- * the coordinator-supplied player/dependency/released-artifact identities.
+ * the same player/dependency/released-artifact identities.
  * Domain items combine the independent ordered keyword-family fingerprints;
  * the opaque capture also requires the existing complete alias/tier/cardinality
  * attestation. Runtime eligibility and selection remain separate. Output is
@@ -104,6 +107,26 @@ WholeShaderEvidenceStatus unity_shaderlab_lift_capture_structural_evidence(
     const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
     const WholeShaderSubject *subject, WholeShaderEvidence **output,
     UnityShaderLabStructuralEvidenceReport *report);
+
+typedef struct {
+    ShaderCatalogObjectStatus source_status;
+    ShaderCatalogObjectReport candidate;
+    UnityShaderDependencyReport target_dependencies;
+    UnityShaderDependencyReport candidate_dependencies;
+} UnityShaderDependencyEvidenceReport;
+
+/* Compare independently inspected runtime dependency inventories from the
+ * opaque target lift and an actual subject-bound candidate capture. Restricted
+ * to the resource-free V/F scope documented by unity_shader_dependency_closure.
+ * Outside that scope produces UNAVAILABLE, never raw-reference equality.
+ * Subject dependency_map_digest must match this capture's map (which also
+ * binds selected compiler/include authority). Original source includes are
+ * unknown and not claimed; runtime environment/selection remain separate. */
+WholeShaderEvidenceStatus unity_shaderlab_lift_capture_dependency_evidence(
+    const UnityShaderLabLiftCapture *capture, const ShaderCatalog *candidate_catalog,
+    const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
+    const WholeShaderSubject *subject, WholeShaderEvidence **output,
+    UnityShaderDependencyEvidenceReport *report);
 
 void unity_shaderlab_lift_capture_free(UnityShaderLabLiftCapture *capture);
 

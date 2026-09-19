@@ -11,6 +11,155 @@
         }                                                                                          \
     } while (0)
 
+/* Mutate an owned decoded tree and re-project through the production parser;
+ * these tests never supply a model that disagrees with its serialized values. */
+static int check_dependency_mutation(ShaderObject *object, TypeTreeValue *field,
+                                     const TypeTreeValue *replacement,
+                                     UnityShaderDependencyStatus expected) {
+    CHECK(field && replacement);
+    const TypeTreeValue saved = *field;
+    *field = *replacement;
+    const bool parsed =
+        serialized_shader_parse_with_profile(&object->shader, &object->root, object->profile);
+    UnityShaderDependencyReport report;
+    const UnityShaderDependencyStatus result = unity_shader_dependency_closure(object, &report);
+    *field = saved;
+    CHECK(serialized_shader_parse_with_profile(&object->shader, &object->root, object->profile));
+    CHECK(parsed && result == expected);
+    const uint8_t zero[32] = {0};
+    CHECK(memcmp(report.digest, zero, sizeof(zero)) == 0);
+    return 0;
+}
+
+static int check_text_dependency(ShaderObject *object, TypeTreeValue *parent, const char *path,
+                                 const char *replacement, UnityShaderDependencyStatus expected) {
+    TypeTreeValue *field = (TypeTreeValue *)typetree_find_path(parent, path);
+    CHECK(field && field->type == VAL_TYPE_STRING);
+    TypeTreeValue changed = *field;
+    changed.string_val = (char *)replacement;
+    changed.string_length = strlen(replacement);
+    return check_dependency_mutation(object, field, &changed, expected);
+}
+
+static int check_dependency_boundaries(ShaderObject *object) {
+    UnityShaderDependencyReport before, after;
+    (void)unity_shader_dependency_closure(object, &before);
+    CHECK(check_text_dependency(object, &object->root, "m_ParsedForm/m_FallbackName",
+                                "Dependency/Other",
+                                UNITY_SHADER_DEPENDENCIES_EXTERNAL_REFERENCE) == 0);
+    CHECK(check_text_dependency(object, &object->root, "m_ParsedForm/m_CustomEditorName",
+                                "ExternalEditor",
+                                UNITY_SHADER_DEPENDENCIES_EXTERNAL_REFERENCE) == 0);
+    /* Even byte-identical raw IDs or a null slot are not a resolved graph. */
+    TypeTreeValue pointer_fields[] = {
+        {.name = "m_FileID", .type_str = "int", .type = VAL_TYPE_INT, .int_val = 0},
+        {.name = "m_PathID", .type_str = "SInt64", .type = VAL_TYPE_INT, .int_val = 7},
+    };
+    TypeTreeValue pointer = {.name = "data", .type_str = "PPtr<Shader>", .type = VAL_TYPE_STRUCT};
+    pointer.struct_val.members = pointer_fields;
+    pointer.struct_val.count = 2;
+    TypeTreeValue *references =
+        (TypeTreeValue *)typetree_find_child(&object->root, "m_Dependencies");
+    CHECK(references);
+    TypeTreeValue changed = *references;
+    changed.array_val.elements = &pointer;
+    changed.array_val.count = 1;
+    CHECK(check_dependency_mutation(object, references, &changed,
+                                    UNITY_SHADER_DEPENDENCIES_EXTERNAL_REFERENCE) == 0);
+    pointer_fields[1].int_val = 0;
+    CHECK(check_dependency_mutation(object, references, &changed,
+                                    UNITY_SHADER_DEPENDENCIES_EXTERNAL_REFERENCE) == 0);
+
+    TypeTreeValue *subshaders =
+        (TypeTreeValue *)typetree_find_path(&object->root, "m_ParsedForm/m_SubShaders");
+    CHECK(subshaders);
+    if (subshaders->array_val.count) {
+        TypeTreeValue *passes =
+            (TypeTreeValue *)typetree_find_child(&subshaders->array_val.elements[0], "m_Passes");
+        CHECK(passes && passes->array_val.count);
+        TypeTreeValue *pass = &passes->array_val.elements[0];
+        const char *const text_fields[] = {"m_UseName", "m_TextureName", "m_State/zTest/name"};
+        for (size_t i = 0; i < sizeof(text_fields) / sizeof(text_fields[0]); ++i)
+            CHECK(check_text_dependency(object, pass, text_fields[i], "ExternalInput",
+                                        UNITY_SHADER_DEPENDENCIES_UNSUPPORTED_PASS) == 0);
+        CHECK(check_text_dependency(object, pass, "m_State/fogColor/name", "OtherFog",
+                                    UNITY_SHADER_DEPENDENCIES_EXTERNAL_REFERENCE) == 0);
+        CHECK(check_text_dependency(object, pass, "m_State/fogStart/name", "unity_FogEnd",
+                                    UNITY_SHADER_DEPENDENCIES_EXTERNAL_REFERENCE) == 0);
+        const char *const integer_fields[] = {"m_Type", "m_HasInstancingVariant",
+                                              "m_HasProceduralInstancingVariant"};
+        for (size_t i = 0; i < sizeof(integer_fields) / sizeof(integer_fields[0]); ++i) {
+            TypeTreeValue *field = (TypeTreeValue *)typetree_find_child(pass, integer_fields[i]);
+            CHECK(field && field->type == VAL_TYPE_INT);
+            changed = *field;
+            changed.int_val = 1;
+            CHECK(check_dependency_mutation(object, field, &changed,
+                                            UNITY_SHADER_DEPENDENCIES_UNSUPPORTED_PASS) == 0);
+        }
+        /* Add a real common texture binding and its name-table authority. The
+         * parameter parser and common/residual reflection union must expose it. */
+        TypeTreeValue name_fields[] = {
+            {.name = "first",
+             .type_str = "string",
+             .type = VAL_TYPE_STRING,
+             .string_val = "DependencyTexture",
+             .string_length = 17},
+            {.name = "second", .type_str = "int", .type = VAL_TYPE_INT, .int_val = 0},
+        };
+        TypeTreeValue name_pair = {.name = "data", .type_str = "pair", .type = VAL_TYPE_STRUCT};
+        name_pair.struct_val.members = name_fields;
+        name_pair.struct_val.count = 2;
+        TypeTreeValue *names = (TypeTreeValue *)typetree_find_child(pass, "m_NameIndices");
+        CHECK(names);
+        const TypeTreeValue saved_names = *names;
+        names->array_val.elements = &name_pair;
+        names->array_val.count = 1;
+        TypeTreeValue texture_fields[] = {
+            {.name = "m_NameIndex", .type_str = "int", .type = VAL_TYPE_INT, .int_val = 0},
+            {.name = "m_Index", .type_str = "int", .type = VAL_TYPE_INT, .int_val = 0},
+            {.name = "m_SamplerIndex", .type_str = "int", .type = VAL_TYPE_INT, .int_val = 0},
+            {.name = "m_MultiSampled", .type_str = "bool", .type = VAL_TYPE_INT, .int_val = 0},
+            {.name = "m_Dim", .type_str = "SInt8", .type = VAL_TYPE_INT, .int_val = 2},
+        };
+        TypeTreeValue texture = {
+            .name = "data", .type_str = "TextureParameter", .type = VAL_TYPE_STRUCT};
+        texture.struct_val.members = texture_fields;
+        texture.struct_val.count = 5;
+        TypeTreeValue *textures = (TypeTreeValue *)typetree_find_path(
+            pass, "progFragment/m_CommonParameters/m_TextureParams");
+        CHECK(textures);
+        changed = *textures;
+        changed.array_val.elements = &texture;
+        changed.array_val.count = 1;
+        const int binding_result = check_dependency_mutation(
+            object, textures, &changed, UNITY_SHADER_DEPENDENCIES_EXTERNAL_BINDING);
+        *names = saved_names;
+        CHECK(
+            serialized_shader_parse_with_profile(&object->shader, &object->root, object->profile));
+        CHECK(binding_result == 0);
+
+        TypeTreeValue *fog = (TypeTreeValue *)typetree_find_path(pass, "m_State/fogColor/name");
+        CHECK(fog && fog->type == VAL_TYPE_STRING);
+        if (before.status == UNITY_SHADER_DEPENDENCIES_OK &&
+            strcmp(fog->string_val, "unity_FogColor") == 0) {
+            const TypeTreeValue saved = *fog;
+            fog->string_val = "<noninit>";
+            fog->string_length = 9;
+            CHECK(serialized_shader_parse_with_profile(&object->shader, &object->root,
+                                                       object->profile));
+            CHECK(unity_shader_dependency_closure(object, &after) == UNITY_SHADER_DEPENDENCIES_OK);
+            *fog = saved;
+            CHECK(serialized_shader_parse_with_profile(&object->shader, &object->root,
+                                                       object->profile));
+            CHECK(after.engine_fog_input_count + 1 == before.engine_fog_input_count);
+            CHECK(memcmp(before.digest, after.digest, 32) != 0);
+        }
+    }
+    CHECK(unity_shader_dependency_closure(object, &after) == before.status);
+    CHECK(memcmp(before.digest, after.digest, sizeof(before.digest)) == 0);
+    return 0;
+}
+
 static int check_evidence(const UnityShaderLabLiftCapture *capture, const ShaderCatalog *catalog,
                           const TypeTreeSchemaRegistry *registry,
                           const UnityShaderLabLiftCaptureReport *capture_report,
@@ -22,6 +171,7 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture, const Shader
     ShaderCatalogObjectReport candidate_report;
     CHECK(shader_catalog_decode_object(catalog, catalog->records, registry, &candidate,
                                        &candidate_report) == SHADER_CATALOG_OBJECT_OK);
+    CHECK(check_dependency_boundaries(&candidate) == 0);
     shader_object_dispose(&candidate);
     memcpy(descriptor.candidate_release_digest, candidate_report.release_digest, 32);
     CHECK(capture_report->structural_digest_valid);
@@ -59,7 +209,7 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture, const Shader
     CHECK(!invalid);
     printf("domain=pass dxbc=pass diagnostics=pass bindings=pass compile_items=%llu\n",
            (unsigned long long)a.expected_item_count);
-    for (size_t mutation = 0; mutation < 15; ++mutation) {
+    for (size_t mutation = 0; mutation < 16; ++mutation) {
         WholeShaderSubjectDescriptor changed = descriptor;
         switch (mutation) {
         case 0:
@@ -107,6 +257,9 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture, const Shader
         case 14:
             changed.serialized_target_platform++;
             break;
+        case 15:
+            changed.dependency_map_digest[0] ^= 1;
+            break;
         }
         WholeShaderSubject *mismatch = NULL;
         CHECK(whole_shader_subject_create(&mismatch, &changed) == WHOLE_SHADER_SUBJECT_OK);
@@ -151,6 +304,35 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture, const Shader
     CHECK(!structure && !structure_report.emission_attempted);
     whole_shader_subject_free(wrong);
 
+    WholeShaderEvidence *dependencies = NULL;
+    UnityShaderDependencyEvidenceReport dependency_report;
+    printf("target_dependencies=%s pass=%d stage=%d program=%d\n",
+           unity_shader_dependency_status_name(capture_report->dependencies.status),
+           capture_report->dependencies.pass_index, capture_report->dependencies.stage_index,
+           capture_report->dependencies.subprogram_index);
+    CHECK(capture_report->dependencies.status == UNITY_SHADER_DEPENDENCIES_OK);
+    CHECK(unity_shaderlab_lift_capture_dependency_evidence(
+              capture, catalog, catalog->records, registry, subject, &dependencies,
+              &dependency_report) == WHOLE_SHADER_EVIDENCE_OK);
+    WholeShaderEvidenceSummary dependency_summary;
+    CHECK(whole_shader_evidence_describe(dependencies, &dependency_summary) ==
+          WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(dependency_summary.status == (expected_structure == WHOLE_SHADER_PLANE_UNAVAILABLE
+                                            ? WHOLE_SHADER_PLANE_UNAVAILABLE
+                                            : WHOLE_SHADER_PLANE_PASS));
+    printf("dependencies=%s programs=%zu/%zu\n",
+           whole_shader_plane_status_name(dependency_summary.status),
+           dependency_report.target_dependencies.subprogram_count,
+           dependency_report.candidate_dependencies.subprogram_count);
+    whole_shader_evidence_free(dependencies);
+    dependencies = NULL;
+    CHECK(whole_shader_subject_create(&wrong, &wrong_release) == WHOLE_SHADER_SUBJECT_OK);
+    CHECK(unity_shaderlab_lift_capture_dependency_evidence(
+              capture, catalog, catalog->records, registry, wrong, &dependencies,
+              &dependency_report) == WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+    CHECK(!dependencies);
+    whole_shader_subject_free(wrong);
+
     /* These compiler planes alone cannot certify whole-shader equivalence. */
     WholeShaderCertificateInput *certificate = NULL;
     CHECK(whole_shader_certificate_input_create(&certificate, subject,
@@ -182,6 +364,11 @@ int main(int argc, char **argv) {
           UNITY_SHADERLAB_CAPTURE_INVALID_ARGUMENT);
     CHECK(!capture && !unity_shaderlab_lift_capture_result(NULL));
     unity_shaderlab_lift_capture_free(NULL);
+    UnityShaderDependencyReport missing;
+    CHECK(unity_shader_dependency_closure(NULL, &missing) ==
+          UNITY_SHADER_DEPENDENCIES_INVALID_ARGUMENT);
+    CHECK(unity_shader_dependency_closure(NULL, NULL) ==
+          UNITY_SHADER_DEPENDENCIES_INVALID_ARGUMENT);
     WholeShaderEvidence *absent = NULL;
     UnityShaderLabStructuralEvidenceReport absent_report;
     CHECK(unity_shaderlab_lift_capture_structural_evidence(NULL, NULL, NULL, NULL, NULL, &absent,
@@ -202,6 +389,13 @@ int main(int argc, char **argv) {
     const char *path = argc >= 5 ? argv[1] : CAPTURE_EMPTY_FIXTURE;
     CHECK(shader_catalog_build(&path, 1, &options, &catalog) == SHADER_CATALOG_OK);
     CHECK(catalog.record_count == 1 && shader_catalog_is_complete(&catalog));
+    ShaderObject boundary_object;
+    shader_object_init(&boundary_object);
+    ShaderCatalogObjectReport boundary_report;
+    CHECK(shader_catalog_decode_object(&catalog, catalog.records, &registry, &boundary_object,
+                                       &boundary_report) == SHADER_CATALOG_OBJECT_OK);
+    CHECK(check_dependency_boundaries(&boundary_object) == 0);
+    shader_object_dispose(&boundary_object);
     UnityCompileProfile profile;
     unity_compile_profile_init(&profile);
     profile.build_platform = 19;

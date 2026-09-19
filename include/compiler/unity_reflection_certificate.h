@@ -70,6 +70,9 @@ typedef struct {
     UnityReflectionCertificateStatus status;
     UnityReflectionCertificateAuthority authority;
     size_t expected_record_count;
+    /* Valid with expected_bindings_digest_valid, even when callbacks are
+     * absent. All non-input rows require runtime parameter/resource authority. */
+    size_t expected_non_input_record_count;
     size_t observed_record_count;
     size_t matched_record_count;
     /* Independently hashed binding multisets, including constant-buffer scope.

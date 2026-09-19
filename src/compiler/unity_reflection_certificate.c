@@ -1073,6 +1073,12 @@ UnityReflectionCertificateStatus unity_reflection_certify_d3d11_bindings(
 
     report->expected_bindings_digest_valid = fingerprint_bindings(
         expected, NULL, expected_count, report->expected_bindings_digest);
+    if (report->expected_bindings_digest_valid) {
+        for (size_t index = 0; index < expected_count; ++index) {
+            if (expected[index].kind != UNITY_COMPILER_REFLECTION_INPUT)
+                ++report->expected_non_input_record_count;
+        }
+    }
     report->observed_bindings_digest_valid = fingerprint_bindings(
         NULL, observed_records, observed_record_count, report->observed_bindings_digest);
 

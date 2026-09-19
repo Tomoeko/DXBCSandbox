@@ -142,6 +142,7 @@ static int test_complete_binding_certificate(void) {
               sizeof(records) / sizeof(records[0]), &report) ==
           UNITY_REFLECTION_CERTIFICATE_COMPATIBLE);
     CHECK(report.expected_record_count == 10U);
+    CHECK(report.expected_non_input_record_count == 9U);
     CHECK(report.observed_record_count == 10U);
     CHECK(report.matched_record_count == 10U);
     CHECK(report.ignored_stats_record_count == 1U);
@@ -774,6 +775,29 @@ static int test_empty_binding_fingerprint(void) {
     CHECK(report.expected_bindings_digest_valid && report.observed_bindings_digest_valid);
     CHECK(memcmp(expected, report.expected_bindings_digest, 32) == 0);
     CHECK(memcmp(expected, report.observed_bindings_digest, 32) == 0);
+    CHECK(report.expected_non_input_record_count == 0);
+    return 0;
+}
+
+static int test_inventory_without_callbacks(void) {
+    ReflectionFixture fixture;
+    initialize_fixture(&fixture);
+    UnityReflectionCertificateReport report;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+              &fixture.player, &fixture.parameters, NULL, NULL, 0, &report) ==
+          UNITY_REFLECTION_CERTIFICATE_MISSING_RECORD);
+    CHECK(report.expected_bindings_digest_valid && report.expected_non_input_record_count == 9);
+    fixture.parameters.cb_count = fixture.parameters.res_count = 0;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+              &fixture.player, &fixture.parameters, NULL, NULL, 0, &report) ==
+          UNITY_REFLECTION_CERTIFICATE_MISSING_RECORD);
+    CHECK(report.expected_bindings_digest_valid && report.expected_record_count == 1 &&
+          report.expected_non_input_record_count == 0);
+    fixture.player.source_map = UINT32_MAX;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+              &fixture.player, &fixture.parameters, NULL, NULL, 0, &report) ==
+          UNITY_REFLECTION_CERTIFICATE_INVALID_METADATA);
+    CHECK(!report.expected_bindings_digest_valid);
     return 0;
 }
 
@@ -830,6 +854,7 @@ static int test_binding_fingerprint_buffer_scope(void) {
 }
 
 int main(void) {
+    CHECK(test_inventory_without_callbacks() == 0);
     CHECK(test_empty_binding_fingerprint() == 0);
     CHECK(test_binding_fingerprint_buffer_scope() == 0);
     CHECK(test_complete_binding_certificate() == 0);
