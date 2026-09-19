@@ -83,6 +83,17 @@ bool emit_stage_hlsl_with_variant_plan(
     StringBuilder* sb,
     ShaderLabStageDiagnostic* diagnostic);
 
+typedef struct {
+    ShaderLabExpressionSourceMap *map;
+    int subshader_index;
+    int pass_index;
+} ShaderLabExpressionMapContext;
+
+bool shaderlab_expression_source_map_append(
+    ShaderLabExpressionSourceMap *map, const ShaderLabExpressionSourceRecord *record);
+bool shaderlab_expression_source_map_offset(
+    ShaderLabExpressionSourceMap *map, size_t first_record, size_t offset);
+
 bool emit_stage_hlsl_with_variant_plan_mode(
     const ShaderLabVariantPlan* variant_plan,
     int stage_index,
@@ -92,6 +103,7 @@ bool emit_stage_hlsl_with_variant_plan_mode(
     const int* segment_lengths,
     int segment_count,
     bool high_level,
+    const ShaderLabExpressionMapContext *trace,
     StringBuilder* sb,
     ShaderLabStageDiagnostic* diagnostic);
 

@@ -1325,12 +1325,14 @@ static int test_high_level_shaderlab_candidate(void) {
   uint8_t *segments[3] = {NULL, NULL, NULL};
   int segment_lengths[3] = {0, 0, 0};
   BlobEntry entries[3];
+  uint8_t target_digests[2][COMMON_SHA256_DIGEST_SIZE];
   size_t cursor = 0;
   for (int stage = 0; stage < 2; ++stage) {
     size_t dxbc_size = 0;
     const uint8_t *dxbc = find_first_dxbc(fixture + cursor,
                                          fixture_size - cursor, &dxbc_size);
     CHECK(dxbc != NULL);
+    common_sha256(dxbc, dxbc_size, target_digests[stage]);
     cursor = (size_t)(dxbc - fixture) + dxbc_size;
     size_t blob_size = 0;
     segments[stage] = build_variant_blob(dxbc, dxbc_size, stage ? 17 : 15,
@@ -1368,8 +1370,59 @@ static int test_high_level_shaderlab_candidate(void) {
   sb_init(&low);
   sb_init(&repeated);
   ShaderLabCandidateDiagnostic diagnostic;
-  CHECK(shaderlab_emit_high_level_candidate(
-      &shader, entries, 2, segments, segment_lengths, 2, &high, &diagnostic));
+  ShaderLabExpressionSourceMap map = {0};
+  const char *prefix = "// caller prefix\n";
+  sb_append(&high, prefix);
+  CHECK(shaderlab_emit_high_level_candidate_with_source_map(
+      &shader, entries, 2, segments, segment_lengths, 2, &high, &map, &diagnostic));
+  CHECK(shaderlab_expression_source_map_matches_source(&map, &high));
+  CHECK(map.count == 2u);
+  for (size_t i = 0; i < map.count; ++i) {
+    const ShaderLabExpressionSourceRecord *record = &map.records[i];
+    CHECK(record->subshader_index == 0 && record->pass_index == 0);
+    CHECK(record->stage_index == (int)i && record->subprogram_index == 0);
+    CHECK(record->blob_index == (int)i && record->hardware_tier_group == 3);
+    CHECK(record->serialized_state == 0 && record->instructions.count == 3u);
+    CHECK(memcmp(record->target_digest, target_digests[i], sizeof(record->target_digest)) == 0);
+    for (size_t j = 0; j < record->instructions.count; ++j) {
+      const HLSLExpressionOrigin *origin = &record->instructions.origins[j];
+      CHECK(origin->source_begin >= strlen(prefix));
+      CHECK(origin->source_end <= high.len);
+      CHECK(high.buf[origin->source_begin] == '(' ||
+            high.buf[origin->source_begin] == ' ');
+      if (origin->kind == HLSL_EXPRESSION_ORIGIN_RETURN)
+        CHECK(high.buf[origin->source_end - 1] == '\n');
+    }
+  }
+  const HLSLExpressionSourceMap *fragment_map = &map.records[1].instructions;
+  const HLSLExpressionOrigin *nested = &fragment_map->origins[0];
+  const HLSLExpressionOrigin *outer = &fragment_map->origins[1];
+  CHECK(nested->source_begin > outer->source_begin);
+  CHECK(nested->source_end < outer->source_end);
+  CHECK(outer->source_end - outer->source_begin == strlen("(((v1) * (v1.yzwx)) * (v1.zwxy))"));
+  CHECK(memcmp(high.buf + outer->source_begin,
+               "(((v1) * (v1.yzwx)) * (v1.zwxy))",
+               outer->source_end - outer->source_begin) == 0);
+  for (int mutation = 0; mutation < 8; ++mutation) {
+    ShaderLabExpressionSourceRecord saved = map.records[0];
+    const size_t saved_size = map.source_size;
+    switch (mutation) {
+      case 0: ++map.source_size; break;
+      case 1: map.source_digest[0] ^= 1u; break;
+      case 2: map.records[0].instructions.origins[0].source_end = high.len + 1; break;
+      case 3: map.records[0].instructions.origins[0].instruction_index = -1; break;
+      case 4: map.records[0].instructions.origins[0].kind = HLSL_EXPRESSION_ORIGIN_UNMAPPED; break;
+      case 5: map.records[0].instructions.origins[0].kind = HLSL_EXPRESSION_ORIGIN_DEAD; break;
+      case 6: map.records[0].hardware_tier_group = 4; break;
+      case 7: high.buf[0] = '#'; break;
+    }
+    CHECK(!shaderlab_expression_source_map_matches_source(&map, &high));
+    map.records[0] = saved;
+    map.source_size = saved_size;
+    if (mutation == 1) map.source_digest[0] ^= 1u;
+    high.buf[0] = '/';
+    CHECK(shaderlab_expression_source_map_matches_source(&map, &high));
+  }
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_OK);
   CHECK(strstr(high.buf, "o0 = (((v1) * (v1.yzwx)) * (v1.zwxy));") != NULL);
   CHECK(strstr(high.buf, "float4 r0") == NULL);
@@ -1378,10 +1431,45 @@ static int test_high_level_shaderlab_candidate(void) {
       &shader, entries, 2, segments, segment_lengths, 2, &low, &diagnostic));
   CHECK(strstr(low.buf, "float4 r0") != NULL);
   CHECK(strcmp(low.buf, high.buf) != 0);
+  sb_append(&repeated, prefix);
   CHECK(shaderlab_emit_high_level_candidate(
       &shader, entries, 2, segments, segment_lengths, 2, &repeated, &diagnostic));
   CHECK(strcmp(high.buf, repeated.buf) == 0);
   sb_free(&repeated);
+
+  /* Each concrete tier has its own source body even when target bytes agree.
+   * The map must retain those identities rather than deduplicate by hash. */
+  SerializedSubProgram tier_programs[2][3];
+  SerializedSubProgramIdentity tier_identities[2][3];
+  for (int stage = 0; stage < 2; ++stage) {
+    for (int tier = 0; tier < 3; ++tier) {
+      tier_programs[stage][tier] = programs[stage];
+      tier_identities[stage][tier] = identities[stage];
+      tier_identities[stage][tier].hardware_tier_group = tier;
+    }
+    passes[0].subprogram_count[stage] = 3;
+    passes[0].subprograms[stage] = tier_programs[stage];
+    passes[0].subprogram_identities[stage] = tier_identities[stage];
+  }
+  sb_init(&repeated);
+  CHECK(shaderlab_emit_high_level_candidate_with_source_map(
+      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
+  CHECK(shaderlab_expression_source_map_matches_source(&map, &repeated));
+  CHECK(map.count == 6u);
+  for (size_t i = 0; i < map.count; ++i) {
+    CHECK(map.records[i].stage_index == (int)(i / 3u));
+    CHECK(map.records[i].hardware_tier_group == (int)(i % 3u));
+    CHECK(map.records[i].subprogram_index == (int)(i % 3u));
+    CHECK(map.records[i].serialized_state == 0u);
+    if (i) CHECK(map.records[i].instructions.origins[0].source_begin >
+                 map.records[i - 1].instructions.origins[2].source_end);
+  }
+  sb_free(&repeated);
+  for (int stage = 0; stage < 2; ++stage) {
+    passes[0].subprogram_count[stage] = 1;
+    passes[0].subprograms[stage] = &programs[stage];
+    passes[0].subprogram_identities[stage] = &identities[stage];
+  }
 
   /* Reject a valid low-level vertex with cbuffer operations in a later pass.
    * The fully emitted first pass must not leak into the caller's fallback. */
@@ -1402,8 +1490,9 @@ static int test_high_level_shaderlab_candidate(void) {
   subshader.pass_count = 2;
   sb_init(&repeated);
   sb_append(&repeated, low.buf);
-  CHECK(!shaderlab_emit_high_level_candidate(
-      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &diagnostic));
+  CHECK(!shaderlab_emit_high_level_candidate_with_source_map(
+      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &map, &diagnostic));
+  CHECK(!map.complete && map.count == 0u && map.records == NULL);
   CHECK(strcmp(repeated.buf, low.buf) == 0);
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
   CHECK(diagnostic.subshader_index == 0 && diagnostic.pass_index == 1);
@@ -1434,8 +1523,9 @@ static int test_high_level_shaderlab_candidate(void) {
   shader.keyword_flags = feature_flags;
   sb_init(&repeated);
   sb_append(&repeated, low.buf);
-  CHECK(!shaderlab_emit_high_level_candidate(
-      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &diagnostic));
+  CHECK(!shaderlab_emit_high_level_candidate_with_source_map(
+      &shader, entries, 3, segments, segment_lengths, 3, &repeated, &map, &diagnostic));
+  CHECK(!map.complete && map.count == 0u && map.records == NULL);
   CHECK(strcmp(repeated.buf, low.buf) == 0);
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
   CHECK(diagnostic.stage.subprogram_index == 1);
@@ -1443,8 +1533,16 @@ static int test_high_level_shaderlab_candidate(void) {
   sb_free(&repeated);
   variants[1].blob_index = 0;
   sb_init(&repeated);
-  CHECK(shaderlab_emit_high_level_candidate(
-      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &diagnostic));
+  CHECK(shaderlab_emit_high_level_candidate_with_source_map(
+      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
+  CHECK(shaderlab_expression_source_map_matches_source(&map, &repeated));
+  CHECK(map.count == 3u);
+  CHECK(map.records[1].stage_index == 0 && map.records[1].subprogram_index == 1);
+  CHECK(map.records[1].serialized_state == 1u);
+  CHECK(map.records[1].instructions.origins[0].source_begin >
+        map.records[0].instructions.origins[2].source_end);
+  CHECK(map.records[2].instructions.origins[0].source_begin >
+        map.records[1].instructions.origins[2].source_end);
   CHECK(count_text(repeated.buf, "// DXBCSandbox-VariantPlan stage=vertex") == 2u);
   CHECK(strstr(repeated.buf, "#pragma multi_compile_vertex __ FEATURE") != NULL);
   sb_free(&repeated);
@@ -1463,14 +1561,16 @@ static int test_high_level_shaderlab_candidate(void) {
   shader.keyword_flags = flags;
   sb_init(&repeated);
   sb_append(&repeated, low.buf);
-  CHECK(!shaderlab_emit_high_level_candidate(
-      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &diagnostic));
+  CHECK(!shaderlab_emit_high_level_candidate_with_source_map(
+      &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));
+  CHECK(!map.complete && map.count == 0u && map.records == NULL);
   CHECK(strcmp(repeated.buf, low.buf) == 0);
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED);
   CHECK(diagnostic.stage.status == SHADERLAB_STAGE_HLSL_EMISSION_FAILED);
   sb_free(&repeated);
   sb_free(&low);
   sb_free(&high);
+  shaderlab_expression_source_map_free(&map);
   for (size_t i = 0; i < 3; ++i) free(segments[i]);
   free(unsupported);
   free(fixture);

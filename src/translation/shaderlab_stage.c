@@ -561,7 +561,7 @@ static bool translate_stage_to_hlsl(
     const HLSLEmitNames *names,
     const char *const *reserved_preprocessor_identifiers,
     size_t reserved_preprocessor_identifier_count, bool high_level,
-    ShaderLabStageDiagnostic *diagnostic) {
+    ShaderLabExpressionSourceRecord *record, ShaderLabStageDiagnostic *diagnostic) {
   if (!pass || !out_hlsl || !names || stage_index < 0 || stage_index >= 6 ||
       subprogram_index < 0 ||
       subprogram_index >= pass->subprogram_count[stage_index] ||
@@ -726,6 +726,7 @@ static bool translate_stage_to_hlsl(
   }
   HLSLEmitOptions emit_options = HLSL_EMIT_RECOMPILE_OPTIONS_INIT;
   if (high_level) emit_options.mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+  if (record) emit_options.expression_source_map = &record->instructions;
   emit_options.omit_unity_builtin_declarations = true;
   emit_options.reserved_preprocessor_identifiers =
       reserved_preprocessor_identifiers;
@@ -745,6 +746,7 @@ static bool translate_stage_to_hlsl(
   } else {
     set_diagnostic(diagnostic, SHADERLAB_STAGE_OK, stage_index,
                    subprogram_index, -1);
+    if (record) common_sha256(raw_view.data, raw_view.size, record->target_digest);
     success = true;
   }
   usil_free(&usil);
@@ -815,13 +817,39 @@ static void emit_variant_predicate(const ShaderLabStagePlan *plan,
 }
 
 static void append_indented_source(StringBuilder *output,
-                                   const StringBuilder *source) {
+                                   const StringBuilder *source,
+                                   HLSLExpressionSourceMap *map) {
+  HLSLExpressionSourceMap original = {0};
+  if (map) {
+    if (!map->complete || map->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT) {
+      output->failed = true;
+      return;
+    }
+    original = *map;
+  }
   const char *cursor = source->buf;
   while (cursor && *cursor) {
+    const size_t line_begin = (size_t)(cursor - source->buf);
     append_indent(output, 3);
-    while (*cursor && *cursor != '\n') sb_append_char(output, *cursor++);
+    const size_t output_begin = output->len;
+    const char *line = cursor;
+    while (*cursor && *cursor != '\n') ++cursor;
+    sb_append_len(output, line, (size_t)(cursor - line));
     sb_append_char(output, '\n');
     if (*cursor == '\n') ++cursor;
+    const size_t line_end = (size_t)(cursor - source->buf);
+    if (!sb_ok(output)) return;
+    /* Exclusive ends at a newline precede the next line's indentation;
+     * starts at that same boundary follow it. Keep those affinities distinct. */
+    for (size_t i = 0; map && i < original.count; ++i) {
+      const HLSLExpressionOrigin *origin = &original.origins[i];
+      if (origin->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
+          origin->kind != HLSL_EXPRESSION_ORIGIN_RETURN) continue;
+      if (origin->source_begin >= line_begin && origin->source_begin < line_end)
+        map->origins[i].source_begin = output_begin + (origin->source_begin - line_begin);
+      if (origin->source_end > line_begin && origin->source_end <= line_end)
+        map->origins[i].source_end = output_begin + (origin->source_end - line_begin);
+    }
   }
 }
 
@@ -888,7 +916,7 @@ bool emit_stage_hlsl(const SerializedPass *pass, int stage_index,
             pass, stage_index, variant->subprogram_index, blob_entries,
             entry_count, segments, segment_lengths, segment_count,
             &variant_hlsl, &names,
-            (const char *const *)plan.keywords, plan.keyword_count, false,
+            (const char *const *)plan.keywords, plan.keyword_count, false, NULL,
             diagnostic)) {
       sb_free(&variant_hlsl);
       sb_free(&stage_output);
@@ -906,7 +934,7 @@ bool emit_stage_hlsl(const SerializedPass *pass, int stage_index,
       append_indent(&stage_output, 3);
       sb_append(&stage_output, "// Single exact variant\n");
     }
-    append_indented_source(&stage_output, &variant_hlsl);
+    append_indented_source(&stage_output, &variant_hlsl, NULL);
     sb_free(&variant_hlsl);
     if (!sb_ok(&stage_output)) {
       set_diagnostic(diagnostic, SHADERLAB_STAGE_OUTPUT_FAILED, stage_index,
@@ -1401,11 +1429,16 @@ bool emit_stage_hlsl_with_variant_plan_mode(
     const ShaderLabVariantPlan *variant_plan, int stage_index,
     const BlobEntry *blob_entries, int entry_count, uint8_t **segments,
     const int *segment_lengths, int segment_count, bool high_level,
-    StringBuilder *output, ShaderLabStageDiagnostic *diagnostic) {
+    const ShaderLabExpressionMapContext *trace, StringBuilder *output,
+    ShaderLabStageDiagnostic *diagnostic) {
   set_diagnostic(diagnostic, SHADERLAB_STAGE_INVALID_ARGUMENT, stage_index, -1,
                  -1);
   if (!variant_plan || !variant_plan->pass || !variant_plan->shader ||
       !output || stage_index < 0 || stage_index > 4) return false;
+  ShaderLabExpressionSourceMap *source_map = trace ? trace->map : NULL;
+  if (source_map && (!high_level || trace->subshader_index < 0 || trace->pass_index < 0))
+    return false;
+  const size_t first_record = source_map ? source_map->count : 0;
   const ShaderLabPassStageVariantPlan *stage =
       &variant_plan->stages[stage_index];
   const bool symbolic_selector =
@@ -1575,6 +1608,14 @@ bool emit_stage_hlsl_with_variant_plan_mode(
       }
       const SerializedSubProgram *sub =
           &variant_plan->pass->subprograms[stage_index][subprogram_index];
+      ShaderLabExpressionSourceRecord record = {0};
+      record.subshader_index = trace ? trace->subshader_index : -1;
+      record.pass_index = trace ? trace->pass_index : -1;
+      record.stage_index = stage_index;
+      record.subprogram_index = subprogram_index;
+      record.blob_index = sub->blob_index;
+      record.hardware_tier_group = tier;
+      record.serialized_state = original_state;
       StringBuilder variant_hlsl;
       sb_init_with_capacity(&variant_hlsl, 4096);
       if (!translate_stage_to_hlsl(
@@ -1584,7 +1625,7 @@ bool emit_stage_hlsl_with_variant_plan_mode(
               (const char *const *)
                   variant_plan->shader->keyword_names.keywords,
               (size_t)variant_plan->shader->keyword_names.count, high_level,
-              diagnostic)) {
+              source_map ? &record : NULL, diagnostic)) {
         sb_free(&variant_hlsl);
         sb_free(&stage_output);
         mem_free(generated_used,
@@ -1614,12 +1655,17 @@ bool emit_stage_hlsl_with_variant_plan_mode(
         append_indent(&stage_output, 3);
         sb_append(&stage_output, "// Single exact planned variant\n");
       }
-      append_indented_source(&stage_output, &variant_hlsl);
+      append_indented_source(&stage_output, &variant_hlsl,
+                             source_map ? &record.instructions : NULL);
+      const bool map_appended = !source_map || !sb_ok(&stage_output) ||
+          shaderlab_expression_source_map_append(source_map, &record);
+      if (!map_appended) stage_output.failed = true;
       sb_free(&variant_hlsl);
       ++emitted_body_count;
       if (!sb_ok(&stage_output)) {
-        set_diagnostic(diagnostic, SHADERLAB_STAGE_OUTPUT_FAILED, stage_index,
-                       subprogram_index, -1);
+        set_diagnostic(diagnostic, map_appended ? SHADERLAB_STAGE_OUTPUT_FAILED
+                                                : SHADERLAB_STAGE_ALLOCATION_FAILED,
+                       stage_index, subprogram_index, -1);
         sb_free(&stage_output);
         mem_free(generated_used,
                  (size_t)variant_plan->shader->keyword_names.count *
@@ -1647,8 +1693,10 @@ bool emit_stage_hlsl_with_variant_plan_mode(
     mem_free(alias_counts, stage->state_count * sizeof(*alias_counts));
     return false;
   }
+  const size_t stage_begin = output->len;
   sb_append_len(output, stage_output.buf, stage_output.len);
-  const bool success = sb_ok(output);
+  const bool success = sb_ok(output) &&
+      shaderlab_expression_source_map_offset(source_map, first_record, stage_begin);
   sb_free(&stage_output);
   mem_free(generated_used,
            (size_t)variant_plan->shader->keyword_names.count *
@@ -1668,5 +1716,5 @@ bool emit_stage_hlsl_with_variant_plan(
     ShaderLabStageDiagnostic *diagnostic) {
   return emit_stage_hlsl_with_variant_plan_mode(
       variant_plan, stage_index, blob_entries, entry_count, segments,
-      segment_lengths, segment_count, false, output, diagnostic);
+      segment_lengths, segment_count, false, NULL, output, diagnostic);
 }

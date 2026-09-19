@@ -440,6 +440,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
                                     const int *segment_lengths,
                                     int segment_count,
                                     bool require_complete_stages, bool high_level,
+                                    ShaderLabExpressionSourceMap *source_map,
                                     StringBuilder *sb,
                                     ShaderLabCandidateDiagnostic
                                         *candidate_diagnostic) {
@@ -528,6 +529,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
     // 4. Passes block
     for (int j = 0; j < sub->pass_count; j++) {
       const SerializedPass *pass = &sub->passes[j];
+      const ShaderLabExpressionMapContext trace = {source_map, i, j};
 
       // Handle GrabPass or UsePass
       if (pass->pass_type == 2) { // GrabPass
@@ -788,7 +790,8 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         ShaderLabStageDiagnostic diagnostic;
         if (!emit_stage_hlsl_with_variant_plan_mode(
                 &pass_variant_plan, 0, blob_entries, entry_count, segments,
-                segment_lengths, segment_count, high_level, sb, &diagnostic)) {
+                segment_lengths, segment_count, high_level, &trace,
+                sb, &diagnostic)) {
           set_candidate_stage_failure(candidate_diagnostic, i, j,
                                       &diagnostic);
           report_candidate_stage_failure(&diagnostic);
@@ -810,7 +813,8 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
           ShaderLabStageDiagnostic diagnostic;
           if (!emit_stage_hlsl_with_variant_plan_mode(
                   &pass_variant_plan, 3, blob_entries, entry_count, segments,
-                  segment_lengths, segment_count, high_level, sb, &diagnostic)) {
+                  segment_lengths, segment_count, high_level, &trace,
+                  sb, &diagnostic)) {
             set_candidate_stage_failure(candidate_diagnostic, i, j,
                                         &diagnostic);
             report_candidate_stage_failure(&diagnostic);
@@ -831,7 +835,8 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
           ShaderLabStageDiagnostic diagnostic;
           if (!emit_stage_hlsl_with_variant_plan_mode(
                   &pass_variant_plan, 4, blob_entries, entry_count, segments,
-                  segment_lengths, segment_count, high_level, sb, &diagnostic)) {
+                  segment_lengths, segment_count, high_level, &trace,
+                  sb, &diagnostic)) {
             set_candidate_stage_failure(candidate_diagnostic, i, j,
                                         &diagnostic);
             report_candidate_stage_failure(&diagnostic);
@@ -853,7 +858,8 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
           ShaderLabStageDiagnostic diagnostic;
           if (!emit_stage_hlsl_with_variant_plan_mode(
                   &pass_variant_plan, 2, blob_entries, entry_count, segments,
-                  segment_lengths, segment_count, high_level, sb, &diagnostic)) {
+                  segment_lengths, segment_count, high_level, &trace,
+                  sb, &diagnostic)) {
             set_candidate_stage_failure(candidate_diagnostic, i, j,
                                         &diagnostic);
             report_candidate_stage_failure(&diagnostic);
@@ -873,7 +879,8 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         ShaderLabStageDiagnostic diagnostic;
         if (!emit_stage_hlsl_with_variant_plan_mode(
                 &pass_variant_plan, 1, blob_entries, entry_count, segments,
-                segment_lengths, segment_count, high_level, sb, &diagnostic)) {
+                segment_lengths, segment_count, high_level, &trace,
+                sb, &diagnostic)) {
           set_candidate_stage_failure(candidate_diagnostic, i, j,
                                       &diagnostic);
           report_candidate_stage_failure(&diagnostic);
@@ -983,7 +990,9 @@ static bool shaderlab_emit_transactional(
     const char *fragment_hlsl, const BlobEntry *blob_entries, int entry_count,
     uint8_t **segments, const int *segment_lengths, int segment_count,
     bool require_complete_stages, bool high_level, StringBuilder *output,
+    ShaderLabExpressionSourceMap *source_map,
     ShaderLabCandidateDiagnostic *candidate_diagnostic) {
+  shaderlab_expression_source_map_free(source_map);
   if (candidate_diagnostic) {
     memset(candidate_diagnostic, 0, sizeof(*candidate_diagnostic));
     candidate_diagnostic->status = SHADERLAB_CANDIDATE_INVALID_ARGUMENT;
@@ -1015,12 +1024,32 @@ static bool shaderlab_emit_transactional(
   }
   StringBuilder generated;
   sb_init_with_capacity(&generated, 16384);
-  const bool generated_ok = shaderlab_emit_internal(
+  bool generated_ok = shaderlab_emit_internal(
       shader, vertex_hlsl, fragment_hlsl, blob_entries, entry_count, segments,
       segment_lengths, segment_count, require_complete_stages, high_level,
-      &generated, candidate_diagnostic);
+      source_map, &generated, candidate_diagnostic);
+  if (generated_ok && source_map) {
+    source_map->complete = true;
+    source_map->source_size = generated.len;
+    common_sha256(generated.buf, generated.len, source_map->source_digest);
+    generated_ok = shaderlab_expression_source_map_matches_source(source_map, &generated);
+    if (!generated_ok)
+      set_candidate_failure(candidate_diagnostic,
+                            SHADERLAB_CANDIDATE_OUTPUT_FAILED, -1, -1, -1);
+  }
+  const size_t source_begin = output->len;
   if (generated_ok) sb_append_len(output, generated.buf, generated.len);
-  const bool success = generated_ok && sb_ok(output);
+  bool success = generated_ok && sb_ok(output);
+  if (success && source_map) {
+    success = shaderlab_expression_source_map_offset(source_map, 0, source_begin);
+    source_map->source_size = output->len;
+    common_sha256(output->buf, output->len, source_map->source_digest);
+    if (!success) {
+      output->len = source_begin;
+      output->buf[source_begin] = '\0';
+    }
+  }
+  if (!success) shaderlab_expression_source_map_free(source_map);
   if (generated_ok && !success) {
     set_candidate_failure(candidate_diagnostic,
                           SHADERLAB_CANDIDATE_OUTPUT_FAILED, -1, -1, -1);
@@ -1045,13 +1074,13 @@ bool shaderlab_emit_candidate_with_diagnostic(
     ShaderLabCandidateDiagnostic *diagnostic) {
   return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
                                       entry_count, segments, segment_lengths,
-                                      segment_count, true, false, sb, diagnostic);
+                                      segment_count, true, false, sb, NULL, diagnostic);
 }
 
 bool shaderlab_emit_raw(const SerializedShader *shader, const char *vertex_hlsl,
                         const char *fragment_hlsl, StringBuilder *sb) {
   return shaderlab_emit_transactional(shader, vertex_hlsl, fragment_hlsl, NULL,
-                                      0, NULL, NULL, 0, false, false, sb, NULL);
+                                      0, NULL, NULL, 0, false, false, sb, NULL, NULL);
 }
 
 bool shaderlab_emit_high_level_candidate(
@@ -1061,5 +1090,15 @@ bool shaderlab_emit_high_level_candidate(
     ShaderLabCandidateDiagnostic *diagnostic) {
   return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
                                       entry_count, segments, segment_lengths,
-                                      segment_count, true, true, sb, diagnostic);
+                                      segment_count, true, true, sb, NULL, diagnostic);
+}
+
+bool shaderlab_emit_high_level_candidate_with_source_map(
+    const SerializedShader *shader, const BlobEntry *blob_entries,
+    int entry_count, uint8_t **segments, const int *segment_lengths,
+    int segment_count, StringBuilder *sb, ShaderLabExpressionSourceMap *map,
+    ShaderLabCandidateDiagnostic *diagnostic) {
+  return shaderlab_emit_transactional(shader, NULL, NULL, blob_entries,
+                                      entry_count, segments, segment_lengths,
+                                      segment_count, true, true, sb, map, diagnostic);
 }

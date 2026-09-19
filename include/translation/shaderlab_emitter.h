@@ -4,6 +4,7 @@
 #define SHADERLAB_EMITTER_H
 
 #include "common/shader_stage.h"
+#include "common/sha256.h"
 #include "dxbc/dxbc_document.h"
 #include "common/string_builder.h"
 #include "dxbc/dxbc_stage_contract.h"
@@ -163,6 +164,48 @@ bool shaderlab_emit_high_level_candidate(
     int segment_count,
     StringBuilder* sb,
     ShaderLabCandidateDiagnostic* diagnostic);
+
+/* One emitted stage body, identified by serialized coordinates and the
+ * selected released container. Generic hardware tier is 3; concrete tiers
+ * are 0..2. Source ranges refer to the complete output builder, including
+ * caller prefixes, routing code and indentation. */
+typedef struct {
+    int subshader_index;
+    int pass_index;
+    int stage_index;
+    int subprogram_index;
+    int blob_index;
+    int hardware_tier_group;
+    size_t serialized_state;
+    uint8_t target_digest[COMMON_SHA256_DIGEST_SIZE];
+    HLSLExpressionSourceMap instructions;
+} ShaderLabExpressionSourceRecord;
+
+typedef struct {
+    ShaderLabExpressionSourceRecord *records;
+    size_t count;
+    size_t capacity;
+    size_t source_size;
+    uint8_t source_digest[COMMON_SHA256_DIGEST_SIZE];
+    bool complete;
+} ShaderLabExpressionSourceMap;
+
+/* Initialize with {0}; free releases all owned records and resets the map.
+ * Maps are provenance only: their hashes and spans establish no equivalence. */
+void shaderlab_expression_source_map_free(ShaderLabExpressionSourceMap *map);
+/* Checks source binding and basic record shape. It does not re-decode the
+ * target containers or validate serialized coordinates or semantics. */
+bool shaderlab_expression_source_map_matches_source(
+    const ShaderLabExpressionSourceMap *map, const StringBuilder *source);
+
+/* Same atomic candidate contract. An optional initialized map is cleared on
+ * entry and failure, and completed only after the whole output succeeds.
+ * Retain accepted candidate maps separately when attempting another lift. */
+bool shaderlab_emit_high_level_candidate_with_source_map(
+    const SerializedShader *shader, const BlobEntry *blob_entries,
+    int entry_count, uint8_t **segments, const int *segment_lengths,
+    int segment_count, StringBuilder *sb, ShaderLabExpressionSourceMap *map,
+    ShaderLabCandidateDiagnostic *diagnostic);
 
 /* Non-exact verifier convenience API.  It embeds supplied HLSL and fills an
  * omitted stage with a trivial placeholder so one stage can be compiled in
