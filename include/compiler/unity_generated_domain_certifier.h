@@ -242,6 +242,12 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
  * fields[0], fields[1], and the exact message. File, record text, and
  * fields[2] (source line) are retained in reports but excluded here. The
  * comparison is an exact unordered multiset, including multiplicity. */
+/* The fingerprint follows the same normalization. No success or availability
+ * is implied; empty diagnostics have a nonzero canonical digest. */
+bool unity_generated_domain_diagnostics_fingerprint(
+    const UnityCompilerResponseStatus *response,
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE]);
+
 bool unity_generated_domain_diagnostics_match_normalized(
     const UnityCompilerResponseStatus* generated,
     const UnityCompilerResponseStatus* original);

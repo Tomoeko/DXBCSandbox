@@ -3,6 +3,7 @@
 #define UNITY_SHADERLAB_LIFT_CAPTURE_H
 
 #include "app/shader_catalog_object.h"
+#include "app/whole_shader_evidence.h"
 #include "compiler/unity_shaderlab_lift.h"
 
 typedef struct UnityShaderLabLiftCapture UnityShaderLabLiftCapture;
@@ -53,6 +54,26 @@ unity_shaderlab_lift_capture(const UnityShaderLabLiftCaptureInput *input,
                              UnityShaderLabLiftCaptureReport *report);
 const UnityShaderLabLiftResult *
 unity_shaderlab_lift_capture_result(const UnityShaderLabLiftCapture *capture);
+/* Copy the actual target/source/profile/session/scope bindings. String views
+ * are owned by capture. Player, dependencies, producer and candidate release
+ * remain zero for the coordinator to fill from their own authorities. Scope
+ * is every emitted local D3D11 pass and its full generated compile domain. */
+bool unity_shaderlab_lift_capture_subject(const UnityShaderLabLiftCapture *capture,
+                                          WholeShaderSubjectDescriptor *descriptor);
+
+/* Produce VARIANT_DOMAIN, FULL_DXBC, COMPILER_DIAGNOSTICS or REFLECTION_BINDING
+ * using retained primary compile results and shared ordered compile-item identities. Subject fields
+ * owned by this capture must match exactly. Other evidence planes must bind
+ * the coordinator-supplied player/dependency/released-artifact identities.
+ * Domain items combine the independent ordered keyword-family fingerprints;
+ * the opaque capture also requires the existing complete alias/tier/cardinality
+ * attestation. Runtime eligibility and selection remain separate. Output is
+ * NULL on invalid/incomplete evidence or allocation error. Diagnostics compare
+ * the complete normalized callback multiset against a strict empty policy;
+ * even informational records therefore produce FAIL, not silent acceptance. */
+WholeShaderEvidenceStatus unity_shaderlab_lift_capture_make_evidence(
+    const UnityShaderLabLiftCapture *capture, const WholeShaderSubject *subject,
+    WholeShaderVerificationPlane plane, WholeShaderEvidence **output);
 void unity_shaderlab_lift_capture_free(UnityShaderLabLiftCapture *capture);
 
 #endif

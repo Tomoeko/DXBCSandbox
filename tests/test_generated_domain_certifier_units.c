@@ -1158,7 +1158,38 @@ static int test_full_tiered_certification(void) {
     return 0;
 }
 
+static int test_diagnostic_fingerprints(void) {
+    UnityCompilerDiagnostic records[2] = {
+        {.fields = {1, 3206, 12}, .message = "conversion"},
+        {.fields = {0, 0, 18}, .message = "information"},
+    };
+    UnityCompilerResponseStatus response = {.diagnostics = records, .diagnostic_count = 2};
+    uint8_t baseline[32], changed[32];
+    CHECK(unity_generated_domain_diagnostics_fingerprint(&response, baseline));
+    UnityCompilerDiagnostic swap = records[0];
+    records[0] = records[1];
+    records[1] = swap;
+    records[0].fields[2]++;
+    CHECK(unity_generated_domain_diagnostics_fingerprint(&response, changed));
+    CHECK(memcmp(baseline, changed, 32) == 0);
+    records[0].message = "different information";
+    CHECK(unity_generated_domain_diagnostics_fingerprint(&response, changed));
+    CHECK(memcmp(baseline, changed, 32) != 0);
+    records[0].message = NULL;
+    CHECK(!unity_generated_domain_diagnostics_fingerprint(&response, changed));
+    response.diagnostic_count = 0;
+    CHECK(unity_generated_domain_diagnostics_fingerprint(&response, changed));
+    CHECK(memcmp(baseline, changed, 32) != 0);
+    static const uint8_t empty_digest[32] = {0x20, 0x6c, 0x77, 0x1c, 0x36, 0x45, 0x00, 0x76,
+                                             0x65, 0x06, 0x41, 0x81, 0x7e, 0x2b, 0xb1, 0xa0,
+                                             0x12, 0x2d, 0x14, 0xe7, 0x51, 0x81, 0x48, 0x03,
+                                             0x4b, 0x59, 0x4a, 0x0f, 0x01, 0xc3, 0xff, 0x0c};
+    CHECK(memcmp(empty_digest, changed, 32) == 0);
+    return 0;
+}
+
 int main(void) {
+    CHECK(test_diagnostic_fingerprints() == 0);
     CHECK(test_contract_attestation() == 0);
     CHECK(test_distinct_cross_stage_raw_aliases_build_emit_and_attest() == 0);
     CHECK(test_user_axis_option_order_is_attested() == 0);

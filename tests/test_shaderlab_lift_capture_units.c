@@ -11,6 +11,121 @@
         }                                                                                          \
     } while (0)
 
+static int check_evidence(const UnityShaderLabLiftCapture *capture) {
+    WholeShaderSubjectDescriptor descriptor;
+    CHECK(unity_shaderlab_lift_capture_subject(capture, &descriptor));
+    WholeShaderSubject *subject = NULL;
+    CHECK(whole_shader_subject_create(&subject, &descriptor) == WHOLE_SHADER_SUBJECT_OK);
+    WholeShaderEvidence *dxbc = NULL, *bindings = NULL, *domain = NULL, *diagnostics = NULL,
+                        *invalid = NULL;
+    CHECK(unity_shaderlab_lift_capture_make_evidence(capture, subject, WHOLE_SHADER_PLANE_FULL_DXBC,
+                                                     &dxbc) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(unity_shaderlab_lift_capture_make_evidence(capture, subject,
+                                                     WHOLE_SHADER_PLANE_REFLECTION_BINDING,
+                                                     &bindings) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(unity_shaderlab_lift_capture_make_evidence(capture, subject,
+                                                     WHOLE_SHADER_PLANE_VARIANT_DOMAIN,
+                                                     &domain) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(unity_shaderlab_lift_capture_make_evidence(capture, subject,
+                                                     WHOLE_SHADER_PLANE_COMPILER_DIAGNOSTICS,
+                                                     &diagnostics) == WHOLE_SHADER_EVIDENCE_OK);
+    WholeShaderEvidenceSummary a, b, d, diagnostic_summary;
+    CHECK(whole_shader_evidence_describe(diagnostics, &diagnostic_summary) ==
+          WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(diagnostic_summary.status == WHOLE_SHADER_PLANE_PASS);
+    CHECK(whole_shader_evidence_describe(domain, &d) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(d.status == WHOLE_SHADER_PLANE_PASS);
+    CHECK(whole_shader_evidence_describe(dxbc, &a) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(whole_shader_evidence_describe(bindings, &b) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(a.status == WHOLE_SHADER_PLANE_PASS && b.status == WHOLE_SHADER_PLANE_PASS);
+    CHECK(a.expected_item_count > 0 && a.expected_item_count == b.expected_item_count);
+    CHECK(memcmp(a.coverage_digest, b.coverage_digest, 32) == 0);
+    CHECK(memcmp(a.coverage_digest, d.coverage_digest, 32) == 0);
+    CHECK(memcmp(a.coverage_digest, diagnostic_summary.coverage_digest, 32) == 0);
+    CHECK(unity_shaderlab_lift_capture_make_evidence(
+              capture, subject, WHOLE_SHADER_PLANE_RUNTIME_SELECTION, &invalid) ==
+          WHOLE_SHADER_EVIDENCE_INVALID_PLANE);
+    CHECK(!invalid);
+    printf("domain=pass dxbc=pass diagnostics=pass bindings=pass compile_items=%llu\n",
+           (unsigned long long)a.expected_item_count);
+    for (size_t mutation = 0; mutation < 15; ++mutation) {
+        WholeShaderSubjectDescriptor changed = descriptor;
+        switch (mutation) {
+        case 0:
+            changed.target_shader_path_id++;
+            break;
+        case 1:
+            changed.target_occurrence_digest[0] ^= 1;
+            break;
+        case 2:
+            changed.target_serialized_file_digest[0] ^= 1;
+            break;
+        case 3:
+            changed.target_object_payload_digest[0] ^= 1;
+            break;
+        case 4:
+            changed.schema_authority_digest[0] ^= 1;
+            break;
+        case 5:
+            changed.candidate_source_digest[0] ^= 1;
+            break;
+        case 6:
+            changed.compiler_profile_digest[0] ^= 1;
+            break;
+        case 7:
+            changed.compiler_session_digest[0] ^= 1;
+            break;
+        case 8:
+            changed.verification_scope_digest[0] ^= 1;
+            break;
+        case 9:
+            changed.build_platform++;
+            break;
+        case 10:
+            changed.compiler_platform++;
+            break;
+        case 11:
+            changed.graphics_api++;
+            break;
+        case 12:
+            changed.candidate_logical_name = "Different/Shader";
+            break;
+        case 13:
+            changed.unity_version = "different";
+            break;
+        case 14:
+            changed.serialized_target_platform++;
+            break;
+        }
+        WholeShaderSubject *mismatch = NULL;
+        CHECK(whole_shader_subject_create(&mismatch, &changed) == WHOLE_SHADER_SUBJECT_OK);
+        CHECK(unity_shaderlab_lift_capture_make_evidence(capture, mismatch,
+                                                         WHOLE_SHADER_PLANE_FULL_DXBC, &invalid) ==
+              WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+        CHECK(!invalid);
+        whole_shader_subject_free(mismatch);
+    }
+    /* These two planes alone cannot certify whole-shader equivalence. */
+    WholeShaderCertificateInput *certificate = NULL;
+    CHECK(whole_shader_certificate_input_create(&certificate, subject,
+                                                WHOLE_SHADER_D3D11_LOGICAL_REQUIRED_MASK) ==
+          WHOLE_SHADER_CERTIFICATE_OK);
+    CHECK(whole_shader_certificate_input_add_evidence(certificate, dxbc) ==
+          WHOLE_SHADER_CERTIFICATE_ADD_OK);
+    CHECK(whole_shader_certificate_input_add_evidence(certificate, bindings) ==
+          WHOLE_SHADER_CERTIFICATE_ADD_OK);
+    WholeShaderCertificateReport report;
+    (void)whole_shader_certificate_evaluate(certificate, &report);
+    CHECK(!report.d3d11_byte_equivalence_certified && !report.d3d11_logical_equivalence_certified);
+    whole_shader_certificate_input_free(certificate);
+    whole_shader_evidence_free(diagnostics);
+    whole_shader_evidence_free(domain);
+    whole_shader_evidence_free(dxbc);
+    whole_shader_evidence_free(bindings);
+    whole_shader_subject_free(subject);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 1 || argc == 5);
     UnityShaderLabLiftCapture *capture = NULL;
@@ -83,6 +198,7 @@ int main(int argc, char **argv) {
         CHECK(memcmp(digest, report.accepted_source_digest, 32) == 0);
         CHECK(unity_compile_profile_fingerprint(&profile, digest) == UNITY_COMPILE_PROFILE_OK);
         CHECK(memcmp(digest, report.profile_digest, 32) == 0);
+        CHECK(check_evidence(capture) == 0);
         printf("high_level=%d helper=%d passes=%zu\n", accepted->high_level,
                accepted->unity_uv_helpers, accepted->certified_pass_count);
     }

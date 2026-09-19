@@ -83,6 +83,57 @@ void unity_generated_domain_report_free(UnityGeneratedDomainReport* report) {
     unity_generated_domain_report_init(report);
 }
 
+static void evidence_hash_word(CommonSha256Context *hash, uint64_t value) {
+    uint8_t bytes[8];
+    for (size_t i = 0; i < sizeof(bytes); ++i)
+        bytes[i] = (uint8_t)(value >> (8U * i));
+    common_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+static int compare_diagnostic_digests(const void *left, const void *right) {
+    return memcmp(left, right, COMMON_SHA256_DIGEST_SIZE);
+}
+
+bool unity_generated_domain_diagnostics_fingerprint(const UnityCompilerResponseStatus *response,
+                                                    uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
+    if (!response || !digest || (response->diagnostic_count && !response->diagnostics) ||
+        response->diagnostic_count > SIZE_MAX / COMMON_SHA256_DIGEST_SIZE)
+        return false;
+    const size_t count = response->diagnostic_count;
+    uint8_t (*rows)[COMMON_SHA256_DIGEST_SIZE] = count ? malloc(count * sizeof(*rows)) : NULL;
+    if (count && !rows)
+        return false;
+    for (size_t i = 0; i < count; ++i) {
+        const UnityCompilerDiagnostic *diagnostic = &response->diagnostics[i];
+        if (!diagnostic->message) {
+            free(rows);
+            return false;
+        }
+        CommonSha256Context hash;
+        common_sha256_init(&hash);
+        static const char name[] = "DXBCSandbox.NormalizedDiagnostic.v1";
+        common_sha256_update(&hash, name, sizeof(name));
+        evidence_hash_word(&hash, (uint32_t)diagnostic->fields[0]);
+        evidence_hash_word(&hash, (uint32_t)diagnostic->fields[1]);
+        const size_t length = strlen(diagnostic->message);
+        evidence_hash_word(&hash, length);
+        common_sha256_update(&hash, diagnostic->message, length);
+        common_sha256_final(&hash, rows[i]);
+    }
+    if (count > 1)
+        qsort(rows, count, sizeof(*rows), compare_diagnostic_digests);
+    CommonSha256Context hash;
+    common_sha256_init(&hash);
+    static const char name[] = "DXBCSandbox.NormalizedDiagnosticMultiset.v1";
+    common_sha256_update(&hash, name, sizeof(name));
+    evidence_hash_word(&hash, count);
+    if (count)
+        common_sha256_update(&hash, rows, count * sizeof(*rows));
+    common_sha256_final(&hash, digest);
+    free(rows);
+    return true;
+}
+
 static bool normalized_diagnostic_equal(
     const UnityCompilerDiagnostic* left,
     const UnityCompilerDiagnostic* right) {
@@ -638,24 +689,18 @@ static UnityGeneratedDomainStatus parse_contract_row(
     return UNITY_GENERATED_DOMAIN_OK;
 }
 
-static void keyword_hash_word(CommonSha256Context* hash, uint64_t value) {
-    uint8_t bytes[8];
-    for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(value >> (8U * i));
-    common_sha256_update(hash, bytes, sizeof(bytes));
-}
-
 static void fingerprint_keyword_rows(const OrderedKeywordRow* rows, size_t count,
                                      uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
     CommonSha256Context hash;
     common_sha256_init(&hash);
     static const char domain[] = "DXBCSandbox.OrderedKeywordFamily.v1";
     common_sha256_update(&hash, domain, sizeof(domain));
-    keyword_hash_word(&hash, count);
+    evidence_hash_word(&hash, count);
     for (size_t row = 0; row < count; ++row) {
-        keyword_hash_word(&hash, rows[row].has_default);
-        keyword_hash_word(&hash, rows[row].count);
+        evidence_hash_word(&hash, rows[row].has_default);
+        evidence_hash_word(&hash, rows[row].count);
         for (size_t word = 0; word < rows[row].count; ++word)
-            keyword_hash_word(&hash, rows[row].indices[word]);
+            evidence_hash_word(&hash, rows[row].indices[word]);
     }
     common_sha256_final(&hash, digest);
 }
