@@ -190,6 +190,218 @@ static bool check_loop_phi(void) {
     return true;
 }
 
+static bool has_flow_edge(const HLSLEmitterContext *ctx, int from, int to) {
+    const HLSLBasicBlock *block = &ctx->cfg.blocks[ctx->cfg.instruction_block[from]];
+    for (int i = 0; i < block->successor_count; ++i)
+        if (block->successors[i] == ctx->cfg.instruction_block[to])
+            return true;
+    return false;
+}
+
+static bool check_structured_flow_edges(void) {
+    /* A DXBC loop has no implicit exit at ENDLOOP. Only the conditional
+     * break reaches the output, so its preceding definition dominates it. */
+    USILInstruction instructions[8] = {0};
+    instructions[0].opcode = USIL_OP_LOOP;
+    instructions[1] = move(reg(OPERAND_TYPE_TEMP, 0, 0x10), reg(OPERAND_TYPE_INPUT, 0, 0));
+    instructions[2].opcode = USIL_OP_BREAKC;
+    instructions[2].operand_count = 1;
+    instructions[2].operands[0] = reg(OPERAND_TYPE_INPUT, 0, 0);
+    instructions[3] = move(reg(OPERAND_TYPE_TEMP, 0, 0x10), reg(OPERAND_TYPE_INPUT, 1, 0));
+    instructions[4].opcode = USIL_OP_ENDLOOP;
+    instructions[5] = move(reg(OPERAND_TYPE_OUTPUT, 0, 0x10), reg(OPERAND_TYPE_TEMP, 0, 0));
+    instructions[6].opcode = USIL_OP_RET;
+    USILProgram program = {.instructions = instructions, .instruction_count = 7, .temp_count = 1};
+    HLSLEmitterContext ctx;
+    CHECK(analyze(&ctx, &program));
+    CHECK(!has_flow_edge(&ctx, 4, 5));
+    CHECK(has_flow_edge(&ctx, 4, 1));
+    CHECK(has_flow_edge(&ctx, 2, 5));
+    CHECK(hlsl_operand_definition(&ctx, 5, 1, 0) == 1);
+    dispose(&ctx);
+
+    /* An empty unconditional loop is a self-edge, with an unreachable tail. */
+    memset(instructions, 0, sizeof(instructions));
+    instructions[0].opcode = USIL_OP_LOOP;
+    instructions[1].opcode = USIL_OP_ENDLOOP;
+    instructions[2].opcode = USIL_OP_RET;
+    program.instruction_count = 3;
+    CHECK(analyze(&ctx, &program));
+    CHECK(has_flow_edge(&ctx, 1, 1));
+    CHECK(!has_flow_edge(&ctx, 1, 2));
+    CHECK(ctx.cfg.idom[ctx.cfg.instruction_block[2]] == -1);
+    dispose(&ctx);
+    return true;
+}
+
+static bool check_switch_flow_and_scope(void) {
+    USILInstruction instructions[24] = {0};
+    instructions[0].opcode = USIL_OP_SWITCH;
+    instructions[0].operand_count = 1;
+    instructions[0].operands[0] = reg(OPERAND_TYPE_INPUT, 0, 0);
+    for (int arm = 0; arm < 5; ++arm) {
+        const int start = 1 + arm * 3;
+        instructions[start].opcode = arm < 4 ? USIL_OP_CASE : USIL_OP_DEFAULT;
+        if (arm < 4) {
+            instructions[start].operand_count = 1;
+            instructions[start].operands[0].type = OPERAND_TYPE_IMMEDIATE32;
+            instructions[start].operands[0].imm_value_count = 1;
+            instructions[start].operands[0].imm_values[0] = (uint32_t)arm;
+        }
+        instructions[start + 1] =
+            move(reg(OPERAND_TYPE_TEMP, 0, 0x10), reg(OPERAND_TYPE_INPUT, arm, 0));
+        instructions[start + 2].opcode = USIL_OP_BREAK;
+    }
+    instructions[16].opcode = USIL_OP_ENDSWITCH;
+    instructions[17] = move(reg(OPERAND_TYPE_OUTPUT, 0, 0x10), reg(OPERAND_TYPE_TEMP, 0, 0));
+    instructions[18].opcode = USIL_OP_RET;
+    USILProgram program = {.instructions = instructions, .instruction_count = 19, .temp_count = 1};
+    HLSLEmitterContext ctx;
+    CHECK(analyze(&ctx, &program));
+    CHECK(ctx.cfg.blocks[0].successor_count == 5);
+    CHECK(!has_flow_edge(&ctx, 0, 17));
+    CHECK(hlsl_operand_definition(&ctx, 17, 1, 0) == HLSL_DEFINITION_AMBIGUOUS);
+    for (int arm = 0; arm < 5; ++arm) {
+        CHECK(has_flow_edge(&ctx, 0, 1 + arm * 3));
+        CHECK(has_flow_edge(&ctx, 3 + arm * 3, 17));
+        CHECK(hlsl_definition_use_count(&ctx, 2 + arm * 3, 0) == 1);
+    }
+    dispose(&ctx);
+
+    /* Without default, an unmatched selector bypasses every assignment. */
+    instructions[13].opcode = USIL_OP_CASE;
+    instructions[13].operand_count = 1;
+    instructions[13].operands[0] = instructions[1].operands[0];
+    instructions[13].operands[0].imm_values[0] = 4;
+    CHECK(analyze(&ctx, &program));
+    CHECK(ctx.cfg.blocks[0].successor_count == 6);
+    CHECK(has_flow_edge(&ctx, 0, 17));
+    HLSLBlockPhis *phis = &ctx.ssa.block_phis[ctx.cfg.instruction_block[17]];
+    CHECK(phis->phi_count == 1);
+    bool entry_is_undefined = false;
+    for (int edge = 0; edge < ctx.cfg.blocks[ctx.cfg.instruction_block[17]].predecessor_count;
+         ++edge)
+        if (phis->phis[0].incoming_blocks[edge] == 0)
+            entry_is_undefined = phis->phis[0].incoming_vars[edge] == -1;
+    CHECK(entry_is_undefined);
+    dispose(&ctx);
+
+    /* BREAK leaves the inner switch; CONTINUE still targets the outer loop. */
+    memset(instructions, 0, sizeof(instructions));
+    const USILOpcode opcodes[] = {USIL_OP_LOOP,  USIL_OP_SWITCH,    USIL_OP_DEFAULT,
+                                  USIL_OP_BREAK, USIL_OP_ENDSWITCH, USIL_OP_CONTINUEC,
+                                  USIL_OP_BREAK, USIL_OP_ENDLOOP,   USIL_OP_RET};
+    for (size_t i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); ++i)
+        instructions[i].opcode = opcodes[i];
+    for (int i = 1; i <= 5; i += 4) {
+        instructions[i].operand_count = 1;
+        instructions[i].operands[0] = reg(OPERAND_TYPE_INPUT, 0, 0);
+    }
+    program.instruction_count = 9;
+    CHECK(analyze(&ctx, &program));
+    CHECK(has_flow_edge(&ctx, 3, 5) && !has_flow_edge(&ctx, 3, 8));
+    CHECK(has_flow_edge(&ctx, 5, 7) && has_flow_edge(&ctx, 5, 6));
+    CHECK(has_flow_edge(&ctx, 6, 8));
+    CHECK(has_flow_edge(&ctx, 7, 1) && !has_flow_edge(&ctx, 7, 8));
+    dispose(&ctx);
+
+    instructions[3].opcode = USIL_OP_BREAKC;
+    instructions[3].operand_count = 1;
+    instructions[3].operands[0] = reg(OPERAND_TYPE_INPUT, 0, 0);
+    CHECK(analyze(&ctx, &program));
+    CHECK(has_flow_edge(&ctx, 3, 4) && has_flow_edge(&ctx, 3, 5));
+    CHECK(!has_flow_edge(&ctx, 3, 8));
+    dispose(&ctx);
+
+    instructions[3].opcode = USIL_OP_CONTINUE;
+    instructions[3].operand_count = 0;
+    CHECK(analyze(&ctx, &program));
+    CHECK(has_flow_edge(&ctx, 3, 7) && !has_flow_edge(&ctx, 3, 5));
+    dispose(&ctx);
+    return true;
+}
+
+static bool check_flow_structure_validation(void) {
+    USILInstruction instructions[132] = {0};
+    USILProgram program = {.instructions = instructions, .instruction_count = 8};
+    HLSLEmitterContext ctx = {.program = &program};
+    const USILOpcode nested[] = {USIL_OP_IF,    USIL_OP_ELSE,  USIL_OP_IF,  USIL_OP_ELSE,
+                                 USIL_OP_ENDIF, USIL_OP_ENDIF, USIL_OP_NOP, USIL_OP_RET};
+    for (size_t i = 0; i < sizeof(nested) / sizeof(nested[0]); ++i)
+        instructions[i].opcode = nested[i];
+    CHECK(build_control_flow_graph(&ctx) && analyze_block_nesting(&ctx));
+    CHECK(ctx.cfg.nesting[ctx.cfg.instruction_block[2]].parent_block ==
+          ctx.cfg.instruction_block[1]);
+    CHECK(ctx.cfg.nesting[ctx.cfg.instruction_block[6]].parent_block == -1);
+    free_control_flow_graph(&ctx);
+
+    const USILOpcode malformed[][4] = {
+        {USIL_OP_BREAK, USIL_OP_NOP, USIL_OP_NOP, USIL_OP_RET},
+        {USIL_OP_CONTINUE, USIL_OP_NOP, USIL_OP_NOP, USIL_OP_RET},
+        {USIL_OP_IF, USIL_OP_ELSE, USIL_OP_ELSE, USIL_OP_ENDIF},
+        {USIL_OP_IF, USIL_OP_LOOP, USIL_OP_ENDIF, USIL_OP_ENDLOOP},
+        {USIL_OP_IF, USIL_OP_NOP, USIL_OP_NOP, USIL_OP_RET},
+        {USIL_OP_ELSE, USIL_OP_NOP, USIL_OP_NOP, USIL_OP_RET},
+        {USIL_OP_CASE, USIL_OP_NOP, USIL_OP_NOP, USIL_OP_RET},
+        {USIL_OP_SWITCH, USIL_OP_DEFAULT, USIL_OP_DEFAULT, USIL_OP_ENDSWITCH},
+        {USIL_OP_SWITCH, USIL_OP_CONTINUE, USIL_OP_NOP, USIL_OP_ENDSWITCH},
+        {USIL_OP_ENDIF, USIL_OP_NOP, USIL_OP_NOP, USIL_OP_RET}};
+    program.instruction_count = 4;
+    for (size_t case_index = 0; case_index < sizeof(malformed) / sizeof(malformed[0]);
+         ++case_index) {
+        for (int i = 0; i < 4; ++i)
+            instructions[i].opcode = malformed[case_index][i];
+        CHECK(!build_control_flow_graph(&ctx));
+        CHECK(!ctx.cfg.blocks && !ctx.cfg.successor_storage && !ctx.cfg.nesting);
+    }
+    for (int depth = 64; depth <= 65; ++depth) {
+        for (int i = 0; i < depth; ++i)
+            instructions[i].opcode = USIL_OP_IF;
+        for (int i = depth; i < depth * 2; ++i)
+            instructions[i].opcode = USIL_OP_ENDIF;
+        instructions[depth * 2].opcode = USIL_OP_RET;
+        program.instruction_count = depth * 2 + 1;
+        CHECK(build_control_flow_graph(&ctx) == (depth == 64));
+        free_control_flow_graph(&ctx);
+    }
+    return true;
+}
+
+static bool check_long_dominator_chain(void) {
+    /* Sequential diamonds keep source nesting shallow while producing a deep
+     * dominator tree. Traversal must not depend on the C call-stack limit or
+     * allocate a dense block-by-block frontier matrix. */
+    enum { BRANCHES = 2048, COUNT = BRANCHES * 3 + 3 };
+    USILInstruction *instructions = calloc(COUNT, sizeof(*instructions));
+    CHECK(instructions);
+    instructions[0] = move(reg(OPERAND_TYPE_TEMP, 0, 0x10), reg(OPERAND_TYPE_INPUT, 0, 0));
+    for (int branch = 0; branch < BRANCHES; ++branch) {
+        const int start = 1 + branch * 3;
+        instructions[start].opcode = USIL_OP_IF;
+        instructions[start].operand_count = 1;
+        instructions[start].operands[0] = reg(OPERAND_TYPE_INPUT, 0, 0);
+        instructions[start + 1] =
+            move(reg(OPERAND_TYPE_TEMP, 0, 0x10), reg(OPERAND_TYPE_INPUT, 1, 0));
+        instructions[start + 2].opcode = USIL_OP_ENDIF;
+    }
+    instructions[COUNT - 2] = move(reg(OPERAND_TYPE_OUTPUT, 0, 0x10), reg(OPERAND_TYPE_TEMP, 0, 0));
+    instructions[COUNT - 1].opcode = USIL_OP_RET;
+    USILProgram program = {
+        .instructions = instructions, .instruction_count = COUNT, .temp_count = 1};
+    HLSLEmitterContext ctx;
+    CHECK(analyze(&ctx, &program));
+    CHECK(hlsl_operand_definition(&ctx, COUNT - 2, 1, 0) == HLSL_DEFINITION_AMBIGUOUS);
+    size_t phis = 0;
+    for (int block = 0; block < ctx.cfg.block_count; ++block) {
+        phis += (size_t)ctx.ssa.block_phis[block].phi_count;
+        CHECK(ctx.cfg.idom[block] >= 0);
+    }
+    CHECK(phis == BRANCHES);
+    dispose(&ctx);
+    free(instructions);
+    return true;
+}
+
 static bool check_copy_candidates(void) {
     USILInstruction instructions[6] = {0};
     instructions[0] = move(reg(OPERAND_TYPE_TEMP, 0, 0xf0), reg(OPERAND_TYPE_INPUT, 0, 0));
@@ -979,9 +1191,11 @@ static bool check_expression_emission(void) {
 
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
-        !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_copy_candidates() ||
-        !check_result_candidates() || !check_effects() || !check_transactions() ||
-        !check_result_transactions() || !check_expression_emission())
+        !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
+        !check_switch_flow_and_scope() || !check_flow_structure_validation() ||
+        !check_long_dominator_chain() || !check_copy_candidates() || !check_result_candidates() ||
+        !check_effects() || !check_transactions() || !check_result_transactions() ||
+        !check_expression_emission())
         return 1;
     puts("HLSL dataflow contracts passed");
     return 0;

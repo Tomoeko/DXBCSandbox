@@ -99,15 +99,11 @@ static bool append_undo_entry(RenamingUndoEntry **undo_log, int *undo_count,
     return true;
 }
 
-static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
-                       int **dom_children, int *dom_child_counts,
-                       int (*active_version)[4], int *next_ssa_var) {
+static bool rename_ssa_block(HLSLEmitterContext *ctx, int block, int (*active_version)[4],
+                             int *next_ssa_var, RenamingUndoEntry **undo_log, int *undo_count,
+                             int *undo_capacity) {
     HLSLControlFlowGraph *cfg = &ctx->cfg;
     HLSLSSAGraph *ssa = &ctx->ssa;
-
-    int undo_count = 0;
-    int undo_capacity = 0;
-    RenamingUndoEntry *undo_log = NULL;
 
     // 1. Rename definitions in Phi nodes
     HLSLBlockPhis *bp = &ssa->block_phis[block];
@@ -121,9 +117,9 @@ static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
         /* A merge is not the first executable instruction in its block. */
         ssa->ssa_var_defs[new_var] = HLSL_DEFINITION_AMBIGUOUS;
 
-        if (!append_undo_entry(&undo_log, &undo_count, &undo_capacity,
-                               reg, comp, active_version[reg][comp])) {
-            goto fail;
+        if (!append_undo_entry(undo_log, undo_count, undo_capacity, reg, comp,
+                               active_version[reg][comp])) {
+            return false;
         }
 
         active_version[reg][comp] = new_var;
@@ -139,17 +135,19 @@ static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
         for (int op_idx = 0; op_idx < inst->operand_count; ++op_idx) {
             USILOperandUseInfo use;
             if (!usil_instruction_operand_use(ctx->program, inst, op_idx, &use)) {
-                goto fail;
+                return false;
             }
             const DXBCOperand *operand = &inst->operands[op_idx];
             if (operand->type != OPERAND_TYPE_TEMP ||
                 use.use != USIL_OPERAND_USE_SOURCE) continue;
             int reg = operand->register_index;
-            if (reg < 0 || reg >= ctx->program->temp_count) goto fail;
+            if (reg < 0 || reg >= ctx->program->temp_count)
+                return false;
             for (int comp = 0; comp < 4; ++comp) {
                 if (!(use.source_lane_mask & (1u << comp))) continue;
                 int source = usil_operand_source_component(operand, comp);
-                if (source < 0) goto fail;
+                if (source < 0)
+                    return false;
                 ssa->operand_ssa_vars[operand_offset(inst_idx, op_idx, comp)] =
                     active_version[reg][source];
             }
@@ -160,22 +158,23 @@ static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
         for (int op_idx = 0; op_idx < inst->operand_count; ++op_idx) {
             USILOperandUseInfo use;
             if (!usil_instruction_operand_use(ctx->program, inst, op_idx, &use)) {
-                goto fail;
+                return false;
             }
             const DXBCOperand *operand = &inst->operands[op_idx];
             if (operand->type != OPERAND_TYPE_TEMP ||
                 use.use != USIL_OPERAND_USE_DESTINATION) continue;
             int reg = operand->register_index;
-            if (reg < 0 || reg >= ctx->program->temp_count) goto fail;
+            if (reg < 0 || reg >= ctx->program->temp_count)
+                return false;
             uint8_t mask = usil_operand_destination_lane_mask(operand);
             for (int comp = 0; comp < 4; ++comp) {
                 if (!(mask & (1u << comp))) continue;
                 int new_var = (*next_ssa_var)++;
                 ssa->operand_ssa_vars[operand_offset(inst_idx, op_idx, comp)] = new_var;
                 ssa->ssa_var_defs[new_var] = inst_idx;
-                if (!append_undo_entry(&undo_log, &undo_count, &undo_capacity,
-                                       reg, comp, active_version[reg][comp])) {
-                    goto fail;
+                if (!append_undo_entry(undo_log, undo_count, undo_capacity, reg, comp,
+                                       active_version[reg][comp])) {
+                    return false;
                 }
                 active_version[reg][comp] = new_var;
             }
@@ -188,7 +187,7 @@ static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
 
         int pred_slot = -1;
         for (int k = 0; k < cfg->blocks[succ].predecessor_count; k++) {
-            if (preds[succ][k] == block) {
+            if (cfg->blocks[succ].predecessors[k] == block) {
                 pred_slot = k;
                 break;
             }
@@ -206,29 +205,51 @@ static bool rename_ssa(HLSLEmitterContext *ctx, int block, int **preds,
         }
     }
 
-    // 4. Recurse to dominator tree children
-    for (int i = 0; i < dom_child_counts[block]; i++) {
-        int child = dom_children[block][i];
-        if (!rename_ssa(ctx, child, preds, dom_children, dom_child_counts,
-                        active_version, next_ssa_var)) {
-            goto fail;
+    return true;
+}
+
+typedef struct {
+    int block;
+    int next_child;
+    int undo_start;
+    bool entered;
+} SSARenameFrame;
+
+static bool rename_ssa(HLSLEmitterContext *ctx, int **dom_children, int *dom_child_counts,
+                       int (*active_version)[4], int *next_ssa_var) {
+    if (dxbc_size_multiply_overflows((size_t)ctx->cfg.block_count, sizeof(SSARenameFrame)))
+        return false;
+    SSARenameFrame *stack = calloc((size_t)ctx->cfg.block_count, sizeof(*stack));
+    if (!stack)
+        return false;
+    RenamingUndoEntry *undo_log = NULL;
+    int undo_count = 0, undo_capacity = 0, depth = 1;
+    bool success = false;
+    while (depth) {
+        SSARenameFrame *frame = &stack[depth - 1];
+        if (!frame->entered) {
+            frame->undo_start = undo_count;
+            if (!rename_ssa_block(ctx, frame->block, active_version, next_ssa_var, &undo_log,
+                                  &undo_count, &undo_capacity))
+                goto cleanup;
+            frame->entered = true;
+        }
+        if (frame->next_child < dom_child_counts[frame->block]) {
+            const int child = dom_children[frame->block][frame->next_child++];
+            stack[depth++] = (SSARenameFrame){.block = child};
+        } else {
+            while (undo_count > frame->undo_start) {
+                const RenamingUndoEntry *entry = &undo_log[--undo_count];
+                active_version[entry->reg][entry->comp] = entry->old_version;
+            }
+            --depth;
         }
     }
-
-    // 5. Restore active versions
-    for (int i = undo_count - 1; i >= 0; i--) {
-        active_version[undo_log[i].reg][undo_log[i].comp] = undo_log[i].old_version;
-    }
+    success = true;
+cleanup:
     free(undo_log);
-    return true;
-
-fail:
-    for (int i = undo_count - 1; i >= 0; i--) {
-        active_version[undo_log[i].reg][undo_log[i].comp] =
-            undo_log[i].old_version;
-    }
-    free(undo_log);
-    return false;
+    free(stack);
+    return success;
 }
 
 bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
@@ -282,33 +303,6 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
         ctx->ssa.operand_ssa_vars[i] = -1;
     }
 
-    // Build predecessor list for Phi argument assignment
-    int **preds = (int **)malloc(block_count_size * sizeof(int *));
-    int *pred_idx = (int *)calloc(block_count_size, sizeof(int));
-    if (!preds || !pred_idx) {
-        free(preds);
-        free(pred_idx);
-        free_hlsl_ssa_graph(ctx);
-        return false;
-    }
-    for (int i = 0; i < cfg->block_count; i++) {
-        int p_count = cfg->blocks[i].predecessor_count;
-        preds[i] = p_count > 0 ? (int *)malloc((size_t)p_count * sizeof(int)) : NULL;
-        if (p_count > 0 && !preds[i]) {
-            for (int j = 0; j < i; j++) free(preds[j]);
-            free(preds);
-            free(pred_idx);
-            free_hlsl_ssa_graph(ctx);
-            return false;
-        }
-    }
-    for (int i = 0; i < cfg->block_count; i++) {
-        for (int s = 0; s < cfg->blocks[i].successor_count; s++) {
-            int succ = cfg->blocks[i].successors[s];
-            preds[succ][pred_idx[succ]++] = i;
-        }
-    }
-
     // Phis placement (Iterated Dominance Frontier)
     bool *has_phi = calloc(block_count_size, sizeof(bool));
     bool *visited = calloc(block_count_size, sizeof(bool));
@@ -317,9 +311,6 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
         free(has_phi);
         free(visited);
         free(worklist);
-        for (int i = 0; i < cfg->block_count; i++) free(preds[i]);
-        free(preds);
-        free(pred_idx);
         free_hlsl_ssa_graph(ctx);
         return false;
     }
@@ -362,10 +353,6 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
                             free(has_phi);
                             free(visited);
                             free(worklist);
-                            for (int cleanup = 0; cleanup < cfg->block_count;
-                                 ++cleanup) free(preds[cleanup]);
-                            free(preds);
-                            free(pred_idx);
                             free_hlsl_ssa_graph(ctx);
                             return false;
                         }
@@ -390,9 +377,6 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
     if (!dom_child_counts || !dom_children) {
         free(dom_child_counts);
         free(dom_children);
-        for (int i = 0; i < cfg->block_count; i++) free(preds[i]);
-        free(preds);
-        free(pred_idx);
         free_hlsl_ssa_graph(ctx);
         return false;
     }
@@ -408,9 +392,6 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
             for (int j = 0; j < i; j++) free(dom_children[j]);
             free(dom_child_counts);
             free(dom_children);
-            for (int k = 0; k < cfg->block_count; k++) free(preds[k]);
-            free(preds);
-            free(pred_idx);
             free_hlsl_ssa_graph(ctx);
             return false;
         }
@@ -440,8 +421,7 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
         }
     }
     int next_ssa_var = 0;
-    if (!rename_ssa(ctx, 0, preds, dom_children, dom_child_counts,
-                    active_version, &next_ssa_var)) {
+    if (!rename_ssa(ctx, dom_children, dom_child_counts, active_version, &next_ssa_var)) {
         free(active_version);
         goto rename_cleanup_failure;
     }
@@ -452,9 +432,6 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
     for (int i = 0; i < cfg->block_count; i++) free(dom_children[i]);
     free(dom_children);
     free(dom_child_counts);
-    for (int i = 0; i < cfg->block_count; i++) free(preds[i]);
-    free(preds);
-    free(pred_idx);
 
     return true;
 
@@ -462,9 +439,6 @@ rename_cleanup_failure:
     for (int i = 0; i < cfg->block_count; i++) free(dom_children[i]);
     free(dom_children);
     free(dom_child_counts);
-    for (int i = 0; i < cfg->block_count; i++) free(preds[i]);
-    free(preds);
-    free(pred_idx);
     free_hlsl_ssa_graph(ctx);
     return false;
 }

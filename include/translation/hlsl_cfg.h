@@ -10,7 +10,9 @@ struct HLSLEmitterContext;
 typedef struct HLSLBasicBlock {
     int first_instruction;
     int last_instruction;
-    int successors[3];
+    /* Borrowed slices of the enclosing graph's owned edge storage. */
+    int *successors;
+    int *predecessors;
     int successor_count;
     int predecessor_count;
     bool has_ambiguous_flow;
@@ -24,6 +26,8 @@ typedef struct {
 
 typedef struct HLSLControlFlowGraph {
     HLSLBasicBlock *blocks;
+    int *successor_storage;
+    int *predecessor_storage;
     int block_count;
     int *instruction_block;
     int *idom;
