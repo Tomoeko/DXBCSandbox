@@ -109,6 +109,20 @@ typedef struct {
     UnityReflectionCertificateReport reflection_certificate;
 } UnityGeneratedDomainDiagnostic;
 
+/* Hashes describe the attempted request and extracted container bytes. None
+ * of the presence flags imply a successful compile or equality certificate. */
+typedef struct {
+    bool recorded;
+    bool response_received;
+    bool has_request_identity;
+    bool has_output_digest;
+    uint8_t request_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t controls_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t source_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t target_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t output_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+} UnityGeneratedCompileProvenance;
+
 typedef struct {
     int stage_index;
     int hardware_tier_group;
@@ -120,6 +134,8 @@ typedef struct {
     bool original_response_present;
     UnityCompilerResponseStatus original_response;
     DXBCCompareResult original_dxbc_compare;
+    UnityGeneratedCompileProvenance provenance;
+    UnityGeneratedCompileProvenance original_provenance;
 } UnityGeneratedDomainCompilerResponseRecord;
 
 typedef struct {
@@ -187,6 +203,10 @@ typedef struct {
 
     UnityGeneratedDomainCompileCallback compile_callback;
     void* compile_context;
+    /* Retain every attempted request, including clean, unavailable and failed
+     * responses. Without this flag the historical diagnostic-only ledger is
+     * preserved. Original diagnostic-parity requests share their primary row. */
+    bool retain_compile_provenance;
 } UnityGeneratedDomainCertificationInput;
 
 /*

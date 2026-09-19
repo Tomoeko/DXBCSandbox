@@ -1,6 +1,7 @@
 #include "compiler/unity_generated_domain_certifier.h"
 
 #include "common/common.h"
+#include "common/sha256.h"
 #include "dxbc/dxbc_hash.h"
 
 #include <stdio.h>
@@ -596,6 +597,8 @@ typedef struct {
     int32_t diagnostic_type;
     bool add_unexpected_reflection;
     bool cache_only_miss;
+    bool transport_failure;
+    bool omit_identity;
 } FakeCompiler;
 
 static char* duplicate_string(const char* value) {
@@ -640,6 +643,14 @@ static bool set_fake_reflection(
     return true;
 }
 
+/* Distinct synthetic request identities test transfer only. Canonical request
+ * serialization and toolchain authority are exercised by compiler-client tests. */
+static void set_fake_request_identity(UnityCompilerBinaryResponse *response, size_t call) {
+    response->has_request_identity = true;
+    memset(response->request_digest, (int)call, sizeof(response->request_digest));
+    memset(response->controls_digest, 0x55, sizeof(response->controls_digest));
+}
+
 static bool fake_compile(
     void* context, const UnityCompilerSnippetCompileRequest* request,
     UnityCompilerBinaryResponse* response) {
@@ -660,6 +671,8 @@ static bool fake_compile(
     }
     if (!found_tier) return false;
     ++compiler->calls;
+    if (!compiler->omit_identity) set_fake_request_identity(response, compiler->calls);
+    if (compiler->transport_failure) return false;
     if (compiler->cache_only_miss) {
         response->status.availability =
             UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS;
@@ -714,6 +727,7 @@ static bool diagnostic_parity_compile(
     }
     if (!found_tier || tier >= 3U) return false;
     ++compiler->calls;
+    set_fake_request_identity(response, compiler->calls);
     response->status.compiler_success = true;
     if (!set_fake_diagnostic(
             &response->status, 1, 4, original ? 39 : 132,
@@ -884,6 +898,48 @@ static int test_full_tiered_certification(void) {
     CHECK(report.runtime_binding_attested_compile_count == 3U);
     CHECK(report.runtime_binding_compatible_compile_count == 0U);
 
+    CHECK(report.compiler_response_count == 0U);
+    input.retain_compile_provenance = true;
+    compiler.calls = 0;
+    CHECK(unity_generated_domain_certify_d3d11(&input, &report) == UNITY_GENERATED_DOMAIN_OK);
+    CHECK(report.compiler_response_count == 3U);
+    uint8_t target_digest[COMMON_SHA256_DIGEST_SIZE];
+    uint8_t source_digest[COMMON_SHA256_DIGEST_SIZE];
+    common_sha256(reference_dxbc, dxbc_size, target_digest);
+    common_sha256(snippet.source, strlen(snippet.source), source_digest);
+    for (size_t i = 0; i < report.compiler_response_count; ++i) {
+        const UnityGeneratedCompileProvenance *provenance = &report.compiler_responses[i].provenance;
+        CHECK(provenance->recorded && provenance->response_received);
+        CHECK(provenance->has_request_identity && provenance->has_output_digest);
+        CHECK(provenance->request_digest[0] == i + 1U);
+        CHECK(provenance->controls_digest[0] == 0x55);
+        CHECK(memcmp(provenance->source_digest, source_digest, sizeof(source_digest)) == 0);
+        CHECK(memcmp(provenance->target_digest, target_digest, sizeof(target_digest)) == 0);
+        CHECK(memcmp(provenance->output_digest, target_digest, sizeof(target_digest)) == 0);
+        CHECK(!report.compiler_responses[i].original_provenance.recorded);
+    }
+    compiler = (FakeCompiler){.bytes = reference_dxbc, .size = dxbc_size,
+                              .transport_failure = true};
+    CHECK(unity_generated_domain_certify_d3d11(&input, &report) ==
+          UNITY_GENERATED_DOMAIN_COMPILER_TRANSPORT_FAILED);
+    CHECK(report.compiler_response_count == 1U);
+    CHECK(report.compiler_responses[0].provenance.recorded);
+    CHECK(!report.compiler_responses[0].provenance.response_received);
+    CHECK(report.compiler_responses[0].provenance.has_request_identity);
+    CHECK(!report.compiler_responses[0].provenance.has_output_digest);
+    compiler = (FakeCompiler){.bytes = reference_dxbc, .size = 1U};
+    CHECK(unity_generated_domain_certify_d3d11(&input, &report) ==
+          UNITY_GENERATED_DOMAIN_COMPILED_DXBC_INVALID);
+    CHECK(report.compiler_response_count == 1U);
+    CHECK(report.compiler_responses[0].provenance.response_received);
+    CHECK(report.compiler_responses[0].provenance.has_request_identity);
+    CHECK(!report.compiler_responses[0].provenance.has_output_digest);
+    compiler = (FakeCompiler){.bytes = reference_dxbc, .size = dxbc_size, .omit_identity = true};
+    CHECK(unity_generated_domain_certify_d3d11(&input, &report) == UNITY_GENERATED_DOMAIN_OK);
+    CHECK(report.compiler_response_count == 3U);
+    CHECK(!report.compiler_responses[0].provenance.has_request_identity);
+    CHECK(report.compiler_responses[0].provenance.request_digest[0] == 0);
+
     compiler = (FakeCompiler){
         .bytes = reference_dxbc,
         .size = dxbc_size,
@@ -913,6 +969,11 @@ static int test_full_tiered_certification(void) {
           UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS);
     CHECK(strcmp(unity_generated_domain_status_name(report.status),
                  "compiler-cache-only-miss") == 0);
+    CHECK(report.compiler_response_count == 1U);
+    CHECK(report.compiler_responses[0].provenance.recorded);
+    CHECK(report.compiler_responses[0].provenance.response_received);
+    CHECK(report.compiler_responses[0].provenance.has_request_identity);
+    CHECK(!report.compiler_responses[0].provenance.has_output_digest);
 
     compiler = (FakeCompiler){
         .bytes = reference_dxbc,
@@ -981,6 +1042,16 @@ static int test_full_tiered_certification(void) {
         CHECK(record->response.diagnostics[0].fields[2] == 132);
         CHECK(record->original_response.diagnostics[0].fields[2] == 39);
         CHECK(record->original_dxbc_compare.status == DXBC_COMPARE_EQUAL);
+        CHECK(record->provenance.recorded && record->original_provenance.recorded);
+        CHECK(record->original_provenance.response_received);
+        CHECK(record->original_provenance.has_request_identity);
+        CHECK(record->original_provenance.has_output_digest);
+        CHECK(memcmp(record->provenance.source_digest, record->original_provenance.source_digest,
+                     COMMON_SHA256_DIGEST_SIZE) != 0);
+        CHECK(memcmp(record->provenance.request_digest, record->original_provenance.request_digest,
+                     COMMON_SHA256_DIGEST_SIZE) != 0);
+        CHECK(memcmp(record->provenance.target_digest, record->original_provenance.output_digest,
+                     COMMON_SHA256_DIGEST_SIZE) == 0);
     }
 
     parity_compiler = (DiagnosticParityCompiler){
@@ -1032,6 +1103,11 @@ static int test_full_tiered_certification(void) {
           UNITY_GENERATED_DOMAIN_DXBC_MISMATCH);
     CHECK(report.diagnostic.dxbc_compare.status ==
           DXBC_COMPARE_INSTRUCTION_OPCODE);
+    CHECK(report.compiler_response_count == 1U);
+    CHECK(report.compiler_responses[0].provenance.has_output_digest);
+    CHECK(memcmp(report.compiler_responses[0].provenance.target_digest,
+                 report.compiler_responses[0].provenance.output_digest,
+                 COMMON_SHA256_DIGEST_SIZE) != 0);
 
     unity_generated_domain_report_free(&report);
     unity_compiler_snippet_contract_free(&original_snippet.contract);

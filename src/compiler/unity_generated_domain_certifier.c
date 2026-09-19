@@ -3,6 +3,7 @@
 #include "compiler/unity_generated_domain_certifier.h"
 
 #include "common/shader_stage.h"
+#include "common/sha256.h"
 #include "common/stream.h"
 #include "dxbc/dxbc_document.h"
 #include "dxbc/dxbc_parser.h"
@@ -1481,10 +1482,10 @@ static UnityGeneratedDomainStatus retain_compiler_status(
 static UnityGeneratedDomainStatus append_compiler_response(
     UnityGeneratedDomainReport* report, int stage_index, int tier,
     size_t generated_state, size_t aliased_state, int subprogram_index,
-    const UnityCompilerResponseStatus* response,
+    const UnityCompilerResponseStatus* response, bool force_record,
     UnityGeneratedDomainCompilerResponseRecord** out_record) {
     if (out_record) *out_record = NULL;
-    if (response->diagnostic_count == 0U) {
+    if (!force_record && response->diagnostic_count == 0U) {
         return UNITY_GENERATED_DOMAIN_OK;
     }
     if (report->compiler_response_count ==
@@ -1518,6 +1519,31 @@ static UnityGeneratedDomainStatus append_compiler_response(
     report->compiler_response_count = next_count;
     if (out_record) *out_record = record;
     return UNITY_GENERATED_DOMAIN_OK;
+}
+
+static void record_compile_provenance(
+    UnityGeneratedCompileProvenance *provenance,
+    const UnityCompilerSnippetCompileRequest *request,
+    const UnityCompilerBinaryResponse *response, bool received,
+    const DXBCContainerView *reference) {
+    memset(provenance, 0, sizeof(*provenance));
+    provenance->recorded = true;
+    provenance->response_received = received;
+    provenance->has_request_identity = response->has_request_identity;
+    if (response->has_request_identity) {
+        memcpy(provenance->request_digest, response->request_digest,
+               sizeof(provenance->request_digest));
+        memcpy(provenance->controls_digest, response->controls_digest,
+               sizeof(provenance->controls_digest));
+    }
+    common_sha256(request->snippet_source, strlen(request->snippet_source),
+                  provenance->source_digest);
+    common_sha256(reference->data, reference->size, provenance->target_digest);
+    DXBCContainerView output;
+    if (received && exact_container_view(response->data, response->size, &output)) {
+        common_sha256(output.data, output.size, provenance->output_digest);
+        provenance->has_output_digest = true;
+    }
 }
 
 UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
@@ -1719,6 +1745,20 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
                 ++report->compile_attempt_count;
                 const bool received = compile(
                     compile_context, &request, &response);
+                UnityGeneratedDomainCompilerResponseRecord *response_record = NULL;
+                if (input->retain_compile_provenance) {
+                    status = append_compiler_response(
+                        report, stage_index, tier, generated_state, alias,
+                        subprogram_index, &response.status, true, &response_record);
+                    if (status != UNITY_GENERATED_DOMAIN_OK) {
+                        unity_compiler_binary_response_free(&response);
+                        unity_compile_authority_free(&authority);
+                        subprogram_metadata_free_variant(&player);
+                        return status;
+                    }
+                    record_compile_provenance(&response_record->provenance,
+                                              &request, &response, received, &reference);
+                }
                 if (!received) {
                     unity_compiler_binary_response_free(&response);
                     unity_compile_authority_free(&authority);
@@ -1741,12 +1781,11 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
                 }
                 report->compiler_diagnostic_count +=
                     response.status.diagnostic_count;
-                UnityGeneratedDomainCompilerResponseRecord* response_record =
-                    NULL;
-                status = append_compiler_response(
-                    report, stage_index, tier, generated_state, alias,
-                    subprogram_index,
-                    &response.status, &response_record);
+                if (!response_record) {
+                    status = append_compiler_response(
+                        report, stage_index, tier, generated_state, alias,
+                        subprogram_index, &response.status, false, &response_record);
+                }
                 if (status != UNITY_GENERATED_DOMAIN_OK) {
                     unity_compiler_binary_response_free(&response);
                     unity_compile_authority_free(&authority);
@@ -1843,6 +1882,10 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
                     const bool original_received = compile(
                         compile_context, &original_request,
                         &original_response);
+                    if (input->retain_compile_provenance && response_record)
+                        record_compile_provenance(&response_record->original_provenance,
+                                                  &original_request, &original_response,
+                                                  original_received, &reference);
                     if (!original_received) {
                         response_record->diagnostic_parity_status =
                             UNITY_GENERATED_DIAGNOSTIC_PARITY_ORIGINAL_TRANSPORT_FAILED;
