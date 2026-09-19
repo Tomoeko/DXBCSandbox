@@ -36,6 +36,7 @@
 #include "compiler/unity_compile_profile.h"
 #include "compiler/unity_compiler_broker.h"
 #include "compiler/unity_generated_domain_certifier.h"
+#include "compiler/unity_shaderlab_mapping.h"
 #include "translation/shaderlab_emitter.h"
 #include "test_helpers.h"
 
@@ -200,29 +201,6 @@ static bool is_variant_filtered(long long path_id, int stage, int sub_idx, int p
     return false;
 }
 
-static bool pass_produces_preprocessed_snippet(const SerializedPass* pass) {
-    return pass && pass->pass_type != 2 && pass->pass_type != 1 &&
-           pass->use_name[0] == '\0' &&
-           !shaderlab_pass_is_proven_not_platform(pass, 4);
-}
-
-static int serialized_pass_to_snippet_index(
-    const SerializedShader* shader, int serialized_pass_index);
-
-static bool pass_has_d3d11_authority(const SerializedPass* pass) {
-    if (!pass) return false;
-    for (int stage = 0; stage < 6; ++stage) {
-        for (int subprogram = 0;
-             subprogram < pass->subprogram_count[stage]; ++subprogram) {
-            if (serialized_pass_subprogram_is_platform(
-                    pass, stage, subprogram, 4)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 static bool pass_is_admitted_by_tuple_filter(
     long long path_id, const SerializedPass* pass,
     int serialized_pass_index) {
@@ -240,110 +218,6 @@ static bool pass_is_admitted_by_tuple_filter(
         }
     }
     return false;
-}
-
-static int serialized_preprocessed_pass_count(
-    const SerializedShader* shader) {
-    if (!shader || shader->subshader_count < 0) return -1;
-    int count = 0;
-    for (int subshader = 0; subshader < shader->subshader_count;
-         ++subshader) {
-        const SerializedSubShader* serialized_subshader =
-            &shader->subshaders[subshader];
-        for (int pass = 0; pass < serialized_subshader->pass_count; ++pass) {
-            if (!pass_produces_preprocessed_snippet(
-                    &serialized_subshader->passes[pass])) {
-                continue;
-            }
-            if (count == INT32_MAX) return -1;
-            ++count;
-        }
-    }
-    return count;
-}
-
-/* Generated ShaderLab preserves serialized subshader/pass order and emits
- * exactly one HLSLPROGRAM for each ordinary pass retained by the fail-closed
- * D3D11 projection. Requiring the complete projected count makes this ordinal
- * mapping bijective instead of silently accepting a shifted or partial
- * preprocess result. */
-static const PreprocessedSnippet* find_unique_generated_pass_snippet(
-    const SerializedShader* shader, int serialized_pass_index,
-    const PreprocessResult* generated, int* out_snippet_index) {
-    if (out_snippet_index) *out_snippet_index = -1;
-    if (!shader || !generated || generated->snippet_count < 0 ||
-        (generated->snippet_count > 0 && !generated->snippets) ||
-        serialized_preprocessed_pass_count(shader) !=
-            generated->snippet_count) {
-        return NULL;
-    }
-    const int snippet_index = serialized_pass_to_snippet_index(
-        shader, serialized_pass_index);
-    if (snippet_index < 0 || snippet_index >= generated->snippet_count) {
-        return NULL;
-    }
-    const PreprocessedSnippet* snippet =
-        &generated->snippets[snippet_index];
-    if (!snippet->source || !snippet->has_contract) return NULL;
-    if (out_snippet_index) *out_snippet_index = snippet_index;
-    return snippet;
-}
-
-static int serialized_pass_to_snippet_index(const SerializedShader* shader,
-                                            int serialized_pass_index) {
-    int current_pass_index = 0;
-    int current_snippet_index = 0;
-    for (int subshader_idx = 0; subshader_idx < shader->subshader_count;
-         subshader_idx++) {
-        const SerializedSubShader* subshader = &shader->subshaders[subshader_idx];
-        for (int pass_idx = 0; pass_idx < subshader->pass_count; pass_idx++) {
-            const SerializedPass* pass = &subshader->passes[pass_idx];
-            if (current_pass_index == serialized_pass_index) {
-                return pass_produces_preprocessed_snippet(pass)
-                           ? current_snippet_index
-                           : -1;
-            }
-            if (pass_produces_preprocessed_snippet(pass)) {
-                current_snippet_index++;
-            }
-            current_pass_index++;
-        }
-    }
-    return -1;
-}
-
-static const SerializedPass* serialized_pass_at(
-    const SerializedShader* shader, int serialized_pass_index) {
-    int current_pass_index = 0;
-    for (int subshader_idx = 0; subshader_idx < shader->subshader_count;
-         subshader_idx++) {
-        const SerializedSubShader* subshader = &shader->subshaders[subshader_idx];
-        for (int pass_idx = 0; pass_idx < subshader->pass_count; pass_idx++) {
-            if (current_pass_index++ == serialized_pass_index) {
-                return &subshader->passes[pass_idx];
-            }
-        }
-    }
-    return NULL;
-}
-
-static const PreprocessedSnippet* find_original_snippet_by_program_id(
-    const SerializedShader* shader, int serialized_pass_index,
-    const PreprocessResult* original) {
-    if (!original) return NULL;
-    const SerializedPass* pass =
-        serialized_pass_at(shader, serialized_pass_index);
-    if (!pass) return NULL;
-    const PreprocessedSnippet* match = NULL;
-    for (int i = 0; i < original->snippet_count; i++) {
-        if (original->snippets[i].gpu_program_id ==
-            pass->state.gpuProgramID) {
-            /* A duplicate GPU program ID is not enough to identify source. */
-            if (match) return NULL;
-            match = &original->snippets[i];
-        }
-    }
-    return match;
 }
 
 typedef struct {
@@ -1459,8 +1333,8 @@ static void discover_generated_d3d11_pass_domains(
              ++local_pass_index, ++serialized_pass_index) {
             const SerializedPass* pass =
                 &subshader->passes[local_pass_index];
-            if (!pass_produces_preprocessed_snippet(pass) ||
-                !pass_has_d3d11_authority(pass)) {
+            if (!unity_shaderlab_pass_emits_snippet(pass) ||
+                !unity_shaderlab_pass_has_d3d11(pass)) {
                 continue;
             }
             ++g_generated_domain.eligible_passes;
@@ -1518,8 +1392,8 @@ static void certify_generated_d3d11_pass_domains(
              ++local_pass_index, ++serialized_pass_index) {
             const SerializedPass* pass =
                 &subshader->passes[local_pass_index];
-            if (!pass_produces_preprocessed_snippet(pass) ||
-                !pass_has_d3d11_authority(pass)) {
+            if (!unity_shaderlab_pass_emits_snippet(pass) ||
+                !unity_shaderlab_pass_has_d3d11(pass)) {
                 continue;
             }
 
@@ -1581,7 +1455,7 @@ static void certify_generated_d3d11_pass_domains(
                 pass_record->snippet_mapping_attempted = true;
             }
             const PreprocessedSnippet* snippet =
-                find_unique_generated_pass_snippet(
+                unity_shaderlab_find_generated_snippet(
                     shader, serialized_pass_index, generated,
                     &generated_snippet_index);
             if (pass_record) {
@@ -1603,7 +1477,7 @@ static void certify_generated_d3d11_pass_domains(
                         "snippet (serialized emitted passes=%d, "
                         "compiler snippets=%d)\n",
                         path_id, serialized_pass_index,
-                        serialized_preprocessed_pass_count(shader),
+                        unity_shaderlab_snippet_count(shader),
                         generated->snippet_count);
                 record_failure_at(
                     shader_result_index, path_id, -1, -1,
@@ -1618,7 +1492,7 @@ static void certify_generated_d3d11_pass_domains(
             }
 
             const PreprocessedSnippet* original_snippet =
-                find_original_snippet_by_program_id(
+                unity_shaderlab_find_original_snippet(
                     shader, serialized_pass_index, original);
 
             UnityGeneratedDomainReport report;
@@ -3700,7 +3574,7 @@ static void verify_subprogram_shaderlab(
         return;
     }
 
-    int snippet_idx = serialized_pass_to_snippet_index(shader, pass_idx);
+    int snippet_idx = unity_shaderlab_pass_snippet_index(shader, pass_idx);
     if (snippet_idx < 0 || snippet_idx >= gen_prep->snippet_count) {
         pthread_mutex_lock(&g_stats_mutex);
         printf("    [FAIL] Serialized pass %d maps to generated snippet %d "
@@ -3713,7 +3587,7 @@ static void verify_subprogram_shaderlab(
     }
     const PreprocessedSnippet* gen_snip = &gen_prep->snippets[snippet_idx];
     const PreprocessedSnippet* orig_snip =
-        find_original_snippet_by_program_id(shader, pass_idx, orig_prep);
+        unity_shaderlab_find_original_snippet(shader, pass_idx, orig_prep);
 
 
     char gen_name[512];
@@ -4067,7 +3941,7 @@ static void verify_serialized_glcore_targets(
                 record->expected_size = target.released_text_size;
 
                 const int snippet_index =
-                    serialized_pass_to_snippet_index(
+                    unity_shaderlab_pass_snippet_index(
                         shader, serialized_pass_index);
                 if (snippet_index < 0 ||
                     snippet_index >= generated_preprocess->snippet_count) {

@@ -43,6 +43,7 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         src/compiler/unity_compiler_session_report.c
         src/compiler/unity_reflection_certificate.c
         src/compiler/unity_generated_domain_certifier.c
+        src/compiler/unity_shaderlab_mapping.c
     )
 
     add_library(unity_compiler_support STATIC ${COMPILER_SOURCES})

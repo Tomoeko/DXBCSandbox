@@ -430,6 +430,12 @@ if(BUILD_TESTING)
         add_test(NAME reflection_certificate_units COMMAND
             test_reflection_certificate_units)
 
+        add_executable(test_shaderlab_mapping_units
+            tests/test_shaderlab_mapping_units.c)
+        target_link_libraries(test_shaderlab_mapping_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME shaderlab_mapping_units COMMAND test_shaderlab_mapping_units)
+
         add_executable(test_generated_domain_certifier_units
             tests/test_generated_domain_certifier_units.c)
         target_include_directories(test_generated_domain_certifier_units
