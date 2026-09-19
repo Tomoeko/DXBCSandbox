@@ -318,6 +318,11 @@ typedef struct PreprocessResult {
 typedef struct UnityCompilerPreprocessResponse {
     UnityCompilerResponseStatus status;
     PreprocessResult result;
+    /* Locally derived canonical request identity, never authority supplied by
+     * a response cache payload. Controls exclude only the ShaderLab text. */
+    bool has_request_identity;
+    uint8_t request_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t controls_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
 } UnityCompilerPreprocessResponse;
 
 void unity_compiler_preprocess_response_init(

@@ -1626,6 +1626,9 @@ int main(int argc, char** argv) {
         },
         .result = serialized_result,
     };
+    preprocess_response.has_request_identity = true;
+    memset(preprocess_response.request_digest, 0x31, sizeof(preprocess_response.request_digest));
+    memset(preprocess_response.controls_digest, 0x42, sizeof(preprocess_response.controls_digest));
     encoded_response = NULL;
     encoded_response_size = 0U;
     CHECK(usc_cache_serialize_preprocess_response(
@@ -1634,6 +1637,9 @@ int main(int argc, char** argv) {
     CHECK(usc_cache_deserialize_preprocess_response(
         encoded_response, encoded_response_size,
         &decoded_preprocess_response));
+    CHECK(!decoded_preprocess_response.has_request_identity);
+    CHECK(decoded_preprocess_response.request_digest[0] == 0 &&
+          decoded_preprocess_response.controls_digest[0] == 0);
     CHECK(decoded_preprocess_response.status.compiler_success &&
           decoded_preprocess_response.status.diagnostic_count == 1U &&
           preprocess_results_equal(
@@ -2063,7 +2069,13 @@ int main(int argc, char** argv) {
               UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS &&
           offline_capability_channel.process_id == 0 &&
           offline_capability_channel.socket_fd == -1);
+    CHECK(offline_preprocess_response.has_request_identity);
+    uint8_t offline_request_bits = 0;
+    for (size_t i = 0; i < sizeof(offline_preprocess_response.request_digest); ++i)
+        offline_request_bits |= offline_preprocess_response.request_digest[i];
+    CHECK(offline_request_bits != 0);
     unity_compiler_preprocess_response_free(&offline_preprocess_response);
+    CHECK(!offline_preprocess_response.has_request_identity);
     UnityCompilerTextResponse offline_disassemble_response;
     CHECK(unity_compiler_disassemble_response(
         &offline_capability_channel, "offline-cache-only-disassemble", 4,
@@ -2413,13 +2425,71 @@ int main(int argc, char** argv) {
                  "err: 10 11 12") == 0 &&
           strcmp(diagnosed_preprocess.status.diagnostics[0].message,
                  "fixture preprocess warning") == 0);
+    CHECK(diagnosed_preprocess.has_request_identity);
+    uint8_t preprocess_request_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t preprocess_controls_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    memcpy(preprocess_request_digest, diagnosed_preprocess.request_digest, sizeof(preprocess_request_digest));
+    memcpy(preprocess_controls_digest, diagnosed_preprocess.controls_digest, sizeof(preprocess_controls_digest));
+    uint8_t *preprocess_identity_transcript = NULL;
+    size_t preprocess_identity_transcript_size = 0;
+    uint8_t serialized_preprocess_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    CHECK(unity_compiler_serialize_preprocess_request(
+        &fixture_channel, &fixture_preprocess, &preprocess_identity_transcript,
+        &preprocess_identity_transcript_size, serialized_preprocess_digest));
+    CHECK(preprocess_identity_transcript != NULL && preprocess_identity_transcript_size > 0);
+    free(preprocess_identity_transcript);
+    CHECK(memcmp(serialized_preprocess_digest, preprocess_request_digest,
+                 sizeof(preprocess_request_digest)) == 0);
     unity_compiler_preprocess_response_free(&diagnosed_preprocess);
     CHECK(unity_compiler_preprocess_contract_response(
         &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
     CHECK(diagnosed_preprocess.status.compiler_success &&
           diagnosed_preprocess.status.from_cache &&
           diagnosed_preprocess.status.diagnostic_count == 1U);
+    CHECK(diagnosed_preprocess.has_request_identity);
+    CHECK(memcmp(diagnosed_preprocess.request_digest, preprocess_request_digest,
+                 sizeof(preprocess_request_digest)) == 0);
+    CHECK(memcmp(diagnosed_preprocess.controls_digest, preprocess_controls_digest,
+                 sizeof(preprocess_controls_digest)) == 0);
     unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    const char *saved_preprocess_source = fixture_preprocess.source;
+    fixture_preprocess.source = "Shader \"ChangedSource\" {}";
+    CHECK(unity_compiler_preprocess_contract_response(
+        &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+    CHECK(diagnosed_preprocess.has_request_identity);
+    CHECK(memcmp(diagnosed_preprocess.request_digest, preprocess_request_digest,
+                 sizeof(preprocess_request_digest)) != 0);
+    CHECK(memcmp(diagnosed_preprocess.controls_digest, preprocess_controls_digest,
+                 sizeof(preprocess_controls_digest)) == 0);
+    unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    fixture_preprocess.source = "";
+    preprocess_identity_transcript = NULL;
+    CHECK(unity_compiler_serialize_preprocess_request(
+        &fixture_channel, &fixture_preprocess, &preprocess_identity_transcript,
+        &preprocess_identity_transcript_size, serialized_preprocess_digest));
+    free(preprocess_identity_transcript);
+    CHECK(memcmp(serialized_preprocess_digest, preprocess_controls_digest,
+                 sizeof(preprocess_controls_digest)) == 0);
+    fixture_preprocess.source = saved_preprocess_source;
+    const char *saved_preprocess_path = fixture_preprocess.file_path;
+    fixture_preprocess.file_path = "Assets/ChangedIdentity.shader";
+    CHECK(unity_compiler_preprocess_contract_response(
+        &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+    CHECK(diagnosed_preprocess.has_request_identity);
+    CHECK(memcmp(diagnosed_preprocess.controls_digest, preprocess_controls_digest,
+                 sizeof(preprocess_controls_digest)) != 0);
+    unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    fixture_preprocess.file_path = saved_preprocess_path;
+    CHECK(unsetenv("DXBC_USC_CACHE_DIR") == 0);
+    CHECK(unity_compiler_preprocess_contract_response(
+        &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+    CHECK(diagnosed_preprocess.has_request_identity && !diagnosed_preprocess.status.from_cache);
+    CHECK(memcmp(diagnosed_preprocess.request_digest, preprocess_request_digest,
+                 sizeof(preprocess_request_digest)) == 0);
+    CHECK(memcmp(diagnosed_preprocess.controls_digest, preprocess_controls_digest,
+                 sizeof(preprocess_controls_digest)) == 0);
+    unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    CHECK(setenv("DXBC_USC_CACHE_DIR", diagnostic_cache_dir, 1) == 0);
     CHECK(!unity_compiler_preprocess_contract(
         &fixture_channel, &fixture_preprocess, &fixture_result));
     CHECK(fixture_result.snippets == NULL && fixture_result.blob == NULL &&

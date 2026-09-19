@@ -2438,6 +2438,17 @@ static bool validate_captured_session_valid_apis(
     return false;
 }
 
+static bool compiler_fingerprint_has_value(const uint8_t *fingerprint);
+
+static void preprocess_response_request_identity(
+    UnityCompilerPreprocessResponse *response,
+    const uint8_t request_digest[USC_CACHE_DIGEST_SIZE],
+    const uint8_t controls_digest[USC_CACHE_DIGEST_SIZE]) {
+    memcpy(response->request_digest, request_digest, USC_CACHE_DIGEST_SIZE);
+    memcpy(response->controls_digest, controls_digest, USC_CACHE_DIGEST_SIZE);
+    response->has_request_identity = true;
+}
+
 bool unity_compiler_preprocess_contract_response(
     UnityCompilerChannel* channel,
     const UnityCompilerShaderPreprocessRequest* input_request,
@@ -2464,10 +2475,15 @@ bool unity_compiler_preprocess_contract_response(
 
     const char* cache_dir = getenv("DXBC_USC_CACHE_DIR");
     uint8_t request_digest[USC_CACHE_DIGEST_SIZE];
+    uint8_t controls_digest[USC_CACHE_DIGEST_SIZE];
+    usc_cache_preprocess_request_digest(&request, compiler_fingerprint, request_digest);
+    UnityCompilerPreprocessRequest controls = request;
+    controls.source = "";
+    usc_cache_preprocess_request_digest(&controls, compiler_fingerprint, controls_digest);
+    if (!compiler_fingerprint_has_value(request_digest) ||
+        !compiler_fingerprint_has_value(controls_digest)) return false;
     bool cache_ready = false;
     if (cache_dir && cache_dir[0]) {
-        usc_cache_preprocess_request_digest(
-            &request, compiler_fingerprint, request_digest);
         uint8_t* cached_data = NULL;
         size_t cached_size = 0;
         cache_ready = true;
@@ -2477,6 +2493,7 @@ bool unity_compiler_preprocess_contract_response(
                 cached_data, cached_size, out_response);
             free(cached_data);
             if (decoded) {
+                preprocess_response_request_identity(out_response, request_digest, controls_digest);
                 const bool toolchain_valid =
                     validate_existing_toolchain_authority(channel);
                 response_status_capture_valid_apis_authority(
@@ -2504,6 +2521,7 @@ bool unity_compiler_preprocess_contract_response(
         }
     }
 
+    preprocess_response_request_identity(out_response, request_digest, controls_digest);
     if (compiler_cache_only_enabled()) {
         response_status->availability =
             UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS;
@@ -2915,8 +2933,6 @@ bool unity_compiler_preprocess(UnityCompilerChannel* channel,
     free(file_path);
     return result;
 }
-
-static bool compiler_fingerprint_has_value(const uint8_t *fingerprint);
 
 static void binary_response_request_identity(UnityCompilerBinaryResponse *response,
                                              const uint8_t request_digest[USC_CACHE_DIGEST_SIZE],
