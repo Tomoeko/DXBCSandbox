@@ -88,6 +88,12 @@ HLSLLiftStatus hlsl_lift_transaction_begin(const USILProgram *baseline, const ui
 HLSLLiftStatus hlsl_lift_transaction_try_copy(HLSLLiftTransaction *transaction, int instruction,
                                               HLSLLiftResult *result);
 
+/* The same transaction gate applied to a single-use result-forwarding copy.
+ * Re-proving against the accepted program also permits deterministic copy /
+ * result composition without overlapping stale claims. */
+HLSLLiftStatus hlsl_lift_transaction_try_result(HLSLLiftTransaction *transaction, int instruction,
+                                                HLSLLiftResult *result);
+
 const USILProgram *hlsl_lift_transaction_program(const HLSLLiftTransaction *transaction);
 const HLSLLiftArtifact *hlsl_lift_transaction_artifact(const HLSLLiftTransaction *transaction);
 void hlsl_lift_transaction_stats(const HLSLLiftTransaction *transaction, HLSLLiftStats *stats);

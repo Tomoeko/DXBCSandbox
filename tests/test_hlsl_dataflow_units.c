@@ -263,6 +263,132 @@ static bool check_copy_candidates(void) {
     return true;
 }
 
+static bool check_result_candidates(void) {
+    USILInstruction instructions[5] = {0};
+    instructions[0] = move(reg(OPERAND_TYPE_TEMP, 0, 0xf0), reg(OPERAND_TYPE_INPUT, 0, 0));
+    instructions[0].opcode = USIL_OP_ADD;
+    instructions[0].operand_count = 3;
+    instructions[0].operands[2] = reg(OPERAND_TYPE_INPUT, 1, 0);
+    instructions[0].source_instruction_index = 23;
+    instructions[1].opcode = USIL_OP_NOP;
+    instructions[2] = move(reg(OPERAND_TYPE_OUTPUT, 0, 0xf0), reg(OPERAND_TYPE_TEMP, 0, 0));
+    instructions[3].opcode = USIL_OP_RET;
+    USILProgram program = {.instructions = instructions,
+                           .instruction_count = 4,
+                           .temp_count = 1,
+                           .has_stage_contract = true,
+                           .program_type = DXBC_PROGRAM_TYPE_PIXEL,
+                           .shader_model_major = 5};
+    HLSLCopyLift *candidate = NULL;
+    const uint32_t a[4] = {0x80000000u, 0x7fc01234u, 0xdeadbeefu, 0x12345678u};
+    const uint32_t b[4] = {0xffff0000u, 0x00ffff00u, 0x0000ffffu, 0xf0f0f0f0u};
+    const USILOpcode opcodes[] = {USIL_OP_ADD, USIL_OP_MUL, USIL_OP_AND, USIL_OP_OR, USIL_OP_XOR};
+    /* All 24 permutations, all five admitted operations; independent bitwise
+     * evaluation checks composition rather than duplicating the planner. */
+    for (size_t op = 0; op < sizeof(opcodes) / sizeof(opcodes[0]); ++op) {
+        instructions[0].opcode = opcodes[op];
+        for (int x = 0; x < 4; ++x)
+            for (int y = 0; y < 4; ++y)
+                for (int z = 0; z < 4; ++z)
+                    for (int w = 0; w < 4; ++w) {
+                        if (x == y || x == z || x == w || y == z || y == w || z == w)
+                            continue;
+                        uint8_t permutation[4] = {(uint8_t)x, (uint8_t)y, (uint8_t)z, (uint8_t)w};
+                        memcpy(instructions[2].operands[1].swizzle, permutation,
+                               sizeof(permutation));
+                        instructions[0].operands[1].swizzle[0] = 3;
+                        instructions[0].operands[1].swizzle[3] = 0;
+                        CHECK(hlsl_result_lift_create(&program, 2, &candidate) ==
+                              HLSL_COPY_LIFT_OK);
+                        const USILProgram *view = hlsl_copy_lift_program(candidate);
+                        CHECK(view->instructions[0].opcode == USIL_OP_NOP);
+                        CHECK(view->instructions[2].opcode == opcodes[op]);
+                        CHECK(view->instructions[2].source_instruction_index == 23);
+                        CHECK(hlsl_copy_lift_producer_instruction(candidate) == 0);
+                        CHECK(hlsl_copy_lift_instruction(candidate) == 2);
+                        for (int lane = 0; lane < 4; ++lane) {
+                            uint32_t left =
+                                a[instructions[0].operands[1].swizzle[permutation[lane]]];
+                            uint32_t right = b[permutation[lane]];
+                            uint32_t new_left = a[view->instructions[2].operands[1].swizzle[lane]];
+                            uint32_t new_right = b[view->instructions[2].operands[2].swizzle[lane]];
+                            CHECK(left == new_left && right == new_right);
+                            if (opcodes[op] == USIL_OP_AND)
+                                CHECK((left & right) == (new_left & new_right));
+                            if (opcodes[op] == USIL_OP_OR)
+                                CHECK((left | right) == (new_left | new_right));
+                            if (opcodes[op] == USIL_OP_XOR)
+                                CHECK((left ^ right) == (new_left ^ new_right));
+                        }
+                        hlsl_copy_lift_destroy(candidate);
+                    }
+    }
+    instructions[0].opcode = USIL_OP_ADD;
+    for (int lane = 0; lane < 4; ++lane)
+        instructions[2].operands[1].swizzle[lane] = (uint8_t)(3 - lane);
+    instructions[0].operands[2] = (DXBCOperand){
+        .type = OPERAND_TYPE_IMMEDIATE32, .imm_value_count = 4, .immediate_word_count = 4};
+    memcpy(instructions[0].operands[2].imm_values, a, sizeof(a));
+    memcpy(instructions[0].operands[2].immediate_words, a, sizeof(a));
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_OK);
+    const DXBCOperand *literal = &hlsl_copy_lift_program(candidate)->instructions[2].operands[2];
+    for (int lane = 0; lane < 4; ++lane) {
+        CHECK(literal->imm_values[lane] == a[3 - lane]);
+        CHECK(literal->immediate_words[lane] == a[3 - lane]);
+    }
+    hlsl_copy_lift_destroy(candidate);
+    instructions[0].operands[2].imm_value_count = 1;
+    instructions[0].operands[2].immediate_word_count = 1;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_OK);
+    CHECK(hlsl_copy_lift_program(candidate)->instructions[2].operands[2].imm_values[0] == a[0]);
+    hlsl_copy_lift_destroy(candidate);
+    instructions[0].operands[2] = reg(OPERAND_TYPE_INPUT, 1, 0);
+
+    instructions[3] = move(reg(OPERAND_TYPE_OUTPUT, 1, 0x10), reg(OPERAND_TYPE_TEMP, 0, 0));
+    instructions[4].opcode = USIL_OP_RET;
+    program.instruction_count = 5;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_MULTIPLE_USES);
+    instructions[3] = (USILInstruction){.opcode = USIL_OP_RET};
+    program.instruction_count = 4;
+    instructions[2].operands[1].swizzle[0] = 2;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_NONBIJECTIVE_LANES);
+    instructions[2].operands[1].swizzle[0] = 3;
+    instructions[2].operands[0].destination_mask = 0x70;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_NONBIJECTIVE_LANES);
+    instructions[2].operands[0].destination_mask = 0xf0;
+    instructions[0].operands[0].destination_mask = 0xa0;
+    instructions[2].operands[0].destination_mask = 0x50;
+    instructions[2].operands[1].swizzle[0] = 3;
+    instructions[2].operands[1].swizzle[2] = 1;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_OK);
+    const USILInstruction *partial = &hlsl_copy_lift_program(candidate)->instructions[2];
+    CHECK(partial->operands[0].destination_mask == 0x50);
+    CHECK(partial->operands[1].swizzle[0] == 0 && partial->operands[1].swizzle[2] == 1);
+    hlsl_copy_lift_destroy(candidate);
+    instructions[0].operands[0].destination_mask = 0xf0;
+    instructions[2].operands[0].destination_mask = 0xf0;
+    instructions[0].saturate = true;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_NOT_PLAIN_RESULT);
+    instructions[0].saturate = false;
+    instructions[0].precise_mask = 1;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_PRECISION_CONTROL);
+    instructions[0].precise_mask = 0;
+    instructions[0].operands[1].has_abs = true;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_NOT_PLAIN_RESULT);
+    instructions[0].operands[1].has_abs = false;
+    instructions[0].operands[1].type = OPERAND_TYPE_TEMP;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_UNDEFINED_SOURCE);
+    instructions[0].operands[1].type = OPERAND_TYPE_INPUT;
+    instructions[1] = move(reg(OPERAND_TYPE_OUTPUT, 1, 0x10), reg(OPERAND_TYPE_INPUT, 1, 0));
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_NOT_PLAIN_RESULT);
+    instructions[1] = (USILInstruction){.opcode = USIL_OP_NOP};
+    instructions[0].opcode = USIL_OP_DERIV_RTX;
+    instructions[0].operand_count = 2;
+    CHECK(hlsl_result_lift_create(&program, 2, &candidate) == HLSL_COPY_LIFT_EFFECTFUL_REGION);
+    CHECK(candidate == NULL && instructions[2].opcode == USIL_OP_MOV);
+    return true;
+}
+
 static bool check_effects(void) {
     USILTexture texture = {.reg_idx = 0, .dimension = "2d"};
     USILProgram program = {.textures = &texture, .texture_count = 1};
@@ -480,10 +606,54 @@ static bool check_transactions(void) {
     return true;
 }
 
+static bool check_result_transactions(void) {
+    USILInstruction instructions[4] = {0};
+    instructions[0] = move(reg(OPERAND_TYPE_TEMP, 0, 0xf0), reg(OPERAND_TYPE_INPUT, 0, 0));
+    instructions[0].opcode = USIL_OP_MUL;
+    instructions[0].operand_count = 3;
+    instructions[0].operands[2] = reg(OPERAND_TYPE_INPUT, 1, 0);
+    instructions[1] = move(reg(OPERAND_TYPE_TEMP, 1, 0xf0), reg(OPERAND_TYPE_TEMP, 0, 0));
+    instructions[2] = move(reg(OPERAND_TYPE_OUTPUT, 0, 0xf0), reg(OPERAND_TYPE_TEMP, 1, 0));
+    instructions[3].opcode = USIL_OP_RET;
+    USILProgram program = {.instructions = instructions,
+                           .instruction_count = 4,
+                           .temp_count = 2,
+                           .has_stage_contract = true,
+                           .program_type = DXBC_PROGRAM_TYPE_VERTEX,
+                           .shader_model_major = 5};
+    TransactionFixture fixture = {0};
+    HLSLLiftServices services = {
+        .compile = transaction_compile, .monotonic_ms = transaction_clock, .context = &fixture};
+    HLSLLiftLimits limits = {.max_candidates = 8, .max_compiles = 8, .max_elapsed_ms = 1000};
+    HLSLLiftTransaction *transaction = NULL;
+    HLSLLiftResult result;
+    CHECK(hlsl_lift_transaction_begin(&program, transaction_target, sizeof(transaction_target),
+                                      &services, &limits, &transaction,
+                                      &result) == HLSL_LIFT_VERIFIED);
+    fixture.mutate = true;
+    CHECK(hlsl_lift_transaction_try_result(transaction, 1, &result) == HLSL_LIFT_DXBC_MISMATCH);
+    CHECK(hlsl_lift_transaction_program(transaction) == &program);
+    fixture.mutate = false;
+    CHECK(hlsl_lift_transaction_try_result(transaction, 1, &result) == HLSL_LIFT_VERIFIED);
+    const USILProgram *accepted = hlsl_lift_transaction_program(transaction);
+    CHECK(accepted->instructions[0].opcode == USIL_OP_NOP);
+    CHECK(accepted->instructions[1].opcode == USIL_OP_MUL);
+    CHECK(hlsl_lift_transaction_try_copy(transaction, 1, &result) ==
+          HLSL_LIFT_PRECONDITION_REJECTED);
+    CHECK(hlsl_lift_transaction_program(transaction) == accepted);
+    CHECK(hlsl_lift_transaction_try_result(transaction, 2, &result) == HLSL_LIFT_VERIFIED);
+    CHECK(hlsl_lift_transaction_program(transaction)->instructions[1].opcode == USIL_OP_NOP);
+    CHECK(hlsl_lift_transaction_program(transaction)->instructions[2].opcode == USIL_OP_MUL);
+    CHECK(instructions[0].opcode == USIL_OP_MUL && instructions[1].opcode == USIL_OP_MOV);
+    hlsl_lift_transaction_destroy(transaction);
+    return true;
+}
+
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_copy_candidates() ||
-        !check_effects() || !check_transactions())
+        !check_result_candidates() || !check_effects() || !check_transactions() ||
+        !check_result_transactions())
         return 1;
     puts("HLSL dataflow contracts passed");
     return 0;

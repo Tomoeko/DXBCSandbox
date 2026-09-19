@@ -14,6 +14,7 @@ struct HLSLCopyLift {
     size_t edit_count;
     size_t edit_capacity;
     int copy_instruction;
+    int producer_instruction;
 };
 
 static bool plain_operand(const DXBCOperand *operand) {
@@ -82,6 +83,70 @@ static HLSLCopyLiftStatus validate_region(const USILProgram *program) {
     return HLSL_COPY_LIFT_OK;
 }
 
+static HLSLCopyLiftStatus validate_defined_sources(const USILProgram *program,
+                                                   const HLSLEmitterContext *ctx) {
+    /* Undefined lanes are outside this proof, even when the candidate would
+     * leave that particular use unchanged. No convenient value is invented. */
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILInstruction *inst = &program->instructions[index];
+        for (int operand = 0; operand < inst->operand_count; ++operand) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(program, inst, operand, &use)) {
+                return HLSL_COPY_LIFT_INVALID_PROGRAM;
+            }
+            if (use.use != USIL_OPERAND_USE_SOURCE ||
+                inst->operands[operand].type != OPERAND_TYPE_TEMP)
+                continue;
+            for (int lane = 0; lane < 4; ++lane) {
+                if ((use.source_lane_mask & (1u << lane)) &&
+                    hlsl_operand_definition(ctx, index, operand, lane) < 0) {
+                    return HLSL_COPY_LIFT_UNDEFINED_SOURCE;
+                }
+            }
+        }
+    }
+    return HLSL_COPY_LIFT_OK;
+}
+
+static bool clone_instructions(HLSLCopyLift *candidate, const USILProgram *baseline) {
+    if (dxbc_size_multiply_overflows((size_t)baseline->instruction_count,
+                                     sizeof(*candidate->instructions)))
+        return false;
+    size_t bytes = (size_t)baseline->instruction_count * sizeof(*candidate->instructions);
+    candidate->instructions = malloc(bytes);
+    if (!candidate->instructions)
+        return false;
+    memcpy(candidate->instructions, baseline->instructions, bytes);
+    candidate->view = *baseline;
+    candidate->view.instructions = candidate->instructions;
+    candidate->view.instruction_alloc = baseline->instruction_count;
+    return true;
+}
+
+static void rewrite_selection(DXBCOperand *operand, const uint8_t components[4]) {
+    operand->text[0] = '\0';
+    if (operand->type == OPERAND_TYPE_IMMEDIATE32) {
+        if (operand->imm_value_count == 4) {
+            uint32_t original[4];
+            memcpy(original, operand->imm_values, sizeof(original));
+            for (int lane = 0; lane < 4; ++lane) {
+                operand->imm_values[lane] = original[components[lane]];
+                if (operand->immediate_word_count == 4)
+                    operand->immediate_words[lane] = operand->imm_values[lane];
+            }
+        }
+        return;
+    }
+    operand->swizzle_mode = 1;
+    operand->destination_mask = 0;
+    /* Only semantic selection changes; the lossless target stays immutable. */
+    operand->raw_token = (operand->raw_token & ~UINT32_C(0xfff)) | 6u;
+    for (int lane = 0; lane < 4; ++lane) {
+        operand->swizzle[lane] = components[lane];
+        operand->raw_token |= (uint32_t)components[lane] << (4u + 2u * (unsigned)lane);
+    }
+}
+
 HLSLCopyLiftStatus hlsl_copy_lift_create(const USILProgram *baseline, int copy_instruction,
                                          HLSLCopyLift **out_candidate) {
     if (!out_candidate)
@@ -110,34 +175,16 @@ HLSLCopyLiftStatus hlsl_copy_lift_create(const USILProgram *baseline, int copy_i
         status = HLSL_COPY_LIFT_INVALID_PROGRAM;
         goto cleanup;
     }
-    /* Undefined lanes are outside this proof, even when the candidate would
-     * leave that particular use unchanged. No convenient value is invented. */
-    for (int index = 0; index < baseline->instruction_count; ++index) {
-        const USILInstruction *inst = &baseline->instructions[index];
-        for (int operand = 0; operand < inst->operand_count; ++operand) {
-            USILOperandUseInfo use;
-            if (!usil_instruction_operand_use(baseline, inst, operand, &use)) {
-                status = HLSL_COPY_LIFT_INVALID_PROGRAM;
-                goto cleanup;
-            }
-            if (use.use != USIL_OPERAND_USE_SOURCE ||
-                inst->operands[operand].type != OPERAND_TYPE_TEMP)
-                continue;
-            for (int lane = 0; lane < 4; ++lane) {
-                if ((use.source_lane_mask & (1u << lane)) &&
-                    hlsl_operand_definition(&ctx, index, operand, lane) < 0) {
-                    status = HLSL_COPY_LIFT_UNDEFINED_SOURCE;
-                    goto cleanup;
-                }
-            }
-        }
-    }
+    status = validate_defined_sources(baseline, &ctx);
+    if (status != HLSL_COPY_LIFT_OK)
+        goto cleanup;
     candidate = calloc(1u, sizeof(*candidate));
     if (!candidate) {
         status = HLSL_COPY_LIFT_OUT_OF_MEMORY;
         goto cleanup;
     }
     candidate->copy_instruction = copy_instruction;
+    candidate->producer_instruction = copy_instruction;
     const uint8_t written = usil_operand_destination_lane_mask(destination);
     for (int index = copy_instruction + 1; index < baseline->instruction_count; ++index) {
         const USILInstruction *inst = &baseline->instructions[index];
@@ -211,37 +258,16 @@ HLSLCopyLiftStatus hlsl_copy_lift_create(const USILProgram *baseline, int copy_i
         status = HLSL_COPY_LIFT_NO_USES;
         goto cleanup;
     }
-    if (dxbc_size_multiply_overflows((size_t)baseline->instruction_count,
-                                     sizeof(*candidate->instructions))) {
+    if (!clone_instructions(candidate, baseline)) {
         status = HLSL_COPY_LIFT_OUT_OF_MEMORY;
         goto cleanup;
     }
-    size_t bytes = (size_t)baseline->instruction_count * sizeof(*candidate->instructions);
-    candidate->instructions = malloc(bytes);
-    if (!candidate->instructions) {
-        status = HLSL_COPY_LIFT_OUT_OF_MEMORY;
-        goto cleanup;
-    }
-    memcpy(candidate->instructions, baseline->instructions, bytes);
-    candidate->view = *baseline;
-    candidate->view.instructions = candidate->instructions;
-    candidate->view.instruction_alloc = baseline->instruction_count;
     for (size_t index = 0; index < candidate->edit_count; ++index) {
         const HLSLCopyLiftEdit *edit = &candidate->edits[index];
         DXBCOperand *operand =
             &candidate->instructions[edit->instruction_index].operands[edit->operand_index];
         *operand = *source;
-        operand->swizzle_mode = 1;
-        operand->destination_mask = 0;
-        operand->text[0] = '\0';
-        /* Rebuild only the component-selection part of this semantic operand.
-         * The original lossless DXBC document is untouched. Unconsumed lanes
-         * are explicitly absent from the edit's demand mask. */
-        operand->raw_token = (operand->raw_token & ~UINT32_C(0xfff)) | 6u;
-        for (int lane = 0; lane < 4; ++lane) {
-            operand->swizzle[lane] = edit->source_components[lane];
-            operand->raw_token |= (uint32_t)operand->swizzle[lane] << (4u + 2u * (unsigned)lane);
-        }
+        rewrite_selection(operand, edit->source_components);
     }
     candidate->instructions[copy_instruction].opcode = USIL_OP_NOP;
     candidate->instructions[copy_instruction].operand_count = 0;
@@ -253,6 +279,153 @@ cleanup:
     free_hlsl_ssa_graph(&ctx);
     free_control_flow_graph(&ctx);
     return status;
+}
+
+static bool result_opcode(USILOpcode opcode) {
+    return opcode == USIL_OP_ADD || opcode == USIL_OP_MUL || opcode == USIL_OP_AND ||
+           opcode == USIL_OP_OR || opcode == USIL_OP_XOR;
+}
+
+HLSLCopyLiftStatus hlsl_result_lift_create(const USILProgram *baseline, int copy_instruction,
+                                           HLSLCopyLift **out_candidate) {
+    if (!out_candidate)
+        return HLSL_COPY_LIFT_INVALID_PROGRAM;
+    *out_candidate = NULL;
+    HLSLCopyLiftStatus status = validate_region(baseline);
+    if (status != HLSL_COPY_LIFT_OK)
+        return status;
+    if (copy_instruction < 1 || copy_instruction >= baseline->instruction_count)
+        return HLSL_COPY_LIFT_NOT_PLAIN_RESULT;
+    const USILInstruction *copy = &baseline->instructions[copy_instruction];
+    const DXBCOperand *destination = &copy->operands[0], *source = &copy->operands[1];
+    if (copy->opcode != USIL_OP_MOV || copy->operand_count != 2 || copy->saturate ||
+        source->type != OPERAND_TYPE_TEMP || !plain_operand(source) ||
+        !plain_operand(destination) ||
+        (destination->type != OPERAND_TYPE_TEMP && destination->type != OPERAND_TYPE_OUTPUT))
+        return HLSL_COPY_LIFT_NOT_PLAIN_COPY;
+    int producer_index = copy_instruction - 1;
+    while (producer_index >= 0 && baseline->instructions[producer_index].opcode == USIL_OP_NOP)
+        --producer_index;
+    if (producer_index < 0)
+        return HLSL_COPY_LIFT_NOT_PLAIN_RESULT;
+    const USILInstruction *producer = &baseline->instructions[producer_index];
+    if (!result_opcode(producer->opcode) || producer->operand_count != 3 || producer->saturate ||
+        producer->operands[0].type != OPERAND_TYPE_TEMP ||
+        producer->operands[0].register_index != source->register_index)
+        return HLSL_COPY_LIFT_NOT_PLAIN_RESULT;
+    for (int operand = 0; operand < 3; ++operand) {
+        const DXBCOperand *value = &producer->operands[operand];
+        if (!plain_operand(value) ||
+            (value->type != OPERAND_TYPE_TEMP && !immutable_source(value) &&
+             value->type != OPERAND_TYPE_IMMEDIATE32) ||
+            (value->type == OPERAND_TYPE_IMMEDIATE32 && value->imm_value_count != 1 &&
+             value->imm_value_count != 4))
+            return HLSL_COPY_LIFT_NOT_PLAIN_RESULT;
+    }
+    const uint8_t written = usil_operand_destination_lane_mask(&producer->operands[0]);
+    const uint8_t consumed = usil_operand_destination_lane_mask(destination);
+    uint8_t selected = 0, lanes[4] = {0};
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!(consumed & (1u << lane)))
+            continue;
+        int component = usil_operand_source_component(source, lane);
+        if (component < 0 || !(written & (1u << component)) || (selected & (1u << component)))
+            return HLSL_COPY_LIFT_NONBIJECTIVE_LANES;
+        lanes[lane] = (uint8_t)component;
+        selected |= (uint8_t)(1u << component);
+    }
+    if (!written || selected != written)
+        return HLSL_COPY_LIFT_NONBIJECTIVE_LANES;
+    HLSLEmitterContext ctx = {0};
+    ctx.program = baseline;
+    HLSLCopyLift *candidate = NULL;
+    if (!build_control_flow_graph(&ctx) || !compute_dominance(&ctx.cfg) ||
+        !build_hlsl_ssa_graph(&ctx) || !build_component_provenance(&ctx)) {
+        status = HLSL_COPY_LIFT_INVALID_PROGRAM;
+        goto cleanup;
+    }
+    status = validate_defined_sources(baseline, &ctx);
+    if (status != HLSL_COPY_LIFT_OK)
+        goto cleanup;
+    /* Count actual reaching uses, including later reads through a partial
+     * overwrite. Merely counting appearances of the register is insufficient. */
+    for (int index = 0; index < baseline->instruction_count; ++index) {
+        const USILInstruction *inst = &baseline->instructions[index];
+        for (int operand = 0; operand < inst->operand_count; ++operand) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(baseline, inst, operand, &use)) {
+                status = HLSL_COPY_LIFT_INVALID_PROGRAM;
+                goto cleanup;
+            }
+            if (use.use != USIL_OPERAND_USE_SOURCE ||
+                inst->operands[operand].type != OPERAND_TYPE_TEMP)
+                continue;
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!(use.source_lane_mask & (1u << lane)))
+                    continue;
+                int definition = hlsl_operand_definition(&ctx, index, operand, lane);
+                if (definition == producer_index && (index != copy_instruction || operand != 1)) {
+                    status = HLSL_COPY_LIFT_MULTIPLE_USES;
+                    goto cleanup;
+                }
+                if (index == copy_instruction && operand == 1 && definition != producer_index) {
+                    status = HLSL_COPY_LIFT_PARTIAL_USE;
+                    goto cleanup;
+                }
+            }
+        }
+    }
+    candidate = calloc(1u, sizeof(*candidate));
+    if (!candidate) {
+        status = HLSL_COPY_LIFT_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+    candidate->copy_instruction = copy_instruction;
+    candidate->producer_instruction = producer_index;
+    if (!clone_instructions(candidate, baseline)) {
+        status = HLSL_COPY_LIFT_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+    USILInstruction *forwarded = &candidate->instructions[copy_instruction];
+    *forwarded = *producer;
+    forwarded->operands[0] = *destination;
+    for (int operand = 1; operand < 3; ++operand) {
+        HLSLCopyLiftEdit edit = {.instruction_index = copy_instruction,
+                                 .operand_index = operand,
+                                 .logical_lane_mask = consumed};
+        for (int lane = 0; lane < 4; ++lane) {
+            if (!(consumed & (1u << lane)))
+                continue;
+            const DXBCOperand *input = &producer->operands[operand];
+            int component = input->type == OPERAND_TYPE_IMMEDIATE32
+                                ? lanes[lane]
+                                : usil_operand_source_component(input, lanes[lane]);
+            if (component < 0) {
+                status = HLSL_COPY_LIFT_INVALID_PROGRAM;
+                goto cleanup;
+            }
+            edit.source_components[lane] = (uint8_t)component;
+        }
+        if (!append_edit(candidate, edit)) {
+            status = HLSL_COPY_LIFT_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        rewrite_selection(&forwarded->operands[operand], edit.source_components);
+    }
+    candidate->instructions[producer_index].opcode = USIL_OP_NOP;
+    candidate->instructions[producer_index].operand_count = 0;
+    *out_candidate = candidate;
+    candidate = NULL;
+cleanup:
+    hlsl_copy_lift_destroy(candidate);
+    free_component_provenance(&ctx);
+    free_hlsl_ssa_graph(&ctx);
+    free_control_flow_graph(&ctx);
+    return status;
+}
+
+int hlsl_copy_lift_producer_instruction(const HLSLCopyLift *candidate) {
+    return candidate ? candidate->producer_instruction : -1;
 }
 
 const USILProgram *hlsl_copy_lift_program(const HLSLCopyLift *candidate) {
@@ -289,6 +462,9 @@ const char *hlsl_copy_lift_status_name(HLSLCopyLiftStatus status) {
         STATUS(UNDEFINED_SOURCE, "undefined-source");
         STATUS(SOURCE_CHANGED, "source-changed");
         STATUS(NO_USES, "no-uses");
+        STATUS(NOT_PLAIN_RESULT, "not-plain-result");
+        STATUS(MULTIPLE_USES, "multiple-uses");
+        STATUS(NONBIJECTIVE_LANES, "nonbijective-lanes");
         STATUS(OUT_OF_MEMORY, "out-of-memory");
 #undef STATUS
     }

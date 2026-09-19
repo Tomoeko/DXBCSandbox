@@ -165,8 +165,8 @@ HLSLLiftStatus hlsl_lift_transaction_begin(const USILProgram *baseline, const ui
     return result->status;
 }
 
-HLSLLiftStatus hlsl_lift_transaction_try_copy(HLSLLiftTransaction *transaction, int instruction,
-                                              HLSLLiftResult *result) {
+static HLSLLiftStatus try_lift(HLSLLiftTransaction *transaction, int instruction,
+                               HLSLLiftResult *result, bool forward_result) {
     if (!result)
         return HLSL_LIFT_INVALID_ARGUMENT;
     result_init(result);
@@ -181,7 +181,9 @@ HLSLLiftStatus hlsl_lift_transaction_try_copy(HLSLLiftTransaction *transaction, 
     }
     ++transaction->stats.candidates;
     HLSLCopyLift *copy = NULL;
-    result->precondition = hlsl_copy_lift_create(transaction->program, instruction, &copy);
+    result->precondition = forward_result
+                               ? hlsl_result_lift_create(transaction->program, instruction, &copy)
+                               : hlsl_copy_lift_create(transaction->program, instruction, &copy);
     result->status = work_status(transaction);
     if (result->status != HLSL_LIFT_VERIFIED) {
         hlsl_copy_lift_destroy(copy);
@@ -216,6 +218,16 @@ HLSLLiftStatus hlsl_lift_transaction_try_copy(HLSLLiftTransaction *transaction, 
         hlsl_copy_lift_destroy(copy);
     }
     return result->status;
+}
+
+HLSLLiftStatus hlsl_lift_transaction_try_copy(HLSLLiftTransaction *transaction, int instruction,
+                                              HLSLLiftResult *result) {
+    return try_lift(transaction, instruction, result, false);
+}
+
+HLSLLiftStatus hlsl_lift_transaction_try_result(HLSLLiftTransaction *transaction, int instruction,
+                                                HLSLLiftResult *result) {
+    return try_lift(transaction, instruction, result, true);
 }
 
 const USILProgram *hlsl_lift_transaction_program(const HLSLLiftTransaction *transaction) {
