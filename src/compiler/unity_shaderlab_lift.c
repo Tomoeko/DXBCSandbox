@@ -341,6 +341,24 @@ static HLSLLiftStatus certify_pass(LiftContext *context, UnityShaderLabLiftArtif
     return status;
 }
 
+bool unity_shaderlab_lift_emit(const SerializedShader *shader, const ShaderBlobArchive *archive,
+                               bool high_level, bool unity_uv_helpers, StringBuilder *source,
+                               ShaderLabExpressionSourceMap *map,
+                               ShaderLabCandidateDiagnostic *diagnostic) {
+    if (unity_uv_helpers)
+        return shaderlab_emit_unity_uv_candidate(shader, archive->entries, archive->entry_count,
+                                                 archive->segments, archive->segment_lengths,
+                                                 archive->segment_count, high_level, source,
+                                                 high_level ? map : NULL, diagnostic);
+    if (high_level)
+        return shaderlab_emit_high_level_candidate_with_source_map(
+            shader, archive->entries, archive->entry_count, archive->segments,
+            archive->segment_lengths, archive->segment_count, source, map, diagnostic);
+    return shaderlab_emit_candidate_with_diagnostic(shader, archive->entries, archive->entry_count,
+                                                    archive->segments, archive->segment_lengths,
+                                                    archive->segment_count, source, diagnostic);
+}
+
 static HLSLLiftStatus attempt(LiftContext *context, UnityShaderLabLiftArtifact *artifact,
                               bool high_level, bool unity_uv_helpers,
                               const UnityShaderLabLiftArtifact *baseline) {
@@ -356,20 +374,9 @@ static HLSLLiftStatus attempt(LiftContext *context, UnityShaderLabLiftArtifact *
         return status;
     const ShaderBlobArchive *archive = input->archive;
     artifact->emission_attempted = true;
-    const bool emitted =
-        unity_uv_helpers
-            ? shaderlab_emit_unity_uv_candidate(
-                  input->shader, archive->entries, archive->entry_count, archive->segments,
-                  archive->segment_lengths, archive->segment_count, high_level, &artifact->source,
-                  high_level ? &artifact->source_map : NULL, &artifact->emission_diagnostic)
-        : high_level ? shaderlab_emit_high_level_candidate_with_source_map(
-                           input->shader, archive->entries, archive->entry_count, archive->segments,
-                           archive->segment_lengths, archive->segment_count, &artifact->source,
-                           &artifact->source_map, &artifact->emission_diagnostic)
-                     : shaderlab_emit_candidate_with_diagnostic(
-                           input->shader, archive->entries, archive->entry_count, archive->segments,
-                           archive->segment_lengths, archive->segment_count, &artifact->source,
-                           &artifact->emission_diagnostic);
+    const bool emitted = unity_shaderlab_lift_emit(
+        input->shader, archive, high_level, unity_uv_helpers, &artifact->source,
+        &artifact->source_map, &artifact->emission_diagnostic);
     status = work_status(context);
     if (status != HLSL_LIFT_VERIFIED)
         return status;

@@ -5,6 +5,7 @@
 #include "app/shader_catalog_object.h"
 #include "app/whole_shader_evidence.h"
 #include "compiler/unity_shaderlab_lift.h"
+#include "translation/shaderlab_structural_certificate.h"
 
 typedef struct UnityShaderLabLiftCapture UnityShaderLabLiftCapture;
 
@@ -27,7 +28,8 @@ typedef enum {
     UNITY_SHADERLAB_CAPTURE_ARCHIVE_UNAVAILABLE,
     UNITY_SHADERLAB_CAPTURE_NO_ACCEPTED_SOURCE,
     UNITY_SHADERLAB_CAPTURE_SOURCE_CHANGED,
-    UNITY_SHADERLAB_CAPTURE_OUT_OF_MEMORY
+    UNITY_SHADERLAB_CAPTURE_OUT_OF_MEMORY,
+    UNITY_SHADERLAB_CAPTURE_SUBJECT_UNAVAILABLE
 } UnityShaderLabLiftCaptureStatus;
 
 typedef struct {
@@ -39,6 +41,9 @@ typedef struct {
     uint8_t compiler_digest[32];
     uint8_t environment_digest[32];
     uint8_t profile_digest[32];
+    ShaderLabStructuralDiagnostic structure;
+    bool structural_digest_valid;
+    uint8_t structural_digest[32];
 } UnityShaderLabLiftCaptureReport;
 
 /* Execute the production lift against an owned captured catalog record. The
@@ -74,6 +79,32 @@ bool unity_shaderlab_lift_capture_subject(const UnityShaderLabLiftCapture *captu
 WholeShaderEvidenceStatus unity_shaderlab_lift_capture_make_evidence(
     const UnityShaderLabLiftCapture *capture, const WholeShaderSubject *subject,
     WholeShaderVerificationPlane plane, WholeShaderEvidence **output);
+typedef struct {
+    ShaderCatalogObjectStatus source_status;
+    ShaderCatalogObjectReport candidate;
+    ShaderObjectStatus archive_status;
+    ShaderLabStructuralDiagnostic target_structure;
+    ShaderLabStructuralDiagnostic candidate_structure;
+    bool emission_attempted;
+    bool emitted;
+    ShaderLabCandidateDiagnostic emission;
+} UnityShaderLabStructuralEvidenceReport;
+
+/* Execute candidate capture, structural coverage and exact-mode emission.
+ * Requires the captured target's successful emission and structural coverage.
+ * Compares independently derived ordered m_ParsedForm, schema, and re-emitted
+ * source hashes. This strict projection retains compiled metadata and map
+ * order; it can reject otherwise semantically equivalent representations.
+ * Candidate release/name/version/platform must match subject. Unsupported
+ * structure/emission or missing bounded digests produce typed UNAVAILABLE;
+ * identity/input errors produce no evidence. OK means constructed, not PASS.
+ * No source-identity or runtime claim is made. */
+WholeShaderEvidenceStatus unity_shaderlab_lift_capture_structural_evidence(
+    const UnityShaderLabLiftCapture *capture, const ShaderCatalog *candidate_catalog,
+    const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
+    const WholeShaderSubject *subject, WholeShaderEvidence **output,
+    UnityShaderLabStructuralEvidenceReport *report);
+
 void unity_shaderlab_lift_capture_free(UnityShaderLabLiftCapture *capture);
 
 #endif

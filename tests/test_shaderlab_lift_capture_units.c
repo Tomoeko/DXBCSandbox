@@ -11,9 +11,20 @@
         }                                                                                          \
     } while (0)
 
-static int check_evidence(const UnityShaderLabLiftCapture *capture) {
+static int check_evidence(const UnityShaderLabLiftCapture *capture, const ShaderCatalog *catalog,
+                          const TypeTreeSchemaRegistry *registry,
+                          const UnityShaderLabLiftCaptureReport *capture_report,
+                          WholeShaderPlaneStatus expected_structure) {
     WholeShaderSubjectDescriptor descriptor;
     CHECK(unity_shaderlab_lift_capture_subject(capture, &descriptor));
+    ShaderObject candidate;
+    shader_object_init(&candidate);
+    ShaderCatalogObjectReport candidate_report;
+    CHECK(shader_catalog_decode_object(catalog, catalog->records, registry, &candidate,
+                                       &candidate_report) == SHADER_CATALOG_OBJECT_OK);
+    shader_object_dispose(&candidate);
+    memcpy(descriptor.candidate_release_digest, candidate_report.release_digest, 32);
+    CHECK(capture_report->structural_digest_valid);
     WholeShaderSubject *subject = NULL;
     CHECK(whole_shader_subject_create(&subject, &descriptor) == WHOLE_SHADER_SUBJECT_OK);
     WholeShaderEvidence *dxbc = NULL, *bindings = NULL, *domain = NULL, *diagnostics = NULL,
@@ -105,7 +116,42 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture) {
         CHECK(!invalid);
         whole_shader_subject_free(mismatch);
     }
-    /* These two planes alone cannot certify whole-shader equivalence. */
+    WholeShaderEvidence *structure = NULL;
+    UnityShaderLabStructuralEvidenceReport structure_report;
+    CHECK(unity_shaderlab_lift_capture_structural_evidence(
+              capture, catalog, catalog->records, registry, subject, &structure,
+              &structure_report) == WHOLE_SHADER_EVIDENCE_OK);
+    WholeShaderEvidenceSummary structural_summary;
+    CHECK(whole_shader_evidence_describe(structure, &structural_summary) ==
+          WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(structural_summary.status == expected_structure);
+    if (expected_structure == WHOLE_SHADER_PLANE_PASS)
+        CHECK(structural_summary.matched_item_count == 3);
+    if (expected_structure == WHOLE_SHADER_PLANE_UNAVAILABLE) {
+        CHECK(!structure_report.emitted && !structural_summary.complete);
+    } else {
+        CHECK(structure_report.emission_attempted && structure_report.emitted);
+    }
+    CHECK(structure_report.target_structure.status == SHADERLAB_STRUCTURE_OK &&
+          structure_report.candidate_structure.status == SHADERLAB_STRUCTURE_OK);
+    printf("structure=%s covered=%zu/%zu matched=%llu/3\n",
+           whole_shader_plane_status_name(structural_summary.status),
+           structure_report.target_structure.covered_semantic_fields,
+           structure_report.candidate_structure.covered_semantic_fields,
+           (unsigned long long)structural_summary.matched_item_count);
+    whole_shader_evidence_free(structure);
+    structure = NULL;
+    WholeShaderSubjectDescriptor wrong_release = descriptor;
+    wrong_release.candidate_release_digest[0] ^= 1;
+    WholeShaderSubject *wrong = NULL;
+    CHECK(whole_shader_subject_create(&wrong, &wrong_release) == WHOLE_SHADER_SUBJECT_OK);
+    CHECK(unity_shaderlab_lift_capture_structural_evidence(
+              capture, catalog, catalog->records, registry, wrong, &structure, &structure_report) ==
+          WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+    CHECK(!structure && !structure_report.emission_attempted);
+    whole_shader_subject_free(wrong);
+
+    /* These compiler planes alone cannot certify whole-shader equivalence. */
     WholeShaderCertificateInput *certificate = NULL;
     CHECK(whole_shader_certificate_input_create(&certificate, subject,
                                                 WHOLE_SHADER_D3D11_LOGICAL_REQUIRED_MASK) ==
@@ -127,13 +173,22 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture) {
 }
 
 int main(int argc, char **argv) {
-    CHECK(argc == 1 || argc == 5);
+    CHECK(argc == 1 || argc == 5 || argc == 7);
+    CHECK(argc != 7 || strcmp(argv[6], "pass") == 0 || strcmp(argv[6], "fail") == 0 ||
+          strcmp(argv[6], "unavailable") == 0);
     UnityShaderLabLiftCapture *capture = NULL;
     UnityShaderLabLiftCaptureReport report;
     CHECK(unity_shaderlab_lift_capture(NULL, &capture, &report) ==
           UNITY_SHADERLAB_CAPTURE_INVALID_ARGUMENT);
     CHECK(!capture && !unity_shaderlab_lift_capture_result(NULL));
     unity_shaderlab_lift_capture_free(NULL);
+    WholeShaderEvidence *absent = NULL;
+    UnityShaderLabStructuralEvidenceReport absent_report;
+    CHECK(unity_shaderlab_lift_capture_structural_evidence(NULL, NULL, NULL, NULL, NULL, &absent,
+                                                           &absent_report) ==
+          WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+    CHECK(!absent && !absent_report.emission_attempted);
+
     TypeTreeSchemaRegistry registry;
     typetree_schema_registry_init(&registry);
     CHECK(typetree_schema_registry_import_file_replace(&registry, CAPTURE_REGISTRY) ==
@@ -144,7 +199,7 @@ int main(int argc, char **argv) {
     shader_catalog_options_default(&options);
     options.schema_registry = &registry;
     options.retain_source_snapshots = true;
-    const char *path = argc == 5 ? argv[1] : CAPTURE_EMPTY_FIXTURE;
+    const char *path = argc >= 5 ? argv[1] : CAPTURE_EMPTY_FIXTURE;
     CHECK(shader_catalog_build(&path, 1, &options, &catalog) == SHADER_CATALOG_OK);
     CHECK(catalog.record_count == 1 && shader_catalog_is_complete(&catalog));
     UnityCompileProfile profile;
@@ -152,10 +207,10 @@ int main(int argc, char **argv) {
     profile.build_platform = 19;
     profile.valid_apis = 295472;
     strcpy(profile.provenance, "synthetic-unit-test");
-    if (argc == 5)
+    if (argc >= 5)
         CHECK(unity_compile_profile_load(argv[2], &profile) == UNITY_COMPILE_PROFILE_OK);
     UnityCompilerBroker *broker =
-        unity_compiler_broker_create_lazy(argc == 5 ? argv[3] : ".", argc == 5 ? argv[4] : NULL);
+        unity_compiler_broker_create_lazy(argc >= 5 ? argv[3] : ".", argc >= 5 ? argv[4] : NULL);
     CHECK(broker);
     HLSLLiftLimits limits = {2, 128, 60000};
     UnityShaderLabLiftCaptureInput input = {
@@ -165,7 +220,7 @@ int main(int argc, char **argv) {
         .profile = &profile,
         .broker = broker,
         .source_path = "Assets/Captured.shader",
-        .source_directory = argc == 5 ? argv[3] : ".",
+        .source_directory = argc >= 5 ? argv[3] : ".",
         .source_basename = "Captured.shader",
         .limits = &limits,
     };
@@ -198,7 +253,18 @@ int main(int argc, char **argv) {
         CHECK(memcmp(digest, report.accepted_source_digest, 32) == 0);
         CHECK(unity_compile_profile_fingerprint(&profile, digest) == UNITY_COMPILE_PROFILE_OK);
         CHECK(memcmp(digest, report.profile_digest, 32) == 0);
-        CHECK(check_evidence(capture) == 0);
+        ShaderCatalog released;
+        shader_catalog_init(&released);
+        const char *released_path = argc == 7 ? argv[5] : path;
+        CHECK(shader_catalog_build(&released_path, 1, &options, &released) == SHADER_CATALOG_OK);
+        CHECK(released.record_count == 1 && shader_catalog_is_complete(&released));
+        WholeShaderPlaneStatus expected_structure = WHOLE_SHADER_PLANE_PASS;
+        if (argc == 7 && strcmp(argv[6], "fail") == 0)
+            expected_structure = WHOLE_SHADER_PLANE_FAIL;
+        if (argc == 7 && strcmp(argv[6], "unavailable") == 0)
+            expected_structure = WHOLE_SHADER_PLANE_UNAVAILABLE;
+        CHECK(check_evidence(capture, &released, &registry, &report, expected_structure) == 0);
+        shader_catalog_dispose(&released);
         printf("high_level=%d helper=%d passes=%zu\n", accepted->high_level,
                accepted->unity_uv_helpers, accepted->certified_pass_count);
     }

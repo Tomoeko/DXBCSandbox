@@ -23,4 +23,10 @@ struct UnityShaderLabLiftResult {
     uint8_t source_basename_digest[32];
 };
 
+/* Shared mode dispatch for the lift and released-object structural evidence. */
+bool unity_shaderlab_lift_emit(const SerializedShader *shader, const ShaderBlobArchive *archive,
+                               bool high_level, bool unity_uv_helpers, StringBuilder *source,
+                               ShaderLabExpressionSourceMap *map,
+                               ShaderLabCandidateDiagnostic *diagnostic);
+
 #endif
