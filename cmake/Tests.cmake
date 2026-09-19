@@ -33,6 +33,13 @@ if(BUILD_TESTING)
     add_executable(test_roundtrip tests/test_roundtrip.c)
     target_link_libraries(test_roundtrip PRIVATE dxbc_core dxbc_build_options)
 
+    add_executable(test_unity_include_scan_units
+        tests/test_unity_include_scan_units.c src/compiler/unity_include_scan.c)
+    target_include_directories(test_unity_include_scan_units PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_unity_include_scan_units PRIVATE dxbc_build_options)
+    add_test(NAME unity_include_scan_units COMMAND test_unity_include_scan_units)
+
     add_executable(test_bundle_corpus tests/test_bundle_corpus.c)
     target_link_libraries(test_bundle_corpus PRIVATE
         dxbc_core dxbc_build_options)

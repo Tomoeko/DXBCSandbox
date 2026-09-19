@@ -1767,17 +1767,18 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
                         report,
                         UNITY_GENERATED_DOMAIN_COMPILER_TRANSPORT_FAILED);
                 }
-                if (response.status.availability ==
-                    UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS) {
+                if (response.status.availability != UNITY_COMPILER_RESPONSE_AVAILABLE) {
+                    const UnityGeneratedDomainStatus unavailable =
+                        response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS
+                            ? UNITY_GENERATED_DOMAIN_COMPILER_CACHE_ONLY_MISS
+                            : UNITY_GENERATED_DOMAIN_INCLUDE_AUTHORITY_UNAVAILABLE;
                     status = retain_compiler_status(
                         report, &response.status);
                     unity_compiler_binary_response_free(&response);
                     unity_compile_authority_free(&authority);
                     subprogram_metadata_free_variant(&player);
                     if (status != UNITY_GENERATED_DOMAIN_OK) return status;
-                    return fail_report(
-                        report,
-                        UNITY_GENERATED_DOMAIN_COMPILER_CACHE_ONLY_MISS);
+                    return fail_report(report, unavailable);
                 }
                 report->compiler_diagnostic_count +=
                     response.status.diagnostic_count;
@@ -2035,6 +2036,8 @@ const char* unity_generated_domain_status_name(
             return "compile-authority-failed";
         case UNITY_GENERATED_DOMAIN_REQUIREMENTS_MISMATCH:
             return "requirements-mismatch";
+        case UNITY_GENERATED_DOMAIN_INCLUDE_AUTHORITY_UNAVAILABLE:
+            return "include-authority-unavailable";
         case UNITY_GENERATED_DOMAIN_COMPILER_CACHE_ONLY_MISS:
             return "compiler-cache-only-miss";
         case UNITY_GENERATED_DOMAIN_COMPILER_TRANSPORT_FAILED:

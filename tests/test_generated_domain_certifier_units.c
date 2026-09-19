@@ -597,6 +597,7 @@ typedef struct {
     int32_t diagnostic_type;
     bool add_unexpected_reflection;
     bool cache_only_miss;
+    bool include_authority_unavailable;
     bool transport_failure;
     bool omit_identity;
 } FakeCompiler;
@@ -673,9 +674,10 @@ static bool fake_compile(
     ++compiler->calls;
     if (!compiler->omit_identity) set_fake_request_identity(response, compiler->calls);
     if (compiler->transport_failure) return false;
-    if (compiler->cache_only_miss) {
-        response->status.availability =
-            UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS;
+    if (compiler->cache_only_miss || compiler->include_authority_unavailable) {
+        response->status.availability = compiler->cache_only_miss
+            ? UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS
+            : UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
         return true;
     }
     response->status.compiler_success = true;
@@ -974,6 +976,18 @@ static int test_full_tiered_certification(void) {
     CHECK(report.compiler_responses[0].provenance.response_received);
     CHECK(report.compiler_responses[0].provenance.has_request_identity);
     CHECK(!report.compiler_responses[0].provenance.has_output_digest);
+
+    compiler = (FakeCompiler){.include_authority_unavailable = true, .omit_identity = true};
+    input.compile_context = &compiler;
+    CHECK(unity_generated_domain_certify_d3d11(&input, &report) ==
+          UNITY_GENERATED_DOMAIN_INCLUDE_AUTHORITY_UNAVAILABLE);
+    CHECK(compiler.calls == 1U && report.clean_compile_count == 0U &&
+          report.matched_dxbc_count == 0U && report.compiler_response_count == 1U);
+    CHECK(report.diagnostic.compiler_response.availability ==
+          UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE);
+    CHECK(strcmp(unity_generated_domain_status_name(report.status),
+                 "include-authority-unavailable") == 0);
+    CHECK(!report.compiler_responses[0].provenance.has_request_identity);
 
     compiler = (FakeCompiler){
         .bytes = reference_dxbc,

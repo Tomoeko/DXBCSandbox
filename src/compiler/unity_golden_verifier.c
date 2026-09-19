@@ -1630,7 +1630,7 @@ static HLSLLiftStatus compile_lift_mode(void *context, const USILProgram *progra
     artifact->has_request_identity = response.has_request_identity;
     memcpy(artifact->request_digest, response.request_digest, sizeof(artifact->request_digest));
     memcpy(artifact->controls_digest, response.controls_digest, sizeof(artifact->controls_digest));
-    if (!available || response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS) {
+    if (!available || response.status.availability != UNITY_COMPILER_RESPONSE_AVAILABLE) {
         unity_compiler_binary_response_free(&response);
         return HLSL_LIFT_COMPILER_UNAVAILABLE;
     }
@@ -1874,11 +1874,12 @@ static bool verify_case(UnityCompilerBroker *broker, const char *golden_dir, con
             broker, stage_source, flags.shader_name, stage->id, 4,
             job->requirements, job->keywords, (int)job->keyword_count,
             job->defines, (int)job->define_count, &response);
-        if (!response_available || response.status.availability ==
-                UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS) {
+        if (!response_available || response.status.availability !=
+                UNITY_COMPILER_RESPONSE_AVAILABLE) {
             result.compilation = "unavailable";
-            result.reason = response_available ? "cache_only_miss"
-                                              : "compiler_or_protocol_unavailable";
+            result.reason = !response_available ? "compiler_or_protocol_unavailable"
+                : response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS
+                    ? "cache_only_miss" : "include_authority_unavailable";
             unity_compiler_binary_response_free(&response);
             goto record_done;
         }

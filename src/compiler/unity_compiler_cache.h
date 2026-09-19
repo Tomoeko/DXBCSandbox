@@ -169,6 +169,28 @@ bool usc_cache_search_roots_lease_create(
     uint8_t request_environment_digest[USC_CACHE_DIGEST_SIZE],
     UscCacheToolchainLease** out_lease);
 
+/* Stable content capture for one potential include pathname, including a
+ * missing-path observation. Existing nodes must resolve to regular files;
+ * their parent resolution is pinned to catch moved ancestor symlinks.
+ * On success the caller owns the lease and the optionally empty byte buffer;
+ * out_missing distinguishes a missing file from an empty existing file.
+ * Existing bytes have an extra NUL outside out_size. Failure clears outputs. */
+bool usc_cache_include_file_lease_create(
+    const char* path, size_t max_size, uint8_t** out_bytes, size_t* out_size,
+    uint8_t digest[USC_CACHE_DIGEST_SIZE], bool* out_missing,
+    UscCacheToolchainLease** out_lease);
+
+/* Merge compatible observations by exact pathname, validating both leases.
+ * On success source is consumed and cleared. On failure both remain owned by
+ * the caller, and destination retains its prior observations. */
+bool usc_cache_toolchain_lease_merge(
+    UscCacheToolchainLease** destination, UscCacheToolchainLease** source);
+
+/* Exact observed pathname membership, for cross-checking native dependency
+ * callbacks against a captured include lease. This does not validate time. */
+bool usc_cache_toolchain_lease_contains_path(
+    const UscCacheToolchainLease* lease, const char* path, bool require_existing);
+
 bool usc_cache_toolchain_lease_validate(
     const UscCacheToolchainLease* lease);
 

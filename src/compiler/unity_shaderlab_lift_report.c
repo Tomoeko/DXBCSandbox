@@ -19,12 +19,24 @@ static void digest(StringBuilder *out, const char *name, const uint8_t bytes[32]
     }
 }
 
+static const char *availability_name(UnityCompilerResponseAvailability availability) {
+    switch (availability) {
+    case UNITY_COMPILER_RESPONSE_AVAILABLE:
+        return "available";
+    case UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS:
+        return "cache-only-miss";
+    case UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE:
+        return "include-authority-unavailable";
+    default:
+        return "unknown";
+    }
+}
+
 static void response_status(StringBuilder *out, const UnityCompilerResponseStatus *status) {
     sb_appendf(out,
                "{\"availability\":\"%s\",\"compiler_success\":%s,\"cache_hit\":%s,"
                "\"diagnostic_count\":%zu,\"actionable_diagnostic_count\":%zu}",
-               status->availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS ? "cache-only-miss"
-                                                                               : "available",
+               availability_name(status->availability),
                boolean(status->compiler_success), boolean(status->from_cache),
                status->diagnostic_count,
                unity_compiler_response_status_actionable_diagnostic_count(status));

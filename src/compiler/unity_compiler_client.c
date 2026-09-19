@@ -2,6 +2,7 @@
 
 #include "compiler/unity_compiler_client.h"
 #include "compiler/unity_compiler_cache.h"
+#include "compiler/unity_include_closure.h"
 #include "common/string_builder.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -408,6 +409,11 @@ char* unity_compiler_response_status_format(
         sb_append(&formatted,
                   "Unity compiler cache-only lookup missed; no compiler "
                   "process was started");
+    } else if (status && status->availability ==
+                             UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE) {
+        sb_append(&formatted,
+                  "Unity compiler include authority unavailable: dependencies must be "
+                  "bounded literal includes in explicit HLSL/CG programs");
     } else if (status) {
         for (size_t i = 0; i < status->diagnostic_count; i++) {
             const UnityCompilerDiagnostic* diagnostic =
@@ -1252,14 +1258,32 @@ static bool configure_toolchain_paths(UnityCompilerChannel* channel) {
 }
 
 static void invalidate_compiler_channel(UnityCompilerChannel* channel);
+static int unity_compiler_include_paths(const UnityCompilerChannel* channel, char* include_paths[3]);
 
 static void discard_source_authority(UnityCompilerChannel* channel) {
     usc_cache_toolchain_lease_destroy(channel->cache_source_lease);
     channel->cache_source_lease = NULL;
+    usc_cache_toolchain_lease_destroy(channel->cache_include_lease);
+    usc_cache_toolchain_lease_destroy(channel->cache_prior_include_lease);
+    channel->cache_include_lease = channel->cache_prior_include_lease = NULL;
     free(channel->cache_source_root);
     channel->cache_source_root = NULL;
+    free(channel->cache_working_directory);
+    channel->cache_working_directory = NULL;
     memset(channel->cache_source_environment, 0, sizeof(channel->cache_source_environment));
     ++channel->source_authority_revision;
+}
+
+static bool validate_include_authority(const UnityCompilerChannel* channel) {
+    if ((channel->cache_include_lease &&
+         !usc_cache_toolchain_lease_validate(channel->cache_include_lease)) ||
+        (channel->cache_prior_include_lease &&
+         !usc_cache_toolchain_lease_validate(channel->cache_prior_include_lease))) return false;
+    if (!channel->cache_working_directory) return true;
+    char* current = getcwd(NULL, 0);
+    const bool same = current && !strcmp(current, channel->cache_working_directory);
+    free(current);
+    return same;
 }
 
 static void discard_toolchain_authority(UnityCompilerChannel* channel,
@@ -1309,7 +1333,7 @@ static bool capture_or_validate_toolchain_authority(
     if (!channel || !channel->configured) return false;
     if (channel->cache_toolchain_lease) {
         if (usc_cache_toolchain_lease_validate(
-                channel->cache_toolchain_lease)) {
+                channel->cache_toolchain_lease) && validate_include_authority(channel)) {
             return !channel->session_capabilities_failed;
         }
         discard_toolchain_authority(channel, true);
@@ -1342,7 +1366,8 @@ static bool validate_existing_toolchain_authority(
     if (!channel || !channel->cache_toolchain_lease) return false;
     if (usc_cache_toolchain_lease_validate(channel->cache_toolchain_lease) &&
         (!channel->cache_source_lease ||
-         usc_cache_toolchain_lease_validate(channel->cache_source_lease))) {
+         usc_cache_toolchain_lease_validate(channel->cache_source_lease)) &&
+        validate_include_authority(channel)) {
         return !channel->session_capabilities_failed;
     }
     discard_toolchain_authority(channel, true);
@@ -1365,21 +1390,16 @@ static bool get_toolchain_fingerprints(
     return true;
 }
 
-static char* request_search_root(const char* path) {
-    if (!path) return NULL;
+static char* request_search_root(const char* path, const char* working_directory) {
+    if (!path || !working_directory) return NULL;
     char* normalized = strdup(path);
     if (!normalized) return NULL;
     for (char* c = normalized; *c; ++c)
         if (*c == '\\') *c = '/';
     if (normalized[0] == '/') return normalized;
-    char* working_directory = getcwd(NULL, 0);
-    if (!working_directory) {
-        free(normalized);
-        return NULL;
-    }
     if (!normalized[0] || strcmp(normalized, ".") == 0) {
         free(normalized);
-        return working_directory;
+        return strdup(working_directory);
     }
     size_t directory_size = strlen(working_directory), path_size = strlen(normalized);
     char* absolute = NULL;
@@ -1390,44 +1410,79 @@ static char* request_search_root(const char* path) {
                      working_directory, normalized);
     }
     free(normalized);
-    free(working_directory);
     return absolute;
 }
 
-static bool get_request_fingerprints(
+static bool get_source_fingerprints(
     UnityCompilerChannel* channel, const char* source_directory,
     uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE]) {
-    if (!get_toolchain_fingerprints(channel, compiler_fingerprint, environment_fingerprint))
+    if (!channel || !channel->configured) return false;
+    char* working_directory = getcwd(NULL, 0);
+    char* root = request_search_root(source_directory, working_directory);
+    if (!root) {
+        free(working_directory);
         return false;
-    char* root = request_search_root(source_directory);
-    if (!root) return false;
-    if (channel->cache_source_lease) {
-        const bool valid = usc_cache_toolchain_lease_validate(channel->cache_source_lease);
-        if (valid && strcmp(root, channel->cache_source_root) == 0) {
-            memcpy(environment_fingerprint, channel->cache_source_environment,
-                   USC_CACHE_DIGEST_SIZE);
-            free(root);
-            return true;
-        }
-        /* Refresh only between requests; in-flight acceptance validates the
-         * captured lease. Switching roots drops the previous lease, whose
-         * headers may change while another root is active. Recycle USC's own
-         * include cache on either change instead of retaining stale contents. */
+    }
+    if (channel->cache_source_lease &&
+        (!usc_cache_toolchain_lease_validate(channel->cache_source_lease) ||
+         strcmp(root, channel->cache_source_root) || !validate_include_authority(channel))) {
+        /* Refresh only between requests. In-flight validation never refreshes.
+         * Recycle USC so its own include cache cannot retain the old inputs. */
         invalidate_compiler_channel(channel);
         discard_source_authority(channel);
+    }
+    if (!get_toolchain_fingerprints(channel, compiler_fingerprint, environment_fingerprint)) {
+        free(root);
+        free(working_directory);
+        return false;
+    }
+    if (channel->cache_source_lease) {
+        memcpy(environment_fingerprint, channel->cache_source_environment, USC_CACHE_DIGEST_SIZE);
+        free(root);
+        free(working_directory);
+        return true;
     }
     const char* roots[] = {root};
     if (!usc_cache_search_roots_lease_create(roots, 1U, environment_fingerprint,
                                             environment_fingerprint,
                                             &channel->cache_source_lease)) {
         free(root);
+        free(working_directory);
         return false;
     }
     channel->cache_source_root = root;
+    channel->cache_working_directory = working_directory;
     memcpy(channel->cache_source_environment, environment_fingerprint, USC_CACHE_DIGEST_SIZE);
     ++channel->source_authority_revision;
     return true;
+}
+
+static bool get_request_fingerprints(
+    UnityCompilerChannel* channel, const char* source_directory, const char* source,
+    uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
+    uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE]) {
+    if (channel) channel->include_authority_unavailable = false;
+    if (!source || !get_source_fingerprints(channel, source_directory, compiler_fingerprint,
+                                             environment_fingerprint)) return false;
+    if (channel->cache_include_lease &&
+        !usc_cache_toolchain_lease_merge(&channel->cache_prior_include_lease,
+                                         &channel->cache_include_lease)) {
+        discard_toolchain_authority(channel, true);
+        return false;
+    }
+    char* includes[3];
+    const int count = unity_compiler_include_paths(channel, includes);
+    const char* roots[5] = {channel->cache_source_root};
+    for (int i = 0; i < count; ++i) roots[i + 1] = includes[i];
+    roots[count + 1] = channel->cache_working_directory;
+    if (!usc_include_closure_create((const uint8_t*)source, strlen(source), roots,
+            (size_t)count + 2U, environment_fingerprint, environment_fingerprint,
+            &channel->cache_include_lease)) {
+        channel->include_authority_unavailable = true;
+        return false;
+    }
+    return validate_existing_toolchain_authority(channel);
 }
 
 static bool environment_entry_has_name(
@@ -2503,6 +2558,55 @@ static bool validate_captured_session_valid_apis(
 
 static bool compiler_fingerprint_has_value(const uint8_t *fingerprint);
 
+static bool read_dependency_paths(
+    int fd, int count, UnityCompilerDependencyPaths* dependencies) {
+    if (count < 0 || count > UNITY_SNIPPET_CONTRACT_MAX_ITEMS - dependencies->count)
+        return false;
+    const int total = dependencies->count + count;
+    if (count) {
+        char** paths = realloc(dependencies->paths, (size_t)total * sizeof(*paths));
+        if (!paths) return false;
+        dependencies->paths = paths;
+    }
+    dependencies->present = true;
+    while (dependencies->count < total) {
+        size_t path_size = 0;
+        char* path = read_string_with_size(fd, &path_size);
+        if (!path) return false;
+        if (!path_size || memchr(path, '\0', path_size)) {
+            free(path);
+            return false;
+        }
+        dependencies->paths[dependencies->count++] = path;
+    }
+    return true;
+}
+
+static bool preprocess_dependencies_are_captured(
+    const UnityCompilerChannel* channel, const PreprocessResult* result) {
+    const UnityCompilerDependencyPaths* families[] = {&result->includes, &result->probed_paths};
+    for (size_t family = 0; family < 2U; ++family) {
+        for (int i = 0; i < families[family]->count; ++i) {
+            char* path = request_search_root(families[family]->paths[i],
+                                             channel->cache_working_directory);
+            const bool captured = path && usc_cache_toolchain_lease_contains_path(
+                channel->cache_include_lease, path, family == 0U);
+            free(path);
+            if (!captured) return false;
+        }
+    }
+    return true;
+}
+
+static void reject_preprocess_include_authority(
+    UnityCompilerChannel* channel, UnityCompilerPreprocessResponse* response) {
+    response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+    response->has_request_identity = false;
+    memset(response->request_digest, 0, sizeof(response->request_digest));
+    memset(response->controls_digest, 0, sizeof(response->controls_digest));
+    discard_toolchain_authority(channel, true);
+}
+
 static void preprocess_response_request_identity(
     UnityCompilerPreprocessResponse *response,
     const uint8_t request_digest[USC_CACHE_DIGEST_SIZE],
@@ -2527,10 +2631,14 @@ bool unity_compiler_preprocess_contract_response(
     uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE];
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE];
     UnityCompilerPreprocessRequest request;
-    if (!input_request ||
-        !get_request_fingerprints(channel, input_request->source_directory,
-                                  compiler_fingerprint, environment_fingerprint) ||
-        !preprocess_request_to_wire(
+    if (!input_request) return false;
+    if (!get_request_fingerprints(channel, input_request->source_directory, input_request->source,
+                                   compiler_fingerprint, environment_fingerprint)) {
+        if (!channel || !channel->include_authority_unavailable) return false;
+        response_status->availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+        return true;
+    }
+    if (!preprocess_request_to_wire(
             channel, input_request, environment_fingerprint,
             include_paths, &request)) {
         return false;
@@ -2557,6 +2665,11 @@ bool unity_compiler_preprocess_contract_response(
                 cached_data, cached_size, out_response);
             free(cached_data);
             if (decoded) {
+                if (!preprocess_dependencies_are_captured(channel, out_result)) {
+                    response_status->from_cache = true;
+                    reject_preprocess_include_authority(channel, out_response);
+                    return true;
+                }
                 preprocess_response_request_identity(out_response, request_digest, controls_digest);
                 const bool toolchain_valid =
                     validate_existing_toolchain_authority(channel);
@@ -2662,6 +2775,8 @@ bool unity_compiler_preprocess_contract_response(
                     unity_compiler_preprocess_response_free(out_response);
                     return false;
                 }
+                if (!preprocess_dependencies_are_captured(channel, out_result))
+                    reject_preprocess_include_authority(channel, out_response);
                 return true;
             }
             if (!seal_pending(
@@ -2678,8 +2793,12 @@ bool unity_compiler_preprocess_contract_response(
             out_result->blob_len = blob_size;
             finish_compiler_transaction();
             if (!validate_existing_toolchain_authority(channel)) {
-                unity_compiler_free_preprocess(out_result);
+                unity_compiler_preprocess_response_free(out_response);
                 return false;
+            }
+            if (!preprocess_dependencies_are_captured(channel, out_result)) {
+                reject_preprocess_include_authority(channel, out_response);
+                return true;
             }
             if (cache_ready) {
                 uint8_t* serialized = NULL;
@@ -2720,15 +2839,10 @@ bool unity_compiler_preprocess_contract_response(
             if (count < 0 || count > max_response_count) {
                 goto preprocess_parse_failure;
             }
-            /* Consume the complete protocol record. Request identities cover
-             * configured trees and the implicit source search tree. These
-             * callbacks alone are not proof of a complete transitive closure:
-             * includes can resolve outside those roots. */
-            for (int i = 0; i < count; i++) {
-                char* dependency = read_string(fd);
-                if (!dependency) goto preprocess_parse_failure;
-                free(dependency);
-            }
+            UnityCompilerDependencyPaths* dependencies = prefix[0] == 'i'
+                ? &out_result->includes : &out_result->probed_paths;
+            if (!read_dependency_paths(fd, count, dependencies))
+                goto preprocess_parse_failure;
         } else if (strncmp(msg, "keywordsUserGlobal:", 19) == 0 ||
                    strncmp(msg, "keywordsUserLocal:", 18) == 0 ||
                    strncmp(msg, "keywordsBuiltin:", 16) == 0) {
@@ -3029,9 +3143,11 @@ static bool unity_compiler_compile_request_response_internal(
     }
     uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE];
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE];
-    if (!get_request_fingerprints(channel, input_request->source_directory,
+    if (!get_request_fingerprints(channel, input_request->source_directory, input_request->snippet_source,
                                   compiler_fingerprint, environment_fingerprint)) {
-        return false;
+        if (!channel->include_authority_unavailable) return false;
+        out_response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+        return true;
     }
     UnityCompilerCompileRequest request = *input_request;
     request.environment_fingerprint = environment_fingerprint;
@@ -3434,19 +3550,36 @@ bool unity_compiler_get_toolchain_provenance(
     return true;
 }
 
-bool unity_compiler_get_source_provenance(
-    UnityCompilerChannel* channel, const char* source_root,
+static bool get_scoped_provenance(
+    UnityCompilerChannel* channel, const char* source_root, const char* source,
     UnityCompilerToolchainProvenance* out_provenance) {
     if (!out_provenance) return false;
     UnityCompilerToolchainProvenance provenance;
-    if (!unity_compiler_get_toolchain_provenance(channel, &provenance) ||
-        !get_request_fingerprints(channel, source_root,
-                                  provenance.compiler_fingerprint,
-                                  provenance.environment_fingerprint))
+    uint8_t compiler[USC_CACHE_DIGEST_SIZE], environment[USC_CACHE_DIGEST_SIZE];
+    /* Refresh request inputs before the read-only toolchain accessor validates
+     * the prior lease. A between-request edit is allowed to start a new epoch. */
+    const bool captured = source
+        ? get_request_fingerprints(channel, source_root, source, compiler, environment)
+        : get_source_fingerprints(channel, source_root, compiler, environment);
+    if (!captured || !unity_compiler_get_toolchain_provenance(channel, &provenance))
         return false;
+    memcpy(provenance.compiler_fingerprint, compiler, sizeof(compiler));
+    memcpy(provenance.environment_fingerprint, environment, sizeof(environment));
     provenance.source_authority_revision = channel->source_authority_revision;
     *out_provenance = provenance;
     return true;
+}
+
+bool unity_compiler_get_request_provenance(
+    UnityCompilerChannel* channel, const char* source_root, const char* source,
+    UnityCompilerToolchainProvenance* out_provenance) {
+    return source && get_scoped_provenance(channel, source_root, source, out_provenance);
+}
+
+bool unity_compiler_get_source_provenance(
+    UnityCompilerChannel* channel, const char* source_root,
+    UnityCompilerToolchainProvenance* out_provenance) {
+    return get_scoped_provenance(channel, source_root, NULL, out_provenance);
 }
 
 bool unity_compiler_serialize_preprocess_request(
@@ -3463,7 +3596,7 @@ bool unity_compiler_serialize_preprocess_request(
     memset(out_request_digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
     UnityCompilerToolchainProvenance provenance;
     if (!request ||
-        !get_request_fingerprints(channel, request->source_directory,
+        !get_request_fingerprints(channel, request->source_directory, request->source,
                                   provenance.compiler_fingerprint,
                                   provenance.environment_fingerprint)) {
         return false;
@@ -3530,7 +3663,8 @@ bool unity_compiler_serialize_compile_request(
     memset(out_request_digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
     UnityCompilerToolchainProvenance provenance;
     if (!request ||
-        !unity_compiler_get_source_provenance(channel, request->source_directory, &provenance)) {
+        !unity_compiler_get_request_provenance(
+            channel, request->source_directory, request->snippet_source, &provenance)) {
         return false;
     }
     if (!serialize_compile_request_authority(
@@ -3913,6 +4047,8 @@ void unity_compiler_free_preprocess(PreprocessResult* result) {
     if (result->blob) {
         free(result->blob);
     }
+    free_string_array(result->includes.paths, result->includes.count);
+    free_string_array(result->probed_paths.paths, result->probed_paths.count);
     memset(result, 0, sizeof(PreprocessResult));
 }
 

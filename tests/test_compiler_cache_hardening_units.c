@@ -1,4 +1,5 @@
 #include "compiler/unity_compiler_cache.h"
+#include "compiler/unity_include_closure.h"
 #include "compiler/unity_compiler_client.h"
 
 #include <dirent.h>
@@ -470,6 +471,159 @@ static bool verify_collision_safe_publication(const char* cache_dir) {
     return true;
 }
 
+static bool verify_include_file_leases(const char* temporary_dir) {
+    char header[PATH_MAX], absent[PATH_MAX], link[PATH_MAX], empty[PATH_MAX];
+    CHECK(snprintf(header, sizeof(header), "%s/lease.inc", temporary_dir) > 0);
+    CHECK(snprintf(absent, sizeof(absent), "%s/absent.inc", temporary_dir) > 0);
+    CHECK(snprintf(link, sizeof(link), "%s/alias.inc", temporary_dir) > 0);
+    CHECK(snprintf(empty, sizeof(empty), "%s/empty.inc", temporary_dir) > 0);
+    const uint8_t contents[] = {1, 0, 3};
+    CHECK(write_file(header, contents, sizeof(contents)));
+    CHECK(write_file(empty, NULL, 0));
+    CHECK(symlink("lease.inc", link) == 0);
+    uint8_t* bytes = NULL;
+    size_t size = 0;
+    uint8_t digest[32], reference[32];
+    bool missing = false;
+    UscCacheToolchainLease *all = NULL, *addition = NULL;
+    CHECK(usc_cache_sha256_file(header, reference));
+    const char* paths[] = {header, header, link};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(*paths); ++i) {
+        CHECK(usc_cache_include_file_lease_create(
+            paths[i], sizeof(contents), &bytes, &size, digest, &missing, &addition));
+        CHECK(!missing && size == sizeof(contents) && !memcmp(bytes, contents, size) &&
+              bytes[size] == 0 && !memcmp(digest, reference, sizeof(digest)));
+        free(bytes);
+        CHECK(usc_cache_toolchain_lease_merge(&all, &addition));
+        CHECK(all && !addition && usc_cache_toolchain_lease_validate(all));
+    }
+    CHECK(!usc_cache_toolchain_lease_merge(&all, &all));
+    CHECK(usc_cache_include_file_lease_create(
+        empty, 0, &bytes, &size, digest, &missing, &addition));
+    CHECK(!missing && bytes && !bytes[0] && size == 0);
+    free(bytes);
+    CHECK(usc_cache_toolchain_lease_merge(&all, &addition));
+    CHECK(usc_cache_include_file_lease_create(
+        absent, 0, &bytes, &size, digest, &missing, &addition));
+    CHECK(missing && !bytes && size == 0);
+    CHECK(usc_cache_toolchain_lease_merge(&all, &addition));
+    CHECK(write_file(absent, contents, sizeof(contents)));
+    CHECK(!usc_cache_toolchain_lease_validate(all));
+    CHECK(usc_cache_include_file_lease_create(
+        absent, sizeof(contents), &bytes, &size, digest, &missing, &addition));
+    free(bytes);
+    CHECK(!usc_cache_toolchain_lease_merge(&all, &addition));
+    CHECK(all && addition && usc_cache_toolchain_lease_validate(addition));
+    usc_cache_toolchain_lease_destroy(all);
+    usc_cache_toolchain_lease_destroy(addition);
+    all = addition = NULL;
+    CHECK(usc_cache_include_file_lease_create(
+        link, sizeof(contents), &bytes, &size, digest, &missing, &all));
+    free(bytes);
+    CHECK(write_file(header, "new", 3));
+    CHECK(!usc_cache_toolchain_lease_validate(all));
+    usc_cache_toolchain_lease_destroy(all);
+    all = NULL;
+    CHECK(!usc_cache_include_file_lease_create(
+        header, 2, &bytes, &size, digest, &missing, &all));
+    CHECK(!bytes && size == 0 && !all && !missing);
+    CHECK(!usc_cache_include_file_lease_create(
+        temporary_dir, SIZE_MAX, &bytes, &size, digest, &missing, &all));
+    CHECK(!usc_cache_include_file_lease_create(
+        "relative.inc", SIZE_MAX, &bytes, &size, digest, &missing, &all));
+    CHECK(!usc_cache_include_file_lease_create(NULL, 0, NULL, NULL, NULL, NULL, NULL));
+    return true;
+}
+
+static bool verify_include_closure(const char* temporary_dir) {
+    char source_root[PATH_MAX], outside[PATH_MAX], cwd[PATH_MAX];
+    char entry[PATH_MAX], dependency[PATH_MAX], missing_header[PATH_MAX];
+    CHECK(snprintf(source_root, sizeof(source_root), "%s/closure-source", temporary_dir) > 0);
+    CHECK(snprintf(outside, sizeof(outside), "%s/closure-outside", temporary_dir) > 0);
+    CHECK(snprintf(cwd, sizeof(cwd), "%s/closure-working", temporary_dir) > 0);
+    CHECK(mkdir(source_root, 0700) == 0 && mkdir(outside, 0700) == 0 && mkdir(cwd, 0700) == 0);
+    CHECK(snprintf(entry, sizeof(entry), "%s/entry.inc", source_root) > 0);
+    CHECK(snprintf(dependency, sizeof(dependency), "%s/external.inc", outside) > 0);
+    CHECK(snprintf(missing_header, sizeof(missing_header), "%s/missing.inc", source_root) > 0);
+    const char contents[] = "#if SOMETIMES\n#include \"../closure-outside/external.inc\"\n#endif\n"
+                            "#include \"missing.inc\"\n";
+    const char cycle[] = "#include \"./external.inc\"\n";
+    CHECK(write_file(entry, contents, sizeof(contents) - 1U));
+    CHECK(write_file(dependency, cycle, sizeof(cycle) - 1U));
+    const char source[] = "#include \"entry.inc\"\n";
+    const char* roots[] = {source_root, cwd};
+    uint8_t base[32] = {1}, first[32], second[32];
+    UscCacheToolchainLease *original = NULL, *current = NULL;
+    CHECK(usc_include_closure_create((const uint8_t*)source, sizeof(source) - 1U,
+        roots, 2, base, first, &original));
+    CHECK(usc_cache_toolchain_lease_contains_path(original, dependency, true));
+    CHECK(usc_cache_toolchain_lease_contains_path(original, missing_header, false));
+    CHECK(!usc_cache_toolchain_lease_contains_path(original, missing_header, true));
+    CHECK(usc_include_closure_create((const uint8_t*)source, sizeof(source) - 1U,
+        roots, 2, base, second, &current));
+    CHECK(!memcmp(first, second, sizeof(first)));
+    usc_cache_toolchain_lease_destroy(current);
+    CHECK(write_file(dependency, "// changed\n", 11));
+    CHECK(!usc_cache_toolchain_lease_validate(original));
+    usc_cache_toolchain_lease_destroy(original);
+    CHECK(usc_include_closure_create((const uint8_t*)source, sizeof(source) - 1U,
+        roots, 2, base, second, &current));
+    CHECK(memcmp(first, second, sizeof(first)) != 0);
+    memcpy(first, second, sizeof(first));
+    CHECK(write_file(missing_header, "// newly present\n", 17));
+    CHECK(!usc_cache_toolchain_lease_validate(current));
+    usc_cache_toolchain_lease_destroy(current);
+    CHECK(usc_include_closure_create((const uint8_t*)source, sizeof(source) - 1U,
+        roots, 2, base, second, &current));
+    CHECK(memcmp(first, second, sizeof(first)) != 0);
+    usc_cache_toolchain_lease_destroy(current);
+    const char macro[] = "#include HEADER_MACRO\n";
+    CHECK(!usc_include_closure_create((const uint8_t*)macro, sizeof(macro) - 1U,
+        roots, 2, base, second, &current));
+    CHECK(current == NULL);
+    uint8_t zero[32] = {0};
+    CHECK(!memcmp(second, zero, sizeof(zero)));
+
+    char deep[PATH_MAX], alias[PATH_MAX], lexical_choice[PATH_MAX], physical_choice[PATH_MAX];
+    CHECK(snprintf(deep, sizeof(deep), "%s/deep", outside) > 0);
+    CHECK(snprintf(alias, sizeof(alias), "%s/alias", source_root) > 0);
+    CHECK(snprintf(lexical_choice, sizeof(lexical_choice), "%s/choice.inc", source_root) > 0);
+    CHECK(snprintf(physical_choice, sizeof(physical_choice), "%s/choice.inc", outside) > 0);
+    CHECK(mkdir(deep, 0700) == 0 && symlink(deep, alias) == 0);
+    CHECK(write_file(lexical_choice, "// lexical\n", 11));
+    CHECK(write_file(physical_choice, "// physical\n", 12));
+    const char ambiguous[] = "#include \"alias/../choice.inc\"\n";
+    CHECK(usc_include_closure_create((const uint8_t*)ambiguous, sizeof(ambiguous) - 1U,
+        roots, 2, base, first, &original));
+    CHECK(usc_cache_toolchain_lease_contains_path(original, lexical_choice, true));
+    CHECK(write_file(physical_choice, "// changed physical\n", 20));
+    CHECK(!usc_cache_toolchain_lease_validate(original));
+    usc_cache_toolchain_lease_destroy(original);
+    CHECK(usc_include_closure_create((const uint8_t*)ambiguous, sizeof(ambiguous) - 1U,
+        roots, 2, base, second, &current));
+    CHECK(memcmp(first, second, sizeof(first)) != 0);
+    CHECK(write_file(lexical_choice, "// changed lexical\n", 19));
+    CHECK(!usc_cache_toolchain_lease_validate(current));
+    usc_cache_toolchain_lease_destroy(current);
+    /* The same hard-linked header can acquire a different nested-include
+     * parent when an ancestor directory symlink moves. File inode checks alone
+     * cannot detect that change after a symlink followed by '..'. */
+    char moved[PATH_MAX], moved_deep[PATH_MAX], moved_choice[PATH_MAX];
+    CHECK(snprintf(moved, sizeof(moved), "%s/closure-moved", temporary_dir) > 0);
+    CHECK(snprintf(moved_deep, sizeof(moved_deep), "%s/deep", moved) > 0);
+    CHECK(snprintf(moved_choice, sizeof(moved_choice), "%s/choice.inc", moved) > 0);
+    CHECK(mkdir(moved, 0700) == 0 && mkdir(moved_deep, 0700) == 0);
+    const char nested[] = "#include \"child.inc\"\n";
+    CHECK(write_file(physical_choice, nested, sizeof(nested) - 1U));
+    CHECK(link(physical_choice, moved_choice) == 0);
+    CHECK(usc_include_closure_create((const uint8_t*)ambiguous, sizeof(ambiguous) - 1U,
+        roots, 2, base, first, &original));
+    CHECK(unlink(alias) == 0 && symlink(moved_deep, alias) == 0);
+    CHECK(!usc_cache_toolchain_lease_validate(original));
+    usc_cache_toolchain_lease_destroy(original);
+    return true;
+}
+
 static bool run_all_tests(void) {
     CHECK(verify_preprocess_shape_validation());
     char temporary_template[] = "/tmp/dxbc-cache-hardening.XXXXXX";
@@ -477,7 +631,9 @@ static bool run_all_tests(void) {
     CHECK(temporary_dir != NULL);
     bool ok = verify_collision_safe_publication(temporary_dir) &&
               verify_environment_fingerprint_hardening(temporary_dir) &&
-              verify_request_search_roots(temporary_dir);
+              verify_request_search_roots(temporary_dir) &&
+              verify_include_file_leases(temporary_dir) &&
+              verify_include_closure(temporary_dir);
     remove_tree(temporary_dir);
     CHECK(ok);
     return true;

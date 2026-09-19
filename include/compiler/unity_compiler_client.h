@@ -77,9 +77,13 @@ typedef struct {
     bool expected_valid_apis_ready;
     struct UscCacheToolchainLease* cache_toolchain_lease;
     struct UscCacheToolchainLease* cache_source_lease;
+    struct UscCacheToolchainLease* cache_include_lease;
+    struct UscCacheToolchainLease* cache_prior_include_lease;
     char* cache_source_root;
+    char* cache_working_directory;
     uint8_t cache_source_environment[32];
     uint64_t source_authority_revision;
+    bool include_authority_unavailable;
 } UnityCompilerChannel;
 
 #define UNITY_COMPILER_FINGERPRINT_SIZE 32
@@ -135,6 +139,8 @@ typedef struct {
 typedef enum {
     UNITY_COMPILER_RESPONSE_AVAILABLE = 0,
     UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS = 1,
+    /* No complete dependency snapshot could authorize this request. */
+    UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE = 2,
 } UnityCompilerResponseAvailability;
 
 /* Terminal compiler status plus every ordered diagnostic that preceded it.
@@ -317,11 +323,23 @@ typedef struct {
     bool has_contract;
 } PreprocessedSnippet;
 
+/* Owned paths from one family of native dependency callbacks, concatenated
+ * in response order without sorting or deduplication. An absent callback is
+ * distinct from an observed empty list. These observations describe this
+ * preprocessing request, not every later compile variant's include closure. */
+typedef struct {
+    bool present;
+    char** paths;
+    int count;
+} UnityCompilerDependencyPaths;
+
 typedef struct PreprocessResult {
     PreprocessedSnippet* snippets;
     int snippet_count;
     uint8_t* blob;
     size_t blob_len;
+    UnityCompilerDependencyPaths includes;
+    UnityCompilerDependencyPaths probed_paths;
 } PreprocessResult;
 
 typedef struct UnityCompilerPreprocessResponse {
@@ -638,10 +656,22 @@ bool unity_compiler_get_toolchain_provenance(
 /* Request authority also covers the complete implicit source search tree.
  * Relative roots resolve in the compiler process's inherited working
  * directory. Refreshing a changed tree recycles USC's in-memory include cache.
- * A multi-request transaction must pin both fingerprints and the revision. */
+ * This root-only digest omits request-specific include closure. A multi-request
+ * transaction must pin both fingerprints and the revision; subsequent queries
+ * also validate dependencies captured by earlier requests in that epoch. */
 bool unity_compiler_get_source_provenance(
     UnityCompilerChannel* channel,
     const char* source_root,
+    UnityCompilerToolchainProvenance* out_provenance);
+
+/* Includes request-specific literal dependencies in every conditional branch
+ * as well as the implicit Unity headers. Nonliteral include operands fail
+ * closed, as does implicit Surface Shader generation. Working-directory
+ * changes and external dependency edits recycle the compiler between requests.
+ * Use this environment fingerprint for an offline request transcript;
+ * the source-root-only accessor cannot infer additional source dependencies. */
+bool unity_compiler_get_request_provenance(
+    UnityCompilerChannel* channel, const char* source_root, const char* source,
     UnityCompilerToolchainProvenance* out_provenance);
 
 /*

@@ -97,8 +97,9 @@ static bool compile(void *opaque, const UnityCompilerSnippetCompileRequest *requ
         ++context->result->stats.cache_hits;
     if (work_status(context) != HLSL_LIFT_VERIFIED)
         return false;
-    if (received && (!response->has_request_identity || !has_digest(response->request_digest) ||
-                     !has_digest(response->controls_digest))) {
+    if (received && response->status.availability == UNITY_COMPILER_RESPONSE_AVAILABLE &&
+        (!response->has_request_identity || !has_digest(response->request_digest) ||
+         !has_digest(response->controls_digest))) {
         context->control.status = HLSL_LIFT_PROVENANCE_MISMATCH;
         return false;
     }
@@ -114,6 +115,7 @@ static HLSLLiftStatus domain_status(UnityGeneratedDomainStatus status) {
     case UNITY_GENERATED_DOMAIN_REFERENCE_DXBC_INVALID:
     case UNITY_GENERATED_DOMAIN_COMPILED_DXBC_INVALID:
         return HLSL_LIFT_INVALID_DXBC;
+    case UNITY_GENERATED_DOMAIN_INCLUDE_AUTHORITY_UNAVAILABLE:
     case UNITY_GENERATED_DOMAIN_COMPILER_CACHE_ONLY_MISS:
     case UNITY_GENERATED_DOMAIN_COMPILER_TRANSPORT_FAILED:
         return HLSL_LIFT_COMPILER_UNAVAILABLE;
@@ -152,7 +154,7 @@ static HLSLLiftStatus preprocess(LiftContext *context, UnityShaderLabLiftArtifac
     status = work_status(context);
     if (status != HLSL_LIFT_VERIFIED)
         return status;
-    if (!received || response->status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS)
+    if (!received || response->status.availability != UNITY_COMPILER_RESPONSE_AVAILABLE)
         return HLSL_LIFT_COMPILER_UNAVAILABLE;
     if (!unity_compiler_response_status_is_clean_success(&response->status))
         return HLSL_LIFT_COMPILER_REJECTED;

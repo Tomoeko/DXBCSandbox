@@ -424,8 +424,58 @@ static int run_fake_compiler(
                 (void)fake_write_string(fd, "");
                 (void)fake_write_string(fd, "fixture preprocess note");
             }
+            if (strcmp(name, "dependencies-preprocess") == 0 ||
+                strcmp(name, "failed-dependencies-preprocess") == 0 ||
+                strcmp(name, "mutating-dependencies-preprocess") == 0) {
+                char first[PATH_MAX], second[PATH_MAX], missing[PATH_MAX];
+                snprintf(first, sizeof(first), "%s/A.inc", file_path);
+                snprintf(second, sizeof(second), "%s/B.inc", file_path);
+                snprintf(missing, sizeof(missing), "%s/Missing.inc", file_path);
+                (void)fake_write_string(fd, "includes: 2");
+                (void)fake_write_string(fd, first);
+                (void)fake_write_string(fd, second);
+                (void)fake_write_string(fd, "filepaths: 0");
+                (void)fake_write_string(fd, "includes: 1");
+                (void)fake_write_string(fd, first);
+                (void)fake_write_string(fd, "filepaths: 1");
+                (void)fake_write_string(fd, missing);
+                if (strcmp(name, "mutating-dependencies-preprocess") == 0) {
+                    const int file = open(first, O_WRONLY | O_TRUNC);
+                    if (file >= 0) {
+                        (void)write(file, "// changed\n", 11U);
+                        close(file);
+                    }
+                }
+            } else if (strcmp(name, "uncaptured-include-preprocess") == 0 ||
+                       strcmp(name, "uncaptured-probe-preprocess") == 0 ||
+                       strcmp(name, "missing-include-preprocess") == 0) {
+                char path[PATH_MAX];
+                snprintf(path, sizeof(path), "%s/%s", file_path,
+                         strcmp(name, "missing-include-preprocess") == 0
+                             ? "Missing.inc" : "Uncaptured.inc");
+                (void)fake_write_string(fd, strcmp(name, "uncaptured-probe-preprocess") == 0
+                                               ? "filepaths: 1" : "includes: 1");
+                (void)fake_write_string(fd, path);
+            } else if (strcmp(name, "truncated-dependencies-preprocess") == 0) {
+                (void)fake_write_string(fd, "includes: 2");
+                (void)fake_write_string(fd, "Headers/A.inc");
+                free(name);
+                free(file_path);
+                break;
+            } else if (strcmp(name, "empty-dependency-preprocess") == 0) {
+                (void)fake_write_string(fd, "filepaths: 1");
+                (void)fake_write_string(fd, "");
+            } else if (strcmp(name, "nul-dependency-preprocess") == 0) {
+                static const uint8_t invalid_path[] = {'a', 0, 'b'};
+                (void)fake_write_string(fd, "includes: 1");
+                (void)fake_write_buffer(fd, invalid_path, sizeof(invalid_path));
+            } else if (strcmp(name, "negative-dependency-count-preprocess") == 0) {
+                (void)fake_write_string(fd, "includes: -1");
+            }
             const char* status = "shader: 1 0 0";
-            if (strcmp(name, "primary-false") == 0) {
+            if (strcmp(name, "failed-dependencies-preprocess") == 0) {
+                status = "shader: 0 0 0";
+            } else if (strcmp(name, "primary-false") == 0) {
                 status = "shader: 0 1 0";
             } else if (strcmp(name, "error-preprocess") == 0) {
                 status = "shader: 0 0 0";
@@ -473,6 +523,15 @@ static int run_fake_compiler(
             if (strcmp(source, "mutate-source-root") == 0) {
                 char path[PATH_MAX];
                 if (snprintf(path, sizeof(path), "%s/late.data", directory) <= 0)
+                    break;
+                FILE* mutation = fopen(path, "wb");
+                if (!mutation) break;
+                fputs("changed during compile", mutation);
+                fclose(mutation);
+            }
+            if (strstr(source, "DXBC_MUTATE_EXTERNAL_INCLUDE")) {
+                char path[PATH_MAX];
+                if (snprintf(path, sizeof(path), "%s/../outside.inc", directory) <= 0)
                     break;
                 FILE* mutation = fopen(path, "wb");
                 if (!mutation) break;
@@ -686,6 +745,12 @@ static int contracts_equal(
 static int preprocess_results_equal(
     const PreprocessResult* left, const PreprocessResult* right) {
     if (left->snippet_count != right->snippet_count ||
+        left->includes.present != right->includes.present ||
+        left->probed_paths.present != right->probed_paths.present ||
+        !string_arrays_equal(left->includes.paths, left->includes.count,
+                             right->includes.paths, right->includes.count) ||
+        !string_arrays_equal(left->probed_paths.paths, left->probed_paths.count,
+                             right->probed_paths.paths, right->probed_paths.count) ||
         left->blob_len != right->blob_len ||
         (left->blob_len > 0 &&
          memcmp(left->blob, right->blob, left->blob_len) != 0)) {
@@ -780,8 +845,11 @@ static int verify_source_root_cache(
     CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
     CHECK(unity_compiler_compile_contract_response(channel, &request, &binary));
     CHECK(binary.status.compiler_success && !binary.status.from_cache);
+    UnityCompilerToolchainProvenance full_request;
+    CHECK(unity_compiler_get_request_provenance(
+        channel, directory, request.snippet_source, &full_request));
     const UnityCompilerOfflineAuthority authority = {
-        changed.compiler_fingerprint, changed.environment_fingerprint};
+        full_request.compiler_fingerprint, full_request.environment_fingerprint};
     uint8_t* transcript = NULL;
     size_t transcript_size = 0;
     uint8_t offline_digest[32];
@@ -798,6 +866,96 @@ static int verify_source_root_cache(
     CHECK(binary.data == NULL && channel->process_id == 0);
     unity_compiler_binary_response_free(&binary);
     remove_tree(directory);
+    return 0;
+}
+
+static int verify_external_include_cache(
+    UnityCompilerChannel* channel, const UnityCompilerSnippetCompileRequest* template_request) {
+    char temporary[] = "/tmp/dxbc-external-includes.XXXXXX";
+    CHECK(mkdtemp(temporary) != NULL);
+    char source_root[PATH_MAX], dependency[PATH_MAX], alternate_cwd[PATH_MAX];
+    CHECK(snprintf(source_root, sizeof(source_root), "%s/source", temporary) > 0);
+    CHECK(snprintf(dependency, sizeof(dependency), "%s/outside.inc", temporary) > 0);
+    CHECK(snprintf(alternate_cwd, sizeof(alternate_cwd), "%s/working", temporary) > 0);
+    CHECK(mkdir(source_root, 0700) == 0 && mkdir(alternate_cwd, 0700) == 0);
+    CHECK(write_file(dependency, "// first\n", 9));
+    UnityCompilerSnippetCompileRequest request = *template_request;
+    request.source_directory = source_root;
+    request.snippet_source = "#include \"../outside.inc\"\n";
+    uint8_t initial[32];
+    UnityCompilerBinaryResponse response;
+    for (int warm = 0; warm < 2; ++warm) {
+        CHECK(unity_compiler_compile_contract_response(channel, &request, &response));
+        CHECK(response.status.compiler_success && response.status.from_cache == (warm != 0));
+        if (!warm) memcpy(initial, response.request_digest, sizeof(initial));
+        else CHECK(!memcmp(initial, response.request_digest, sizeof(initial)));
+        unity_compiler_binary_response_free(&response);
+    }
+    UnityCompilerToolchainProvenance provenance;
+    CHECK(unity_compiler_get_request_provenance(
+        channel, source_root, request.snippet_source, &provenance));
+    const UnityCompilerOfflineAuthority authority = {
+        provenance.compiler_fingerprint, provenance.environment_fingerprint};
+    uint8_t* transcript = NULL;
+    size_t transcript_size = 0;
+    uint8_t offline[32];
+    CHECK(unity_compiler_serialize_compile_request_with_authority(
+        &request, &authority, &transcript, &transcript_size, offline));
+    free(transcript);
+    CHECK(!memcmp(initial, offline, sizeof(initial)));
+    CHECK(write_file(dependency, "// second\n", 10));
+    UnityCompilerToolchainProvenance refreshed;
+    CHECK(unity_compiler_get_request_provenance(
+        channel, source_root, request.snippet_source, &refreshed));
+    CHECK(refreshed.source_authority_revision != provenance.source_authority_revision &&
+          memcmp(refreshed.environment_fingerprint, provenance.environment_fingerprint, 32) != 0 &&
+          channel->process_id == 0);
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    CHECK(unity_compiler_compile_contract_response(channel, &request, &response));
+    CHECK(response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS &&
+          memcmp(initial, response.request_digest, sizeof(initial)) != 0 && channel->process_id == 0);
+    unity_compiler_binary_response_free(&response);
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
+    CHECK(unity_compiler_compile_contract_response(channel, &request, &response));
+    CHECK(response.status.compiler_success && !response.status.from_cache);
+    memcpy(initial, response.request_digest, sizeof(initial));
+    unity_compiler_binary_response_free(&response);
+    char* original_cwd = getcwd(NULL, 0);
+    CHECK(original_cwd && chdir(alternate_cwd) == 0);
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    CHECK(unity_compiler_compile_contract_response(channel, &request, &response));
+    CHECK(response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS &&
+          memcmp(initial, response.request_digest, sizeof(initial)) != 0 && channel->process_id == 0);
+    unity_compiler_binary_response_free(&response);
+    CHECK(chdir(original_cwd) == 0);
+    free(original_cwd);
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
+    const char* unsupported_sources[] = {"#define HEADER \"../outside.inc\"\n#include HEADER\n",
+                                         "#pragma surface surf Lambert\n"};
+    for (size_t i = 0; i < 2U; ++i) {
+        request.snippet_source = unsupported_sources[i];
+        CHECK(unity_compiler_compile_contract_response(channel, &request, &response));
+        CHECK(response.status.availability == UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE &&
+              !response.has_request_identity && !response.data && channel->process_id == 0);
+        char* reason = unity_compiler_response_status_format(&response.status, NULL);
+        CHECK(reason && strstr(reason, "include authority unavailable"));
+        free(reason);
+        unity_compiler_binary_response_free(&response);
+        UnityCompilerShaderPreprocessRequest preprocess = {
+            .source = unsupported_sources[i], .source_directory = source_root,
+            .shader_name = "unsupported-dependencies", .valid_apis = FAKE_SESSION_VALID_APIS};
+        UnityCompilerPreprocessResponse preprocessed;
+        CHECK(unity_compiler_preprocess_contract_response(channel, &preprocess, &preprocessed));
+        CHECK(preprocessed.status.availability == UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE &&
+              !preprocessed.has_request_identity && !preprocessed.result.snippets &&
+              channel->process_id == 0);
+        unity_compiler_preprocess_response_free(&preprocessed);
+    }
+    request.snippet_source = "#include \"../outside.inc\"\n// DXBC_MUTATE_EXTERNAL_INCLUDE\n";
+    CHECK(!unity_compiler_compile_contract_response(channel, &request, &response));
+    CHECK(!response.data && !response.has_request_identity && channel->process_id == 0);
+    unity_compiler_binary_response_free(&response);
+    remove_tree(temporary);
     return 0;
 }
 
@@ -1596,11 +1754,14 @@ int main(int argc, char** argv) {
         parsed_contract.conditional_requirements;
     serialized_snippets[0].conditional_requirement_count =
         parsed_contract.conditional_requirement_count;
+    char* serialized_includes[] = {"Headers/A.inc", "../Shared/B.inc", "Headers/A.inc"};
     PreprocessResult serialized_result = {
         .snippets = serialized_snippets,
         .snippet_count = 2,
         .blob = (uint8_t*)preprocess_blob,
         .blob_len = sizeof(preprocess_blob),
+        .includes = {true, serialized_includes, 3},
+        .probed_paths = {.present = true},
     };
     uint8_t* serialized_data = NULL;
     size_t serialized_size = 0;
@@ -1628,6 +1789,40 @@ int main(int argc, char** argv) {
         trailing_data, serialized_size + 1U, &decoded_result));
     free(trailing_data);
     free(serialized_data);
+
+    PreprocessResult dependency_only = {.includes = {.present = true}};
+    CHECK(usc_cache_serialize_preprocess_result(
+        &dependency_only, &serialized_data, &serialized_size));
+    CHECK(serialized_size == 40U);
+    CHECK(usc_cache_deserialize_preprocess_result(
+        serialized_data, serialized_size, &decoded_result));
+    CHECK(decoded_result.includes.present && decoded_result.includes.count == 0 &&
+          !decoded_result.probed_paths.present);
+    unity_compiler_free_preprocess(&decoded_result);
+    serialized_data[28] = 2; /* Non-boolean presence marker. */
+    CHECK(!usc_cache_deserialize_preprocess_result(
+        serialized_data, serialized_size, &decoded_result));
+    serialized_data[28] = 1;
+    serialized_data[32] = 1; /* Promised path with no complete string payload. */
+    CHECK(!usc_cache_deserialize_preprocess_result(
+        serialized_data, serialized_size, &decoded_result));
+    serialized_data[7] = '4';
+    serialized_data[8] = 4;
+    CHECK(usc_cache_deserialize_preprocess_result(
+        serialized_data, 28U, &decoded_result));
+    CHECK(!decoded_result.includes.present && !decoded_result.probed_paths.present);
+    unity_compiler_free_preprocess(&decoded_result);
+    free(serialized_data);
+    dependency_only.includes = (UnityCompilerDependencyPaths){false, serialized_includes, 3};
+    CHECK(!usc_cache_serialize_preprocess_result(
+        &dependency_only, &serialized_data, &serialized_size));
+    dependency_only.includes = (UnityCompilerDependencyPaths){true, serialized_includes, -1};
+    CHECK(!usc_cache_serialize_preprocess_result(
+        &dependency_only, &serialized_data, &serialized_size));
+    char* empty_path[] = {""};
+    dependency_only.includes = (UnityCompilerDependencyPaths){true, empty_path, 1};
+    CHECK(!usc_cache_serialize_preprocess_result(
+        &dependency_only, &serialized_data, &serialized_size));
 
     UnityCompilerDiagnostic cached_diagnostic = {
         .fields = {13, 14, 15},
@@ -2572,6 +2767,101 @@ int main(int argc, char** argv) {
     CHECK(fixture_result.snippet_count == 0 && fixture_result.blob_len == 0U);
     unity_compiler_free_preprocess(&fixture_result);
 
+    char dependency_template[] = "/tmp/dxbc-preprocess-dependencies.XXXXXX";
+    char* dependency_root = mkdtemp(dependency_template);
+    CHECK(dependency_root != NULL);
+    char dependency_a[PATH_MAX], dependency_b[PATH_MAX], dependency_missing[PATH_MAX];
+    snprintf(dependency_a, sizeof(dependency_a), "%s/A.inc", dependency_root);
+    snprintf(dependency_b, sizeof(dependency_b), "%s/B.inc", dependency_root);
+    snprintf(dependency_missing, sizeof(dependency_missing), "%s/Missing.inc", dependency_root);
+    CHECK(write_file(dependency_a, "// A", 4U));
+    CHECK(write_file(dependency_b, "// B", 4U));
+    fixture_preprocess.source_directory = dependency_root;
+    fixture_preprocess.source = "#include \"A.inc\"\n#include \"B.inc\"\n"
+                                "#if 0\n#include \"Missing.inc\"\n#endif\n";
+    fixture_preprocess.shader_name = "dependencies-preprocess";
+    for (int warm = 0; warm < 2; ++warm) {
+        CHECK(unity_compiler_preprocess_contract_response(
+            &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+        CHECK(diagnosed_preprocess.status.compiler_success &&
+              diagnosed_preprocess.status.from_cache == (warm != 0));
+        const PreprocessResult* result = &diagnosed_preprocess.result;
+        CHECK(result->includes.present && result->includes.count == 3 &&
+              strcmp(result->includes.paths[0], dependency_a) == 0 &&
+              strcmp(result->includes.paths[1], dependency_b) == 0 &&
+              strcmp(result->includes.paths[2], dependency_a) == 0 &&
+              result->probed_paths.present && result->probed_paths.count == 1 &&
+              strcmp(result->probed_paths.paths[0], dependency_missing) == 0);
+        if (warm) {
+            /* A well-formed payload is still untrusted: its observations must
+             * be checked again against the current request's captured files. */
+            free(diagnosed_preprocess.result.includes.paths[0]);
+            diagnosed_preprocess.result.includes.paths[0] = strdup("Uncaptured.inc");
+            CHECK(diagnosed_preprocess.result.includes.paths[0] != NULL);
+            uint8_t* forged = NULL;
+            size_t forged_size = 0;
+            CHECK(usc_cache_serialize_preprocess_response(
+                &diagnosed_preprocess, &forged, &forged_size));
+            char forged_path[PATH_MAX];
+            cache_entry_path(diagnostic_cache_dir, diagnosed_preprocess.request_digest, forged_path);
+            CHECK(unlink(forged_path) == 0);
+            CHECK(usc_cache_store(diagnostic_cache_dir, diagnosed_preprocess.request_digest,
+                                  forged, forged_size));
+            free(forged);
+        }
+        unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    }
+    CHECK(unity_compiler_preprocess_contract_response(
+        &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+    CHECK(diagnosed_preprocess.status.availability ==
+              UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE &&
+          diagnosed_preprocess.status.from_cache && !diagnosed_preprocess.has_request_identity &&
+          fixture_channel.process_id == 0);
+    unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    fixture_preprocess.shader_name = "failed-dependencies-preprocess";
+    CHECK(unity_compiler_preprocess_contract_response(
+        &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+    CHECK(!diagnosed_preprocess.status.compiler_success &&
+          diagnosed_preprocess.result.includes.count == 3 &&
+          diagnosed_preprocess.result.probed_paths.count == 1);
+    unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    const char* uncaptured_dependencies[] = {"uncaptured-include-preprocess",
+        "uncaptured-probe-preprocess", "missing-include-preprocess"};
+    for (size_t i = 0; i < 3U; ++i) {
+        fixture_preprocess.shader_name = uncaptured_dependencies[i];
+        CHECK(unity_compiler_preprocess_contract_response(
+            &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+        CHECK(diagnosed_preprocess.status.availability ==
+                  UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE &&
+              !diagnosed_preprocess.has_request_identity &&
+              !unity_compiler_response_status_is_clean_success(&diagnosed_preprocess.status) &&
+              fixture_channel.process_id == 0);
+        unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    }
+    fixture_preprocess.shader_name = "mutating-dependencies-preprocess";
+    CHECK(!unity_compiler_preprocess_contract_response(
+        &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+    CHECK(!diagnosed_preprocess.has_request_identity &&
+          !diagnosed_preprocess.status.compiler_success &&
+          !diagnosed_preprocess.result.includes.paths && fixture_channel.process_id == 0);
+    unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    const char* malformed_dependencies[] = {"truncated-dependencies-preprocess",
+        "empty-dependency-preprocess", "negative-dependency-count-preprocess",
+        "nul-dependency-preprocess"};
+    for (size_t i = 0; i < sizeof(malformed_dependencies) / sizeof(*malformed_dependencies); ++i) {
+        fixture_preprocess.shader_name = malformed_dependencies[i];
+        CHECK(!unity_compiler_preprocess_contract_response(
+            &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
+        CHECK(!diagnosed_preprocess.result.includes.paths &&
+              !diagnosed_preprocess.result.probed_paths.paths &&
+              fixture_channel.process_id == 0 && fixture_channel.socket_fd == -1);
+        unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    }
+
+    fixture_preprocess.source_directory = saved_preprocess_path;
+    fixture_preprocess.source = saved_preprocess_source;
+    remove_tree(dependency_root);
+
     /* The compatibility wrappers derive paths from shader names.  Exercise
      * names well beyond the former 1024-byte stack buffers and have the fake
      * compiler reject any byte-for-byte path mismatch. */
@@ -3017,6 +3307,7 @@ int main(int argc, char** argv) {
 
     CHECK(verify_source_root_cache(&fixture_channel, &informational_compile_request,
                                    &fixture_preprocess) == 0);
+    CHECK(verify_external_include_cache(&fixture_channel, &informational_compile_request) == 0);
     fixture_text = unity_compiler_disassemble(
         &fixture_channel, "ignore-shutdown", 4, 0, NULL, 0U);
     CHECK(fixture_text && strcmp(fixture_text, "fake disassembly") == 0);

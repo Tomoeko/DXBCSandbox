@@ -21,12 +21,14 @@
 typedef enum {
     NONE,
     PREPROCESS_TRANSPORT,
+    PREPROCESS_INCLUDE_AUTHORITY,
     PREPROCESS_REJECTED,
     PREPROCESS_MISSING_IDENTITY,
     PREPROCESS_ZERO_IDENTITY,
     PREPROCESS_CONTROL_DRIFT,
     PREPROCESS_EXTRA_SNIPPET,
     COMPILE_TRANSPORT,
+    COMPILE_INCLUDE_AUTHORITY,
     COMPILE_REJECTED,
     COMPILE_MISSING_IDENTITY,
     COMPILE_ZERO_IDENTITY,
@@ -168,6 +170,10 @@ static bool preprocess_service(void *opaque, const UnityCompilerShaderPreprocess
         service->cancelled = true;
     if (failure == PREPROCESS_TRANSPORT)
         return false;
+    if (failure == PREPROCESS_INCLUDE_AUTHORITY) {
+        response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+        return true;
+    }
     response->status.compiler_success = failure != PREPROCESS_REJECTED;
     response->status.from_cache = service->cached;
     response->has_request_identity = failure != PREPROCESS_MISSING_IDENTITY;
@@ -227,6 +233,10 @@ static bool compile_service(void *opaque, const UnityCompilerSnippetCompileReque
         service->fixture->profile.build_platform++;
     if (failure == COMPILE_TRANSPORT)
         return false;
+    if (failure == COMPILE_INCLUDE_AUTHORITY) {
+        response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+        return true;
+    }
     response->status.compiler_success = failure != COMPILE_REJECTED;
     response->status.from_cache = service->cached;
     if (failure == COMPILE_CACHE_MISS)
@@ -316,12 +326,14 @@ static int test_verified_and_fallback(void) {
         bool preprocess;
     } failures[] = {
         {PREPROCESS_TRANSPORT, HLSL_LIFT_COMPILER_UNAVAILABLE, true},
+        {PREPROCESS_INCLUDE_AUTHORITY, HLSL_LIFT_COMPILER_UNAVAILABLE, true},
         {PREPROCESS_REJECTED, HLSL_LIFT_COMPILER_REJECTED, true},
         {PREPROCESS_MISSING_IDENTITY, HLSL_LIFT_PROVENANCE_MISMATCH, true},
         {PREPROCESS_ZERO_IDENTITY, HLSL_LIFT_PROVENANCE_MISMATCH, true},
         {PREPROCESS_CONTROL_DRIFT, HLSL_LIFT_AUTHORITY_MISMATCH, true},
         {PREPROCESS_EXTRA_SNIPPET, HLSL_LIFT_AUTHORITY_MISMATCH, true},
         {COMPILE_TRANSPORT, HLSL_LIFT_COMPILER_UNAVAILABLE, false},
+        {COMPILE_INCLUDE_AUTHORITY, HLSL_LIFT_COMPILER_UNAVAILABLE, false},
         {COMPILE_REJECTED, HLSL_LIFT_COMPILER_REJECTED, false},
         {COMPILE_MISSING_IDENTITY, HLSL_LIFT_PROVENANCE_MISMATCH, false},
         {COMPILE_ZERO_IDENTITY, HLSL_LIFT_PROVENANCE_MISMATCH, false},
@@ -366,6 +378,9 @@ static int test_verified_and_fallback(void) {
         if (failures[i].failure == PREPROCESS_TRANSPORT)
             CHECK(!unity_shaderlab_lift_candidate(result)->preprocess_received &&
                   strstr(json, "\"preprocessing\":{\"attempted\":true,\"received\":false"));
+        if (failures[i].failure == PREPROCESS_INCLUDE_AUTHORITY ||
+            failures[i].failure == COMPILE_INCLUDE_AUTHORITY)
+            CHECK(strstr(json, "\"availability\":\"include-authority-unavailable\""));
         if (status == HLSL_LIFT_DXBC_MISMATCH)
             CHECK(strstr(json, "\"dxbc_mismatch\":{") && strstr(json, "\"byte_offset\":"));
         free(json);

@@ -63,7 +63,10 @@ build-unity/dxbc-sandbox extract /path/to/assets --kind graphics --all \
 Select Unity with `DXBC_UNITY_CONTENTS_PATH`, `DXBC_UNITY_APP`, or
 `UNITY_EDITOR_PATH`. Additional package headers must be supplied through
 `--includes` or a local `shader_includes/` folder under the project root.
-Unity binaries and copied package headers are not included.
+Unity binaries and copied package headers are not included. Compiler verification
+captures bounded literal include dependencies, including inactive branches and
+external headers. Macro-expanded include names and implicit Surface Shader
+generation currently return `include-authority-unavailable`.
 
 `unity_golden_verifier --high-level --report results.jsonl` tests an opt-in
 float4 expression lift for bounded straight-line vertex/fragment programs.

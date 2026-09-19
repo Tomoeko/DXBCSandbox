@@ -135,6 +135,7 @@ typedef enum {
     CACHE_LEASE_ENTRY_MISSING,
     CACHE_LEASE_ENTRY_DIRECT,
     CACHE_LEASE_ENTRY_SYMLINK,
+    CACHE_LEASE_ENTRY_DIRECTORY_RESOLUTION,
 } CacheLeaseEntryKind;
 
 typedef struct {
@@ -169,21 +170,19 @@ static void cache_lease_stat_capture(CacheLeaseStat* destination,
         cache_stat_ctime_nanoseconds(source);
 }
 
+static bool cache_lease_stats_equal(const CacheLeaseStat* a, const CacheLeaseStat* b) {
+    return a->device == b->device && a->inode == b->inode && a->mode == b->mode &&
+           a->link_count == b->link_count && a->user == b->user && a->group == b->group &&
+           a->size == b->size && a->mtime_seconds == b->mtime_seconds &&
+           a->mtime_nanoseconds == b->mtime_nanoseconds && a->ctime_seconds == b->ctime_seconds &&
+           a->ctime_nanoseconds == b->ctime_nanoseconds;
+}
+
 static bool cache_lease_stat_matches(const CacheLeaseStat* expected,
                                      const struct stat* current) {
     CacheLeaseStat captured;
     cache_lease_stat_capture(&captured, current);
-    return expected->device == captured.device &&
-           expected->inode == captured.inode &&
-           expected->mode == captured.mode &&
-           expected->link_count == captured.link_count &&
-           expected->user == captured.user &&
-           expected->group == captured.group &&
-           expected->size == captured.size &&
-           expected->mtime_seconds == captured.mtime_seconds &&
-           expected->mtime_nanoseconds == captured.mtime_nanoseconds &&
-           expected->ctime_seconds == captured.ctime_seconds &&
-           expected->ctime_nanoseconds == captured.ctime_nanoseconds;
+    return cache_lease_stats_equal(expected, &captured);
 }
 
 static bool cache_lease_reserve(UscCacheToolchainLease* lease) {
@@ -281,7 +280,9 @@ static bool digest_regular_file_snapshot(
     Sha256Context* context,
     const char* path,
     const struct stat* expected,
-    bool follow) {
+    bool follow,
+    uint8_t** out_bytes) {
+    if (out_bytes) *out_bytes = NULL;
     int flags = O_RDONLY;
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
@@ -296,6 +297,12 @@ static bool digest_regular_file_snapshot(
     bool ok = fstat(fd, &before) == 0 && S_ISREG(before.st_mode) &&
               cache_stat_identity_equal(expected, &before) &&
               before.st_size >= 0;
+    uint8_t* captured = NULL;
+    if (ok && out_bytes) {
+        ok = (uint64_t)before.st_size < SIZE_MAX;
+        if (ok) captured = malloc((size_t)before.st_size + 1U);
+        ok = ok && captured != NULL;
+    }
     uint64_t total = 0;
     uint8_t buffer[64U * 1024U];
     while (ok) {
@@ -307,6 +314,13 @@ static bool digest_regular_file_snapshot(
                 break;
             }
             total += amount;
+            if (captured) {
+                if (total > (uint64_t)before.st_size) {
+                    ok = false;
+                    break;
+                }
+                memcpy(captured + (size_t)(total - amount), buffer, (size_t)count);
+            }
             sha256_update(context, buffer, (size_t)count);
         } else if (count == 0) {
             break;
@@ -328,13 +342,22 @@ static bool digest_regular_file_snapshot(
         ok = cache_stat_path(path, follow, &current) &&
              cache_stat_identity_equal(&before, &current);
     }
+    if (ok && captured) {
+        captured[(size_t)total] = 0;
+        *out_bytes = captured;
+    } else {
+        free(captured);
+    }
     return ok;
 }
 
-static bool cache_sha256_file_snapshot(
+static bool cache_file_snapshot(
     const char* path,
     uint8_t digest[USC_CACHE_DIGEST_SIZE],
-    UscCacheToolchainLease* lease) {
+    UscCacheToolchainLease* lease,
+    size_t max_size, uint8_t** out_bytes, size_t* out_size) {
+    if (out_bytes) *out_bytes = NULL;
+    if (out_size) *out_size = 0;
     if (!path || !digest) return false;
     memset(digest, 0, USC_CACHE_DIGEST_SIZE);
     struct stat link_status;
@@ -348,14 +371,16 @@ static bool cache_sha256_file_snapshot(
     }
     struct stat target_status = link_status;
     if ((follow && stat(path, &target_status) != 0) ||
-        !S_ISREG(target_status.st_mode)) {
+        !S_ISREG(target_status.st_mode) || target_status.st_size < 0 ||
+        (out_bytes && (uint64_t)target_status.st_size > max_size)) {
         free(target_name);
         return false;
     }
     Sha256Context context;
     sha256_init(&context);
+    uint8_t* captured = NULL;
     if (!digest_regular_file_snapshot(&context, path, &target_status,
-                                      follow)) {
+                                      follow, out_bytes ? &captured : NULL)) {
         free(target_name);
         return false;
     }
@@ -375,6 +400,7 @@ static bool cache_sha256_file_snapshot(
         free(current_name);
         if (!stable) {
             free(target_name);
+            free(captured);
             return false;
         }
     }
@@ -384,9 +410,19 @@ static bool cache_sha256_file_snapshot(
               target_name, target_name_size)
         : cache_lease_record_direct(lease, path, &target_status);
     free(target_name);
-    if (!recorded) return false;
+    if (!recorded) {
+        free(captured);
+        return false;
+    }
     sha256_final(&context, digest);
+    if (out_bytes) *out_bytes = captured;
+    if (out_size) *out_size = (size_t)target_status.st_size;
     return true;
+}
+
+static bool cache_sha256_file_snapshot(
+    const char* path, uint8_t digest[USC_CACHE_DIGEST_SIZE], UscCacheToolchainLease* lease) {
+    return cache_file_snapshot(path, digest, lease, SIZE_MAX, NULL, NULL);
 }
 
 bool usc_cache_sha256_file(
@@ -564,7 +600,7 @@ static bool encode_compile_request(
     CompileRequestSink* sink, const UnityCompilerCompileRequest* request,
     const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE]) {
     static const uint8_t schema[] =
-        "DXBCSandbox.UnityCompiler.compileSnippet.cache.v7";
+        "DXBCSandbox.UnityCompiler.compileSnippet.cache.v8";
     if (!sink || !request || !compiler_fingerprint) return false;
     compile_request_sink_buffer(sink, schema, sizeof(schema) - 1U);
     compile_request_sink_buffer(sink, compiler_fingerprint,
@@ -655,7 +691,7 @@ static bool encode_preprocess_request(
     const UnityCompilerPreprocessRequest* request,
     const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE]) {
     static const uint8_t schema[] =
-        "DXBCSandbox.UnityCompiler.preprocess.cache.v7";
+        "DXBCSandbox.UnityCompiler.preprocess.cache.v9";
     if (!sink || !request || !compiler_fingerprint) return false;
     compile_request_sink_buffer(sink, schema, sizeof(schema) - 1U);
     compile_request_sink_buffer(sink, compiler_fingerprint,
@@ -842,6 +878,14 @@ bool usc_cache_toolchain_lease_validate(
     for (size_t i = 0; i < lease->entry_count; i++) {
         const CacheLeaseEntry* entry = &lease->entries[i];
         struct stat link_status;
+        if (entry->kind == CACHE_LEASE_ENTRY_DIRECTORY_RESOLUTION) {
+            char* resolved = realpath(entry->path, NULL);
+            const bool same = resolved && strlen(resolved) == entry->target_name_size &&
+                !memcmp(resolved, entry->target_name, entry->target_name_size);
+            free(resolved);
+            if (!same) return false;
+            continue;
+        }
         if (entry->kind == CACHE_LEASE_ENTRY_MISSING) {
             if (lstat(entry->path, &link_status) == 0 || errno != ENOENT) {
                 return false;
@@ -873,6 +917,133 @@ bool usc_cache_toolchain_lease_validate(
         free(target_name);
         if (!ok) return false;
     }
+    return true;
+}
+
+/* Record where nested relative includes resolve, without treating unrelated
+ * additions to ancestor directories (for example /tmp) as header mutations.
+ * This covers symlinks in any ancestor, including paths containing '..'. */
+static bool cache_lease_record_parent_resolution(UscCacheToolchainLease* lease, const char* path) {
+    char* parent = strdup(path);
+    if (!parent) return false;
+    char* slash = strrchr(parent, '/');
+    if (!slash) {
+        free(parent);
+        return false;
+    }
+    slash[slash == parent ? 1 : 0] = 0;
+    char* resolved = realpath(parent, NULL);
+    const bool ok = resolved && cache_lease_record(
+        lease, parent, CACHE_LEASE_ENTRY_DIRECTORY_RESOLUTION, NULL, NULL,
+        (const uint8_t*)resolved, strlen(resolved));
+    free(resolved);
+    free(parent);
+    return ok;
+}
+
+bool usc_cache_include_file_lease_create(
+    const char* path, size_t max_size, uint8_t** out_bytes, size_t* out_size,
+    uint8_t digest[USC_CACHE_DIGEST_SIZE], bool* out_missing,
+    UscCacheToolchainLease** out_lease) {
+    if (out_bytes) *out_bytes = NULL;
+    if (out_size) *out_size = 0;
+    if (digest) memset(digest, 0, USC_CACHE_DIGEST_SIZE);
+    if (out_missing) *out_missing = false;
+    if (out_lease) *out_lease = NULL;
+    if (!path || path[0] != '/' || !out_bytes || !out_size || !digest ||
+        !out_missing || !out_lease) return false;
+    UscCacheToolchainLease* lease = calloc(1U, sizeof(*lease));
+    if (!lease) return false;
+    struct stat status;
+    const bool missing = lstat(path, &status) != 0;
+    bool ok = missing
+        ? errno == ENOENT && cache_lease_record_missing(lease, path)
+        : cache_file_snapshot(path, digest, lease, max_size, out_bytes, out_size) &&
+          cache_lease_record_parent_resolution(lease, path);
+    ok = ok && usc_cache_toolchain_lease_validate(lease);
+    if (!ok) {
+        free(*out_bytes);
+        *out_bytes = NULL;
+        *out_size = 0;
+        memset(digest, 0, USC_CACHE_DIGEST_SIZE);
+        usc_cache_toolchain_lease_destroy(lease);
+        return false;
+    }
+    *out_missing = missing;
+    *out_lease = lease;
+    return true;
+}
+
+static bool cache_lease_entries_equal(const CacheLeaseEntry* a, const CacheLeaseEntry* b) {
+    return a->kind == b->kind &&
+           cache_lease_stats_equal(&a->link_status, &b->link_status) &&
+           cache_lease_stats_equal(&a->target_status, &b->target_status) &&
+           a->target_name_size == b->target_name_size &&
+           (!a->target_name_size || !memcmp(a->target_name, b->target_name, a->target_name_size));
+}
+
+bool usc_cache_toolchain_lease_contains_path(
+    const UscCacheToolchainLease* lease, const char* path, bool require_existing) {
+    if (!lease || !path) return false;
+    for (size_t i = 0; i < lease->entry_count; ++i) {
+        if (lease->entries[i].kind != CACHE_LEASE_ENTRY_DIRECTORY_RESOLUTION &&
+            !strcmp(lease->entries[i].path, path))
+            return !require_existing || lease->entries[i].kind != CACHE_LEASE_ENTRY_MISSING;
+    }
+    return false;
+}
+
+bool usc_cache_toolchain_lease_merge(
+    UscCacheToolchainLease** destination, UscCacheToolchainLease** source) {
+    if (!destination || !source || destination == source || !*source ||
+        *destination == *source || !usc_cache_toolchain_lease_validate(*source) ||
+        (*destination && !usc_cache_toolchain_lease_validate(*destination))) return false;
+    if (!*destination) {
+        *destination = *source;
+        *source = NULL;
+        return true;
+    }
+    UscCacheToolchainLease* target = *destination;
+    UscCacheToolchainLease* addition = *source;
+    if (addition->entry_count > SIZE_MAX - target->entry_count) return false;
+    const size_t maximum = target->entry_count + addition->entry_count;
+    if (maximum > SIZE_MAX / sizeof(*target->entries)) return false;
+    bool* duplicate = calloc(addition->entry_count ? addition->entry_count : 1U, sizeof(*duplicate));
+    if (!duplicate) return false;
+    for (size_t i = 0; i < addition->entry_count; ++i) {
+        for (size_t j = 0; j < target->entry_count + i; ++j) {
+            const CacheLeaseEntry* prior = j < target->entry_count
+                ? &target->entries[j] : &addition->entries[j - target->entry_count];
+            if (strcmp(addition->entries[i].path, prior->path)) continue;
+            if (!cache_lease_entries_equal(&addition->entries[i], prior)) {
+                free(duplicate);
+                return false;
+            }
+            duplicate[i] = true;
+            break;
+        }
+    }
+    if (maximum > target->entry_capacity) {
+        CacheLeaseEntry* entries = realloc(target->entries, maximum * sizeof(*entries));
+        if (!entries) {
+            free(duplicate);
+            return false;
+        }
+        target->entries = entries;
+        target->entry_capacity = maximum;
+    }
+    for (size_t i = 0; i < addition->entry_count; ++i) {
+        if (duplicate[i]) {
+            free(addition->entries[i].path);
+            free(addition->entries[i].target_name);
+        } else {
+            target->entries[target->entry_count++] = addition->entries[i];
+        }
+    }
+    free(duplicate);
+    free(addition->entries);
+    free(addition);
+    *source = NULL;
     return true;
 }
 
@@ -1043,7 +1214,7 @@ static bool digest_resolved_tree_node(Sha256Context* context,
         digest_string(context, relative_path);
         digest_u64(context, (uint64_t)status->st_size);
         bool ok = digest_regular_file_snapshot(
-            context, path, status, follow);
+            context, path, status, follow, NULL);
         if (ok && !follow) {
             ok = cache_lease_record_direct(state->lease, path, status);
         }
@@ -1727,12 +1898,32 @@ static void encoder_snippet_contract(
     }
 }
 
+static void encoder_dependency_paths(
+    CacheEncoder* encoder, const UnityCompilerDependencyPaths* dependencies) {
+    if (dependencies->count < 0 ||
+        (uint32_t)dependencies->count > USC_PREPROCESS_MAX_COUNT ||
+        (dependencies->count && (!dependencies->present || !dependencies->paths)) ||
+        (!dependencies->present && dependencies->paths)) {
+        encoder->ok = false;
+        return;
+    }
+    encoder_u32(encoder, dependencies->present ? 1U : 0U);
+    if (!dependencies->present) return;
+    for (int i = 0; i < dependencies->count; ++i) {
+        if (!dependencies->paths[i] || !dependencies->paths[i][0]) {
+            encoder->ok = false;
+            return;
+        }
+    }
+    encoder_string_array(encoder, dependencies->paths, dependencies->count);
+}
+
 bool usc_cache_serialize_preprocess_result(
     const PreprocessResult* result,
     uint8_t** out_data,
     size_t* out_size) {
     static const uint8_t magic[8] = {
-        'U', 'S', 'C', 'P', 'R', 'E', 'P', '4'
+        'U', 'S', 'C', 'P', 'R', 'E', 'P', '5'
     };
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
@@ -1745,7 +1936,7 @@ bool usc_cache_serialize_preprocess_result(
 
     CacheEncoder encoder = {.ok = true};
     encoder_bytes(&encoder, magic, sizeof(magic));
-    encoder_u32(&encoder, 4U);
+    encoder_u32(&encoder, 5U);
     encoder_u32(&encoder, 0U);
     encoder_u32(&encoder, (uint32_t)result->snippet_count);
     encoder_u64(&encoder, (uint64_t)result->blob_len);
@@ -1788,6 +1979,8 @@ bool usc_cache_serialize_preprocess_result(
             }
         }
     }
+    encoder_dependency_paths(&encoder, &result->includes);
+    encoder_dependency_paths(&encoder, &result->probed_paths);
     if (!encoder.ok) {
         free(encoder.data);
         return false;
@@ -1997,12 +2190,21 @@ static bool decoder_snippet_contract(
     return unity_compiler_snippet_contract_validate(contract);
 }
 
+static bool decoder_dependency_paths(
+    CacheDecoder* decoder, UnityCompilerDependencyPaths* dependencies) {
+    uint32_t present = 0;
+    if (!decoder_u32(decoder, &present) || present > 1U) return false;
+    dependencies->present = present != 0U;
+    return !present || decoder_string_array(
+        decoder, &dependencies->paths, &dependencies->count, false);
+}
+
 bool usc_cache_deserialize_preprocess_result(
     const uint8_t* data,
     size_t size,
     PreprocessResult* out_result) {
     static const uint8_t magic[8] = {
-        'U', 'S', 'C', 'P', 'R', 'E', 'P', '4'
+        'U', 'S', 'C', 'P', 'R', 'E', 'P', '5'
     };
     if (!data || !out_result) return false;
     memset(out_result, 0, sizeof(*out_result));
@@ -2013,8 +2215,9 @@ bool usc_cache_deserialize_preprocess_result(
     uint32_t snippet_count = 0;
     uint64_t blob_size64 = 0;
     if (!decoder_bytes(&decoder, stored_magic, sizeof(stored_magic)) ||
-        memcmp(stored_magic, magic, sizeof(magic)) != 0 ||
-        !decoder_u32(&decoder, &version) || version != 4U ||
+        memcmp(stored_magic, magic, sizeof(magic) - 1U) != 0 ||
+        !decoder_u32(&decoder, &version) || (version != 4U && version != 5U) ||
+        stored_magic[7] != (uint8_t)('0' + version) ||
         !decoder_u32(&decoder, &reserved) || reserved != 0U ||
         !decoder_u32(&decoder, &snippet_count) ||
         snippet_count > USC_PREPROCESS_MAX_COUNT ||
@@ -2095,6 +2298,11 @@ bool usc_cache_deserialize_preprocess_result(
             }
         }
     }
+    /* v4 records remain readable as observations with absent dependencies.
+     * New request keys cannot replay them as current live cache authority. */
+    if (ok && version == 5U)
+        ok = decoder_dependency_paths(&decoder, &out_result->includes) &&
+             decoder_dependency_paths(&decoder, &out_result->probed_paths);
     ok = ok && decoder.cursor == decoder.size;
     if (!ok) unity_compiler_free_preprocess(out_result);
     return ok;

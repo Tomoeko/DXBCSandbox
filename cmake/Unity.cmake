@@ -37,6 +37,8 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
     set(COMPILER_SOURCES
         src/compiler/unity_compiler_client.c
         src/compiler/unity_compiler_cache.c
+        src/compiler/unity_include_scan.c
+        src/compiler/unity_include_closure.c
         src/compiler/unity_compiler_broker.c
         src/compiler/unity_compiler_singleflight.c
         src/compiler/unity_compile_authority.c
