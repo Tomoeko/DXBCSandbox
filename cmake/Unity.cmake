@@ -42,6 +42,7 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         src/compiler/unity_compiler_broker.c
         src/compiler/unity_compiler_singleflight.c
         src/compiler/unity_compile_authority.c
+        src/compiler/unity_uv_helper.c
         src/compiler/unity_compiler_session_report.c
         src/compiler/unity_reflection_certificate.c
         src/compiler/unity_generated_domain_certifier.c
@@ -80,6 +81,11 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         DXBC_GOLDEN_DEFAULT_INCLUDES="${_dxbc_golden_include_authority}"
         DXBC_GOLDEN_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/unlit_color/target.bin")
     target_link_libraries(unity_golden_verifier PRIVATE
+        unity_compiler_support dxbc_build_options)
+
+    # Explicit profile/root inputs; run manually against the selected toolchain.
+    add_executable(unity_uv_helper_probe tests/probes/unity_uv_helper_probe.c)
+    target_link_libraries(unity_uv_helper_probe PRIVATE
         unity_compiler_support dxbc_build_options)
 
     # Reproducible information-loss witness: two ShaderLab sources produce

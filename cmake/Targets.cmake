@@ -6,6 +6,7 @@ set(COMMON_SOURCES
     src/common/oracle_metadata.c
     src/common/shader_stage.c
     src/common/shaderlab_source.c
+    src/common/source_scan.c
 )
 
 set(IO_SOURCES

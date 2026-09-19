@@ -434,6 +434,11 @@ if(BUILD_TESTING)
             test_compiler_client_units)
         add_test(NAME compiler_broker_units COMMAND test_compiler_broker_units)
 
+        add_executable(test_unity_uv_helper_units tests/test_unity_uv_helper_units.c)
+        target_link_libraries(test_unity_uv_helper_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME unity_uv_helper_units COMMAND test_unity_uv_helper_units)
+
         add_executable(test_compile_authority_units
             tests/test_compile_authority_units.c)
         target_link_libraries(test_compile_authority_units PRIVATE
