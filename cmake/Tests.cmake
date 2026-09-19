@@ -357,6 +357,16 @@ if(BUILD_TESTING)
     endif()
 
     if(DXBCSANDBOX_BUILD_UNITY_BUNDLE_GATE)
+        add_executable(test_unity_shader_bundle_evidence_units
+            tests/unity/test_unity_shader_bundle_evidence_units.c)
+        target_include_directories(test_unity_shader_bundle_evidence_units PRIVATE tests)
+        target_link_libraries(test_unity_shader_bundle_evidence_units PRIVATE
+            unity_shader_bundle_gate dxbc_build_options)
+        target_compile_definitions(test_unity_shader_bundle_evidence_units PRIVATE
+            DXBC_BUNDLE_EVIDENCE_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unity_uv_shaderlab/source.shader"
+            DXBC_RELEASE_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry")
+        add_test(NAME unity_shader_bundle_evidence_units
+            COMMAND test_unity_shader_bundle_evidence_units)
         add_executable(test_unity_shader_bundle_gate_units
             tests/unity/test_unity_shader_bundle_gate_units.c)
         target_link_libraries(test_unity_shader_bundle_gate_units PRIVATE

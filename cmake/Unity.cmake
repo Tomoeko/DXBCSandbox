@@ -23,7 +23,8 @@ if(DXBCSANDBOX_BUILD_UNITY_IMPORT_GATE)
 endif()
 if(DXBCSANDBOX_BUILD_UNITY_BUNDLE_GATE)
     dxbc_add_unity_gate(unity_shader_bundle_gate dxbc-unity-bundle-gate
-        DXBCShaderBundleGate.cs src/compiler/unity_shader_bundle_gate.c)
+        DXBCShaderBundleGate.cs src/compiler/unity_shader_bundle_gate.c
+        src/compiler/unity_shader_bundle_evidence.c)
 endif()
 if(DXBCSANDBOX_BUILD_UNITY_FINITE_VISUAL_GATE)
     dxbc_add_unity_gate(unity_finite_visual_gate dxbc-unity-finite-visual-gate
