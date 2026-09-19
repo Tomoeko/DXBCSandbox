@@ -758,6 +758,87 @@ static void summarize_observed(
     summarize_name_parts(summary, NULL, record->name);
 }
 
+/* Explicit little-endian words avoid host ABI and struct-padding identity. */
+static void binding_hash_word(CommonSha256Context* hash, uint64_t value) {
+    uint8_t bytes[8];
+    for (size_t i = 0; i < sizeof(bytes); ++i) {
+        bytes[i] = (uint8_t)(value >> (i * 8U));
+    }
+    common_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+static int compare_binding_digests(const void* left, const void* right) {
+    return memcmp(left, right, COMMON_SHA256_DIGEST_SIZE);
+}
+
+/* Either expected or observed is supplied. Both take the same canonical path,
+ * but each digest is derived solely from that side's records. */
+static bool fingerprint_bindings(
+    const ExpectedReflectionRecord* expected,
+    const UnityCompilerReflectionRecord* observed, size_t count,
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
+    if (count > SIZE_MAX / COMMON_SHA256_DIGEST_SIZE) return false;
+    uint8_t (*rows)[COMMON_SHA256_DIGEST_SIZE] = count
+        ? malloc(count * sizeof(*rows)) : NULL;
+    if (count && !rows) return false;
+    uint8_t owner[COMMON_SHA256_DIGEST_SIZE] = {0};
+    bool have_owner = false;
+    size_t row_count = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const UnityCompilerReflectionKind kind = expected
+            ? expected[i].kind : observed[i].kind;
+        if (kind == UNITY_COMPILER_REFLECTION_STATS) continue;
+        const size_t value_count = expected
+            ? expected[i].value_count : observed[i].value_count;
+        if (kind < UNITY_COMPILER_REFLECTION_INPUT ||
+            kind > UNITY_COMPILER_REFLECTION_UAV_BINDING ||
+            value_count > UNITY_COMPILER_REFLECTION_MAX_VALUES ||
+            (kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER && value_count != 2U) ||
+            (kind == UNITY_COMPILER_REFLECTION_CONSTANT && !have_owner)) {
+            free(rows);
+            return false;
+        }
+        UnityReflectionCertificateRecordSummary summary;
+        if (expected) summarize_expected(&summary, &expected[i]);
+        else summarize_observed(&summary, &observed[i]);
+        CommonSha256Context hash;
+        common_sha256_init(&hash);
+        static const char domain[] = "DXBCSandbox.ReflectionBindingRecord.v1";
+        common_sha256_update(&hash, domain, sizeof(domain));
+        binding_hash_word(&hash, (uint64_t)kind);
+        binding_hash_word(&hash, summary.has_name);
+        binding_hash_word(&hash, summary.name_length);
+        common_sha256_update(&hash, summary.name_sha256, sizeof(summary.name_sha256));
+        binding_hash_word(&hash, value_count);
+        for (size_t j = 0; j < value_count; ++j) {
+            const int32_t value = kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER && j == 1U
+                ? UNITY_REFLECTION_CB_VARIABLE_COUNT_UNAVAILABLE : summary.values[j];
+            binding_hash_word(&hash, (uint32_t)value);
+        }
+        if (kind == UNITY_COMPILER_REFLECTION_CONSTANT) {
+            common_sha256_update(&hash, owner, sizeof(owner));
+        }
+        common_sha256_final(&hash, rows[row_count]);
+        if (kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER) {
+            memcpy(owner, rows[row_count], sizeof(owner));
+            have_owner = true;
+        } else if (kind != UNITY_COMPILER_REFLECTION_CONSTANT) {
+            have_owner = false;
+        }
+        ++row_count;
+    }
+    if (row_count > 1U) qsort(rows, row_count, sizeof(*rows), compare_binding_digests);
+    CommonSha256Context hash;
+    common_sha256_init(&hash);
+    static const char domain[] = "DXBCSandbox.ReflectionBindingSet.v1";
+    common_sha256_update(&hash, domain, sizeof(domain));
+    binding_hash_word(&hash, row_count);
+    if (row_count) common_sha256_update(&hash, rows, row_count * sizeof(*rows));
+    common_sha256_final(&hash, digest);
+    free(rows);
+    return true;
+}
+
 static size_t constant_block_end(
     const ExpectedReflectionRecord* expected, size_t expected_count,
     size_t cb_index) {
@@ -941,6 +1022,12 @@ UnityReflectionCertificateStatus unity_reflection_certify_d3d11_bindings(
         ? UNITY_REFLECTION_AUTHORITY_COMMON_PLUS_RESIDUAL
         : UNITY_REFLECTION_AUTHORITY_COMMON_ONLY;
     for (size_t index = 0U; index < observed_record_count; ++index) {
+        if (observed_records[index].value_count > UNITY_COMPILER_REFLECTION_MAX_VALUES ||
+            observed_records[index].kind < UNITY_COMPILER_REFLECTION_INPUT ||
+            observed_records[index].kind > UNITY_COMPILER_REFLECTION_STATS) {
+            report->status = UNITY_REFLECTION_CERTIFICATE_INVALID_ARGUMENT;
+            return report->status;
+        }
         if (observed_records[index].kind == UNITY_COMPILER_REFLECTION_STATS) {
             ++report->ignored_stats_record_count;
         } else {
@@ -983,6 +1070,11 @@ UnityReflectionCertificateStatus unity_reflection_certify_d3d11_bindings(
         report->status = UNITY_REFLECTION_CERTIFICATE_INVALID_METADATA;
         return report->status;
     }
+
+    report->expected_bindings_digest_valid = fingerprint_bindings(
+        expected, NULL, expected_count, report->expected_bindings_digest);
+    report->observed_bindings_digest_valid = fingerprint_bindings(
+        NULL, observed_records, observed_record_count, report->observed_bindings_digest);
 
     const UnityReflectionCertificateStatus compatibility_status =
         certify_common_parameters(

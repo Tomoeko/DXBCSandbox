@@ -145,6 +145,42 @@ static int test_complete_binding_certificate(void) {
     CHECK(report.observed_record_count == 10U);
     CHECK(report.matched_record_count == 10U);
     CHECK(report.ignored_stats_record_count == 1U);
+    CHECK(report.expected_bindings_digest_valid && report.observed_bindings_digest_valid);
+    CHECK(memcmp(report.expected_bindings_digest, report.observed_bindings_digest, 32) == 0);
+    uint8_t baseline_digest[32];
+    memcpy(baseline_digest, report.expected_bindings_digest, 32);
+
+    /* Resource order and constant order within one buffer are immaterial. */
+    UnityCompilerReflectionRecord swap = records[2];
+    records[2] = records[4];
+    records[4] = swap;
+    swap = records[6];
+    records[6] = records[9];
+    records[9] = swap;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &fixture.player, &fixture.parameters, NULL, records, 10U, &report) ==
+        UNITY_REFLECTION_CERTIFICATE_COMPATIBLE);
+    CHECK(report.observed_bindings_digest_valid);
+    CHECK(memcmp(baseline_digest, report.observed_bindings_digest, 32) == 0);
+    swap = records[2]; records[2] = records[4]; records[4] = swap;
+    swap = records[6]; records[6] = records[9]; records[9] = swap;
+
+    records[6].values[0] ^= 1;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &fixture.player, &fixture.parameters, NULL, records, 11U, &report) ==
+        UNITY_REFLECTION_CERTIFICATE_EXTRA_RECORD);
+    CHECK(report.expected_bindings_digest_valid && report.observed_bindings_digest_valid);
+    CHECK(memcmp(report.expected_bindings_digest, report.observed_bindings_digest, 32) != 0);
+    records[6].values[0] ^= 1;
+
+    size_t saved_count = records[6].value_count;
+    records[6].value_count = UNITY_COMPILER_REFLECTION_MAX_VALUES + 1U;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &fixture.player, &fixture.parameters, NULL, records, 11U, &report) ==
+        UNITY_REFLECTION_CERTIFICATE_INVALID_ARGUMENT);
+    CHECK(!report.expected_bindings_digest_valid && !report.observed_bindings_digest_valid);
+    records[6].value_count = saved_count;
+
 
     /* Unity discards the callback's CB variable count during serialization.
      * It is neither an equality constraint nor a bound on retained children. */
@@ -157,6 +193,8 @@ static int test_complete_binding_certificate(void) {
               &fixture.player, &fixture.parameters, NULL, records,
               sizeof(records) / sizeof(records[0]), &report) ==
           UNITY_REFLECTION_CERTIFICATE_COMPATIBLE);
+    CHECK(report.observed_bindings_digest_valid);
+    CHECK(memcmp(baseline_digest, report.observed_bindings_digest, 32) == 0);
     unity_compiler_reflection_record_free(&records[1]);
     records[1] = saved_cb;
 
@@ -321,6 +359,8 @@ static int test_signed_sampler_sentinel_and_struct(void) {
               &fixture.player, &fixture.parameters, NULL, records,
               sizeof(records) / sizeof(records[0]), &report) ==
           UNITY_REFLECTION_CERTIFICATE_COMPATIBLE);
+    CHECK(report.expected_bindings_digest_valid && report.observed_bindings_digest_valid);
+    CHECK(memcmp(report.expected_bindings_digest, report.observed_bindings_digest, 32) == 0);
 
     /* Player residual blobs store the bare member too; Unity reconstructs
      * the callback spelling from the containing struct name. */
@@ -335,6 +375,8 @@ static int test_signed_sampler_sentinel_and_struct(void) {
               &fixture.player, &empty_common, &fixture.parameters, records,
               sizeof(records) / sizeof(records[0]), &report) ==
           UNITY_REFLECTION_CERTIFICATE_COMPATIBLE);
+    CHECK(report.expected_bindings_digest_valid && report.observed_bindings_digest_valid);
+    CHECK(memcmp(report.expected_bindings_digest, report.observed_bindings_digest, 32) == 0);
     free_records(records, sizeof(records) / sizeof(records[0]));
     return 0;
 }
@@ -721,7 +763,75 @@ static int test_source_map_reconstructs_unbound_input(void) {
     return 0;
 }
 
+static int test_empty_binding_fingerprint(void) {
+    PlayerSubProgramMetadata player = {0};
+    SerializedProgramParameters common = {0};
+    UnityReflectionCertificateReport report;
+    /* Independently computed SHA-256 of the versioned domain and u64le(0). */
+    static const uint8_t expected[32] = {0x58, 0x67, 0x0e, 0xe0, 0xca, 0x04, 0x8a, 0x55, 0x0a, 0x45, 0x49, 0x80, 0x2b, 0x65, 0x08, 0x5c, 0x4e, 0x6f, 0x40, 0xdf, 0xd0, 0x6e, 0xf2, 0x96, 0x0e, 0x1a, 0xe9, 0x0b, 0xa0, 0x27, 0x9c, 0x6c};
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &player, &common, NULL, NULL, 0, &report) == UNITY_REFLECTION_CERTIFICATE_OK);
+    CHECK(report.expected_bindings_digest_valid && report.observed_bindings_digest_valid);
+    CHECK(memcmp(expected, report.expected_bindings_digest, 32) == 0);
+    CHECK(memcmp(expected, report.observed_bindings_digest, 32) == 0);
+    return 0;
+}
+
+static int test_binding_fingerprint_buffer_scope(void) {
+    PlayerSubProgramMetadata player = {0};
+    SerializedVariable variables[2] = {{0}};
+    variables[0].name = "First";
+    variables[1].name = "Second";
+    variables[0].layout[3] = variables[1].layout[3] = 4U;
+    SerializedConstantBuffer buffers[2] = {
+        {.name = "A", .size = 16U, .var_count = 1, .variables = &variables[0]},
+        {.name = "B", .size = 16U, .var_count = 1, .variables = &variables[1]},
+    };
+    SerializedProgramParameters common = {0};
+    common.cb_count = 2;
+    common.constant_buffers = buffers;
+    const char* const text[] = {
+        "cb: A 16 1", "const: First 0 0 0 1 4 0",
+        "cb: B 16 1", "stats: 1 0 0 0", "const: Second 0 0 0 1 4 0",
+    };
+    UnityCompilerReflectionRecord records[5];
+    CHECK(parse_records(text, 5, records));
+    UnityReflectionCertificateReport report;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &player, &common, NULL, records, 5, &report) ==
+        UNITY_REFLECTION_CERTIFICATE_COMPATIBLE);
+    CHECK(report.expected_bindings_digest_valid && report.observed_bindings_digest_valid);
+    CHECK(memcmp(report.expected_bindings_digest, report.observed_bindings_digest, 32) == 0);
+    uint8_t baseline[32];
+    memcpy(baseline, report.observed_bindings_digest, 32);
+    UnityCompilerReflectionRecord reordered[] = {
+        records[2], records[3], records[4], records[0], records[1]
+    };
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &player, &common, NULL, reordered, 5, &report) ==
+        UNITY_REFLECTION_CERTIFICATE_COMPATIBLE);
+    CHECK(report.observed_bindings_digest_valid);
+    CHECK(memcmp(baseline, report.observed_bindings_digest, 32) == 0);
+
+    /* Same unscoped multiset, but each constant belongs to the wrong buffer. */
+    UnityCompilerReflectionRecord swap = records[1];
+    records[1] = records[4]; records[4] = swap;
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &player, &common, NULL, records, 5, &report) ==
+        UNITY_REFLECTION_CERTIFICATE_EXTRA_RECORD);
+    CHECK(report.observed_bindings_digest_valid);
+    CHECK(memcmp(baseline, report.observed_bindings_digest, 32) != 0);
+    CHECK(unity_reflection_certify_d3d11_bindings(
+        &player, &common, NULL, records + 1, 4, &report) ==
+        UNITY_REFLECTION_CERTIFICATE_EXTRA_RECORD);
+    CHECK(!report.observed_bindings_digest_valid);
+    free_records(records, 5);
+    return 0;
+}
+
 int main(void) {
+    CHECK(test_empty_binding_fingerprint() == 0);
+    CHECK(test_binding_fingerprint_buffer_scope() == 0);
     CHECK(test_complete_binding_certificate() == 0);
     CHECK(test_signed_sampler_sentinel_and_struct() == 0);
     CHECK(test_common_plus_residual_composition() == 0);

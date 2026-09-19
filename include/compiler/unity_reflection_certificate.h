@@ -72,6 +72,13 @@ typedef struct {
     size_t expected_record_count;
     size_t observed_record_count;
     size_t matched_record_count;
+    /* Independently hashed binding multisets, including constant-buffer scope.
+     * Stats and the discarded CB variable count are excluded. Valid digests
+     * can disagree on failure; validity alone is never certification. */
+    bool expected_bindings_digest_valid;
+    bool observed_bindings_digest_valid;
+    uint8_t expected_bindings_digest[COMMON_SHA256_DIGEST_SIZE];
+    uint8_t observed_bindings_digest[COMMON_SHA256_DIGEST_SIZE];
     size_t ignored_stats_record_count;
     /* SIZE_MAX when no record-specific failure is available. */
     size_t expected_record_index;

@@ -919,6 +919,13 @@ static int test_full_tiered_certification(void) {
         CHECK(memcmp(provenance->target_digest, target_digest, sizeof(target_digest)) == 0);
         CHECK(memcmp(provenance->output_digest, target_digest, sizeof(target_digest)) == 0);
         CHECK(!report.compiler_responses[i].original_provenance.recorded);
+        CHECK(report.compiler_responses[i].reflection_certificate_present);
+        const UnityReflectionCertificateReport *bindings =
+            &report.compiler_responses[i].reflection_certificate;
+        CHECK(bindings->expected_bindings_digest_valid && bindings->observed_bindings_digest_valid);
+        CHECK(memcmp(bindings->expected_bindings_digest,
+                     bindings->observed_bindings_digest, COMMON_SHA256_DIGEST_SIZE) == 0);
+
     }
     compiler = (FakeCompiler){.bytes = reference_dxbc, .size = dxbc_size,
                               .transport_failure = true};
@@ -927,6 +934,7 @@ static int test_full_tiered_certification(void) {
     CHECK(report.compiler_response_count == 1U);
     CHECK(report.compiler_responses[0].provenance.recorded);
     CHECK(!report.compiler_responses[0].provenance.response_received);
+    CHECK(!report.compiler_responses[0].reflection_certificate_present);
     CHECK(report.compiler_responses[0].provenance.has_request_identity);
     CHECK(!report.compiler_responses[0].provenance.has_output_digest);
     compiler = (FakeCompiler){.bytes = reference_dxbc, .size = 1U};

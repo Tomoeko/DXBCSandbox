@@ -1390,6 +1390,7 @@ static UnityGeneratedDomainStatus certify_variant_reflection(
     const UnityGeneratedDomainCertificationInput* input, int stage_index,
     int subprogram_index, const PlayerSubProgramMetadata* player,
     const UnityCompilerBinaryResponse* response,
+    UnityGeneratedDomainCompilerResponseRecord* response_record,
     UnityGeneratedDomainReport* report) {
     if (!input || !input->pass || !input->d3d11_archive || !player ||
         !response || !report || stage_index < 0 || stage_index >= 6 ||
@@ -1446,6 +1447,10 @@ static UnityGeneratedDomainStatus certify_variant_reflection(
             response->reflection_record_count, &certificate);
     serialized_program_parameters_free(&binary_parameters);
     report->diagnostic.reflection_certificate = certificate;
+    if (response_record) {
+        response_record->reflection_certificate_present = true;
+        response_record->reflection_certificate = certificate;
+    }
     if (certificate_status == UNITY_REFLECTION_CERTIFICATE_OK) {
         ++report->runtime_binding_attested_compile_count;
         return UNITY_GENERATED_DOMAIN_OK;
@@ -1829,7 +1834,7 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
 
                 status = certify_variant_reflection(
                     input, stage_index, subprogram_index, &player,
-                    &response, report);
+                    &response, response_record, report);
                 if (status != UNITY_GENERATED_DOMAIN_OK) {
                     unity_compiler_binary_response_free(&response);
                     unity_compile_authority_free(&authority);

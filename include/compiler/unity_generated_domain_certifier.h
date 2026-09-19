@@ -135,6 +135,8 @@ typedef struct {
     bool original_response_present;
     UnityCompilerResponseStatus original_response;
     DXBCCompareResult original_dxbc_compare;
+    bool reflection_certificate_present;
+    UnityReflectionCertificateReport reflection_certificate;
     UnityGeneratedCompileProvenance provenance;
     UnityGeneratedCompileProvenance original_provenance;
 } UnityGeneratedDomainCompilerResponseRecord;
