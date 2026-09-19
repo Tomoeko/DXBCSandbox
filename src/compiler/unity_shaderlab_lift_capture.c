@@ -98,6 +98,7 @@ static bool subject_matches_capture(const UnityShaderLabLiftCapture *capture,
     memcpy(expected.player_profile_digest, actual.player_profile_digest, 32);
     memcpy(expected.producer_fingerprint, actual.producer_fingerprint, 32);
     memcpy(expected.candidate_release_digest, actual.candidate_release_digest, 32);
+    memcpy(expected.runtime_environment_digest, actual.runtime_environment_digest, 32);
     WholeShaderSubject *bound = NULL;
     if (whole_shader_subject_create(&bound, &expected) != WHOLE_SHADER_SUBJECT_OK)
         return false;

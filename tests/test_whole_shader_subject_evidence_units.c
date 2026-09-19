@@ -61,6 +61,7 @@ static WholeShaderSubjectDescriptor make_descriptor(uint8_t seed) {
         descriptor.dependency_map_digest,
         descriptor.producer_fingerprint,
         descriptor.candidate_release_digest,
+        descriptor.runtime_environment_digest,
     };
     for (size_t index = 0U; index < sizeof(fields) / sizeof(fields[0]);
          ++index) {
@@ -123,11 +124,11 @@ static int test_subject_canonical_encoding(void) {
           WHOLE_SHADER_SUBJECT_OK);
     common_sha256_digest_to_hex(golden_digest, golden_hex);
     if (strcmp(golden_hex,
-               "d80392e9ff8e2a160a9f42c8498803fa27576b963c206970a9a948ad19ea5030") != 0) {
+               "d4bf1c02426ab7a9031f538aad1af8a17e57471e68f2de53afbf4629489221fb") != 0) {
         fprintf(stderr, "Unexpected subject digest: %s\n", golden_hex);
     }
     CHECK(strcmp(golden_hex,
-                 "d80392e9ff8e2a160a9f42c8498803fa27576b963c206970a9a948ad19ea5030") ==
+                 "d4bf1c02426ab7a9031f538aad1af8a17e57471e68f2de53afbf4629489221fb") ==
           0);
     whole_shader_subject_serialized_free(bytes);
 
@@ -200,6 +201,9 @@ static int test_subject_canonical_encoding(void) {
     CHECK(expect_subject_near_miss(subject, &near) == 0);
     near = canonical;
     near.candidate_release_digest[10] ^= 1U;
+    CHECK(expect_subject_near_miss(subject, &near) == 0);
+    near = canonical;
+    near.runtime_environment_digest[11] ^= 1U;
     CHECK(expect_subject_near_miss(subject, &near) == 0);
 
     WholeShaderSubjectDescriptor split_a = make_descriptor(8U);
@@ -322,14 +326,35 @@ static int test_evidence_is_derived_and_ordered(void) {
           WHOLE_SHADER_EVIDENCE_OK);
     common_sha256_digest_to_hex(golden_digest, golden_hex);
     if (strcmp(golden_hex,
-               "30af4166d917b92f80eeab9776880cf354fb829ba7e9a03673ab72e5b5f8dd81") !=
+               "c7c51e84bcd91edecf6426e8732ca2a262b25d0bdbe047ea80192d68c898922a") !=
         0) {
         fprintf(stderr, "unexpected evidence digest: %s\n", golden_hex);
     }
     CHECK(strcmp(golden_hex,
-                 "30af4166d917b92f80eeab9776880cf354fb829ba7e9a03673ab72e5b5f8dd81") ==
+                 "c7c51e84bcd91edecf6426e8732ca2a262b25d0bdbe047ea80192d68c898922a") ==
           0);
     whole_shader_evidence_serialized_free(bytes);
+
+    /* Identical comparison items from another runtime environment cannot be
+     * combined with this subject, even when both independently report PASS. */
+    WholeShaderSubjectDescriptor other_environment = subject_descriptor;
+    other_environment.runtime_environment_digest[0] ^= 1U;
+    WholeShaderSubject* other_subject = NULL;
+    WholeShaderEvidence* other_evidence = NULL;
+    WholeShaderCertificateInput* combined = NULL;
+    CHECK(whole_shader_subject_create(&other_subject, &other_environment) ==
+          WHOLE_SHADER_SUBJECT_OK);
+    CHECK(make_evidence(&other_evidence, other_subject, "dxbc-container-comparator", 1U,
+                        7U, items, 2U) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(whole_shader_certificate_input_create(&combined, subject,
+              WHOLE_SHADER_D3D11_BYTE_REQUIRED_MASK) == WHOLE_SHADER_CERTIFICATE_OK);
+    CHECK(whole_shader_certificate_input_add_evidence(combined, other_evidence) ==
+          WHOLE_SHADER_CERTIFICATE_ADD_SUBJECT_MISMATCH);
+    CHECK(whole_shader_certificate_input_add_evidence(combined, pass) ==
+          WHOLE_SHADER_CERTIFICATE_ADD_OK);
+    whole_shader_certificate_input_free(combined);
+    whole_shader_evidence_free(other_evidence);
+    whole_shader_subject_free(other_subject);
 
     WholeShaderEvidenceComparisonItem reversed[2] = {items[1], items[0]};
     WholeShaderEvidence* changed = NULL;

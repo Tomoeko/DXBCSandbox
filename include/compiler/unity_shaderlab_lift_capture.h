@@ -63,8 +63,9 @@ const UnityShaderLabLiftResult *
 unity_shaderlab_lift_capture_result(const UnityShaderLabLiftCapture *capture);
 /* Copy the actual target/source/profile/session/scope bindings. String views
  * are owned by capture. The admitted dependency map binds actual target
- * inventory plus accepted-source/compiler/include authority. Player, producer
- * and candidate release remain zero for the coordinator to fill from their own authorities. Scope
+ * inventory plus accepted-source/compiler/include authority. Player, producer,
+ * candidate release and runtime environment remain zero for the coordinator
+ * to fill from their own authorities. Scope
  * is every emitted local D3D11 pass and its full generated compile domain. */
 bool unity_shaderlab_lift_capture_subject(const UnityShaderLabLiftCapture *capture,
                                           WholeShaderSubjectDescriptor *descriptor);

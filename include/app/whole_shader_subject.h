@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define WHOLE_SHADER_SUBJECT_FORMAT_VERSION 2U
+#define WHOLE_SHADER_SUBJECT_FORMAT_VERSION 3U
 #define WHOLE_SHADER_SUBJECT_DIGEST_SIZE 32U
 #define WHOLE_SHADER_SUBJECT_MAX_STRING_BYTES UINT32_C(1048576)
 #define WHOLE_SHADER_SUBJECT_SHADER_CLASS_ID 48
@@ -57,6 +57,11 @@ typedef struct {
      * complete outer artifact, member/object coordinates, payload and schema;
      * source identity alone cannot bind a particular build. Appended in v2. */
     uint8_t candidate_release_digest[WHOLE_SHADER_SUBJECT_DIGEST_SIZE];
+    /* Actual runtime image, backend/device and execution-environment authority,
+     * distinct from serialized player build/capability metadata. Appended in
+     * v3 so evidence from different environments cannot share a subject. A
+     * digest is an identity binding, not itself proof of execution/selection. */
+    uint8_t runtime_environment_digest[WHOLE_SHADER_SUBJECT_DIGEST_SIZE];
 } WholeShaderSubjectDescriptor;
 
 typedef enum {

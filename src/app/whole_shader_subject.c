@@ -206,6 +206,8 @@ bool whole_shader_subject_equal(const WholeShaderSubject* left,
         memcmp(a->producer_fingerprint, b->producer_fingerprint,
                WHOLE_SHADER_SUBJECT_DIGEST_SIZE) == 0 &&
         memcmp(a->candidate_release_digest, b->candidate_release_digest,
+               WHOLE_SHADER_SUBJECT_DIGEST_SIZE) == 0 &&
+        memcmp(a->runtime_environment_digest, b->runtime_environment_digest,
                WHOLE_SHADER_SUBJECT_DIGEST_SIZE) == 0;
 }
 
@@ -223,7 +225,7 @@ WholeShaderSubjectStatus whole_shader_subject_serialize(
     const size_t name_size = strlen(descriptor->candidate_logical_name);
     const size_t version_size = strlen(descriptor->unity_version);
     size_t total = 8U + 4U + 8U + 8U + 6U * 4U + 8U +
-        3U * 4U + 12U * WHOLE_SHADER_SUBJECT_DIGEST_SIZE;
+        3U * 4U + 13U * WHOLE_SHADER_SUBJECT_DIGEST_SIZE;
     if (!size_add(&total, member_size) || !size_add(&total, name_size) ||
         !size_add(&total, version_size) || total > UINT64_MAX) {
         return WHOLE_SHADER_SUBJECT_SIZE_OVERFLOW;
@@ -269,6 +271,8 @@ WholeShaderSubjectStatus whole_shader_subject_serialize(
     write_bytes(&cursor, descriptor->producer_fingerprint,
                 WHOLE_SHADER_SUBJECT_DIGEST_SIZE);
     write_bytes(&cursor, descriptor->candidate_release_digest,
+                WHOLE_SHADER_SUBJECT_DIGEST_SIZE);
+    write_bytes(&cursor, descriptor->runtime_environment_digest,
                 WHOLE_SHADER_SUBJECT_DIGEST_SIZE);
     if ((size_t)(cursor - output) != total) {
         free(output);
