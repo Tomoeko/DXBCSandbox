@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_lift_transaction.h"
+#include "translation/hlsl_lift_control.h"
 #include "translation/hlsl_emitter.h"
 #include "common/sha256.h"
 
@@ -21,8 +22,7 @@ struct HLSLLiftTransaction {
     HLSLLiftStats stats;
     HLSLLiftArtifact accepted;
     AcceptedCopy *copies;
-    uint64_t started_ms;
-    HLSLLiftStatus stopped;
+    HLSLLiftControl control;
     bool high_level;
 };
 
@@ -47,24 +47,9 @@ static void hash_hex(const void *bytes, size_t size, char output[65]) {
 }
 
 static HLSLLiftStatus work_status(HLSLLiftTransaction *transaction) {
-    if (transaction->stopped != HLSL_LIFT_VERIFIED)
-        return transaction->stopped;
-    if (transaction->services.cancelled &&
-        transaction->services.cancelled(transaction->services.context)) {
-        transaction->stopped = HLSL_LIFT_CANCELLED;
-        return transaction->stopped;
-    }
-    uint64_t now;
-    if (!transaction->services.monotonic_ms(transaction->services.context, &now) ||
-        now < transaction->started_ms ||
-        now - transaction->started_ms < transaction->stats.elapsed_ms) {
-        transaction->stopped = HLSL_LIFT_CLOCK_UNAVAILABLE;
-    } else {
-        transaction->stats.elapsed_ms = now - transaction->started_ms;
-        if (transaction->stats.elapsed_ms >= transaction->limits.max_elapsed_ms)
-            transaction->stopped = HLSL_LIFT_BUDGET_EXHAUSTED;
-    }
-    return transaction->stopped;
+    const HLSLLiftStatus status = hlsl_lift_control_check(&transaction->control);
+    transaction->stats.elapsed_ms = transaction->control.elapsed_ms;
+    return status;
 }
 
 static bool artifact_request_identity_valid(const HLSLLiftArtifact *artifact) {
@@ -83,8 +68,8 @@ static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USI
     if (status != HLSL_LIFT_VERIFIED)
         return status;
     if (transaction->stats.compiles >= transaction->limits.max_compiles) {
-        transaction->stopped = HLSL_LIFT_BUDGET_EXHAUSTED;
-        return transaction->stopped;
+        transaction->control.status = HLSL_LIFT_BUDGET_EXHAUSTED;
+        return transaction->control.status;
     }
     ++transaction->stats.compiles;
     HLSLLiftStatus (*compile)(void *, const USILProgram *, uint64_t, HLSLLiftArtifact *) =
@@ -116,7 +101,7 @@ static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USI
         return status;
     case HLSL_LIFT_CANCELLED:
     case HLSL_LIFT_BUDGET_EXHAUSTED:
-        transaction->stopped = status;
+        transaction->control.status = status;
         return status;
     default:
         return HLSL_LIFT_INVALID_ARGUMENT;
@@ -175,9 +160,10 @@ HLSLLiftStatus hlsl_lift_transaction_begin(const USILProgram *baseline, const ui
     transaction->target_size = target_size;
     transaction->services = *services;
     transaction->limits = *limits;
-    if (!services->monotonic_ms(services->context, &transaction->started_ms)) {
-        result->status = HLSL_LIFT_CLOCK_UNAVAILABLE;
-    } else {
+    result->status = hlsl_lift_control_begin(
+        &transaction->control, services->monotonic_ms, services->cancelled,
+        services->context, limits->max_elapsed_ms);
+    if (result->status == HLSL_LIFT_VERIFIED) {
         transaction->target = malloc(target_size);
         if (!transaction->target) {
             result->status = HLSL_LIFT_OUT_OF_MEMORY;
@@ -208,8 +194,8 @@ static HLSLLiftStatus try_lift(HLSLLiftTransaction *transaction, int instruction
     if (result->status != HLSL_LIFT_VERIFIED)
         return result->status;
     if (transaction->stats.candidates >= transaction->limits.max_candidates) {
-        transaction->stopped = HLSL_LIFT_BUDGET_EXHAUSTED;
-        return result->status = transaction->stopped;
+        transaction->control.status = HLSL_LIFT_BUDGET_EXHAUSTED;
+        return result->status = transaction->control.status;
     }
     ++transaction->stats.candidates;
     HLSLCopyLift *copy = NULL;
@@ -275,8 +261,8 @@ HLSLLiftStatus hlsl_lift_transaction_try_high_level(HLSLLiftTransaction *transac
     if (result->status != HLSL_LIFT_VERIFIED)
         return result->status;
     if (transaction->stats.candidates >= transaction->limits.max_candidates) {
-        transaction->stopped = HLSL_LIFT_BUDGET_EXHAUSTED;
-        return result->status = transaction->stopped;
+        transaction->control.status = HLSL_LIFT_BUDGET_EXHAUSTED;
+        return result->status = transaction->control.status;
     }
     ++transaction->stats.candidates;
     HLSLLiftArtifact artifact = {0};

@@ -63,6 +63,7 @@ set(DXBC_SOURCES
     src/translation/hlsl_use_def.c
     src/translation/hlsl_ssa.c
     src/translation/hlsl_copy_lift.c
+    src/translation/hlsl_lift_control.c
     src/translation/hlsl_lift_transaction.c
     src/translation/hlsl_ast.c
     src/translation/hlsl_expression_lift.c
