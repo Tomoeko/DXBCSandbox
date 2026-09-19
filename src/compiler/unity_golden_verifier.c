@@ -1694,6 +1694,41 @@ static void report_lift(FILE *report, const char *case_hash, size_t record, int 
             result->request_sha256, result->controls_sha256);
 }
 
+static void report_lift_steps(FILE *report, const char *case_hash, size_t record,
+                              const HLSLLiftTransaction *transaction) {
+    if (!report) return;
+    const size_t count = hlsl_lift_transaction_step_count(transaction);
+    for (size_t i = 0; i < count; ++i) {
+        const HLSLLiftStep *step = hlsl_lift_transaction_step(transaction, i);
+        fprintf(report,
+                "{\"event\":\"lift_accepted_step\",\"case_sha256\":\"%s\",\"record\":%zu,"
+                "\"step\":%zu,\"lift\":\"%s\",\"version\":%u,\"instruction\":%d,"
+                "\"source_instruction\":%" PRIu32 ",\"producer_instruction\":%d,"
+                "\"producer_source_instruction\":%" PRIu32 ","
+                "\"before_source_sha256\":\"%s\",\"before_request_sha256\":\"%s\","
+                "\"before_controls_sha256\":\"%s\",\"source_sha256\":\"%s\","
+                "\"request_sha256\":\"%s\",\"controls_sha256\":\"%s\","
+                "\"output_sha256\":\"%s\",\"lane_edits\":[",
+                case_hash, record, i, step->identifier, step->version, step->instruction_index,
+                step->source_instruction_index, step->producer_instruction_index,
+                step->producer_source_instruction_index, step->before.source_sha256,
+                step->before.request_sha256, step->before.controls_sha256,
+                step->after.source_sha256, step->after.request_sha256,
+                step->after.controls_sha256, step->after.output_sha256);
+        for (size_t edit_index = 0; edit_index < step->edit_count; ++edit_index) {
+            const HLSLCopyLiftEdit *edit = &step->edits[edit_index];
+            fprintf(report,
+                    "%s{\"instruction\":%d,\"operand\":%d,\"lanes\":%u,"
+                    "\"source_components\":[%u,%u,%u,%u]}",
+                    edit_index ? "," : "", edit->instruction_index, edit->operand_index,
+                    (unsigned)edit->logical_lane_mask, (unsigned)edit->source_components[0],
+                    (unsigned)edit->source_components[1], (unsigned)edit->source_components[2],
+                    (unsigned)edit->source_components[3]);
+        }
+        fputs("]}\n", report);
+    }
+}
+
 static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *flags,
                               const CompileJob *job, const GoldenRecord *target,
                               const USILProgram *baseline, const char *case_name, size_t record,
@@ -1747,6 +1782,7 @@ static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *fl
                 : stats.accepted                                 ? "mixed"
                                                                  : "low_level_fallback",
                 source_hash, output_hash);
+    report_lift_steps(report, case_hash, record, transaction);
     if (report && accepted->expression_source_map) {
         char request_hash[65];
         common_sha256_digest_to_hex(accepted->request_digest, request_hash);
@@ -2391,7 +2427,8 @@ static HLSLLiftStatus compile_live_high_level_fixture(void *context, const USILP
     return status;
 }
 
-static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool forward_result) {
+static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool forward_result,
+                                   FILE *report) {
     bool succeeded = false;
     USILProgram decoded = {0};
     uint8_t* bytes = NULL;
@@ -2482,6 +2519,7 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
     const int first = forward_result ? 1 : 0;
     SELF_CHECK(attempt(transaction, first, &result) == HLSL_LIFT_DXBC_MISMATCH);
     SELF_CHECK(hlsl_lift_transaction_program(transaction) == &baseline);
+    SELF_CHECK(hlsl_lift_transaction_step_count(transaction) == 0);
     fixture.corrupt_candidate = false;
     SELF_CHECK(attempt(transaction, first, &result) == HLSL_LIFT_VERIFIED);
     SELF_CHECK(strcmp(baseline_hash, result.source_sha256) != 0);
@@ -2493,6 +2531,13 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
     hlsl_lift_transaction_stats(transaction, &stats);
     SELF_CHECK(stats.accepted == (forward_result ? 1u : 2u) &&
                stats.candidates == stats.accepted + 1u && stats.compiles == stats.accepted + 2u);
+    SELF_CHECK(hlsl_lift_transaction_step_count(transaction) == stats.accepted);
+    const HLSLLiftStep *first_step = hlsl_lift_transaction_step(transaction, 0);
+    SELF_CHECK(first_step && !strcmp(first_step->identifier,
+                                    forward_result ? HLSL_RESULT_LIFT_ID : HLSL_COPY_LIFT_ID));
+    SELF_CHECK(!strcmp(first_step->before.source_sha256, baseline_hash) &&
+               first_step->after.request_sha256[0] &&
+               !strcmp(first_step->before.controls_sha256, first_step->after.controls_sha256));
     const HLSLLiftArtifact *prior = hlsl_lift_transaction_artifact(transaction);
     const char *prior_source = prior->source;
     fixture.corrupt_candidate = true;
@@ -2514,8 +2559,24 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
         fprintf(stderr, "high-level fixture: %s\n", hlsl_lift_status_name(high_status));
     SELF_CHECK(high_status == HLSL_LIFT_VERIFIED &&
                hlsl_lift_transaction_is_high_level(transaction));
+    SELF_CHECK(hlsl_lift_transaction_step_count(transaction) == stats.accepted + 1U);
+    const HLSLLiftStep *final_step = hlsl_lift_transaction_step(transaction, stats.accepted);
+    SELF_CHECK(final_step && !strcmp(final_step->identifier, HLSL_HIGH_LEVEL_LIFT_ID) &&
+               !strcmp(final_step->after.source_sha256, result.source_sha256) &&
+               !strcmp(final_step->after.output_sha256, first_step->before.output_sha256));
+
     SELF_CHECK(hlsl_lift_transaction_try_copy(transaction, 0, &result) ==
                HLSL_LIFT_COMPOSITION_UNSUPPORTED);
+    char case_hash[65];
+    hash_hex(seed, strlen(seed), case_hash);
+    report_lift_steps(report, case_hash, (size_t)stage, transaction);
+    if (report)
+        fprintf(report,
+                "{\"event\":\"controlled_lift_summary\",\"case_sha256\":\"%s\","
+                "\"record\":%d,\"accepted\":%zu,\"source_sha256\":\"%s\","
+                "\"target_sha256\":\"%s\"}\n",
+                case_hash, stage, hlsl_lift_transaction_step_count(transaction),
+                final_step->after.source_sha256, final_step->after.output_sha256);
     printf("%s: %s exactly reproduced target DXBC; deliberately wrong candidate rejected\n",
            k_stages[stage].name, forward_result ? "single-use result" : "two copy lifts");
     succeeded = true;
@@ -2616,6 +2677,14 @@ cleanup:
     return succeeded;
 }
 
+static bool close_report(FILE *report) {
+    if (!report) return true;
+    bool ok = ferror(report) == 0;
+    if (fclose(report) != 0) ok = false;
+    if (!ok) fprintf(stderr, "golden verifier: report write failed\n");
+    return ok;
+}
+
 int main(int argc, char** argv) {
     CommandLine options;
     if (!parse_command_line(argc, argv, &options)) {
@@ -2646,21 +2715,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (options.self_test_lifts) {
-        bool passed =
-            run_live_lift_fixture(broker, 0, false) && run_live_lift_fixture(broker, 1, false) &&
-            run_live_lift_fixture(broker, 0, true) && run_live_lift_fixture(broker, 1, true) &&
-            run_live_expression_fixture(broker, 0, false, false) &&
-            run_live_expression_fixture(broker, 1, false, false) &&
-            run_live_expression_fixture(broker, 0, true, false) &&
-            run_live_expression_fixture(broker, 1, true, false) &&
-            run_live_expression_fixture(broker, 0, true, true) &&
-            run_live_expression_fixture(broker, 1, true, true);
-        unity_compiler_broker_destroy(broker);
-        string_list_free(&cases);
-        return passed ? 0 : 1;
-    }
-
     FILE* report = options.report_path ? fopen(options.report_path, "wx") : NULL;
     if (options.report_path && !report) {
         fprintf(stderr, "golden verifier: cannot create report: %s\n",
@@ -2669,6 +2723,29 @@ int main(int argc, char** argv) {
         string_list_free(&cases);
         return 1;
     }
+    if (options.self_test_lifts) {
+        if (report)
+            fputs("{\"event\":\"run\",\"schema\":\"dxbc-lift-journal-v1\","
+                  "\"scope\":\"controlled-copy-result-transactions\"}\n", report);
+        bool passed =
+            run_live_lift_fixture(broker, 0, false, report) &&
+            run_live_lift_fixture(broker, 1, false, report) &&
+            run_live_lift_fixture(broker, 0, true, report) &&
+            run_live_lift_fixture(broker, 1, true, report) &&
+            run_live_expression_fixture(broker, 0, false, false) &&
+            run_live_expression_fixture(broker, 1, false, false) &&
+            run_live_expression_fixture(broker, 0, true, false) &&
+            run_live_expression_fixture(broker, 1, true, false) &&
+            run_live_expression_fixture(broker, 0, true, true) &&
+            run_live_expression_fixture(broker, 1, true, true);
+        if (report)
+            fprintf(report, "{\"event\":\"end\",\"passed\":%s}\n", passed ? "true" : "false");
+        passed = close_report(report) && passed;
+        unity_compiler_broker_destroy(broker);
+        string_list_free(&cases);
+        return passed ? 0 : 1;
+    }
+
     if (report) {
         UnityCompilerToolchainProvenance provenance;
         bool available = unity_compiler_broker_get_toolchain_provenance(
@@ -2728,12 +2805,7 @@ int main(int argc, char** argv) {
     if (report) {
         fprintf(report, "{\"event\":\"end\",\"cases\":%zu,\"failed_cases\":%zu}\n",
                 cases.count, failures);
-        bool report_failed = ferror(report) != 0;
-        if (fclose(report) != 0) report_failed = true;
-        if (report_failed) {
-            fprintf(stderr, "golden verifier: report write failed\n");
-            ++failures;
-        }
+        if (!close_report(report)) ++failures;
     }
     unity_compiler_broker_destroy(broker);
     string_list_free(&cases);

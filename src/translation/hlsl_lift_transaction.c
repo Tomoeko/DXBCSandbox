@@ -10,6 +10,7 @@
 
 typedef struct AcceptedCopy {
     HLSLCopyLift *copy;
+    HLSLLiftStep step;
     struct AcceptedCopy *previous;
 } AcceptedCopy;
 
@@ -21,6 +22,8 @@ struct HLSLLiftTransaction {
     HLSLLiftLimits limits;
     HLSLLiftStats stats;
     HLSLLiftArtifact accepted;
+    HLSLLiftResult accepted_result;
+    HLSLLiftStep high_level_step;
     AcceptedCopy *copies;
     HLSLLiftControl control;
     bool high_level;
@@ -174,11 +177,36 @@ HLSLLiftStatus hlsl_lift_transaction_begin(const USILProgram *baseline, const ui
         }
     }
     if (result->status == HLSL_LIFT_VERIFIED) {
+        transaction->accepted_result = *result;
         *out_transaction = transaction;
     } else {
         hlsl_lift_transaction_destroy(transaction);
     }
     return result->status;
+}
+
+static void record_step(HLSLLiftTransaction *transaction, HLSLLiftStep *step,
+                         const char *identifier, unsigned version, int instruction,
+                         HLSLCopyLift *copy, const HLSLLiftResult *result) {
+    const int producer = copy ? hlsl_copy_lift_producer_instruction(copy) : -1;
+    *step = (HLSLLiftStep){
+        .identifier = identifier,
+        .version = version,
+        .instruction_index = instruction,
+        .source_instruction_index =
+            instruction < 0
+                ? 0
+                : transaction->program->instructions[instruction].source_instruction_index,
+        .producer_instruction_index = producer,
+        .producer_source_instruction_index =
+            producer < 0 ? 0
+                         : transaction->program->instructions[producer].source_instruction_index,
+        .before = transaction->accepted_result,
+        .after = *result,
+    };
+    if (copy)
+        step->edits = hlsl_copy_lift_edits(copy, &step->edit_count);
+    transaction->accepted_result = *result;
 }
 
 static HLSLLiftStatus try_lift(HLSLLiftTransaction *transaction, int instruction,
@@ -223,6 +251,10 @@ static HLSLLiftStatus try_lift(HLSLLiftTransaction *transaction, int instruction
             verify_program(transaction, hlsl_copy_lift_program(copy), &artifact, result, false);
     }
     if (result->status == HLSL_LIFT_VERIFIED) {
+        record_step(transaction, &node->step,
+                    forward_result ? HLSL_RESULT_LIFT_ID : HLSL_COPY_LIFT_ID,
+                    forward_result ? HLSL_RESULT_LIFT_VERSION : HLSL_COPY_LIFT_VERSION,
+                    instruction, copy, result);
         node->copy = copy;
         node->previous = transaction->copies;
         transaction->copies = node;
@@ -268,6 +300,8 @@ HLSLLiftStatus hlsl_lift_transaction_try_high_level(HLSLLiftTransaction *transac
     HLSLLiftArtifact artifact = {0};
     result->status = verify_program(transaction, transaction->program, &artifact, result, true);
     if (result->status == HLSL_LIFT_VERIFIED) {
+        record_step(transaction, &transaction->high_level_step, HLSL_HIGH_LEVEL_LIFT_ID,
+                    HLSL_HIGH_LEVEL_LIFT_VERSION, -1, NULL, result);
         artifact_free(&transaction->accepted);
         transaction->accepted = artifact;
         transaction->high_level = true;
@@ -293,6 +327,23 @@ const HLSLLiftArtifact *hlsl_lift_transaction_artifact(const HLSLLiftTransaction
 void hlsl_lift_transaction_stats(const HLSLLiftTransaction *transaction, HLSLLiftStats *stats) {
     if (stats)
         *stats = transaction ? transaction->stats : (HLSLLiftStats){0};
+}
+
+size_t hlsl_lift_transaction_step_count(const HLSLLiftTransaction *transaction) {
+    return transaction ? transaction->stats.accepted : 0;
+}
+
+const HLSLLiftStep *hlsl_lift_transaction_step(const HLSLLiftTransaction *transaction,
+                                               size_t index) {
+    if (!transaction || index >= transaction->stats.accepted)
+        return NULL;
+    const size_t copies = transaction->stats.accepted - (transaction->high_level ? 1U : 0U);
+    if (index == copies)
+        return &transaction->high_level_step;
+    const AcceptedCopy *copy = transaction->copies;
+    for (size_t remaining = copies - index - 1U; remaining; --remaining)
+        copy = copy->previous;
+    return &copy->step;
 }
 
 void hlsl_lift_transaction_destroy(HLSLLiftTransaction *transaction) {

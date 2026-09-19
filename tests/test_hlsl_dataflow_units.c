@@ -531,6 +531,10 @@ static bool check_transactions(void) {
                                       &result) == HLSL_LIFT_VERIFIED);
     CHECK(result.compared && result.comparison.status == DXBC_COMPARE_EQUAL);
     CHECK(strlen(result.source_sha256) == 64 && strlen(result.output_sha256) == 64);
+    CHECK(hlsl_lift_transaction_step_count(transaction) == 0 &&
+          hlsl_lift_transaction_step(transaction, 0) == NULL &&
+          hlsl_lift_transaction_step(NULL, 0) == NULL &&
+          hlsl_lift_transaction_step_count(NULL) == 0);
     const HLSLLiftArtifact *accepted = hlsl_lift_transaction_artifact(transaction);
     const char *baseline_source = accepted->source;
     const uint8_t *baseline_bytes = accepted->dxbc;
@@ -539,6 +543,7 @@ static bool check_transactions(void) {
     CHECK(result.compared && result.comparison.status == DXBC_COMPARE_INSTRUCTION_OPCODE);
     CHECK(hlsl_lift_transaction_program(transaction) == &program);
     CHECK(accepted->source == baseline_source && accepted->dxbc == baseline_bytes);
+    CHECK(hlsl_lift_transaction_step_count(transaction) == 0);
     fixture.mutate = false;
     fixture.malformed = true;
     CHECK(hlsl_lift_transaction_try_copy(transaction, 0, &result) == HLSL_LIFT_INVALID_DXBC);
@@ -557,6 +562,14 @@ static bool check_transactions(void) {
     CHECK(hlsl_lift_transaction_try_copy(transaction, 0, &result) == HLSL_LIFT_VERIFIED);
     CHECK(hlsl_lift_transaction_program(transaction)->instructions[0].opcode == USIL_OP_NOP);
     CHECK(strcmp(accepted->source, "accepted copy candidate") == 0);
+    CHECK(hlsl_lift_transaction_step_count(transaction) == 1);
+    const HLSLLiftStep *first_step = hlsl_lift_transaction_step(transaction, 0);
+    CHECK(first_step && !strcmp(first_step->identifier, HLSL_COPY_LIFT_ID) &&
+          first_step->version == HLSL_COPY_LIFT_VERSION && first_step->instruction_index == 0 &&
+          first_step->before.status == HLSL_LIFT_VERIFIED &&
+          first_step->after.status == HLSL_LIFT_VERIFIED && first_step->edit_count == 1 &&
+          first_step->edits[0].instruction_index == 1 && first_step->edits[0].logical_lane_mask == 15 &&
+          !strcmp(first_step->after.source_sha256, result.source_sha256));
     size_t calls = fixture.calls;
     CHECK(hlsl_lift_transaction_try_copy(transaction, 0, &result) ==
           HLSL_LIFT_PRECONDITION_REJECTED);
@@ -567,6 +580,15 @@ static bool check_transactions(void) {
     CHECK(hlsl_lift_transaction_program(transaction)->instructions[2].operands[1].type ==
           OPERAND_TYPE_INPUT);
     CHECK(instructions[0].opcode == USIL_OP_MOV && instructions[1].opcode == USIL_OP_MOV);
+    const HLSLLiftStep *second_step = hlsl_lift_transaction_step(transaction, 1);
+    CHECK(hlsl_lift_transaction_step_count(transaction) == 2 && second_step &&
+          hlsl_lift_transaction_step(transaction, 0) == first_step &&
+          second_step->instruction_index == 1 &&
+          !strcmp(first_step->after.source_sha256, second_step->before.source_sha256) &&
+          !strcmp(first_step->after.output_sha256, second_step->before.output_sha256) &&
+          !strcmp(second_step->after.source_sha256, result.source_sha256));
+    CHECK(!hlsl_lift_transaction_step(transaction, 2) &&
+          !hlsl_lift_transaction_step(transaction, SIZE_MAX));
     HLSLLiftStats stats;
     hlsl_lift_transaction_stats(transaction, &stats);
     CHECK(stats.accepted == 2 && stats.compiles == fixture.calls);
@@ -666,6 +688,10 @@ static bool check_result_transactions(void) {
                            .has_stage_contract = true,
                            .program_type = DXBC_PROGRAM_TYPE_VERTEX,
                            .shader_model_major = 5};
+    instructions[0].source_instruction_index = 20;
+    instructions[1].source_instruction_index = 30;
+    instructions[2].source_instruction_index = 40;
+    instructions[3].source_instruction_index = 50;
     TransactionFixture fixture = {0};
     HLSLLiftServices services = {.compile = transaction_compile,
                                  .monotonic_ms = transaction_clock,
@@ -682,6 +708,12 @@ static bool check_result_transactions(void) {
     CHECK(hlsl_lift_transaction_program(transaction) == &program);
     fixture.mutate = false;
     CHECK(hlsl_lift_transaction_try_result(transaction, 1, &result) == HLSL_LIFT_VERIFIED);
+    const HLSLLiftStep *first = hlsl_lift_transaction_step(transaction, 0);
+    CHECK(first && !strcmp(first->identifier, HLSL_RESULT_LIFT_ID) &&
+          first->version == HLSL_RESULT_LIFT_VERSION && first->instruction_index == 1 &&
+          first->source_instruction_index == 30 && first->producer_instruction_index == 0 &&
+          first->producer_source_instruction_index == 20 && first->edit_count == 2 &&
+          first->edits[0].operand_index == 1 && first->edits[1].operand_index == 2);
     const USILProgram *accepted = hlsl_lift_transaction_program(transaction);
     CHECK(accepted->instructions[0].opcode == USIL_OP_NOP);
     CHECK(accepted->instructions[1].opcode == USIL_OP_MUL);
@@ -691,6 +723,10 @@ static bool check_result_transactions(void) {
     CHECK(hlsl_lift_transaction_try_result(transaction, 2, &result) == HLSL_LIFT_VERIFIED);
     CHECK(hlsl_lift_transaction_program(transaction)->instructions[1].opcode == USIL_OP_NOP);
     CHECK(hlsl_lift_transaction_program(transaction)->instructions[2].opcode == USIL_OP_MUL);
+    const HLSLLiftStep *second = hlsl_lift_transaction_step(transaction, 1);
+    CHECK(second && second->source_instruction_index == 40 &&
+          second->producer_instruction_index == 1 && second->producer_source_instruction_index == 20 &&
+          !strcmp(second->before.source_sha256, first->after.source_sha256));
     CHECK(instructions[0].opcode == USIL_OP_MUL && instructions[1].opcode == USIL_OP_MOV);
     const HLSLLiftArtifact *artifact = hlsl_lift_transaction_artifact(transaction);
     const char *accepted_source = artifact->source;
@@ -705,10 +741,22 @@ static bool check_result_transactions(void) {
     fixture.status = HLSL_LIFT_VERIFIED;
     CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) == HLSL_LIFT_VERIFIED);
     CHECK(hlsl_lift_transaction_is_high_level(transaction));
+    const HLSLLiftStep *expression = hlsl_lift_transaction_step(transaction, 2);
+    CHECK(hlsl_lift_transaction_step_count(transaction) == 3 && expression &&
+          !strcmp(expression->identifier, HLSL_HIGH_LEVEL_LIFT_ID) &&
+          expression->version == HLSL_HIGH_LEVEL_LIFT_VERSION &&
+          expression->instruction_index == -1 && expression->producer_instruction_index == -1 &&
+          !expression->edits && expression->edit_count == 0 &&
+          !strcmp(expression->before.source_sha256, second->after.source_sha256) &&
+          !strcmp(expression->after.source_sha256, result.source_sha256));
     CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
           HLSL_LIFT_COMPOSITION_UNSUPPORTED);
     CHECK(hlsl_lift_transaction_try_result(transaction, 2, &result) ==
           HLSL_LIFT_COMPOSITION_UNSUPPORTED);
+    CHECK(hlsl_lift_transaction_step_count(transaction) == 3 &&
+          hlsl_lift_transaction_step(transaction, 0) == first &&
+          hlsl_lift_transaction_step(transaction, 1) == second &&
+          hlsl_lift_transaction_step(transaction, 2) == expression);
     hlsl_lift_transaction_destroy(transaction);
     return true;
 }

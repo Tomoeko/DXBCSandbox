@@ -87,6 +87,27 @@ typedef struct {
     uint64_t elapsed_ms;
 } HLSLLiftStats;
 
+/* One accepted transition, in application order. Indices address the program
+ * before this step; source indices retain its decoded DXBC lineage, including
+ * a copy eliminated by result forwarding. -1 means no selected instruction.
+ * Lane edits describe the same rewrite as the versioned lift contract. Follow
+ * these transitions before interpreting the final expression source map.
+ * Before/after records bind source, output and optional compiler identities;
+ * they are observations from this transaction, not standalone certificates.
+ * All pointers are borrowed and immutable until transaction destruction. */
+typedef struct {
+    const char *identifier;
+    unsigned version;
+    int instruction_index;
+    uint32_t source_instruction_index;
+    int producer_instruction_index;
+    uint32_t producer_source_instruction_index;
+    const HLSLCopyLiftEdit *edits;
+    size_t edit_count;
+    HLSLLiftResult before;
+    HLSLLiftResult after;
+} HLSLLiftStep;
+
 typedef struct HLSLLiftTransaction HLSLLiftTransaction;
 
 /* Establishes a baseline by emission, compilation and full-container equality.
@@ -123,6 +144,11 @@ bool hlsl_lift_transaction_is_high_level(const HLSLLiftTransaction *transaction)
 const USILProgram *hlsl_lift_transaction_program(const HLSLLiftTransaction *transaction);
 const HLSLLiftArtifact *hlsl_lift_transaction_artifact(const HLSLLiftTransaction *transaction);
 void hlsl_lift_transaction_stats(const HLSLLiftTransaction *transaction, HLSLLiftStats *stats);
+/* Only accepted candidates enter this journal; rejection and exhausted
+ * budgets leave all earlier records and their order unchanged. */
+size_t hlsl_lift_transaction_step_count(const HLSLLiftTransaction *transaction);
+const HLSLLiftStep *hlsl_lift_transaction_step(const HLSLLiftTransaction *transaction,
+                                              size_t index);
 void hlsl_lift_transaction_destroy(HLSLLiftTransaction *transaction);
 const char *hlsl_lift_status_name(HLSLLiftStatus status);
 
