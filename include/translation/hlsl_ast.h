@@ -16,7 +16,8 @@ typedef enum {
     AST_EXPR_SWIZZLE,
     AST_EXPR_CALL,
     AST_EXPR_CAST,
-    AST_EXPR_BITCAST
+    AST_EXPR_BITCAST,
+    AST_EXPR_EMITTER_OPERAND
 } ASTExprKind;
 
 typedef enum { AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32 } ASTScalarType;
@@ -100,6 +101,7 @@ typedef struct ASTExpr {
         ASTCallExpr call;
         ASTCastExpr cast;
         ASTBitcastExpr bitcast;
+        char *emitter_operand;
     } u;
 } ASTExpr;
 
@@ -156,6 +158,11 @@ ASTExpr *ast_create_call(const char *name, ASTExpr **args, int count);
 ASTExpr *ast_create_cast(const char *type_name, ASTExpr *sub);
 /* Numeric conversion uses CAST; bit reinterpretation uses BITCAST. */
 ASTExpr *ast_create_bitcast(ASTScalarType scalar_type, ASTExpr *sub);
+/* Trusted expression text from the existing validated operand formatter.
+ * This is an explicit boundary for interface/ABI syntax not modeled by this
+ * AST. It owns a copy and always prints parentheses. Never pass source loaded
+ * from a file or user text: this constructor is not an HLSL parser. */
+ASTExpr *ast_create_emitter_operand(const char *expression);
 void ast_free_expr(ASTExpr *expr);
 
 // AST Statement Constructors

@@ -22,6 +22,7 @@ struct HLSLLiftTransaction {
     AcceptedCopy *copies;
     uint64_t started_ms;
     HLSLLiftStatus stopped;
+    bool high_level;
 };
 
 static void artifact_free(HLSLLiftArtifact *artifact) {
@@ -65,7 +66,8 @@ static HLSLLiftStatus work_status(HLSLLiftTransaction *transaction) {
 }
 
 static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USILProgram *program,
-                                     HLSLLiftArtifact *artifact, HLSLLiftResult *result) {
+                                     HLSLLiftArtifact *artifact, HLSLLiftResult *result,
+                                     bool high_level) {
     HLSLLiftStatus status = work_status(transaction);
     if (status != HLSL_LIFT_VERIFIED)
         return status;
@@ -74,9 +76,10 @@ static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USI
         return transaction->stopped;
     }
     ++transaction->stats.compiles;
-    status = transaction->services.compile(
-        transaction->services.context, program,
-        transaction->limits.max_elapsed_ms - transaction->stats.elapsed_ms, artifact);
+    HLSLLiftStatus (*compile)(void *, const USILProgram *, uint64_t, HLSLLiftArtifact *) =
+        high_level ? transaction->services.compile_high_level : transaction->services.compile;
+    status = compile(transaction->services.context, program,
+                     transaction->limits.max_elapsed_ms - transaction->stats.elapsed_ms, artifact);
     result->cache_hit = artifact->cache_hit;
     if (artifact->cache_hit)
         ++transaction->stats.cache_hits;
@@ -154,7 +157,8 @@ HLSLLiftStatus hlsl_lift_transaction_begin(const USILProgram *baseline, const ui
             result->status = HLSL_LIFT_OUT_OF_MEMORY;
         } else {
             memcpy(transaction->target, target, target_size);
-            result->status = verify_program(transaction, baseline, &transaction->accepted, result);
+            result->status =
+                verify_program(transaction, baseline, &transaction->accepted, result, false);
         }
     }
     if (result->status == HLSL_LIFT_VERIFIED) {
@@ -172,6 +176,8 @@ static HLSLLiftStatus try_lift(HLSLLiftTransaction *transaction, int instruction
     result_init(result);
     if (!transaction)
         return result->status;
+    if (transaction->high_level)
+        return result->status = HLSL_LIFT_COMPOSITION_UNSUPPORTED;
     result->status = work_status(transaction);
     if (result->status != HLSL_LIFT_VERIFIED)
         return result->status;
@@ -202,7 +208,7 @@ static HLSLLiftStatus try_lift(HLSLLiftTransaction *transaction, int instruction
         result->status = HLSL_LIFT_OUT_OF_MEMORY;
     } else {
         result->status =
-            verify_program(transaction, hlsl_copy_lift_program(copy), &artifact, result);
+            verify_program(transaction, hlsl_copy_lift_program(copy), &artifact, result, false);
     }
     if (result->status == HLSL_LIFT_VERIFIED) {
         node->copy = copy;
@@ -228,6 +234,40 @@ HLSLLiftStatus hlsl_lift_transaction_try_copy(HLSLLiftTransaction *transaction, 
 HLSLLiftStatus hlsl_lift_transaction_try_result(HLSLLiftTransaction *transaction, int instruction,
                                                 HLSLLiftResult *result) {
     return try_lift(transaction, instruction, result, true);
+}
+
+HLSLLiftStatus hlsl_lift_transaction_try_high_level(HLSLLiftTransaction *transaction,
+                                                    HLSLLiftResult *result) {
+    if (!result)
+        return HLSL_LIFT_INVALID_ARGUMENT;
+    result_init(result);
+    if (!transaction || !transaction->services.compile_high_level)
+        return result->status;
+    if (transaction->high_level)
+        return result->status = HLSL_LIFT_COMPOSITION_UNSUPPORTED;
+    result->status = work_status(transaction);
+    if (result->status != HLSL_LIFT_VERIFIED)
+        return result->status;
+    if (transaction->stats.candidates >= transaction->limits.max_candidates) {
+        transaction->stopped = HLSL_LIFT_BUDGET_EXHAUSTED;
+        return result->status = transaction->stopped;
+    }
+    ++transaction->stats.candidates;
+    HLSLLiftArtifact artifact = {0};
+    result->status = verify_program(transaction, transaction->program, &artifact, result, true);
+    if (result->status == HLSL_LIFT_VERIFIED) {
+        artifact_free(&transaction->accepted);
+        transaction->accepted = artifact;
+        transaction->high_level = true;
+        ++transaction->stats.accepted;
+    } else {
+        artifact_free(&artifact);
+    }
+    return result->status;
+}
+
+bool hlsl_lift_transaction_is_high_level(const HLSLLiftTransaction *transaction) {
+    return transaction && transaction->high_level;
 }
 
 const USILProgram *hlsl_lift_transaction_program(const HLSLLiftTransaction *transaction) {
@@ -275,6 +315,7 @@ const char *hlsl_lift_status_name(HLSLLiftStatus status) {
         STATUS(INVALID_ARGUMENT, "invalid-argument");
         STATUS(OUT_OF_MEMORY, "out-of-memory");
         STATUS(CLOCK_UNAVAILABLE, "clock-unavailable");
+        STATUS(COMPOSITION_UNSUPPORTED, "composition-unsupported");
 #undef STATUS
     }
     return "unknown";

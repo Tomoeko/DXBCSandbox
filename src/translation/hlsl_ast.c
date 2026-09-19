@@ -222,10 +222,23 @@ ASTExpr *ast_create_bitcast(ASTScalarType scalar_type, ASTExpr *sub) {
     return expr;
 }
 
+ASTExpr *ast_create_emitter_operand(const char *expression) {
+    if (!expression || !expression[0] || strpbrk(expression, ";{}#\r\n")) return NULL;
+    ASTExpr *expr = calloc(1u, sizeof(*expr));
+    if (!expr) return NULL;
+    expr->kind = AST_EXPR_EMITTER_OPERAND;
+    expr->u.emitter_operand = ast_duplicate_string(expression);
+    if (!expr->u.emitter_operand) { free(expr); return NULL; }
+    return expr;
+}
+
 void ast_free_expr(ASTExpr *expr) {
     if (!expr)
         return;
     switch (expr->kind) {
+    case AST_EXPR_EMITTER_OPERAND:
+        free(expr->u.emitter_operand);
+        break;
     case AST_EXPR_VAR:
         free(expr->u.var.name);
         break;
@@ -414,6 +427,16 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) 
         return;
     }
     switch (expr->kind) {
+    case AST_EXPR_EMITTER_OPERAND:
+        if (!expr->u.emitter_operand || !expr->u.emitter_operand[0] ||
+            strpbrk(expr->u.emitter_operand, ";{}#\r\n")) {
+            sb->failed = true;
+            break;
+        }
+        sb_append_char(sb, '(');
+        sb_append(sb, expr->u.emitter_operand);
+        sb_append_char(sb, ')');
+        break;
     case AST_EXPR_VAR:
         if (expr->u.var.name && expr->u.var.name[0] != '\0') {
             sb_append(sb, expr->u.var.name);

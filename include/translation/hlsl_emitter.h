@@ -15,15 +15,31 @@ typedef struct {
     const char* output_struct;    // Output struct name (e.g. "v2f", "fout"). Default: "v2f"
 } HLSLEmitNames;
 
+#define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 1U
+#define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 64
+
 typedef enum HLSLEmitMode {
     /* Emit from the decoded instruction stream without source-level semantic
-     * lifts. This is the only mode suitable for recompilation/equivalence
-     * verification and is the default used by hlsl_emit(). */
+     * lifts. This is suitable for recompilation/equivalence verification and
+     * is the default used by hlsl_emit(). */
     HLSL_EMIT_MODE_RECOMPILE = 0,
 
     /* Explicit presentation mode. This may replace proven instruction groups
      * with higher-level Unity/source constructs to improve readability. */
-    HLSL_EMIT_MODE_READABLE = 1
+    HLSL_EMIT_MODE_READABLE = 1,
+
+    /* Verification-eligible candidate, never a certificate by itself. v1
+     * admits at most 64 straight-line SM4/5 vertex/pixel instructions using
+     * full float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP.
+     * No buffers/resources/effects/precision controls or partial definitions.
+     * Single-use SSA expressions are nested once; shared values have typed
+     * deterministic names. Unsupported input fails instead of silently using
+     * presentation recognizers. Reuses compiler inverse operand/MAD spelling;
+     * this is not permission to reorder floating-point operations on its own.
+     * Supply the complete reserved macro universe. Compile and compare under
+     * the original request before accepting; retain RECOMPILE as fallback. */
+    HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE = 2
 } HLSLEmitMode;
 
 typedef struct HLSLEmitOptions {
@@ -179,6 +195,8 @@ const char* hlsl_emit_opcode_name(int opcode);
 
 #define HLSL_EMIT_RECOMPILE_OPTIONS_INIT \
     { HLSL_EMIT_MODE_RECOMPILE, NULL, false, NULL, 0 }
+#define HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT \
+    { HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE, NULL, false, NULL, 0 }
 #define HLSL_EMIT_READABLE_OPTIONS_INIT \
     { HLSL_EMIT_MODE_READABLE, NULL, false, NULL, 0 }
 

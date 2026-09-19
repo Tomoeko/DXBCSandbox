@@ -412,6 +412,8 @@ bool hlsl_ray_box_intersection_lift_matches(const USILProgram* program);
 bool hlsl_volume_slice_sampling_lift_matches(const USILProgram* program);
 void emit_exact_structural_helpers(HLSLEmitterContext* ctx);
 void emit_instructions(HLSLEmitterContext* ctx);
+bool emit_high_level_expressions(HLSLEmitterContext* ctx);
+bool hlsl_expression_identifiers_available(HLSLEmitterContext* ctx, size_t source_start);
 void emit_return_block(HLSLEmitterContext* ctx);
 
 /* Complete, source-backed tessellation compiler inverses. Hull/domain stages
@@ -623,6 +625,7 @@ bool build_d3dcompiler_model(HLSLEmitterContext* ctx);
 const LoopOptimizationInfo* hlsl_typed_loop_bound_for_instruction(
     const HLSLEmitterContext* ctx, int instruction,
     HLSLTypedLoopBoundPhase* out_phase);
+bool compiler_add_uses_mad(const USILInstruction* instruction);
 bool compiler_model_swaps_binary_operands(const HLSLEmitterContext* ctx,
                                           int instruction);
 bool compiler_model_preserves_vector_output(const HLSLEmitterContext* ctx,

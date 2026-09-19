@@ -7,7 +7,7 @@ DXBCSandbox is an experiment utilizing Codex, ChatGPT, and OpenAI heavily.
 C11 tools for inspecting Unity shader assets, decoding DXBC, and checking
 recompiled output. Currently produces **low-level HLSL**, with ShaderLab
 structure reconstructed from supported serialized metadata. High-level Unity
-shader reconstruction is planned.
+shader reconstruction is in progress.
 
 ## Build and test
 
@@ -62,6 +62,12 @@ Select Unity with `DXBC_UNITY_CONTENTS_PATH`, `DXBC_UNITY_APP`, or
 `UNITY_EDITOR_PATH`. Additional package headers must be supplied through
 `--includes` or a local `shader_includes/` folder under the project root.
 Unity binaries and copied package headers are not included.
+
+`unity_golden_verifier --high-level --report results.jsonl` tests an opt-in
+float4 expression lift for bounded straight-line vertex/fragment programs.
+Each accepted candidate must reproduce its entire target DXBC container;
+unsupported candidates retain verified low-level output. This does not yet
+certify complete high-level ShaderLab output.
 
 The import, bundle, and finite-visual gate commands accept an explicit Editor
 path and use isolated projects. Their installed C# bridges live in

@@ -71,6 +71,10 @@ static bool check_literal_bits(void) {
 }
 
 static bool check_operators_and_casts(void) {
+    CHECK(expect_expression(ast_create_emitter_operand("input.position.wzyx"), "(input.position.wzyx)"));
+    CHECK(!ast_create_emitter_operand(""));
+    CHECK(!ast_create_emitter_operand("value; discard"));
+    CHECK(!ast_create_emitter_operand("#define value 0"));
     CHECK(expect_expression(
         ast_create_binary(USIL_OP_MUL, ast_create_literal_int(2), ast_create_literal_int(3)),
         "(2 * 3)"));

@@ -622,8 +622,10 @@ static bool check_result_transactions(void) {
                            .program_type = DXBC_PROGRAM_TYPE_VERTEX,
                            .shader_model_major = 5};
     TransactionFixture fixture = {0};
-    HLSLLiftServices services = {
-        .compile = transaction_compile, .monotonic_ms = transaction_clock, .context = &fixture};
+    HLSLLiftServices services = {.compile = transaction_compile,
+                                 .monotonic_ms = transaction_clock,
+                                 .context = &fixture,
+                                 .compile_high_level = transaction_compile};
     HLSLLiftLimits limits = {.max_candidates = 8, .max_compiles = 8, .max_elapsed_ms = 1000};
     HLSLLiftTransaction *transaction = NULL;
     HLSLLiftResult result;
@@ -645,7 +647,185 @@ static bool check_result_transactions(void) {
     CHECK(hlsl_lift_transaction_program(transaction)->instructions[1].opcode == USIL_OP_NOP);
     CHECK(hlsl_lift_transaction_program(transaction)->instructions[2].opcode == USIL_OP_MUL);
     CHECK(instructions[0].opcode == USIL_OP_MUL && instructions[1].opcode == USIL_OP_MOV);
+    const HLSLLiftArtifact *artifact = hlsl_lift_transaction_artifact(transaction);
+    const char *accepted_source = artifact->source;
+    fixture.mutate = true;
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) == HLSL_LIFT_DXBC_MISMATCH);
+    CHECK(!hlsl_lift_transaction_is_high_level(transaction) && artifact->source == accepted_source);
+    fixture.mutate = false;
+    fixture.status = HLSL_LIFT_EMISSION_REJECTED;
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+          HLSL_LIFT_EMISSION_REJECTED);
+    CHECK(artifact->source == accepted_source);
+    fixture.status = HLSL_LIFT_VERIFIED;
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) == HLSL_LIFT_VERIFIED);
+    CHECK(hlsl_lift_transaction_is_high_level(transaction));
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+          HLSL_LIFT_COMPOSITION_UNSUPPORTED);
+    CHECK(hlsl_lift_transaction_try_result(transaction, 2, &result) ==
+          HLSL_LIFT_COMPOSITION_UNSUPPORTED);
     hlsl_lift_transaction_destroy(transaction);
+    return true;
+}
+
+static DXBCOperand emission_reg(DXBCOperandType type, int index) {
+    DXBCOperand operand = reg(type, index, 0xf0);
+    operand.register_index_dim = 1;
+    operand.index_has_immediate[0] = true;
+    operand.index_values[0] = (uint32_t)index;
+    return operand;
+}
+
+static bool check_expression_emission(void) {
+    USILInstruction instructions[4] = {0};
+    instructions[0].opcode = USIL_OP_MUL;
+    instructions[0].operand_count = 3;
+    instructions[0].operands[0] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    instructions[0].operands[1] = emission_reg(OPERAND_TYPE_INPUT, 0);
+    instructions[0].operands[2] = emission_reg(OPERAND_TYPE_INPUT, 0);
+    for (int lane = 0; lane < 4; ++lane)
+        instructions[0].operands[2].swizzle[lane] = (uint8_t)(3 - lane);
+    instructions[1] = instructions[0];
+    instructions[1].opcode = USIL_OP_ADD;
+    instructions[1].operands[0] = emission_reg(OPERAND_TYPE_TEMP, 1);
+    instructions[1].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    instructions[2] = instructions[0];
+    instructions[2].operands[0] = emission_reg(OPERAND_TYPE_OUTPUT, 0);
+    instructions[2].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 1);
+    instructions[3].opcode = USIL_OP_RET;
+    DXBCSignatureElement input = {
+        .semantic_name = "TEXCOORD", .component_type = 3, .mask = 15, .rw_mask = 15};
+    DXBCSignatureElement output = {
+        .semantic_name = "SV_Target", .component_type = 3, .system_value = 64, .mask = 15};
+    USILProgram program = {.shader_type_model = "ps_5_0",
+                           .instructions = instructions,
+                           .instruction_count = 4,
+                           .instruction_alloc = 4,
+                           .temp_count = 2,
+                           .inputs = &input,
+                           .input_count = 1,
+                           .input_alloc = 1,
+                           .outputs = &output,
+                           .output_count = 1,
+                           .output_alloc = 1,
+                           .has_stage_contract = true,
+                           .program_type = DXBC_PROGRAM_TYPE_PIXEL,
+                           .shader_model_major = 5};
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLEmitDiagnostic diagnostic;
+    StringBuilder source;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
+                                            &diagnostic));
+    CHECK(strstr(source.buf, "o0 = ((") && strstr(source.buf, " * ") && strstr(source.buf, " + "));
+    CHECK(!strstr(source.buf, "float4 r") && !strstr(source.buf, "u_xlat_temp"));
+    char *first = malloc(source.len + 1);
+    CHECK(first);
+    memcpy(first, source.buf, source.len + 1);
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strcmp(first, source.buf) == 0);
+    free(first);
+    /* Two uses retain one evaluated typed value instead of duplicating MUL. */
+    instructions[1].operands[2] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    instructions[1].operands[2].swizzle[0] = 3;
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strstr(source.buf, "const float4 dxbc_value_i0 = "));
+    CHECK(strstr(source.buf, "dxbc_value_i0.wyzw"));
+    const char *reserved[] = {"dxbc_value_i0"};
+    options.reserved_preprocessor_identifiers = reserved;
+    options.reserved_preprocessor_identifier_count = 1;
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(!hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
+                                             &diagnostic));
+    CHECK(diagnostic.reason == HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY);
+    const char *collisions[] = {"float4", "mad", "main", "appdata", "v0", "o0", "SV_Target"};
+    for (size_t index = 0; index < sizeof(collisions) / sizeof(collisions[0]); ++index) {
+        options.reserved_preprocessor_identifiers = &collisions[index];
+        sb_free(&source);
+        sb_init(&source);
+        CHECK(!hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
+                                                 &diagnostic));
+        CHECK(diagnostic.reason == HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY);
+    }
+    const char *non_collisions[] = {"float", "dxbc_value_i", "v", "unused_keyword"};
+    options.reserved_preprocessor_identifiers = non_collisions;
+    options.reserved_preprocessor_identifier_count =
+        sizeof(non_collisions) / sizeof(non_collisions[0]);
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    options.reserved_preprocessor_identifiers = NULL;
+    options.reserved_preprocessor_identifier_count = 0;
+    for (int mutation = 0; mutation < 7; ++mutation) {
+        USILInstruction saved = instructions[0];
+        if (mutation == 0)
+            instructions[0].precise_mask = 1;
+        if (mutation == 1)
+            instructions[0].saturate = true;
+        if (mutation == 2)
+            instructions[0].operands[0].destination_mask = 0x70;
+        if (mutation == 3)
+            instructions[0].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 1);
+        if (mutation == 4)
+            instructions[0].operands[1].has_abs = true;
+        if (mutation == 5)
+            input.component_type = 1;
+        if (mutation == 6) {
+            instructions[0].opcode = USIL_OP_DERIV_RTX;
+            instructions[0].operand_count = 2;
+        }
+        sb_free(&source);
+        sb_init(&source);
+        CHECK(!hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+        instructions[0] = saved;
+        input.component_type = 3;
+    }
+    /* MOV literals retain every raw word through expression emission. */
+    USILInstruction saved_instructions[4];
+    memcpy(saved_instructions, instructions, sizeof(instructions));
+    memset(instructions, 0, sizeof(instructions));
+    instructions[0].opcode = USIL_OP_MOV;
+    instructions[0].operand_count = 2;
+    instructions[0].operands[0] = emission_reg(OPERAND_TYPE_OUTPUT, 0);
+    DXBCOperand *literal = &instructions[0].operands[1];
+    literal->type = OPERAND_TYPE_IMMEDIATE32;
+    literal->imm_value_count = 4;
+    literal->imm_values[0] = UINT32_C(0x80000000);
+    literal->imm_values[1] = 1;
+    literal->imm_values[2] = UINT32_C(0x7fc12345);
+    literal->imm_values[3] = UINT32_C(0x3f800000);
+    instructions[1].opcode = USIL_OP_RET;
+    program.instruction_count = 2;
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strstr(source.buf, "float4(-0.0f, asfloat(0x00000001u), asfloat(0x7FC12345u), 1.0f)"));
+    literal->imm_value_count = 1;
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strstr(source.buf, "float4(-0.0f)"));
+    memcpy(instructions, saved_instructions, sizeof(instructions));
+    program.instruction_count = 4;
+    USILInstruction *long_program =
+        calloc(HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT + 1u, sizeof(*long_program));
+    CHECK(long_program);
+    for (int index = 0; index <= HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT; ++index)
+        long_program[index].opcode = USIL_OP_NOP;
+    memcpy(long_program, instructions, 3u * sizeof(*instructions));
+    long_program[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT].opcode = USIL_OP_RET;
+    program.instructions = long_program;
+    program.instruction_count = program.instruction_alloc = HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT + 1;
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(!hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    free(long_program);
+    sb_free(&source);
     return true;
 }
 
@@ -653,7 +833,7 @@ int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_copy_candidates() ||
         !check_result_candidates() || !check_effects() || !check_transactions() ||
-        !check_result_transactions())
+        !check_result_transactions() || !check_expression_emission())
         return 1;
     puts("HLSL dataflow contracts passed");
     return 0;

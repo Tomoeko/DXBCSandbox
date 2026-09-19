@@ -2201,6 +2201,15 @@ void emit_instructions(HLSLEmitterContext* ctx) {
   const USILProgram* program = ctx->program;
   StringBuilder* sb = ctx->sb;
 
+  if (ctx->emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) {
+    if (!emit_high_level_expressions(ctx)) {
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_UNSUPPORTED,
+                     HLSL_EMIT_PHASE_INSTRUCTION_EMISSION,
+                     HLSL_EMIT_REASON_LOWERING_FAILED);
+    }
+    return;
+  }
+
   /* This lift consumes the complete proven instruction graph. Falling back
    * after a partial write would violate transactional emission, so the match
    * is performed before the first lifted byte is appended. */

@@ -2388,6 +2388,18 @@ static bool base_binary_order(const USILInstruction *inst,
         return is_non_canonical_add(&inst->operands[1],
                                     &inst->operands[2]);
     }
+    /* Controlled full/partial-lane fixtures require component ordering before
+     * the non-contiguous-lane fallback for products of one input register.
+     * This compiler inverse is an empirical candidate spelling, not a proof
+     * that arbitrary FP operations commute. Full-container equality is still
+     * required before accepting any reconstructed production result. */
+    if (inst->opcode == USIL_OP_MUL &&
+        inst->operands[1].type == OPERAND_TYPE_INPUT &&
+        inst->operands[2].type == OPERAND_TYPE_INPUT &&
+        inst->operands[1].register_index == inst->operands[2].register_index &&
+        compiler_plain_operand(&inst->operands[1]) &&
+        compiler_plain_operand(&inst->operands[2]) && !inst->precise_mask)
+        return is_non_canonical_add(&inst->operands[1], &inst->operands[2]);
     int write_mask = inst->operands[0].destination_mask;
     if (has_non_contiguous_swizzle(&inst->operands[1], write_mask) ||
         has_non_contiguous_swizzle(&inst->operands[2], write_mask))
@@ -2654,6 +2666,18 @@ bool build_d3dcompiler_model(HLSLEmitterContext *ctx) {
         ctx->saved_mul_reverse_definition)
         detect_reused_multiply_expressions(ctx);
     return analyze_d3dcompiler_model(ctx);
+}
+
+/* Unity's selected D3D compiler can reorder ADD of two lanes of the same
+ * temporary. Its mad(x, 1, y) inverse spelling retains the decoded order.
+ * Callers must still compile and compare the complete candidate container. */
+bool compiler_add_uses_mad(const USILInstruction *instruction) {
+    return instruction && instruction->opcode == USIL_OP_ADD &&
+           instruction->operand_count >= 3 &&
+           instruction->operands[1].type == OPERAND_TYPE_TEMP &&
+           instruction->operands[2].type == OPERAND_TYPE_TEMP &&
+           instruction->operands[1].register_index == instruction->operands[2].register_index &&
+           instruction->operands[1].swizzle[0] != instruction->operands[2].swizzle[0];
 }
 
 bool compiler_model_swaps_binary_operands(const HLSLEmitterContext *ctx,

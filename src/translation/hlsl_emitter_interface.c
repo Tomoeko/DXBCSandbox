@@ -416,6 +416,8 @@ void emit_entry_point_declarations(HLSLEmitterContext* ctx,
     }
   }
 
+  if (ctx->emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) return;
+
   // Declare Temps
   if (program->temp_count > 0) {
     for (int i = 0; i < program->temp_count; i++) {

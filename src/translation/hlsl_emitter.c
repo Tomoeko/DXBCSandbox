@@ -1588,10 +1588,21 @@ bool hlsl_emit_with_options_diagnostic(
   HLSLEmitMode emit_mode = options ? options->mode
                                    : HLSL_EMIT_MODE_RECOMPILE;
   if (emit_mode != HLSL_EMIT_MODE_RECOMPILE &&
-      emit_mode != HLSL_EMIT_MODE_READABLE) {
+      emit_mode != HLSL_EMIT_MODE_READABLE &&
+      emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_ARGUMENT,
                           HLSL_EMIT_PHASE_ARGUMENT_VALIDATION,
                           HLSL_EMIT_REASON_INVALID_MODE);
+    sb->failed = true;
+    return false;
+  }
+  if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+      (program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT || !program->has_stage_contract ||
+       (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
+        program->program_type != DXBC_PROGRAM_TYPE_PIXEL))) {
+    hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
+                          HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
+                          HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
     sb->failed = true;
     return false;
   }
@@ -1617,6 +1628,7 @@ bool hlsl_emit_with_options_diagnostic(
   }
 #define ctx (*ctx_ptr)
 
+  const size_t source_start = sb->len;
   ctx.program = program;
   ctx.diagnostic = diagnostic;
   ctx.emit_mode = emit_mode;
@@ -1815,6 +1827,8 @@ bool hlsl_emit_with_options_diagnostic(
   }
 
 cleanup:
+  if (sb_ok(sb) && emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
+    hlsl_expression_identifiers_available(&ctx, source_start);
   free_emitter_context(&ctx);
   bool success = sb_ok(sb);
   if (!success && diagnostic && diagnostic->status == HLSL_EMIT_STATUS_OK) {

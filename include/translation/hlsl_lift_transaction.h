@@ -18,7 +18,8 @@ typedef enum {
     HLSL_LIFT_INVALID_DXBC,
     HLSL_LIFT_INVALID_ARGUMENT,
     HLSL_LIFT_OUT_OF_MEMORY,
-    HLSL_LIFT_CLOCK_UNAVAILABLE
+    HLSL_LIFT_CLOCK_UNAVAILABLE,
+    HLSL_LIFT_COMPOSITION_UNSUPPORTED
 } HLSLLiftStatus;
 
 /* The compile service transfers malloc-owned source and one complete released
@@ -40,6 +41,11 @@ typedef struct {
     bool (*monotonic_ms)(void *context, uint64_t *milliseconds);
     bool (*cancelled)(void *context); /* Optional; checked at work boundaries. */
     void *context;
+    /* Optional, same immutable compiler controls, but must emit using
+     * HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE. Returning success is still only a
+     * clean compile; the transaction compares the complete output itself. */
+    HLSLLiftStatus (*compile_high_level)(void *context, const USILProgram *program,
+                                         uint64_t remaining_ms, HLSLLiftArtifact *artifact);
 } HLSLLiftServices;
 
 typedef struct {
@@ -93,6 +99,13 @@ HLSLLiftStatus hlsl_lift_transaction_try_copy(HLSLLiftTransaction *transaction, 
  * result composition without overlapping stale claims. */
 HLSLLiftStatus hlsl_lift_transaction_try_result(HLSLLiftTransaction *transaction, int instruction,
                                                 HLSLLiftResult *result);
+
+/* Final expression-formation step on the accepted IR. Failure retains its
+ * previous artifact. After acceptance, further IR rewrites reject explicitly
+ * until their composition with the expression plan is implemented. */
+HLSLLiftStatus hlsl_lift_transaction_try_high_level(HLSLLiftTransaction *transaction,
+                                                    HLSLLiftResult *result);
+bool hlsl_lift_transaction_is_high_level(const HLSLLiftTransaction *transaction);
 
 const USILProgram *hlsl_lift_transaction_program(const HLSLLiftTransaction *transaction);
 const HLSLLiftArtifact *hlsl_lift_transaction_artifact(const HLSLLiftTransaction *transaction);

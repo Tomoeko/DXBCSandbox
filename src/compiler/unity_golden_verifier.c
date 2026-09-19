@@ -147,6 +147,7 @@ typedef struct {
     bool self_test_lifts;
     bool reconstruct;
     bool lift_copies;
+    bool high_level;
     const char* report_path;
 } CommandLine;
 
@@ -1496,9 +1497,8 @@ static void report_record(FILE* report, const char* case_name, size_t index,
             result->output_sha256);
 }
 
-static char* emit_reconstructed_stage(const USILProgram* program,
-                                      const GoldenStage* stage,
-                                      RecordResult* result) {
+static char *emit_stage_with_options(const USILProgram *program, const GoldenStage *stage,
+                                     RecordResult *result, const HLSLEmitOptions *options) {
     StringBuilder source;
     HLSLEmitDiagnostic emission_diagnostic;
     char* output = NULL;
@@ -1506,9 +1506,8 @@ static char* emit_reconstructed_stage(const USILProgram* program,
     result->emission = "fail";
     /* Raw fixture containers lack serialized Unity parameter names. Generic
      * register declarations intentionally retain that missing information. */
-    if (!hlsl_emit_with_options_diagnostic(program, &source, NULL, NULL,
-                                            NULL, NULL,
-                                            &emission_diagnostic)) {
+    if (!hlsl_emit_with_options_diagnostic(program, &source, NULL, NULL, NULL, options,
+                                           &emission_diagnostic)) {
         result->reason = hlsl_emit_reason_name(emission_diagnostic.reason);
         goto cleanup;
     }
@@ -1529,6 +1528,11 @@ static char* emit_reconstructed_stage(const USILProgram* program,
 cleanup:
     sb_free(&source);
     return output;
+}
+
+static char *emit_reconstructed_stage(const USILProgram *program, const GoldenStage *stage,
+                                      RecordResult *result) {
+    return emit_stage_with_options(program, stage, result, NULL);
 }
 
 static char* reconstruct_stage_source(const GoldenRecord* record,
@@ -1588,14 +1592,16 @@ static bool lift_monotonic_ms(void* context, uint64_t* milliseconds) {
     return true;
 }
 
-static HLSLLiftStatus compile_lift(void* context, const USILProgram* program,
-                                  uint64_t remaining_ms,
-                                  HLSLLiftArtifact* artifact) {
+static HLSLLiftStatus compile_lift_mode(void *context, const USILProgram *program,
+                                        uint64_t remaining_ms, HLSLLiftArtifact *artifact,
+                                        bool high_level) {
     GoldenLiftCompiler* compiler = context;
     const CompileJob* job = compiler->job;
     if (!remaining_ms) return HLSL_LIFT_BUDGET_EXHAUSTED;
     RecordResult emission = record_result_init(true);
-    artifact->source = emit_reconstructed_stage(program, job->stage, &emission);
+    const HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    artifact->source =
+        emit_stage_with_options(program, job->stage, &emission, high_level ? &options : NULL);
     if (!artifact->source) return HLSL_LIFT_EMISSION_REJECTED;
     UnityCompilerBinaryResponse response;
     bool available = unity_compiler_broker_compile_response(
@@ -1630,32 +1636,50 @@ static HLSLLiftStatus compile_lift(void* context, const USILProgram* program,
     return status;
 }
 
-static void report_lift(FILE* report, const char* case_hash, size_t record,
-                        int instruction, const HLSLLiftResult* result, bool forward_result) {
-    if (!report) return;
-    fprintf(report,
-        "{\"event\":\"%s\",\"case_sha256\":\"%s\",\"record\":%zu,"
-        "\"lift\":\"%s\",\"version\":%u,\"instruction\":%d,"
-        "\"status\":\"%s\",\"precondition\":\"%s\",\"compared\":%s,"
-        "\"comparison\":\"%s\",\"cache_hit\":%s,\"source_sha256\":\"%s\","
-        "\"output_sha256\":\"%s\"}\n",
-        instruction < 0 ? "lift_baseline" : "lift", case_hash, record,
-        forward_result ? HLSL_RESULT_LIFT_ID : HLSL_COPY_LIFT_ID,
-        forward_result ? HLSL_RESULT_LIFT_VERSION : HLSL_COPY_LIFT_VERSION, instruction,
-        hlsl_lift_status_name(result->status),
-        instruction < 0 ? "not_requested" : hlsl_copy_lift_status_name(result->precondition),
-        result->compared ? "true" : "false",
-        result->compared ? dxbc_compare_status_name(result->comparison.status) : "not_run",
-        result->cache_hit ? "true" : "false", result->source_sha256, result->output_sha256);
+static HLSLLiftStatus compile_lift(void *context, const USILProgram *program, uint64_t remaining_ms,
+                                   HLSLLiftArtifact *artifact) {
+    return compile_lift_mode(context, program, remaining_ms, artifact, false);
 }
 
-static void verify_copy_lifts(UnityCompilerBroker* broker, const GoldenFlags* flags,
-                              const CompileJob* job, const GoldenRecord* target,
-                              const USILProgram* baseline, const char* case_name,
-                              size_t record, FILE* report) {
+static HLSLLiftStatus compile_high_level(void *context, const USILProgram *program,
+                                         uint64_t remaining_ms, HLSLLiftArtifact *artifact) {
+    return compile_lift_mode(context, program, remaining_ms, artifact, true);
+}
+
+static void report_lift(FILE *report, const char *case_hash, size_t record, int instruction,
+                        const HLSLLiftResult *result, int lift_kind) {
+    if (!report) return;
+    fprintf(report,
+            "{\"event\":\"%s\",\"case_sha256\":\"%s\",\"record\":%zu,"
+            "\"lift\":\"%s\",\"version\":%u,\"instruction\":%d,"
+            "\"status\":\"%s\",\"precondition\":\"%s\",\"compared\":%s,"
+            "\"comparison\":\"%s\",\"cache_hit\":%s,\"source_sha256\":\"%s\","
+            "\"output_sha256\":\"%s\"}\n",
+            instruction < 0 ? "lift_baseline" : "lift", case_hash, record,
+            lift_kind == 2   ? HLSL_HIGH_LEVEL_LIFT_ID
+            : lift_kind == 1 ? HLSL_RESULT_LIFT_ID
+                             : HLSL_COPY_LIFT_ID,
+            lift_kind == 2   ? HLSL_HIGH_LEVEL_LIFT_VERSION
+            : lift_kind == 1 ? HLSL_RESULT_LIFT_VERSION
+                             : HLSL_COPY_LIFT_VERSION,
+            instruction, hlsl_lift_status_name(result->status),
+            instruction < 0  ? "not_requested"
+            : lift_kind == 2 ? "emitter_contract"
+                             : hlsl_copy_lift_status_name(result->precondition),
+            result->compared ? "true" : "false",
+            result->compared ? dxbc_compare_status_name(result->comparison.status) : "not_run",
+            result->cache_hit ? "true" : "false", result->source_sha256, result->output_sha256);
+}
+
+static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *flags,
+                              const CompileJob *job, const GoldenRecord *target,
+                              const USILProgram *baseline, const char *case_name, size_t record,
+                              bool high_level, FILE *report) {
     GoldenLiftCompiler compiler = {.broker = broker, .flags = flags, .job = job};
-    HLSLLiftServices services = {.compile = compile_lift, .monotonic_ms = lift_monotonic_ms,
-                                 .context = &compiler};
+    HLSLLiftServices services = {.compile = compile_lift,
+                                 .monotonic_ms = lift_monotonic_ms,
+                                 .context = &compiler,
+                                 .compile_high_level = compile_high_level};
     HLSLLiftTransaction* transaction = NULL;
     HLSLLiftResult result;
     HLSLLiftStatus status = hlsl_lift_transaction_begin(baseline, target->bytecode,
@@ -1676,27 +1700,35 @@ static void verify_copy_lifts(UnityCompilerBroker* broker, const GoldenFlags* fl
         if (status == HLSL_LIFT_BUDGET_EXHAUSTED || status == HLSL_LIFT_CANCELLED ||
             status == HLSL_LIFT_CLOCK_UNAVAILABLE || status == HLSL_LIFT_OUT_OF_MEMORY) break;
     }
+    if (high_level) {
+        hlsl_lift_transaction_try_high_level(transaction, &result);
+        report_lift(report, case_hash, record, 0, &result, 2);
+    }
     HLSLLiftStats stats;
     hlsl_lift_transaction_stats(transaction, &stats);
     const HLSLLiftArtifact* accepted = hlsl_lift_transaction_artifact(transaction);
     char source_hash[65], output_hash[65];
     hash_hex(accepted->source, strlen(accepted->source), source_hash);
     hash_hex(accepted->dxbc, accepted->dxbc_size, output_hash);
-    if (report) fprintf(report,
-        "{\"event\":\"lift_summary\",\"case_sha256\":\"%s\",\"record\":%zu,"
-        "\"candidates\":%zu,\"compiles\":%zu,\"cache_hits\":%zu,\"accepted\":%zu,"
-        "\"elapsed_ms\":%" PRIu64 ",\"output\":\"%s\",\"source_sha256\":\"%s\","
-        "\"output_sha256\":\"%s\"}\n", case_hash, record, stats.candidates,
-        stats.compiles, stats.cache_hits, stats.accepted, stats.elapsed_ms,
-        stats.accepted ? "mixed" : "low_level_fallback", source_hash, output_hash);
+    if (report)
+        fprintf(report,
+                "{\"event\":\"lift_summary\",\"case_sha256\":\"%s\",\"record\":%zu,"
+                "\"candidates\":%zu,\"compiles\":%zu,\"cache_hits\":%zu,\"accepted\":%zu,"
+                "\"elapsed_ms\":%" PRIu64 ",\"output\":\"%s\",\"source_sha256\":\"%s\","
+                "\"output_sha256\":\"%s\"}\n",
+                case_hash, record, stats.candidates, stats.compiles, stats.cache_hits,
+                stats.accepted, stats.elapsed_ms,
+                hlsl_lift_transaction_is_high_level(transaction) ? "high_level"
+                : stats.accepted                                 ? "mixed"
+                                                                 : "low_level_fallback",
+                source_hash, output_hash);
     printf(" [copy lifts: %zu/%zu]", stats.accepted, stats.candidates);
     hlsl_lift_transaction_destroy(transaction);
 }
 
-static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
-                        const char* case_name, bool reconstruct, bool lift_copies,
-                        FILE* report,
-                        bool* assembly_only_match) {
+static bool verify_case(UnityCompilerBroker *broker, const char *golden_dir, const char *case_name,
+                        bool reconstruct, bool lift_copies, bool high_level, FILE *report,
+                        bool *assembly_only_match) {
     if (assembly_only_match) *assembly_only_match = false;
     bool ok = false;
     size_t reported_records = 0U;
@@ -1842,8 +1874,8 @@ static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
         result.reason = dxbc_compare_status_name(compare_status);
         record_ok = compare_status == DXBC_COMPARE_EQUAL;
         if (record_ok && lift_copies) {
-            verify_copy_lifts(broker, &flags, job, target, &lift_baseline,
-                              case_name, index, report);
+            verify_copy_lifts(broker, &flags, job, target, &lift_baseline, case_name, index,
+                              high_level, report);
         }
         if (!record_ok) {
             report_exact_difference(job->record_name, &comparison);
@@ -2025,13 +2057,15 @@ static void print_usage(const char* executable) {
             "[--includes-dir DIR]\n"
             "          [--unity-contents DIR] [--case NAME] [--self-test]\n"
             "          [--self-test-lifts (launches the selected Unity compiler)]\n"
-            "          [--reconstruct] [--lift-copies] [--report JSONL]\n"
+            "          [--reconstruct] [--lift-copies] [--high-level] [--report JSONL]\n"
             "--reconstruct regenerates low-level HLSL from target containers;\n"
             "raw fixtures lack Unity parameter/sampler metadata. Reports cover\n"
             "fixture-controlled stages, not whole-shader certificates.\n"
-            "--lift-copies implies --reconstruct and audits bounded copy/swizzle and single-use result\n"
+            "--lift-copies implies --reconstruct and audits bounded copy/swizzle and single-use "
+            "result\n"
             "transactions: 64 candidates, 33 compiles, 30s acceptance deadline\n"
             "per exact baseline stage. In-flight compiler I/O has its own timeout.\n"
+            "--high-level also attempts the closed float4 expression candidate mode.\n"
             "--report creates a new privacy-safe JSONL ledger; existing files\n"
             "are never overwritten.\n",
             executable);
@@ -2052,11 +2086,14 @@ static bool parse_command_line(int argc, char** argv, CommandLine* options) {
             options->self_test_lifts = true;
         } else if (strcmp(option, "--reconstruct") == 0) {
             options->reconstruct = true;
+        } else if (strcmp(option, "--high-level") == 0) {
+            options->high_level = true;
+            options->lift_copies = true;
+            options->reconstruct = true;
         } else if (strcmp(option, "--lift-copies") == 0) {
             options->lift_copies = true;
             options->reconstruct = true;
-        } else if (strcmp(option, "--help") == 0 ||
-                   strcmp(option, "-h") == 0) {
+        } else if (strcmp(option, "--help") == 0 || strcmp(option, "-h") == 0) {
             print_usage(argv[0]);
             exit(0);
         } else {
@@ -2262,26 +2299,44 @@ cleanup:
 typedef struct {
     GoldenLiftCompiler compiler;
     bool corrupt_candidate;
-    bool forward_result;
 } LiveLiftFixture;
 
-static HLSLLiftStatus compile_live_lift_fixture(void* context,
-                                               const USILProgram* program,
-                                               uint64_t remaining_ms,
-                                               HLSLLiftArtifact* artifact) {
+static HLSLLiftStatus compile_live_lift_fixture_mode(void *context, const USILProgram *program,
+                                                     uint64_t remaining_ms,
+                                                     HLSLLiftArtifact *artifact, bool high_level) {
     LiveLiftFixture* fixture = context;
-    if (!fixture->corrupt_candidate || program->instructions[0].opcode != USIL_OP_NOP)
-        return compile_lift(&fixture->compiler, program, remaining_ms, artifact);
+    if (!fixture->corrupt_candidate ||
+        (!high_level && program->instructions[0].opcode != USIL_OP_NOP))
+        return compile_lift_mode(&fixture->compiler, program, remaining_ms, artifact, high_level);
     /* Deliberately inject a bad rewrite after the planner. Compile the changed
      * source honestly; the transaction must reject the resulting DXBC. */
     USILInstruction instructions[4];
     if (program->instruction_count != 4) return HLSL_LIFT_INVALID_ARGUMENT;
     memcpy(instructions, program->instructions, sizeof(instructions));
-    if (fixture->forward_result) instructions[1].opcode = USIL_OP_ADD;
-    else instructions[1].operands[1].swizzle[0] ^= 1u;
+    for (int index = 0; index < 4; ++index) {
+        if (instructions[index].opcode == USIL_OP_MUL) {
+            instructions[index].opcode = USIL_OP_ADD;
+            break;
+        }
+        if (instructions[index].opcode == USIL_OP_MOV) {
+            instructions[index].operands[1].swizzle[0] ^= 1u;
+            break;
+        }
+    }
     USILProgram wrong = *program;
     wrong.instructions = instructions;
-    return compile_lift(&fixture->compiler, &wrong, remaining_ms, artifact);
+    return compile_lift_mode(&fixture->compiler, &wrong, remaining_ms, artifact, high_level);
+}
+
+static HLSLLiftStatus compile_live_lift_fixture(void *context, const USILProgram *program,
+                                                uint64_t remaining_ms, HLSLLiftArtifact *artifact) {
+    return compile_live_lift_fixture_mode(context, program, remaining_ms, artifact, false);
+}
+
+static HLSLLiftStatus compile_live_high_level_fixture(void *context, const USILProgram *program,
+                                                      uint64_t remaining_ms,
+                                                      HLSLLiftArtifact *artifact) {
+    return compile_live_lift_fixture_mode(context, program, remaining_ms, artifact, true);
 }
 
 static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool forward_result) {
@@ -2351,9 +2406,11 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
     GoldenFlags flags = {.shader_name = "LiftFixture"};
     CompileJob job = {.stage = &k_stages[stage]};
     LiveLiftFixture fixture = {.compiler = {.broker = broker, .flags = &flags, .job = &job},
-                               .corrupt_candidate = true, .forward_result = forward_result};
+                               .corrupt_candidate = true};
     HLSLLiftServices services = {.compile = compile_live_lift_fixture,
-        .monotonic_ms = lift_monotonic_ms, .context = &fixture};
+                                 .monotonic_ms = lift_monotonic_ms,
+                                 .context = &fixture,
+                                 .compile_high_level = compile_live_high_level_fixture};
     HLSLLiftResult result;
     HLSLLiftStatus baseline_status = hlsl_lift_transaction_begin(
         &baseline, target.bytecode, target.bytecode_size,
@@ -2382,6 +2439,23 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
     hlsl_lift_transaction_stats(transaction, &stats);
     SELF_CHECK(stats.accepted == (forward_result ? 1u : 2u) &&
                stats.candidates == stats.accepted + 1u && stats.compiles == stats.accepted + 2u);
+    const HLSLLiftArtifact *prior = hlsl_lift_transaction_artifact(transaction);
+    const char *prior_source = prior->source;
+    fixture.corrupt_candidate = true;
+    HLSLLiftStatus wrong_status = hlsl_lift_transaction_try_high_level(transaction, &result);
+    if (wrong_status != HLSL_LIFT_DXBC_MISMATCH)
+        fprintf(stderr, "wrong high-level fixture: %s\n", hlsl_lift_status_name(wrong_status));
+    SELF_CHECK(wrong_status == HLSL_LIFT_DXBC_MISMATCH);
+    SELF_CHECK(!hlsl_lift_transaction_is_high_level(transaction));
+    SELF_CHECK(hlsl_lift_transaction_artifact(transaction)->source == prior_source);
+    fixture.corrupt_candidate = false;
+    HLSLLiftStatus high_status = hlsl_lift_transaction_try_high_level(transaction, &result);
+    if (high_status != HLSL_LIFT_VERIFIED)
+        fprintf(stderr, "high-level fixture: %s\n", hlsl_lift_status_name(high_status));
+    SELF_CHECK(high_status == HLSL_LIFT_VERIFIED &&
+               hlsl_lift_transaction_is_high_level(transaction));
+    SELF_CHECK(hlsl_lift_transaction_try_copy(transaction, 0, &result) ==
+               HLSL_LIFT_COMPOSITION_UNSUPPORTED);
     printf("%s: %s exactly reproduced target DXBC; deliberately wrong candidate rejected\n",
            k_stages[stage].name, forward_result ? "single-use result" : "two copy lifts");
     succeeded = true;
@@ -2392,6 +2466,82 @@ cleanup:
     free(error);
     free(bytes);
     usil_free(&decoded);
+    return succeeded;
+}
+
+static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, bool shared,
+                                        bool partial) {
+    bool succeeded = false;
+    USILProgram program = {0};
+    uint8_t *bytes = NULL;
+    size_t byte_count = 0;
+    char *error = NULL;
+    char *reconstructed = NULL;
+    HLSLLiftTransaction *transaction = NULL;
+    StringBuilder seed;
+    sb_init(&seed);
+    sb_append(&seed, "#pragma vertex main\n#pragma fragment main\n");
+    sb_appendf(&seed, "float4 main(float4 value : %s) : %s {\n",
+               stage == 0 ? "POSITION" : "TEXCOORD0", stage == 0 ? "SV_POSITION" : "SV_Target");
+    sb_appendf(&seed, "float4 product = value * value.%s;\n", shared && !partial ? "yzwx" : "wzyx");
+    sb_append(&seed,
+              shared ? "return product + product.zwxy;\n}\n" : "return product * value.zwxy;\n}\n");
+    SELF_CHECK(sb_ok(&seed));
+    bytes = unity_compiler_broker_compile(broker, seed.buf, "ExpressionFixture", stage, 4, 0, NULL,
+                                          0, NULL, 0, &byte_count, &error);
+    SELF_CHECK(bytes);
+    DXBCContainerView container;
+    SELF_CHECK(dxbc_container_view_first(bytes, byte_count, &container));
+    GoldenRecord target = {.name = "controlled-expression",
+                           .bytecode = container.data,
+                           .bytecode_size = container.size};
+    RecordResult reconstruction = record_result_init(true);
+    reconstructed = reconstruct_stage_source(&target, &k_stages[stage], &reconstruction, &program);
+    SELF_CHECK(reconstructed && program.temp_count > 0);
+    GoldenFlags flags = {.shader_name = "ExpressionFixture"};
+    CompileJob job = {.stage = &k_stages[stage]};
+    GoldenLiftCompiler compiler = {.broker = broker, .flags = &flags, .job = &job};
+    HLSLLiftServices services = {.compile = compile_lift,
+                                 .monotonic_ms = lift_monotonic_ms,
+                                 .context = &compiler,
+                                 .compile_high_level = compile_high_level};
+    HLSLLiftResult result;
+    HLSLLiftStatus baseline_status =
+        hlsl_lift_transaction_begin(&program, target.bytecode, target.bytecode_size, &services,
+                                    &k_copy_limits, &transaction, &result);
+    if (baseline_status != HLSL_LIFT_VERIFIED)
+        fprintf(stderr, "%s expression baseline: %s\n", k_stages[stage].name,
+                hlsl_lift_status_name(baseline_status));
+    SELF_CHECK(baseline_status == HLSL_LIFT_VERIFIED);
+    HLSLLiftStatus status = hlsl_lift_transaction_try_high_level(transaction, &result);
+    if (partial) {
+        SELF_CHECK(status == HLSL_LIFT_EMISSION_REJECTED);
+        SELF_CHECK(!hlsl_lift_transaction_is_high_level(transaction));
+        SELF_CHECK(strcmp(hlsl_lift_transaction_artifact(transaction)->source, reconstructed) == 0);
+        printf("%s: partial expression retained verified low-level fallback\n",
+               k_stages[stage].name);
+        succeeded = true;
+        goto cleanup;
+    }
+    if (status != HLSL_LIFT_VERIFIED)
+        fprintf(stderr, "%s %s expression: %s\n", k_stages[stage].name,
+                shared ? "shared" : "nested", hlsl_lift_status_name(status));
+    SELF_CHECK(status == HLSL_LIFT_VERIFIED);
+    const char *accepted = hlsl_lift_transaction_artifact(transaction)->source;
+    SELF_CHECK(!strstr(accepted, "float4 r") && !strstr(accepted, "u_xlat_temp"));
+    SELF_CHECK(shared == (strstr(accepted, "const float4 dxbc_value_") != NULL));
+    printf("%s: decoded %s expression reproduced complete target DXBC\n", k_stages[stage].name,
+           shared ? "shared" : "nested");
+    succeeded = true;
+cleanup:
+    if (!succeeded && error)
+        fprintf(stderr, "%s\n", error);
+    hlsl_lift_transaction_destroy(transaction);
+    free(reconstructed);
+    free(error);
+    free(bytes);
+    usil_free(&program);
+    sb_free(&seed);
     return succeeded;
 }
 
@@ -2426,10 +2576,15 @@ int main(int argc, char** argv) {
     }
 
     if (options.self_test_lifts) {
-        bool passed = run_live_lift_fixture(broker, 0, false) &&
-                      run_live_lift_fixture(broker, 1, false) &&
-                      run_live_lift_fixture(broker, 0, true) &&
-                      run_live_lift_fixture(broker, 1, true);
+        bool passed =
+            run_live_lift_fixture(broker, 0, false) && run_live_lift_fixture(broker, 1, false) &&
+            run_live_lift_fixture(broker, 0, true) && run_live_lift_fixture(broker, 1, true) &&
+            run_live_expression_fixture(broker, 0, false, false) &&
+            run_live_expression_fixture(broker, 1, false, false) &&
+            run_live_expression_fixture(broker, 0, true, false) &&
+            run_live_expression_fixture(broker, 1, true, false) &&
+            run_live_expression_fixture(broker, 0, true, true) &&
+            run_live_expression_fixture(broker, 1, true, true);
         unity_compiler_broker_destroy(broker);
         string_list_free(&cases);
         return passed ? 0 : 1;
@@ -2459,11 +2614,11 @@ int main(int argc, char** argv) {
                 "\"mode\":\"%s\",\"discovered_cases\":%zu,"
                 "\"authority\":\"legacy_fixture_controls\","
                 "\"whole_shader_certificate\":\"not_requested\","
-                "\"lift_copies\":%s,\"lift_max_candidates\":%zu,"
+                "\"lift_copies\":%s,\"high_level\":%s,\"lift_max_candidates\":%zu,"
                 "\"lift_max_compiles\":%zu,\"lift_acceptance_deadline_ms\":%" PRIu64 ","
                 "\"compiler_sha256\":\"%s\",\"environment_sha256\":\"%s\"}\n",
-                options.reconstruct ? "reconstruct" : "retained_source",
-                cases.count, options.lift_copies ? "true" : "false",
+                options.reconstruct ? "reconstruct" : "retained_source", cases.count,
+                options.lift_copies ? "true" : "false", options.high_level ? "true" : "false",
                 k_copy_limits.max_candidates, k_copy_limits.max_compiles,
                 k_copy_limits.max_elapsed_ms, compiler_hash, environment_hash);
     }
@@ -2476,9 +2631,8 @@ int main(int argc, char** argv) {
         printf("Running test: %s ...", cases.values[index]);
         fflush(stdout);
         bool assembly_only_match = false;
-        if (verify_case(broker, options.golden_dir, cases.values[index],
-                        options.reconstruct, options.lift_copies, report,
-                        &assembly_only_match)) {
+        if (verify_case(broker, options.golden_dir, cases.values[index], options.reconstruct,
+                        options.lift_copies, options.high_level, report, &assembly_only_match)) {
             puts(" [PASS]");
         } else {
             puts(assembly_only_match ? " [FAIL: ASSEMBLY-ONLY]" : " [FAIL]");

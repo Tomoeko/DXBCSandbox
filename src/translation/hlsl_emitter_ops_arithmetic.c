@@ -262,19 +262,7 @@ void emit_arithmetic_op(HLSLEmitterContext* ctx, const USILInstruction* inst,
         const char *final_src0 = swap ? src1 : src0;
         const char *final_src1 = swap ? src0 : src1;
         
-        bool preserve_order = false;
-        if (inst->operand_count >= 3 &&
-            inst->operands[1].type == OPERAND_TYPE_TEMP &&
-            inst->operands[2].type == OPERAND_TYPE_TEMP &&
-            inst->operands[1].register_index == inst->operands[2].register_index) {
-          int comp0 = inst->operands[1].swizzle[0];
-          int comp1 = inst->operands[2].swizzle[0];
-          if (comp0 != comp1) {
-            preserve_order = true;
-          }
-        }
-        
-        if (preserve_order) {
+        if (compiler_add_uses_mad(inst)) {
           hlsl_format_checked(ctx, rhs_expr, rhs_len, "mad(%s, 1.0, %s)", src0, src1);
         } else {
           hlsl_format_checked(ctx, rhs_expr, rhs_len, "%s + %s", final_src0, final_src1);
