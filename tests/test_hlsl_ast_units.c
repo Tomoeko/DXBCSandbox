@@ -109,6 +109,46 @@ static bool check_operators_and_casts(void) {
     return true;
 }
 
+typedef struct {
+    const ASTExpr *nodes[3];
+    size_t begins[3], ends[3], count;
+    bool reject;
+} SpanFixture;
+
+static bool capture_span(void *context, const ASTExpr *expression, size_t begin, size_t end) {
+    SpanFixture *fixture = context;
+    if (fixture->reject || fixture->count >= 3)
+        return false;
+    size_t index = fixture->count++;
+    fixture->nodes[index] = expression;
+    fixture->begins[index] = begin;
+    fixture->ends[index] = end;
+    return true;
+}
+
+static bool check_expression_spans(void) {
+    ASTExpr *left = ast_create_literal_int(1), *right = ast_create_literal_int(2);
+    ASTExpr *sum = ast_create_binary(USIL_OP_ADD, left, right);
+    CHECK(sum);
+    StringBuilder source;
+    sb_init(&source);
+    sb_append(&source, "prefix ");
+    SpanFixture fixture = {0};
+    ast_format_expr_traced(sum, &source, capture_span, &fixture);
+    CHECK(sb_ok(&source) && strcmp(source.buf, "prefix (1 + 2)") == 0);
+    CHECK(fixture.count == 3 && fixture.nodes[0] == left && fixture.nodes[1] == right &&
+          fixture.nodes[2] == sum);
+    CHECK(fixture.begins[0] == 8 && fixture.ends[0] == 9 && fixture.begins[1] == 12 &&
+          fixture.ends[1] == 13 && fixture.begins[2] == 7 && fixture.ends[2] == 14);
+    fixture.reject = true;
+    sb_clear(&source);
+    ast_format_expr_traced(sum, &source, capture_span, &fixture);
+    CHECK(!sb_ok(&source));
+    sb_free(&source);
+    ast_free_expr(sum);
+    return true;
+}
+
 static bool check_invalid_trees_and_ownership(void) {
     ASTStmt *block = ast_create_block();
     ASTStmt *flow = ast_create_flow(AST_STMT_RETURN);
@@ -149,7 +189,7 @@ static bool check_invalid_trees_and_ownership(void) {
 
 int main(void) {
     if (!check_literal_bits() || !check_operators_and_casts() ||
-        !check_invalid_trees_and_ownership())
+        !check_invalid_trees_and_ownership() || !check_expression_spans())
         return 1;
     puts("HLSL AST bits, operators and ownership passed");
     return 0;

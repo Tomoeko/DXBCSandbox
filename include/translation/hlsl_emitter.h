@@ -19,6 +19,40 @@ typedef struct {
 #define HLSL_HIGH_LEVEL_LIFT_VERSION 1U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 64
 
+typedef enum {
+    HLSL_EXPRESSION_ORIGIN_UNMAPPED = 0,
+    HLSL_EXPRESSION_ORIGIN_EXPRESSION,
+    HLSL_EXPRESSION_ORIGIN_DEAD,
+    HLSL_EXPRESSION_ORIGIN_NOP,
+    HLSL_EXPRESSION_ORIGIN_RETURN
+} HLSLExpressionOriginKind;
+
+typedef struct {
+    HLSLExpressionOriginKind kind;
+    int instruction_index;
+    uint32_t source_instruction_index;
+    uint8_t destination_lanes;
+    size_t source_begin;
+    size_t source_end; /* Exclusive byte offset in the emitter's output builder. */
+} HLSLExpressionOrigin;
+
+/* One record per decoded instruction for the bounded float4 lift. Nested
+ * expressions have nested spans; elided MOVs may share their producer's span.
+ * Dead pure expressions and NOPs have no span. RETURN covers the generated
+ * return block. Declarations/ABI tokens are not instruction-owned spans.
+ * This is provenance, never an independent correctness certificate. */
+typedef struct HLSLExpressionSourceMap {
+    HLSLExpressionOrigin origins[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
+    size_t count;
+    bool complete;
+} HLSLExpressionSourceMap;
+
+/* Structural trace validation against this exact program/source. This checks
+ * coverage, bounds and instruction identity, not semantic correctness. */
+bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
+                                        const USILProgram *program, const char *source);
+const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind);
+
 typedef enum HLSLEmitMode {
     /* Emit from the decoded instruction stream without source-level semantic
      * lifts. This is suitable for recompilation/equivalence verification and
@@ -63,6 +97,9 @@ typedef struct HLSLEmitOptions {
      * identifier. */
     const char* const* reserved_preprocessor_identifiers;
     size_t reserved_preprocessor_identifier_count;
+    /* Optional caller-owned output, HIGH_LEVEL_CANDIDATE only. Cleared on
+     * entry and failure; complete only after successful emission. */
+    HLSLExpressionSourceMap *expression_source_map;
 } HLSLEmitOptions;
 
 /* Stable, allocation-free failure authority for HLSL emission.  Diagnostics
@@ -193,12 +230,10 @@ const char* hlsl_emit_metadata_source_name(HLSLEmitMetadataSource source);
 const char* hlsl_emit_metadata_kind_name(HLSLEmitMetadataKind kind);
 const char* hlsl_emit_opcode_name(int opcode);
 
-#define HLSL_EMIT_RECOMPILE_OPTIONS_INIT \
-    { HLSL_EMIT_MODE_RECOMPILE, NULL, false, NULL, 0 }
-#define HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT \
-    { HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE, NULL, false, NULL, 0 }
-#define HLSL_EMIT_READABLE_OPTIONS_INIT \
-    { HLSL_EMIT_MODE_READABLE, NULL, false, NULL, 0 }
+#define HLSL_EMIT_RECOMPILE_OPTIONS_INIT {HLSL_EMIT_MODE_RECOMPILE, NULL, false, NULL, 0, NULL}
+#define HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT                                                          \
+    {HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE, NULL, false, NULL, 0, NULL}
+#define HLSL_EMIT_READABLE_OPTIONS_INIT {HLSL_EMIT_MODE_READABLE, NULL, false, NULL, 0, NULL}
 
 // Translates a USIL program and appends recompilable HLSL to the string builder.
 // Semantic reconstruction is disabled. Returns true on success. Pass NULL for

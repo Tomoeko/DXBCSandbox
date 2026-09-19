@@ -175,6 +175,13 @@ ASTStmt *ast_create_loop(ASTExpr *cond, ASTStmt *body);
 ASTStmt *ast_create_flow(ASTStmtKind kind);
 void ast_free_stmt(ASTStmt *stmt);
 
+/* Visits each emitted node after its children with byte offsets in sb.
+ * A false observer result fails the builder. Callbacks must not mutate the
+ * tree or builder; offsets are valid only if the entire formatting succeeds. */
+typedef bool (*ASTExprSpanObserver)(void *context, const ASTExpr *expression, size_t begin,
+                                    size_t end);
+void ast_format_expr_traced(const ASTExpr *expr, StringBuilder *sb, ASTExprSpanObserver observer,
+                            void *context);
 void ast_format_expr(const ASTExpr *expr, StringBuilder *sb);
 void ast_format_stmt(const ASTStmt *stmt, StringBuilder *sb, int indent);
 

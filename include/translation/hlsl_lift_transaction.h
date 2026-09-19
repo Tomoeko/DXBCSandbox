@@ -20,7 +20,8 @@ typedef enum {
     HLSL_LIFT_OUT_OF_MEMORY,
     HLSL_LIFT_CLOCK_UNAVAILABLE,
     HLSL_LIFT_COMPOSITION_UNSUPPORTED,
-    HLSL_LIFT_AUTHORITY_MISMATCH
+    HLSL_LIFT_AUTHORITY_MISMATCH,
+    HLSL_LIFT_PROVENANCE_MISMATCH
 } HLSLLiftStatus;
 
 /* The compile service transfers malloc-owned source and one complete released
@@ -39,6 +40,8 @@ typedef struct {
     bool has_request_identity;
     uint8_t request_digest[32];
     uint8_t controls_digest[32];
+    /* Optional malloc-owned expression provenance; transferred with source. */
+    struct HLSLExpressionSourceMap *expression_source_map;
 } HLSLLiftArtifact;
 
 typedef struct {
@@ -53,6 +56,7 @@ typedef struct {
     HLSLLiftStatus (*compile_high_level)(void *context, const USILProgram *program,
                                          uint64_t remaining_ms, HLSLLiftArtifact *artifact);
     bool require_request_identity;
+    bool require_expression_source_map; /* Applies to high-level candidates. */
 } HLSLLiftServices;
 
 typedef struct {

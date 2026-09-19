@@ -638,6 +638,16 @@ static bool check_transactions(void) {
     CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) == HLSL_LIFT_VERIFIED);
     CHECK(hlsl_lift_transaction_is_high_level(transaction));
     hlsl_lift_transaction_destroy(transaction);
+    services.require_expression_source_map = true;
+    CHECK(hlsl_lift_transaction_begin(&program, transaction_target, sizeof(transaction_target),
+                                      &services, &limits, &transaction,
+                                      &result) == HLSL_LIFT_VERIFIED);
+    baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+          HLSL_LIFT_PROVENANCE_MISMATCH);
+    CHECK(!result.compared &&
+          hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
+    hlsl_lift_transaction_destroy(transaction);
     return true;
 }
 
@@ -747,6 +757,10 @@ static bool check_expression_emission(void) {
                            .program_type = DXBC_PROGRAM_TYPE_PIXEL,
                            .shader_model_major = 5};
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLExpressionSourceMap source_map;
+    options.expression_source_map = &source_map;
+    for (int index = 0; index < 4; ++index)
+        instructions[index].source_instruction_index = (uint32_t)(100 + index);
     HLSLEmitDiagnostic diagnostic;
     StringBuilder source;
     sb_init(&source);
@@ -754,6 +768,42 @@ static bool check_expression_emission(void) {
                                             &diagnostic));
     CHECK(strstr(source.buf, "o0 = ((") && strstr(source.buf, " * ") && strstr(source.buf, " + "));
     CHECK(!strstr(source.buf, "float4 r") && !strstr(source.buf, "u_xlat_temp"));
+    CHECK(source_map.complete && source_map.count == 4);
+    for (size_t index = 0; index < source_map.count; ++index) {
+        const HLSLExpressionOrigin *origin = &source_map.origins[index];
+        CHECK(origin->instruction_index == (int)index &&
+              origin->source_instruction_index == 100 + index);
+        CHECK(origin->source_begin < origin->source_end && origin->source_end <= source.len);
+        CHECK(origin->kind ==
+              (index == 3 ? HLSL_EXPRESSION_ORIGIN_RETURN : HLSL_EXPRESSION_ORIGIN_EXPRESSION));
+    }
+    CHECK(source_map.origins[2].source_begin <= source_map.origins[1].source_begin &&
+          source_map.origins[1].source_begin <= source_map.origins[0].source_begin &&
+          source_map.origins[0].source_end <= source_map.origins[1].source_end &&
+          source_map.origins[1].source_end <= source_map.origins[2].source_end);
+    CHECK(source_map.origins[0].destination_lanes == 15);
+    CHECK(hlsl_expression_source_map_matches(&source_map, &program, source.buf));
+    HLSLExpressionSourceMap valid_map = source_map;
+    for (int mutation = 0; mutation < 8; ++mutation) {
+        if (mutation == 0)
+            source_map.complete = false;
+        if (mutation == 1)
+            source_map.count--;
+        if (mutation == 2)
+            source_map.origins[0].instruction_index++;
+        if (mutation == 3)
+            source_map.origins[0].source_instruction_index++;
+        if (mutation == 4)
+            source_map.origins[0].destination_lanes = 1;
+        if (mutation == 5)
+            source_map.origins[0].source_end = source.len + 1;
+        if (mutation == 6)
+            source_map.origins[0].source_end = source_map.origins[0].source_begin;
+        if (mutation == 7)
+            source_map.origins[2].kind = HLSL_EXPRESSION_ORIGIN_DEAD;
+        CHECK(!hlsl_expression_source_map_matches(&source_map, &program, source.buf));
+        source_map = valid_map;
+    }
     char *first = malloc(source.len + 1);
     CHECK(first);
     memcpy(first, source.buf, source.len + 1);
@@ -762,6 +812,16 @@ static bool check_expression_emission(void) {
     CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
     CHECK(strcmp(first, source.buf) == 0);
     free(first);
+    /* A dead consumer also disposes of its nested single-use producers. */
+    DXBCOperand saved_source = instructions[2].operands[1];
+    instructions[2].operands[1] = emission_reg(OPERAND_TYPE_INPUT, 0);
+    sb_free(&source);
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(source_map.complete && source_map.origins[0].kind == HLSL_EXPRESSION_ORIGIN_DEAD &&
+          source_map.origins[1].kind == HLSL_EXPRESSION_ORIGIN_DEAD);
+    CHECK(source_map.origins[0].source_end == 0 && source_map.origins[1].source_end == 0);
+    instructions[2].operands[1] = saved_source;
     /* Two uses retain one evaluated typed value instead of duplicating MUL. */
     instructions[1].operands[2] = emission_reg(OPERAND_TYPE_TEMP, 0);
     instructions[1].operands[2].swizzle[0] = 3;
@@ -770,6 +830,10 @@ static bool check_expression_emission(void) {
     CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
     CHECK(strstr(source.buf, "const float4 dxbc_value_i0 = "));
     CHECK(strstr(source.buf, "dxbc_value_i0.wyzw"));
+    CHECK(source_map.complete &&
+          source_map.origins[0].source_end < source_map.origins[2].source_begin);
+    CHECK(source_map.origins[2].source_begin <= source_map.origins[1].source_begin &&
+          source_map.origins[1].source_end <= source_map.origins[2].source_end);
     const char *reserved[] = {"dxbc_value_i0"};
     options.reserved_preprocessor_identifiers = reserved;
     options.reserved_preprocessor_identifier_count = 1;
@@ -778,6 +842,7 @@ static bool check_expression_emission(void) {
     CHECK(!hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
                                              &diagnostic));
     CHECK(diagnostic.reason == HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY);
+    CHECK(!source_map.complete && source_map.count == 0);
     const char *collisions[] = {"float4", "mad", "main", "appdata", "v0", "o0", "SV_Target"};
     for (size_t index = 0; index < sizeof(collisions) / sizeof(collisions[0]); ++index) {
         options.reserved_preprocessor_identifiers = &collisions[index];

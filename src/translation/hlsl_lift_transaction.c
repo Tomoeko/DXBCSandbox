@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_lift_transaction.h"
+#include "translation/hlsl_emitter.h"
 #include "common/sha256.h"
 
 #include <stdlib.h>
@@ -28,6 +29,7 @@ struct HLSLLiftTransaction {
 static void artifact_free(HLSLLiftArtifact *artifact) {
     free(artifact->source);
     free(artifact->dxbc);
+    free(artifact->expression_source_map);
     memset(artifact, 0, sizeof(*artifact));
 }
 
@@ -121,6 +123,11 @@ static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USI
     }
     if (!artifact->source || !artifact->source[0])
         return HLSL_LIFT_EMISSION_REJECTED;
+    if (high_level &&
+        (transaction->services.require_expression_source_map || artifact->expression_source_map) &&
+        !hlsl_expression_source_map_matches(artifact->expression_source_map, program,
+                                            artifact->source))
+        return HLSL_LIFT_PROVENANCE_MISMATCH;
     if (((transaction->services.require_request_identity || artifact->has_request_identity) &&
          !artifact_request_identity_valid(artifact)) ||
         (transaction->accepted.has_request_identity &&
@@ -336,6 +343,7 @@ const char *hlsl_lift_status_name(HLSLLiftStatus status) {
         STATUS(CLOCK_UNAVAILABLE, "clock-unavailable");
         STATUS(COMPOSITION_UNSUPPORTED, "composition-unsupported");
         STATUS(AUTHORITY_MISMATCH, "authority-mismatch");
+        STATUS(PROVENANCE_MISMATCH, "provenance-mismatch");
 #undef STATUS
     }
     return "unknown";

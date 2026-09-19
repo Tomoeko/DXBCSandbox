@@ -419,13 +419,15 @@ static void format_literal(const ASTLiteral *literal, StringBuilder *sb) {
         sb_append(sb, ")");
 }
 
-static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) {
+static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth,
+                        ASTExprSpanObserver observer, void *context) {
     if (!sb || !sb_ok(sb))
         return;
     if (!expr || depth > 256u) {
         sb->failed = true;
         return;
     }
+    const size_t begin = sb->len;
     switch (expr->kind) {
     case AST_EXPR_EMITTER_OPERAND:
         if (!expr->u.emitter_operand || !expr->u.emitter_operand[0] ||
@@ -459,7 +461,7 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) 
         }
         sb_append(sb, unary_operator(expr->u.unary.op));
         sb_append(sb, "(");
-        format_expr(expr->u.unary.sub, sb, depth + 1u);
+        format_expr(expr->u.unary.sub, sb, depth + 1u, observer, context);
         sb_append(sb, ")");
         break;
     case AST_EXPR_BINARY:
@@ -468,18 +470,18 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) 
             break;
         }
         sb_append(sb, "(");
-        format_expr(expr->u.binary.left, sb, depth + 1u);
+        format_expr(expr->u.binary.left, sb, depth + 1u, observer, context);
         sb_append(sb, binary_operator(expr->u.binary.op));
-        format_expr(expr->u.binary.right, sb, depth + 1u);
+        format_expr(expr->u.binary.right, sb, depth + 1u, observer, context);
         sb_append(sb, ")");
         break;
     case AST_EXPR_TERNARY:
         sb_append(sb, "(");
-        format_expr(expr->u.ternary.cond, sb, depth + 1u);
+        format_expr(expr->u.ternary.cond, sb, depth + 1u, observer, context);
         sb_append(sb, " ? ");
-        format_expr(expr->u.ternary.true_expr, sb, depth + 1u);
+        format_expr(expr->u.ternary.true_expr, sb, depth + 1u, observer, context);
         sb_append(sb, " : ");
-        format_expr(expr->u.ternary.false_expr, sb, depth + 1u);
+        format_expr(expr->u.ternary.false_expr, sb, depth + 1u, observer, context);
         sb_append(sb, ")");
         break;
     case AST_EXPR_SWIZZLE: {
@@ -492,7 +494,7 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) 
         bool literal = expr->u.swizzle.sub && expr->u.swizzle.sub->kind == AST_EXPR_LITERAL;
         if (literal)
             sb_append(sb, "(");
-        format_expr(expr->u.swizzle.sub, sb, depth + 1u);
+        format_expr(expr->u.swizzle.sub, sb, depth + 1u, observer, context);
         if (literal)
             sb_append(sb, ")");
         sb_append(sb, ".");
@@ -518,7 +520,7 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) 
         for (int i = 0; i < expr->u.call.arg_count; i++) {
             if (i > 0)
                 sb_append(sb, ", ");
-            format_expr(expr->u.call.args[i], sb, depth + 1u);
+            format_expr(expr->u.call.args[i], sb, depth + 1u, observer, context);
         }
         sb_append(sb, ")");
         break;
@@ -530,7 +532,7 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) 
         sb_append(sb, "((");
         sb_append(sb, expr->u.cast.type_name);
         sb_append(sb, ")(");
-        format_expr(expr->u.cast.sub, sb, depth + 1u);
+        format_expr(expr->u.cast.sub, sb, depth + 1u, observer, context);
         sb_append(sb, "))");
         break;
     case AST_EXPR_BITCAST:
@@ -541,16 +543,25 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth) 
         sb_append(sb, expr->u.bitcast.scalar_type == AST_SCALAR_FLOAT32  ? "asfloat("
                       : expr->u.bitcast.scalar_type == AST_SCALAR_UINT32 ? "asuint("
                                                                          : "asint(");
-        format_expr(expr->u.bitcast.sub, sb, depth + 1u);
+        format_expr(expr->u.bitcast.sub, sb, depth + 1u, observer, context);
         sb_append(sb, ")");
         break;
     default:
         sb->failed = true;
         break;
     }
+    if (sb_ok(sb) && observer && !observer(context, expr, begin, sb->len))
+        sb->failed = true;
 }
 
-void ast_format_expr(const ASTExpr *expr, StringBuilder *sb) { format_expr(expr, sb, 0u); }
+void ast_format_expr_traced(const ASTExpr *expr, StringBuilder *sb, ASTExprSpanObserver observer,
+                            void *context) {
+    format_expr(expr, sb, 0u, observer, context);
+}
+
+void ast_format_expr(const ASTExpr *expr, StringBuilder *sb) {
+    ast_format_expr_traced(expr, sb, NULL, NULL);
+}
 
 static void append_indent(StringBuilder *sb, int indent) {
     for (int i = 0; i < indent; i++) {

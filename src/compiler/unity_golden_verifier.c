@@ -1520,8 +1520,20 @@ static char *emit_stage_with_options(const USILProgram *program, const GoldenSta
     if (stage->id > 1) {
         sb_appendf(&harness, "#pragma %s main\n", stage->pragma_name);
     }
+    const size_t source_offset = harness.len + strlen(stage->define_prefix);
     sb_append(&harness, source.buf);
     if (sb_ok(&harness)) output = build_stage_source(harness.buf, stage);
+    if (output && options && options->expression_source_map) {
+        HLSLExpressionSourceMap *map = options->expression_source_map;
+        for (size_t index = 0; index < map->count; ++index) {
+            HLSLExpressionOrigin *origin = &map->origins[index];
+            if (origin->kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION ||
+                origin->kind == HLSL_EXPRESSION_ORIGIN_RETURN) {
+                origin->source_begin += source_offset;
+                origin->source_end += source_offset;
+            }
+        }
+    }
     sb_free(&harness);
     result->reason = output ? "emitted" : "source_allocation_failed";
     if (output) result->emission = "pass";
@@ -1599,7 +1611,13 @@ static HLSLLiftStatus compile_lift_mode(void *context, const USILProgram *progra
     const CompileJob* job = compiler->job;
     if (!remaining_ms) return HLSL_LIFT_BUDGET_EXHAUSTED;
     RecordResult emission = record_result_init(true);
-    const HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    if (high_level) {
+        artifact->expression_source_map = calloc(1, sizeof(*artifact->expression_source_map));
+        if (!artifact->expression_source_map)
+            return HLSL_LIFT_OUT_OF_MEMORY;
+        options.expression_source_map = artifact->expression_source_map;
+    }
     artifact->source =
         emit_stage_with_options(program, job->stage, &emission, high_level ? &options : NULL);
     if (!artifact->source) return HLSL_LIFT_EMISSION_REJECTED;
@@ -1685,7 +1703,8 @@ static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *fl
                                  .monotonic_ms = lift_monotonic_ms,
                                  .context = &compiler,
                                  .compile_high_level = compile_high_level,
-                                 .require_request_identity = true};
+                                 .require_request_identity = true,
+                                 .require_expression_source_map = true};
     HLSLLiftTransaction* transaction = NULL;
     HLSLLiftResult result;
     HLSLLiftStatus status = hlsl_lift_transaction_begin(baseline, target->bytecode,
@@ -1728,6 +1747,25 @@ static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *fl
                 : stats.accepted                                 ? "mixed"
                                                                  : "low_level_fallback",
                 source_hash, output_hash);
+    if (report && accepted->expression_source_map) {
+        char request_hash[65];
+        common_sha256_digest_to_hex(accepted->request_digest, request_hash);
+        const HLSLExpressionSourceMap *map = accepted->expression_source_map;
+        for (size_t index = 0; index < map->count; ++index) {
+            const HLSLExpressionOrigin *origin = &map->origins[index];
+            fprintf(report,
+                    "{\"event\":\"lift_source_span\",\"case_sha256\":\"%s\","
+                    "\"record\":%zu,\"lift\":\"%s\",\"version\":%u,\"instruction\":%d,"
+                    "\"source_instruction\":%" PRIu32 ",\"destination_lanes\":%u,"
+                    "\"kind\":\"%s\",\"begin\":%zu,\"end\":%zu,"
+                    "\"source_sha256\":\"%s\",\"request_sha256\":\"%s\"}\n",
+                    case_hash, record, HLSL_HIGH_LEVEL_LIFT_ID, HLSL_HIGH_LEVEL_LIFT_VERSION,
+                    origin->instruction_index, origin->source_instruction_index,
+                    (unsigned)origin->destination_lanes,
+                    hlsl_expression_origin_kind_name(origin->kind), origin->source_begin,
+                    origin->source_end, source_hash, request_hash);
+        }
+    }
     printf(" [copy lifts: %zu/%zu]", stats.accepted, stats.candidates);
     hlsl_lift_transaction_destroy(transaction);
 }
@@ -2305,6 +2343,7 @@ cleanup:
 typedef struct {
     GoldenLiftCompiler compiler;
     bool corrupt_candidate;
+    bool corrupt_source_map;
 } LiveLiftFixture;
 
 static HLSLLiftStatus compile_live_lift_fixture_mode(void *context, const USILProgram *program,
@@ -2342,7 +2381,13 @@ static HLSLLiftStatus compile_live_lift_fixture(void *context, const USILProgram
 static HLSLLiftStatus compile_live_high_level_fixture(void *context, const USILProgram *program,
                                                       uint64_t remaining_ms,
                                                       HLSLLiftArtifact *artifact) {
-    return compile_live_lift_fixture_mode(context, program, remaining_ms, artifact, true);
+    HLSLLiftStatus status =
+        compile_live_lift_fixture_mode(context, program, remaining_ms, artifact, true);
+    const LiveLiftFixture *fixture = context;
+    if (status == HLSL_LIFT_VERIFIED && fixture->corrupt_source_map &&
+        artifact->expression_source_map)
+        artifact->expression_source_map->origins[0].source_end = SIZE_MAX;
+    return status;
 }
 
 static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool forward_result) {
@@ -2417,7 +2462,8 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
                                  .monotonic_ms = lift_monotonic_ms,
                                  .context = &fixture,
                                  .compile_high_level = compile_live_high_level_fixture,
-                                 .require_request_identity = true};
+                                 .require_request_identity = true,
+                                 .require_expression_source_map = true};
     HLSLLiftResult result;
     HLSLLiftStatus baseline_status = hlsl_lift_transaction_begin(
         &baseline, target.bytecode, target.bytecode_size,
@@ -2456,6 +2502,12 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
     SELF_CHECK(!hlsl_lift_transaction_is_high_level(transaction));
     SELF_CHECK(hlsl_lift_transaction_artifact(transaction)->source == prior_source);
     fixture.corrupt_candidate = false;
+    fixture.corrupt_source_map = true;
+    SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+               HLSL_LIFT_PROVENANCE_MISMATCH);
+    SELF_CHECK(!result.compared &&
+               hlsl_lift_transaction_artifact(transaction)->source == prior_source);
+    fixture.corrupt_source_map = false;
     HLSLLiftStatus high_status = hlsl_lift_transaction_try_high_level(transaction, &result);
     if (high_status != HLSL_LIFT_VERIFIED)
         fprintf(stderr, "high-level fixture: %s\n", hlsl_lift_status_name(high_status));
@@ -2512,7 +2564,8 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
                                  .monotonic_ms = lift_monotonic_ms,
                                  .context = &compiler,
                                  .compile_high_level = compile_high_level,
-                                 .require_request_identity = true};
+                                 .require_request_identity = true,
+                                 .require_expression_source_map = true};
     HLSLLiftResult result;
     HLSLLiftStatus baseline_status =
         hlsl_lift_transaction_begin(&program, target.bytecode, target.bytecode_size, &services,

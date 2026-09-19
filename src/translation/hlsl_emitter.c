@@ -1561,6 +1561,8 @@ bool hlsl_emit_with_options_diagnostic(
     const HLSLEmitNames *names, const HLSLEmitOptions *options,
     HLSLEmitDiagnostic *diagnostic) {
   hlsl_emit_diagnostic_init(diagnostic);
+  if (options && options->expression_source_map)
+    memset(options->expression_source_map, 0, sizeof(*options->expression_source_map));
   if (!sb || !program) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_ARGUMENT,
                           HLSL_EMIT_PHASE_ARGUMENT_VALIDATION,
@@ -1587,9 +1589,11 @@ bool hlsl_emit_with_options_diagnostic(
   }
   HLSLEmitMode emit_mode = options ? options->mode
                                    : HLSL_EMIT_MODE_RECOMPILE;
-  if (emit_mode != HLSL_EMIT_MODE_RECOMPILE &&
-      emit_mode != HLSL_EMIT_MODE_READABLE &&
-      emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) {
+  if ((emit_mode != HLSL_EMIT_MODE_RECOMPILE &&
+       emit_mode != HLSL_EMIT_MODE_READABLE &&
+       emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) ||
+      (options && options->expression_source_map &&
+       emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_ARGUMENT,
                           HLSL_EMIT_PHASE_ARGUMENT_VALIDATION,
                           HLSL_EMIT_REASON_INVALID_MODE);
@@ -1644,6 +1648,7 @@ bool hlsl_emit_with_options_diagnostic(
       options ? options->reserved_preprocessor_identifiers : NULL;
   ctx.reserved_preprocessor_identifier_count =
       options ? options->reserved_preprocessor_identifier_count : 0;
+  ctx.expression_source_map = options ? options->expression_source_map : NULL;
   ctx.readable_screen_pos_helper = readable_screen_pos_helper;
   ctx.readable_screen_pos_mul_y_idx = -1;
   ctx.readable_screen_pos_mul_xzw_idx = -1;
@@ -1819,7 +1824,14 @@ bool hlsl_emit_with_options_diagnostic(
   }
 
   // 8. Return output struct
+  const size_t return_begin = sb->len;
   emit_return_block(&ctx);
+  if (ctx.expression_source_map && ctx.expression_source_map->count) {
+    HLSLExpressionOrigin* origin = &ctx.expression_source_map->origins[
+        ctx.expression_source_map->count - 1];
+    origin->source_begin = return_begin;
+    origin->source_end = sb->len;
+  }
   if (!sb_ok(sb)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                           HLSL_EMIT_PHASE_RETURN_EMISSION,
@@ -1829,6 +1841,13 @@ bool hlsl_emit_with_options_diagnostic(
 cleanup:
   if (sb_ok(sb) && emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
     hlsl_expression_identifiers_available(&ctx, source_start);
+  if (ctx.expression_source_map) {
+    ctx.expression_source_map->complete = sb_ok(sb);
+    if (sb_ok(sb) && !hlsl_expression_source_map_matches(ctx.expression_source_map, program, sb->buf))
+      hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_INTERNAL_INVARIANT,
+                     HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    if (!sb_ok(sb)) memset(ctx.expression_source_map, 0, sizeof(*ctx.expression_source_map));
+  }
   free_emitter_context(&ctx);
   bool success = sb_ok(sb);
   if (!success && diagnostic && diagnostic->status == HLSL_EMIT_STATUS_OK) {

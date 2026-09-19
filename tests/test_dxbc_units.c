@@ -5556,9 +5556,9 @@ static int verify_screen_position_is_readable_only(void) {
     program.instruction_count = 3;
     program.instruction_alloc = 3;
 
-    const HLSLEmitOptions recompile_options = {
-        HLSL_EMIT_MODE_RECOMPILE, "MustNeverAppearInRecompileMode", false,
-        NULL, 0};
+    const HLSLEmitOptions recompile_options = {.mode = HLSL_EMIT_MODE_RECOMPILE,
+                                               .readable_screen_pos_helper =
+                                                   "MustNeverAppearInRecompileMode"};
     StringBuilder recompile;
     sb_init(&recompile);
     CHECK(hlsl_emit_with_options(&program, &recompile, NULL, NULL, NULL,

@@ -240,6 +240,7 @@ typedef struct HLSLEmitterContext {
     /* Borrowed from HLSLEmitOptions for this emission only. */
     const char* const* reserved_preprocessor_identifiers;
     size_t reserved_preprocessor_identifier_count;
+    HLSLExpressionSourceMap *expression_source_map;
     int current_instruction_index;
     bool is_formatting_dest;
     int indent;
