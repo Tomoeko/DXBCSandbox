@@ -62,6 +62,8 @@ set(DXBC_SOURCES
     src/translation/hlsl_provenance.c
     src/translation/hlsl_use_def.c
     src/translation/hlsl_ssa.c
+    src/translation/hlsl_copy_lift.c
+    src/translation/hlsl_lift_transaction.c
     src/translation/hlsl_ast.c
     src/translation/hlsl_value_analysis.c
     src/translation/hlsl_storage_plan.c
@@ -202,4 +204,3 @@ if(DXBCSANDBOX_BUILD_GOLDEN_TARGET_TOOL)
     dxbc_enable_utf8_command_line(golden_target_cli)
     install(TARGETS golden_target_cli RUNTIME DESTINATION bin)
 endif()
-

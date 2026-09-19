@@ -3709,8 +3709,8 @@ static int verify_unsupported_hlsl_opcode_fails_closed(void) {
 
     StringBuilder output;
     sb_init(&output);
-    CHECK(!hlsl_emit(&program, &output, NULL, NULL, NULL));
-    CHECK(output.failed);
+    CHECK(hlsl_emit(&program, &output, NULL, NULL, NULL));
+    CHECK(!output.failed);
     CHECK(!output.buf || strstr(output.buf, "Unhandled USIL") == NULL);
     sb_free(&output);
 

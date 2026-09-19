@@ -686,6 +686,7 @@ static bool opcode_has_condition_test(USILOpcode opcode) {
 
 static bool hlsl_opcode_supported(USILOpcode opcode) {
   switch (opcode) {
+    case USIL_OP_NOP:
     case USIL_OP_ADD:
     case USIL_OP_SUB:
     case USIL_OP_MUL:
@@ -779,7 +780,6 @@ static bool hlsl_opcode_supported(USILOpcode opcode) {
     case USIL_OP_GEOMETRY_APPEND:
     case USIL_OP_GEOMETRY_RESTART_STRIP:
       return true;
-    case USIL_OP_NOP:
     default:
       return false;
   }

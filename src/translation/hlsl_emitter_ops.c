@@ -117,6 +117,9 @@ fail:
 }
 
 void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst) {
+    /* NOP also represents an elided instruction in a lifting transaction.
+     * Its original index remains available for provenance and diagnostics. */
+    if (inst->opcode == USIL_OP_NOP) return;
     const USILProgram* program = ctx->program;
     const SerializedProgramParameters* params = ctx->params;
     StringBuilder* sb = ctx->sb;

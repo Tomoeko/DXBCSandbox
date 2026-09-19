@@ -448,6 +448,11 @@ if(BUILD_TESTING)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_golden_baseline.cmake")
 
         if(DXBCSANDBOX_REGISTER_LIVE_UNITY_TESTS)
+            add_test(NAME unity_copy_lift_live
+                COMMAND unity_golden_verifier --self-test-lifts)
+            set_tests_properties(unity_copy_lift_live PROPERTIES
+                RUN_SERIAL TRUE
+                LABELS "live-unity")
             add_test(NAME unity_precision_collision_live
                 COMMAND unity_precision_collision_probe)
             set_tests_properties(unity_precision_collision_live PROPERTIES

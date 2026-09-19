@@ -431,6 +431,7 @@ bool usil_instruction_shape_valid(const USILProgram *program,
         instruction->operand_count != expected) {
         return false;
     }
+    if (instruction->opcode == USIL_OP_NOP && instruction->saturate) return false;
     /* The SM4/5 integer multi-output encodings have no saturate form. IMUL
      * permits two's-complement negate on its sources but not floating-point
      * absolute value; UDIV permits neither modifier. Reject synthetic USIL
@@ -472,4 +473,45 @@ bool usil_instruction_operand_use(const USILProgram *program,
         return false;
     }
     return operand_use_unchecked(program, instruction, operand_index, info);
+}
+
+bool usil_instruction_effects(const USILProgram *program,
+                               const USILInstruction *instruction,
+                               USILEffectFlags *out_effects) {
+    if (!out_effects) return false;
+    *out_effects = USIL_EFFECT_UNKNOWN;
+    if (!usil_instruction_shape_valid(program, instruction)) return false;
+    USILEffectFlags effects = USIL_EFFECT_NONE;
+    switch (instruction->opcode) {
+        case USIL_OP_DERIV_RTX: case USIL_OP_DERIV_RTY:
+        case USIL_OP_DERIV_RTX_COARSE: case USIL_OP_DERIV_RTY_COARSE:
+        case USIL_OP_DERIV_RTX_FINE: case USIL_OP_DERIV_RTY_FINE:
+            effects = USIL_EFFECT_QUAD_CONTEXT; break;
+        case USIL_OP_SAMPLE: case USIL_OP_SAMPLE_B: case USIL_OP_SAMPLE_C:
+            effects = USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_QUAD_CONTEXT; break;
+        case USIL_OP_SAMPLE_L: case USIL_OP_SAMPLE_D: case USIL_OP_SAMPLE_C_LZ:
+        case USIL_OP_LD: case USIL_OP_LD_STRUCTURED: case USIL_OP_LD_MS:
+        case USIL_OP_LDMS: case USIL_OP_RESINFO: case USIL_OP_SAMPLEINFO:
+            effects = USIL_EFFECT_RESOURCE_READ; break;
+        case USIL_OP_IMM_ATOMIC_IADD:
+            effects = USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_EXTERNAL_WRITE; break;
+        case USIL_OP_GEOMETRY_APPEND: case USIL_OP_GEOMETRY_RESTART_STRIP:
+            effects = USIL_EFFECT_GEOMETRY_OUTPUT; break;
+        case USIL_OP_DISCARD:
+            effects = USIL_EFFECT_CONTROL | USIL_EFFECT_QUAD_CONTEXT; break;
+        case USIL_OP_IF: case USIL_OP_ELSE: case USIL_OP_ENDIF:
+        case USIL_OP_LOOP: case USIL_OP_ENDLOOP: case USIL_OP_SWITCH:
+        case USIL_OP_CASE: case USIL_OP_DEFAULT: case USIL_OP_ENDSWITCH:
+        case USIL_OP_BREAK: case USIL_OP_BREAKC: case USIL_OP_CONTINUE:
+        case USIL_OP_CONTINUEC: case USIL_OP_RET:
+            effects = USIL_EFFECT_CONTROL; break;
+        case USIL_OP_NOP: case USIL_OP_DP2: case USIL_OP_DP3: case USIL_OP_DP4:
+        case USIL_OP_IMUL: case USIL_OP_UDIV: case USIL_OP_SINCOS:
+            break;
+        default:
+            if (regular_componentwise_operand_count(instruction->opcode) < 0) return false;
+            break;
+    }
+    *out_effects = effects;
+    return true;
 }

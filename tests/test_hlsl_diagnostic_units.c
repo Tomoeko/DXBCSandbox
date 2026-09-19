@@ -200,12 +200,12 @@ static int verify_prefailed_output(void) {
   return 0;
 }
 
-static int verify_unsupported_opcode_instruction_context(void) {
+static int verify_invalid_opcode_instruction_context(void) {
   USILProgram program;
   USILInstruction instruction;
   DXBCSignatureElement output_signature;
   init_valid_program(&program, &instruction, &output_signature);
-  instruction.opcode = USIL_OP_NOP;
+  instruction.opcode = (USILOpcode)999;
   instruction.operand_count = 0;
 
   StringBuilder output;
@@ -214,12 +214,12 @@ static int verify_unsupported_opcode_instruction_context(void) {
   sb_init(&output);
   CHECK(!hlsl_emit_with_options_diagnostic(
       &program, &output, NULL, NULL, NULL, NULL, &first));
-  CHECK(first.status == HLSL_EMIT_STATUS_UNSUPPORTED);
+  CHECK(first.status == HLSL_EMIT_STATUS_INVALID_PROGRAM);
   CHECK(first.phase == HLSL_EMIT_PHASE_PROGRAM_VALIDATION);
-  CHECK(first.reason == HLSL_EMIT_REASON_UNSUPPORTED_OPCODE);
+  CHECK(first.reason == HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
   CHECK(first.instruction_index == 0);
   CHECK(first.source_instruction_index == 37u);
-  CHECK(first.opcode == USIL_OP_NOP);
+  CHECK(first.opcode == 999);
   CHECK(first.operand_index == -1);
   sb_free(&output);
 
@@ -432,7 +432,7 @@ int main(void) {
   CHECK(verify_invalid_mode_and_legacy_wrapper() == 0);
   CHECK(verify_reserved_identifier_option_shape() == 0);
   CHECK(verify_prefailed_output() == 0);
-  CHECK(verify_unsupported_opcode_instruction_context() == 0);
+  CHECK(verify_invalid_opcode_instruction_context() == 0);
   CHECK(verify_missing_resource_binding_context() == 0);
   CHECK(verify_conflicting_metadata_locations() == 0);
   CHECK(verify_success_leaves_ok_diagnostic() == 0);

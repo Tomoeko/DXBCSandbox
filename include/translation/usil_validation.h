@@ -21,6 +21,21 @@ typedef struct {
     uint8_t source_lane_mask;
 } USILOperandUseInfo;
 
+/* Conservative observable/context effects. NONE permits value-only local
+ * rewriting; it does not permit floating-point algebraic reassociation. */
+typedef enum {
+    USIL_EFFECT_NONE = 0,
+    USIL_EFFECT_CONTROL = 1u << 0,
+    USIL_EFFECT_RESOURCE_READ = 1u << 1,
+    USIL_EFFECT_EXTERNAL_WRITE = 1u << 2,
+    USIL_EFFECT_QUAD_CONTEXT = 1u << 3,
+    USIL_EFFECT_GEOMETRY_OUTPUT = 1u << 4,
+    USIL_EFFECT_UNKNOWN = 1u << 5
+} USILEffectFlags;
+bool usil_instruction_effects(const USILProgram *program,
+                               const USILInstruction *instruction,
+                               USILEffectFlags *out_effects);
+
 /* Resolve a logical source lane to x/y/z/w, or -1 for an invalid swizzle. */
 int usil_operand_source_component(const DXBCOperand *operand, int lane);
 
