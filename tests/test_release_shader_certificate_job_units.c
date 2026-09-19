@@ -1,4 +1,5 @@
 #include "app/release_shader_certificate_job.h"
+#include "app/shader_catalog_object.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -150,6 +151,7 @@ static bool test_collected_bundle_self_pair(void) {
     ShaderCatalogOptions options;
     shader_catalog_options_default(&options);
     options.schema_registry = &registry;
+    options.retain_source_snapshots = true;
     const char* inputs[] = {DXBC_TEST_SHADER_BUNDLE};
     CHECK(shader_catalog_build(inputs, 1U, &options, &catalog) ==
           SHADER_CATALOG_OK);
@@ -165,6 +167,60 @@ static bool test_collected_bundle_self_pair(void) {
         }
     }
     CHECK(selected != NULL);
+    ShaderObject decoded;
+    ShaderCatalogObjectReport decoded_report;
+    shader_object_init(&decoded);
+    CHECK(shader_catalog_decode_object(&catalog, selected, &registry, &decoded,
+                                        &decoded_report) == SHADER_CATALOG_OBJECT_OK);
+    CHECK(decoded.decoded && decoded.path_id == selected->path_id);
+    CHECK(decoded_report.source_matches == 1U);
+    uint8_t schema_digest[COMMON_SHA256_DIGEST_SIZE];
+    CHECK(typetree_schema_shape_digest(&decoded.schema, schema_digest));
+    CHECK(memcmp(schema_digest, decoded_report.schema_digest, sizeof(schema_digest)) == 0);
+    ShaderCatalogObjectReport original_report = decoded_report;
+    const void* original_schema_nodes = decoded.schema.nodes;
+    ShaderCatalogRecord copy = *selected;
+    CHECK(shader_catalog_decode_object(&catalog, &copy, &registry, &decoded,
+                                        &decoded_report) ==
+          SHADER_CATALOG_OBJECT_RECORD_NOT_OWNED);
+    CHECK(decoded.schema.nodes == original_schema_nodes);
+    ShaderCatalogRecord* mutable_record = &catalog.records[selected - catalog.records];
+    for (unsigned mutation = 0U; mutation < 8U; ++mutation) {
+        switch (mutation) {
+            case 0U: ++mutable_record->path_id; break;
+            case 1U: ++mutable_record->object_size; break;
+            case 2U: ++mutable_record->target_platform; break;
+            case 3U: ++mutable_record->member_index; break;
+            case 4U: mutable_record->serialized_digest[0] ^= 1U; break;
+            case 5U: mutable_record->serialized_digest_hex[0] ^= 1U; break;
+            case 6U: mutable_record->occurrence_digest_hex[0] ^= 1U; break;
+            case 7U: mutable_record->content_id[0] ^= 1U; break;
+        }
+        CHECK(shader_catalog_decode_object(&catalog, selected, &registry, &decoded,
+                                            &decoded_report) ==
+              SHADER_CATALOG_OBJECT_COORDINATE_MISMATCH);
+        CHECK(decoded.schema.nodes == original_schema_nodes);
+        const uint8_t zeros[COMMON_SHA256_DIGEST_SIZE] = {0};
+        CHECK(memcmp(decoded_report.payload_digest, zeros, sizeof(zeros)) == 0);
+        CHECK(memcmp(decoded_report.schema_digest, zeros, sizeof(zeros)) == 0);
+        *mutable_record = copy;
+    }
+    size_t retained_count = catalog.retained_source_snapshot_count;
+    catalog.retained_source_snapshot_count = 0U;
+    CHECK(shader_catalog_decode_object(&catalog, selected, &registry, &decoded,
+                                        &decoded_report) ==
+          SHADER_CATALOG_OBJECT_SOURCE_UNAVAILABLE);
+    CHECK(decoded.schema.nodes == original_schema_nodes);
+    catalog.retained_source_snapshot_count = retained_count;
+    /* An embedded schema remains authoritative without an external registry. */
+    CHECK(catalog.source_count == 1U && catalog.sources[0].type_tree_enabled);
+    CHECK(shader_catalog_decode_object(&catalog, selected, NULL, &decoded,
+                                        &decoded_report) == SHADER_CATALOG_OBJECT_OK);
+    CHECK(shader_catalog_decode_object(&catalog, selected, &registry, &decoded,
+                                        &decoded_report) == SHADER_CATALOG_OBJECT_OK);
+    CHECK(memcmp(decoded_report.payload_digest, original_report.payload_digest,
+                 sizeof(decoded_report.payload_digest)) == 0);
+    shader_object_dispose(&decoded);
     ReleaseShaderCertificatePair pair;
     memset(&pair, 0, sizeof(pair));
     pair.line_number = 2U;

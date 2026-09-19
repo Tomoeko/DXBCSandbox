@@ -332,6 +332,12 @@ if(BUILD_TESTING)
     target_link_libraries(test_compile_profile_units PRIVATE
         dxbc_compile_profile dxbc_build_options)
     add_test(NAME compile_profile_units COMMAND test_compile_profile_units)
+    add_executable(test_unity_player_profile_units tests/test_unity_player_profile_units.c)
+    target_link_libraries(test_unity_player_profile_units PRIVATE
+        dxbc_compile_profile dxbc_build_options)
+    target_compile_definitions(test_unity_player_profile_units PRIVATE
+        DXBC_TEST_PLAYER_PROFILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/player_profile/metadata.assets")
+    add_test(NAME unity_player_profile_units COMMAND test_unity_player_profile_units)
 
     if(DXBCSANDBOX_BUILD_UNITY_IMPORT_GATE)
         add_executable(test_unity_shader_import_gate_units

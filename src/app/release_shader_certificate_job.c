@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "app/release_shader_certificate_job.h"
+#include "app/shader_catalog_object.h"
 
 #include "common/file_io.h"
 #include "common/sha256.h"
@@ -507,104 +508,6 @@ static const ShaderCatalogRecord* find_occurrence(
 }
 
 typedef struct {
-    const ShaderCatalogRecord* record;
-    const TypeTreeSchemaRegistry* registry;
-    ShaderObject* output;
-    TypeTreeSchemaStatus schema_status;
-    ShaderObjectStatus object_status;
-    size_t source_matches;
-} DecodeVisitorContext;
-
-static bool serialized_source_matches_record(
-    const UnitySerializedSource* source, const ShaderCatalogRecord* record,
-    const uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
-    if (strcmp(source->outer_path, record->outer_path) != 0 ||
-        source->member_index != record->member_index ||
-        source->is_bundle_member != record->is_bundle_member ||
-        memcmp(digest, record->serialized_digest,
-               COMMON_SHA256_DIGEST_SIZE) != 0) {
-        return false;
-    }
-    if (!source->member_name || !record->member_name) {
-        return source->member_name == record->member_name;
-    }
-    return strcmp(source->member_name, record->member_name) == 0;
-}
-
-static bool decode_source_visitor(const UnitySerializedSource* source,
-                                  void* opaque) {
-    DecodeVisitorContext* context = (DecodeVisitorContext*)opaque;
-    uint8_t digest[COMMON_SHA256_DIGEST_SIZE];
-    common_sha256(source->data, source->size, digest);
-    if (!serialized_source_matches_record(
-            source, context->record, digest)) {
-        return true;
-    }
-    ++context->source_matches;
-    if (context->source_matches != 1U) return true;
-
-    SerializedFile file;
-    if (!serialized_file_open_metadata(&file, source->data, source->size)) {
-        context->object_status = SHADER_OBJECT_INVALID_SOURCE_FILE;
-        return true;
-    }
-    context->schema_status = serialized_file_resolve_class_schema(
-        &file, 48, context->registry);
-    if (context->schema_status == TYPETREE_SCHEMA_OK) {
-        const AssetObjectInfo* asset = serialized_file_get_object(
-            &file, context->record->path_id);
-        if (!asset || asset->type_id != 48) {
-            context->object_status = SHADER_OBJECT_OBJECT_NOT_OWNED;
-        } else {
-            context->object_status = shader_object_decode(
-                context->output, &file, asset);
-        }
-    }
-    serialized_file_close(&file);
-    return true;
-}
-
-static UnityInputSnapshot* snapshot_for_path(
-    ShaderCatalog* catalog, const char* path) {
-    for (size_t index = 0U;
-         index < catalog->retained_source_snapshot_count; ++index) {
-        const char* snapshot_path = unity_input_snapshot_path(
-            &catalog->retained_source_snapshots[index]);
-        if (snapshot_path && strcmp(snapshot_path, path) == 0) {
-            return &catalog->retained_source_snapshots[index];
-        }
-    }
-    return NULL;
-}
-
-static bool decode_catalog_record(
-    ShaderCatalog* catalog, const ShaderCatalogRecord* record,
-    const TypeTreeSchemaRegistry* registry, ShaderObject* output,
-    TypeTreeSchemaStatus* schema_status,
-    ShaderObjectStatus* object_status) {
-    *schema_status = TYPETREE_SCHEMA_INVALID_ARGUMENT;
-    *object_status = SHADER_OBJECT_NOT_DECODED;
-    UnityInputSnapshot* snapshot = snapshot_for_path(
-        catalog, record->outer_path);
-    if (!snapshot) return false;
-    DecodeVisitorContext context;
-    memset(&context, 0, sizeof(context));
-    context.record = record;
-    context.registry = registry;
-    context.output = output;
-    context.schema_status = TYPETREE_SCHEMA_INVALID_ARGUMENT;
-    context.object_status = SHADER_OBJECT_NOT_DECODED;
-    UnityInputVisitStats stats;
-    UnityInputStatus visit_status = unity_input_snapshot_visit(
-        snapshot, decode_source_visitor, &context, &stats);
-    *schema_status = context.schema_status;
-    *object_status = context.object_status;
-    return visit_status == UNITY_INPUT_OK && context.source_matches == 1U &&
-        context.schema_status == TYPETREE_SCHEMA_OK &&
-        context.object_status == SHADER_OBJECT_OK;
-}
-
-typedef struct {
     const ReleaseShaderCertificateReferenceMap* map;
     uint8_t owner_sha256[2][COMMON_SHA256_DIGEST_SIZE];
 } ReferenceResolverContext;
@@ -806,14 +709,18 @@ ReleaseShaderCertificateCompareStatus release_shader_certificate_compare(
         ShaderObject actual_object;
         shader_object_init(&expected_object);
         shader_object_init(&actual_object);
-        bool expected_decoded = decode_catalog_record(
+        ShaderCatalogObjectReport expected_report;
+        ShaderCatalogObjectReport actual_report;
+        bool expected_decoded = shader_catalog_decode_object(
             &expected_catalog, expected, schema_registry, &expected_object,
-            &pair_result->expected_schema_status,
-            &pair_result->expected_decode_status);
-        bool actual_decoded = decode_catalog_record(
+            &expected_report) == SHADER_CATALOG_OBJECT_OK;
+        bool actual_decoded = shader_catalog_decode_object(
             &actual_catalog, actual, schema_registry, &actual_object,
-            &pair_result->actual_schema_status,
-            &pair_result->actual_decode_status);
+            &actual_report) == SHADER_CATALOG_OBJECT_OK;
+        pair_result->expected_schema_status = expected_report.schema_status;
+        pair_result->expected_decode_status = expected_report.object_status;
+        pair_result->actual_schema_status = actual_report.schema_status;
+        pair_result->actual_decode_status = actual_report.object_status;
         if (!expected_decoded || !actual_decoded) {
             pair_result->status =
                 RELEASE_SHADER_CERTIFICATE_PAIR_AUTHORITY_UNAVAILABLE;

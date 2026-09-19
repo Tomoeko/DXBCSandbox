@@ -4,6 +4,7 @@
 
 #include "app/shader_batch.h"
 #include "app/shader_catalog.h"
+#include "app/shader_catalog_object.h"
 #include "common/file_io.h"
 #include "io/typetree_schema_registry.h"
 #include "test_support/file_mutation.h"
@@ -511,6 +512,8 @@ int main(void) {
     TypeTreeSchemaRegistry registry;
     ShaderCatalog catalog;
     ShaderBatchResult batch;
+    ShaderObject decoded;
+    ShaderCatalogObjectReport decoded_report;
     bool* selected = NULL;
     char* emitted_path = NULL;
     char* compute_emitted_path = NULL;
@@ -537,6 +540,7 @@ int main(void) {
 
     typetree_schema_registry_init(&registry);
     shader_catalog_init(&catalog);
+    shader_object_init(&decoded);
     shader_batch_result_init(&batch);
     CHECK(current_directory_utf8(
               working_directory, sizeof(working_directory)));
@@ -741,8 +745,15 @@ int main(void) {
                  chosen_content_id) == 0);
     memset(selected, 0, catalog.record_count * sizeof(*selected));
     selected[stale_chosen] = true;
+    CHECK(shader_catalog_decode_object(&catalog, &catalog.records[stale_chosen],
+              &registry, &decoded, &decoded_report) == SHADER_CATALOG_OBJECT_OK);
+    const void* decoded_schema_nodes = decoded.schema.nodes;
     CHECK(test_replace_regular_file(
         stale_input, bundle_copy.data, bundle_copy.size));
+    CHECK(shader_catalog_decode_object(&catalog, &catalog.records[stale_chosen],
+              &registry, &decoded, &decoded_report) == SHADER_CATALOG_OBJECT_SOURCE_UNAVAILABLE);
+    CHECK(decoded.schema.nodes == decoded_schema_nodes);
+    shader_object_dispose(&decoded);
     stale_input_created = true;
     common_file_bytes_dispose(&bundle_copy);
 
@@ -1018,6 +1029,7 @@ int main(void) {
               &escaped_compute_artifact) == COMMON_FILE_NOT_FOUND);
 
 cleanup:
+    shader_object_dispose(&decoded);
     shader_batch_result_dispose(&batch);
     common_file_bytes_dispose(&bundle_copy);
     common_file_bytes_dispose(&escaped_compute_artifact);

@@ -5,6 +5,7 @@
 #endif
 
 #include "app/shader_catalog.h"
+#include "app/shader_catalog_internal.h"
 #include "app/shader_catalog_pptr.h"
 
 #include "common/common.h"
@@ -371,7 +372,7 @@ static void store_le64(uint8_t bytes[8], uint64_t value) {
     }
 }
 
-static void source_occurrence_digest(
+void shader_catalog_source_occurrence_digest(
     const UnitySerializedSource* source,
     const uint8_t serialized_digest[COMMON_SHA256_DIGEST_SIZE],
     uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
@@ -407,7 +408,7 @@ static bool initialize_source_identity(
            sizeof(record->serialized_digest));
     common_sha256_digest_to_hex(digest, record->serialized_digest_hex);
     uint8_t occurrence_digest[COMMON_SHA256_DIGEST_SIZE];
-    source_occurrence_digest(source, digest, occurrence_digest);
+    shader_catalog_source_occurrence_digest(source, digest, occurrence_digest);
     common_sha256_digest_to_hex(occurrence_digest,
                                 record->occurrence_digest_hex);
     int written = snprintf(record->occurrence_id,
@@ -640,7 +641,7 @@ static bool initialize_record_identity(
         return false;
     }
     uint8_t occurrence_digest[COMMON_SHA256_DIGEST_SIZE];
-    source_occurrence_digest(source, digest, occurrence_digest);
+    shader_catalog_source_occurrence_digest(source, digest, occurrence_digest);
     common_sha256_digest_to_hex(occurrence_digest,
                                 record->occurrence_digest_hex);
     written = snprintf(record->occurrence_id,
@@ -708,7 +709,7 @@ static bool initialize_material_record_identity(
         return false;
     }
     uint8_t occurrence_digest[COMMON_SHA256_DIGEST_SIZE];
-    source_occurrence_digest(source, digest, occurrence_digest);
+    shader_catalog_source_occurrence_digest(source, digest, occurrence_digest);
     common_sha256_digest_to_hex(occurrence_digest,
                                 record->occurrence_digest_hex);
     written = snprintf(record->occurrence_id,
@@ -1543,4 +1544,20 @@ const char* shader_catalog_schema_profile_name(
         case TYPETREE_SCHEMA_PROFILE_INVALID: return "known-invalid";
         default: return "unknown-enum";
     }
+}
+
+UnityInputSnapshot* shader_catalog_retained_snapshot(
+    const ShaderCatalog* catalog, const char* outer_path) {
+    if (!catalog || !outer_path) return NULL;
+    UnityInputSnapshot* result = NULL;
+    for (size_t index = 0U;
+         index < catalog->retained_source_snapshot_count; ++index) {
+        UnityInputSnapshot* snapshot = &catalog->retained_source_snapshots[index];
+        const char* path = unity_input_snapshot_path(snapshot);
+        if (path && strcmp(path, outer_path) == 0) {
+            if (result) return NULL;
+            result = snapshot;
+        }
+    }
+    return result;
 }

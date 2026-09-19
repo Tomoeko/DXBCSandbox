@@ -5,6 +5,7 @@
 #endif
 
 #include "app/shader_batch.h"
+#include "app/shader_catalog_internal.h"
 #include "app/shader_batch_internal.h"
 
 #include "common/output_publish.h"
@@ -944,21 +945,6 @@ static bool outer_path_was_visited(const ShaderCatalog* catalog,
     return false;
 }
 
-static UnityInputSnapshot* retained_snapshot_for_path(
-    const ShaderCatalog* catalog, const char* outer_path) {
-    if (!catalog || !outer_path) return NULL;
-    for (size_t i = 0U;
-         i < catalog->retained_source_snapshot_count; ++i) {
-        UnityInputSnapshot* snapshot =
-            &catalog->retained_source_snapshots[i];
-        const char* snapshot_path = unity_input_snapshot_path(snapshot);
-        if (snapshot_path && strcmp(snapshot_path, outer_path) == 0) {
-            return snapshot;
-        }
-    }
-    return NULL;
-}
-
 static void revoke_outer_path_results(
     const ShaderCatalog* catalog, const bool* selected,
     const char* outer_path, UnityInputStatus input_status,
@@ -1079,7 +1065,7 @@ ShaderBatchStatus shader_batch_extract_ex(
             continue;
         }
         UnityInputVisitStats stats;
-        UnityInputSnapshot* snapshot = retained_snapshot_for_path(
+        UnityInputSnapshot* snapshot = shader_catalog_retained_snapshot(
             catalog, catalog->records[i].outer_path);
         UnityInputStatus status;
         bool source_identity_close_deferred = false;

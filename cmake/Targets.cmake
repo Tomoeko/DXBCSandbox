@@ -23,6 +23,7 @@ set(IO_SOURCES
     src/io/shader_blob_archive.c
     src/io/serialized_glcore_target.c
     src/app/shader_catalog.c
+    src/app/shader_catalog_object.c
     src/app/shader_catalog_pptr.c
     src/app/shader_batch.c
     src/app/material_batch.c
@@ -169,7 +170,8 @@ endif()
 # start UnityShaderCompiler and is intentionally independent of the live
 # compiler support option.
 add_library(dxbc_compile_profile STATIC
-    src/compiler/unity_compile_profile.c)
+    src/compiler/unity_compile_profile.c
+    src/compiler/unity_player_profile.c)
 add_library(DXBCSandbox::compile_profile ALIAS dxbc_compile_profile)
 target_include_directories(dxbc_compile_profile
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
