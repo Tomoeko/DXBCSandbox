@@ -634,34 +634,28 @@ bool unity_compiler_broker_serialize_compile_request_with_authority(
     return result;
 }
 
-typedef struct {
-    UnityCompilerBroker* broker;
-    const char* snippet_src;
-    const char* shader_name;
-    int shader_type;
-    int platform;
-    uint64_t reqs;
-    char** keywords;
-    int keyword_count;
-    char** defines;
-    int define_count;
-} LegacyCompileContext;
-
-static uint8_t* execute_legacy_compile(void* opaque, size_t* out_size,
-                                       char** out_error) {
-    LegacyCompileContext* context = (LegacyCompileContext*)opaque;
-    UnityCompilerBroker* broker = context->broker;
+bool unity_compiler_broker_compile_response(
+    UnityCompilerBroker* broker, const char* snippet_src,
+    const char* shader_name, int shader_type, int platform, uint64_t reqs,
+    char** keywords, int keyword_count, char** defines, int define_count,
+    UnityCompilerBinaryResponse* out_response) {
+    if (!out_response) return false;
+    unity_compiler_binary_response_init(out_response);
+    if (!broker || !valid_array_shape(keywords, keyword_count) ||
+        !valid_array_shape(defines, define_count)) return false;
+    atomic_fetch_add_explicit(&broker->submitted_requests, 1,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&broker->compile_requests, 1,
+                              memory_order_relaxed);
+    /* Legacy requests lack the contract needed for canonical coalescing. */
     pthread_mutex_lock(&broker->protocol_mutex);
     atomic_fetch_add_explicit(&broker->executed_requests, 1,
                               memory_order_relaxed);
     const pid_t process_before = broker->channel.process_id;
-    uint8_t* result = unity_compiler_compile(
-        &broker->channel, context->snippet_src, context->shader_name,
-        context->shader_type, context->platform, context->reqs,
-        context->keywords, context->keyword_count, context->defines,
-        context->define_count, out_size, out_error);
-    finish_protocol_transaction_locked(
-        broker, process_before, context->snippet_src);
+    bool result = unity_compiler_compile_response(
+        &broker->channel, snippet_src, shader_name, shader_type, platform,
+        reqs, keywords, keyword_count, defines, define_count, out_response);
+    finish_protocol_transaction_locked(broker, process_before, snippet_src);
     pthread_mutex_unlock(&broker->protocol_mutex);
     return result;
 }
@@ -671,25 +665,21 @@ uint8_t* unity_compiler_broker_compile(
     const char* shader_name, int shader_type, int platform, uint64_t reqs,
     char** keywords, int keyword_count, char** defines, int define_count,
     size_t* out_size, char** out_error) {
-    if (out_size) *out_size = 0;
+    if (out_size) *out_size = 0U;
     if (out_error) *out_error = NULL;
-    if (!broker || !out_size ||
-        !valid_array_shape(keywords, keyword_count) ||
-        !valid_array_shape(defines, define_count)) {
+    if (!out_size) return NULL;
+    UnityCompilerBinaryResponse response;
+    if (!unity_compiler_broker_compile_response(
+            broker, snippet_src, shader_name, shader_type, platform, reqs,
+            keywords, keyword_count, defines, define_count, &response)) {
+        if (out_error) {
+            *out_error = strdup("Unity compiler transport or protocol failure");
+        }
+        unity_compiler_binary_response_free(&response);
         return NULL;
     }
-    atomic_fetch_add_explicit(&broker->submitted_requests, 1,
-                              memory_order_relaxed);
-    atomic_fetch_add_explicit(&broker->compile_requests, 1,
-                              memory_order_relaxed);
-    LegacyCompileContext context = {
-        broker, snippet_src, shader_name, shader_type, platform, reqs,
-        keywords, keyword_count, defines, define_count,
-    };
-    /* The legacy surface omits the preprocess contract required by the
-     * canonical compile transcript.  Executing it directly is safer than
-     * coalescing requests under another hand-maintained partial identity. */
-    return execute_legacy_compile(&context, out_size, out_error);
+    return unity_compiler_binary_response_take_clean_data(
+        &response, out_size, out_error);
 }
 
 char* unity_compiler_broker_preprocess_expanded(

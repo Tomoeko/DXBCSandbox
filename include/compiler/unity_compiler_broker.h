@@ -175,6 +175,14 @@ uint8_t* unity_compiler_broker_compile(
     char** keywords, int keyword_count, char** defines, int define_count,
     size_t* out_size, char** out_error);
 
+/* Same legacy authority as compile(), retaining rejection/cache availability
+ * and lossless diagnostics instead of collapsing all failures into NULL. */
+bool unity_compiler_broker_compile_response(
+    UnityCompilerBroker* broker, const char* snippet_src,
+    const char* shader_name, int shader_type, int platform, uint64_t reqs,
+    char** keywords, int keyword_count, char** defines, int define_count,
+    UnityCompilerBinaryResponse* out_response);
+
 char* unity_compiler_broker_preprocess_expanded(
     UnityCompilerBroker* broker, const char* snippet_src,
     const char* shader_name, int shader_type, int platform, uint64_t reqs,

@@ -2766,6 +2766,34 @@ int main(int argc, char** argv) {
           fixture_binary_size == sizeof("expanded fixture") - 1U);
     free(fixture_binary);
 
+    UnityCompilerBinaryResponse legacy_response;
+    CHECK(unity_compiler_compile_response(
+        &fixture_channel, "compile-error-record", "Fixture", 0, 4, 0U,
+        NULL, 0, NULL, 0, &legacy_response));
+    CHECK(legacy_response.status.availability == UNITY_COMPILER_RESPONSE_AVAILABLE);
+    CHECK(!legacy_response.status.compiler_success &&
+          legacy_response.status.diagnostic_count == 1U);
+    CHECK(strstr(legacy_response.status.diagnostics[0].message,
+                 "fixture compile error"));
+    unity_compiler_binary_response_free(&legacy_response);
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    CHECK(unity_compiler_compile_response(
+        &fixture_channel, "legacy-uncached-source", "Fixture", 0, 4, 0U,
+        NULL, 0, NULL, 0, &legacy_response));
+    CHECK(legacy_response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS);
+    CHECK(legacy_response.status.diagnostic_count == 0U);
+    unity_compiler_binary_response_free(&legacy_response);
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
+
+    unity_compiler_binary_response_init(&legacy_response);
+    legacy_response.status.compiler_success = true;
+    legacy_response.size = 10U; /* Invalid ownership must never yield dummy bytes. */
+    CHECK(!unity_compiler_binary_response_take_clean_data(
+        &legacy_response, &fixture_binary_size, &fixture_error));
+    CHECK(fixture_binary_size == 0U && fixture_error);
+    free(fixture_error);
+    fixture_error = NULL;
+
     fixture_binary = unity_compiler_compile(
         &fixture_channel, "compile-error-record", "Fixture", 0, 4, 0U,
         NULL, 0, NULL, 0, &fixture_binary_size, &fixture_error);

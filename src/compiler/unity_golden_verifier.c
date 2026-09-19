@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "common/file_io.h"
+#include "common/sha256.h"
 #include "common/string_builder.h"
 #include "compiler/unity_compiler_broker.h"
 #include "dxbc/dxbc_compare.h"
 #include "dxbc/dxbc_document.h"
 #include "dxbc/dxbc_parser.h"
 #include "dxbc/usbd.h"
+#include "translation/hlsl_emitter.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -136,6 +138,8 @@ typedef struct {
     const char* unity_contents;
     const char* case_name;
     bool self_test;
+    bool reconstruct;
+    const char* report_path;
 } CommandLine;
 
 static void set_error(char* error, size_t error_size, const char* format, ...) {
@@ -471,10 +475,6 @@ static char* path_join(const char* parent, const char* child) {
     return path;
 }
 
-static bool is_regular_path(const char* path) {
-    struct stat info;
-    return path && lstat(path, &info) == 0 && S_ISREG(info.st_mode);
-}
 
 static bool is_directory_path(const char* path) {
     struct stat info;
@@ -1436,10 +1436,129 @@ static bool append_case_path(const char* case_dir, const char* name,
     return *result != NULL;
 }
 
+/* This ledger measures fixture-controlled stage recompilation. It deliberately
+ * makes no claim about ShaderLab state, import, or a complete runtime domain.
+ * Identifiers and inputs are hashed: paths, source and compiler diagnostics
+ * can contain private corpus data and do not belong in this portable report. */
+typedef struct {
+    const char* decode;
+    const char* emission;
+    const char* compilation;
+    const char* comparison;
+    const char* reason;
+    char source_sha256[65];
+    char output_sha256[65];
+} RecordResult;
+
+static void hash_hex(const void* data, size_t size, char result[65]) {
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE];
+    common_sha256(data, size, digest);
+    common_sha256_digest_to_hex(digest, result);
+}
+
+static RecordResult record_result_init(bool reconstruct) {
+    RecordResult result = {
+        .decode = reconstruct ? "not_run" : "not_requested",
+        .emission = reconstruct ? "not_run" : "not_requested",
+        .compilation = "not_run", .comparison = "not_run",
+        .reason = "case_setup_failed",
+    };
+    return result;
+}
+
+static void report_record(FILE* report, const char* case_name, size_t index,
+                           const GoldenRecord* record,
+                           const RecordResult* result) {
+    if (!report) return;
+    char case_hash[65], record_hash[65], target_hash[65];
+    hash_hex(case_name, strlen(case_name), case_hash);
+    hash_hex(record->name, strlen(record->name), record_hash);
+    hash_hex(record->bytecode, record->bytecode_size, target_hash);
+    fprintf(report,
+            "{\"event\":\"record\",\"case_sha256\":\"%s\","
+            "\"index\":%zu,\"record_name_sha256\":\"%s\","
+            "\"target_sha256\":\"%s\",\"target_size\":%zu,"
+            "\"decode\":\"%s\",\"emission\":\"%s\","
+            "\"compilation\":\"%s\",\"comparison\":\"%s\","
+            "\"reason\":\"%s\",\"source_sha256\":\"%s\","
+            "\"output_sha256\":\"%s\"}\n",
+            case_hash, index, record_hash, target_hash, record->bytecode_size,
+            result->decode, result->emission, result->compilation,
+            result->comparison, result->reason, result->source_sha256,
+            result->output_sha256);
+}
+
+static char* reconstruct_stage_source(const GoldenRecord* record,
+                                      const GoldenStage* stage,
+                                      RecordResult* result) {
+    DXBCDocument document;
+    DXBCStageContract contract;
+    DXBCContainer semantic = {0};
+    USILProgram program = {0};
+    StringBuilder source;
+    DXBCDocumentDiagnostic document_diagnostic;
+    DXBCStageContractDiagnostic contract_diagnostic;
+    HLSLEmitDiagnostic emission_diagnostic;
+    char* output = NULL;
+    dxbc_document_init(&document);
+    dxbc_stage_contract_init(&contract);
+    sb_init(&source);
+    result->decode = "fail";
+    result->reason = "document_decode_failed";
+    if (!dxbc_document_parse(&document, record->bytecode,
+                              record->bytecode_size, &document_diagnostic)) {
+        goto cleanup;
+    }
+    result->reason = "semantic_decode_failed";
+    if (!dxbc_document_decode_semantic(&document, &semantic)) goto cleanup;
+    result->reason = "stage_contract_failed";
+    if (!dxbc_stage_contract_decode(&document, &semantic, &contract,
+                                    &contract_diagnostic)) goto cleanup;
+    result->reason = "usil_projection_failed";
+    if (!usil_translate_with_stage_contract(&program, &semantic, &contract)) {
+        goto cleanup;
+    }
+    result->decode = "pass";
+    result->emission = "fail";
+    /* Raw fixture containers lack serialized Unity parameter names. Generic
+     * register declarations intentionally retain that missing information. */
+    if (!hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL,
+                                            NULL, NULL,
+                                            &emission_diagnostic)) {
+        result->reason = hlsl_emit_reason_name(emission_diagnostic.reason);
+        goto cleanup;
+    }
+    /* Unity validates that a graphics snippet declares both entry stages,
+     * even when this request compiles just one stage. The opposite declaration
+     * is an uncompiled harness entry, not a reconstructed ShaderLab pass. */
+    StringBuilder harness;
+    sb_init(&harness);
+    sb_append(&harness, "#pragma vertex main\n#pragma fragment main\n");
+    if (stage->id > 1) {
+        sb_appendf(&harness, "#pragma %s main\n", stage->pragma_name);
+    }
+    sb_append(&harness, source.buf);
+    if (sb_ok(&harness)) output = build_stage_source(harness.buf, stage);
+    sb_free(&harness);
+    result->reason = output ? "emitted" : "source_allocation_failed";
+    if (output) result->emission = "pass";
+cleanup:
+    sb_free(&source);
+    usil_free(&program);
+    dxbc_free(&semantic);
+    dxbc_stage_contract_free(&contract);
+    dxbc_document_free(&document);
+    return output;
+}
+
 static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
-                        const char* case_name, bool* assembly_only_match) {
+                        const char* case_name, bool reconstruct, FILE* report,
+                        bool* assembly_only_match) {
     if (assembly_only_match) *assembly_only_match = false;
     bool ok = false;
+    size_t reported_records = 0U;
+    bool domain_valid = false;
+    bool target_domain_available = false;
     char error[512] = {0};
     char* case_dir = path_join(golden_dir, case_name);
     char* flags_path = NULL;
@@ -1468,20 +1587,6 @@ static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
         set_error(error, sizeof(error), "could not allocate case paths");
         goto cleanup;
     }
-    if (!read_text_file(flags_path, GOLDEN_MAX_FLAGS_SIZE, &flags_text,
-                        &flags_size, error, sizeof(error)) ||
-        !parse_golden_flags(flags_text, &flags, error, sizeof(error)) ||
-        !read_text_file(source_path, GOLDEN_MAX_SOURCE_SIZE, &source_text,
-                        &source_size, error, sizeof(error)) ||
-        !extract_programs(source_text, &programs, &had_blocks, error,
-                          sizeof(error)) ||
-        !build_compile_jobs(&flags, &programs, had_blocks, &jobs, error,
-                            sizeof(error))) {
-        goto cleanup;
-    }
-    (void)flags_size;
-    (void)source_size;
-
     CommonFileStatus target_status = common_file_read_regular(
         target_path, GOLDEN_MAX_BUNDLE_SIZE, &target_file);
     if (target_status != COMMON_FILE_OK) {
@@ -1494,6 +1599,19 @@ static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
         goto cleanup;
     }
 
+    target_domain_available = true;
+    if (!read_text_file(flags_path, GOLDEN_MAX_FLAGS_SIZE, &flags_text,
+                        &flags_size, error, sizeof(error)) ||
+        !parse_golden_flags(flags_text, &flags, error, sizeof(error)) ||
+        !read_text_file(source_path, GOLDEN_MAX_SOURCE_SIZE, &source_text,
+                        &source_size, error, sizeof(error)) ||
+        !extract_programs(source_text, &programs, &had_blocks, error,
+                          sizeof(error)) ||
+        !build_compile_jobs(&flags, &programs, had_blocks, &jobs, error,
+                            sizeof(error))) {
+        goto cleanup;
+    }
+
     if (jobs.count == 0U || target_bundle.count != jobs.count) {
         set_error(error, sizeof(error),
                   "stage count mismatch: source selects %zu, target has %zu",
@@ -1501,59 +1619,70 @@ static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
         goto cleanup;
     }
 
+    domain_valid = true;
     uint32_t target_address = UINT32_C(0x80000000);
     uint32_t generated_address = UINT32_C(0x80000000);
     bool exact_match = true;
+    bool all_compared = true;
+    bool all_disassembled = true;
     for (size_t index = 0U; index < jobs.count; ++index) {
         const CompileJob* job = &jobs.values[index];
         const GoldenStage* stage = job->stage;
         const GoldenRecord* target = &target_bundle.records[index];
+        RecordResult result = record_result_init(reconstruct);
+        char* stage_source = NULL;
+        uint8_t* compiled = NULL;
+        char* compile_error = NULL;
+        size_t compiled_size = 0U;
+        bool record_ok = false;
         int target_stage = dxbc_shader_stage(
             target->bytecode, target->bytecode_size);
+        result.reason = "record_domain_mismatch";
         if (strcmp(target->name, job->record_name) != 0 ||
             target_stage != stage->id) {
-            set_error(error, sizeof(error),
-                      "target record %zu is <%s> stage %d; expected <%s> "
-                      "stage %d",
-                      index, target->name, target_stage, job->record_name,
-                      stage->id);
-            goto cleanup;
+            domain_valid = false;
+            goto record_done;
         }
-
-        char* stage_source = build_stage_source(job->program, stage);
-        if (!stage_source) {
-            set_error(error, sizeof(error),
-                      "could not allocate %s stage source", stage->name);
-            goto cleanup;
-        }
-        size_t compiled_size = 0U;
-        char* compile_error = NULL;
-        uint8_t* compiled = unity_compiler_broker_compile(
+        stage_source = reconstruct
+            ? reconstruct_stage_source(target, stage, &result)
+            : build_stage_source(job->program, stage);
+        if (!stage_source) goto record_done;
+        hash_hex(stage_source, strlen(stage_source), result.source_sha256);
+        UnityCompilerBinaryResponse response;
+        bool response_available = unity_compiler_broker_compile_response(
             broker, stage_source, flags.shader_name, stage->id, 4,
             job->requirements, job->keywords, (int)job->keyword_count,
-            job->defines, (int)job->define_count, &compiled_size,
-            &compile_error);
-        free(stage_source);
-        if (!compiled) {
-            set_error(error, sizeof(error), "compile failed for %s: %s",
-                      stage->name,
-                      compile_error ? compile_error : "no diagnostic");
-            free(compile_error);
-            goto cleanup;
+            job->defines, (int)job->define_count, &response);
+        if (!response_available || response.status.availability ==
+                UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS) {
+            result.compilation = "unavailable";
+            result.reason = response_available ? "cache_only_miss"
+                                              : "compiler_or_protocol_unavailable";
+            unity_compiler_binary_response_free(&response);
+            goto record_done;
         }
-        free(compile_error);
-
+        result.compilation = unity_compiler_response_status_is_clean_success(
+            &response.status) ? "pass" : "fail";
+        result.reason = "compiler_rejected";
+        compiled = unity_compiler_binary_response_take_clean_data(
+            &response, &compiled_size, &compile_error);
+        if (!compiled) {
+            if (strcmp(result.compilation, "pass") == 0) {
+                result.compilation = "unavailable";
+                result.reason = "output_allocation_failed";
+            }
+            fprintf(stderr, "\n  compile failed for %s: %s\n", stage->name,
+                    compile_error ? compile_error : "no diagnostic");
+            goto record_done;
+        }
         DXBCContainerView compiled_view;
+        result.reason = "invalid_compiler_output";
         if (!dxbc_container_view_first(compiled, compiled_size,
                                        &compiled_view) ||
             !validate_raw_dxbc(compiled_view.data, compiled_view.size) ||
             dxbc_shader_stage(compiled_view.data, compiled_view.size) !=
-                stage->id) {
-            set_error(error, sizeof(error),
-                      "Unity returned invalid %s DXBC", stage->name);
-            free(compiled);
-            goto cleanup;
-        }
+                stage->id) goto record_done;
+        hash_hex(compiled_view.data, compiled_view.size, result.output_sha256);
         GoldenRecord generated = {
             .name = job->record_name,
             .bytecode = compiled_view.data,
@@ -1563,31 +1692,46 @@ static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
         DXBCCompareStatus compare_status = dxbc_compare_exact(
             target->bytecode, target->bytecode_size, generated.bytecode,
             generated.bytecode_size, &comparison);
-        bool disassembled = true;
-        if (compare_status != DXBC_COMPARE_EQUAL) {
+        result.comparison = compare_status == DXBC_COMPARE_EQUAL
+            ? "pass" : "fail";
+        result.reason = dxbc_compare_status_name(compare_status);
+        record_ok = compare_status == DXBC_COMPARE_EQUAL;
+        if (!record_ok) {
             report_exact_difference(job->record_name, &comparison);
-            if (!exact_match) {
+            if (target_disassembly.len) {
                 sb_append(&target_disassembly, "\n\n");
                 sb_append(&generated_disassembly, "\n\n");
             }
-            exact_match = false;
-            disassembled = append_disassembled_record(
-                               broker, target, stage->id,
-                               &target_disassembly, &target_address, error,
-                               sizeof(error)) &&
-                           append_disassembled_record(
-                               broker, &generated, stage->id,
-                               &generated_disassembly, &generated_address,
-                               error, sizeof(error));
+            if (!append_disassembled_record(
+                    broker, target, stage->id, &target_disassembly,
+                    &target_address, error, sizeof(error)) ||
+                !append_disassembled_record(
+                    broker, &generated, stage->id, &generated_disassembly,
+                    &generated_address, error, sizeof(error))) {
+                /* Comparison failure remains authoritative even if its
+                 * optional assembly diagnostic cannot be produced. */
+                all_disassembled = false;
+            }
         }
+record_done:
+        if (strcmp(result.comparison, "not_run") == 0) all_compared = false;
+        report_record(report, case_name, index, target, &result);
+        ++reported_records;
+        if (!record_ok) {
+            exact_match = false;
+            fprintf(stderr, "\n  record %zu: %s\n", index, result.reason);
+        }
+        free(compile_error);
         free(compiled);
-        if (!disassembled) goto cleanup;
+        free(stage_source);
     }
 
     if (exact_match) {
         ok = true;
         goto cleanup;
     }
+    if (!all_compared || !all_disassembled ||
+        !target_disassembly.len || !generated_disassembly.len) goto cleanup;
     if (!sb_ok(&target_disassembly) || !sb_ok(&generated_disassembly)) {
         set_error(error, sizeof(error),
                   "could not allocate complete disassembly");
@@ -1609,6 +1753,26 @@ static bool verify_case(UnityCompilerBroker* broker, const char* golden_dir,
     }
 
 cleanup:
+    for (size_t index = reported_records; index < target_bundle.count; ++index) {
+        RecordResult result = record_result_init(reconstruct);
+        report_record(report, case_name, index, &target_bundle.records[index],
+                      &result);
+    }
+    if (report) {
+        char case_hash[65], flags_hash[65] = "", source_hash[65] = "";
+        hash_hex(case_name, strlen(case_name), case_hash);
+        if (flags_text) hash_hex(flags_text, flags_size, flags_hash);
+        if (source_text) hash_hex(source_text, source_size, source_hash);
+        fprintf(report,
+                "{\"event\":\"case\",\"case_sha256\":\"%s\","
+                "\"target_records\":%zu,\"compile_jobs\":%zu,"
+                "\"target_domain_available\":%s,\"domain_valid\":%s,\"exact\":%s,"
+                "\"flags_sha256\":\"%s\",\"retained_source_sha256\":\"%s\"}\n",
+                case_hash, target_bundle.count, jobs.count,
+                target_domain_available ? "true" : "false",
+                domain_valid ? "true" : "false", ok ? "true" : "false",
+                flags_hash, source_hash);
+    }
     if (!ok) fprintf(stderr, "  %s\n", error[0] ? error : "verification failed");
     sb_free(&generated_disassembly);
     sb_free(&target_disassembly);
@@ -1650,18 +1814,11 @@ static bool discover_cases(const char* golden_dir, const char* only_case,
             continue;
         }
         char* case_dir = path_join(golden_dir, entry->d_name);
-        char* source = case_dir ? path_join(case_dir, "source.shader") : NULL;
-        char* target = case_dir ? path_join(case_dir, "target.bin") : NULL;
-        char* flags = case_dir ? path_join(case_dir, "flags.txt") : NULL;
-        bool complete = case_dir && source && target && flags &&
-                        is_directory_path(case_dir) &&
-                        is_regular_path(source) && is_regular_path(target) &&
-                        is_regular_path(flags);
-        free(flags);
-        free(target);
-        free(source);
+        bool is_case = case_dir && is_directory_path(case_dir);
         free(case_dir);
-        if (!complete) continue;
+        /* Every case directory belongs to the denominator, including one
+         * whose required inputs have all been removed. */
+        if (!is_case) continue;
         char* name = strdup(entry->d_name);
         if (!name || !string_list_append_owned(cases, name)) {
             free(name);
@@ -1716,7 +1873,13 @@ static void print_usage(const char* executable) {
     fprintf(stderr,
             "Usage: %s [--golden-dir DIR] [--project-root DIR] "
             "[--includes-dir DIR]\n"
-            "          [--unity-contents DIR] [--case NAME] [--self-test]\n",
+            "          [--unity-contents DIR] [--case NAME] [--self-test]\n"
+            "          [--reconstruct] [--report JSONL]\n"
+            "--reconstruct regenerates low-level HLSL from target containers;\n"
+            "raw fixtures lack Unity parameter/sampler metadata. Reports cover\n"
+            "fixture-controlled stages, not whole-shader certificates.\n"
+            "--report creates a new privacy-safe JSONL ledger; existing files\n"
+            "are never overwritten.\n",
             executable);
 }
 
@@ -1731,6 +1894,8 @@ static bool parse_command_line(int argc, char** argv, CommandLine* options) {
         const char* option = argv[index];
         if (strcmp(option, "--self-test") == 0) {
             options->self_test = true;
+        } else if (strcmp(option, "--reconstruct") == 0) {
+            options->reconstruct = true;
         } else if (strcmp(option, "--help") == 0 ||
                    strcmp(option, "-h") == 0) {
             print_usage(argv[0]);
@@ -1746,6 +1911,8 @@ static bool parse_command_line(int argc, char** argv, CommandLine* options) {
                 options->includes_dir = value;
             } else if (strcmp(option, "--unity-contents") == 0) {
                 options->unity_contents = value;
+            } else if (strcmp(option, "--report") == 0) {
+                options->report_path = value;
             } else if (strcmp(option, "--case") == 0) {
                 options->case_name = value;
             } else {
@@ -1777,6 +1944,7 @@ static bool run_self_test(void) {
     CommonFileBytes fixture = {0};
     GoldenBundle bundle = {0};
     uint8_t* trailing = NULL;
+    char* reconstructed = NULL;
 
     SELF_CHECK(parse_golden_flags(
         "-stage vertex -shader-name 'Name With Spaces' -reqs 42 "
@@ -1888,6 +2056,23 @@ static bool run_self_test(void) {
                                  bundle.records[0].bytecode_size) == 0);
     SELF_CHECK(dxbc_shader_stage(bundle.records[1].bytecode,
                                  bundle.records[1].bytecode_size) == 1);
+    RecordResult reconstructed_result = record_result_init(true);
+    reconstructed = reconstruct_stage_source(
+        &bundle.records[0], &k_stages[0], &reconstructed_result);
+    SELF_CHECK(reconstructed && strcmp(reconstructed_result.decode, "pass") == 0 &&
+               strcmp(reconstructed_result.emission, "pass") == 0);
+    SELF_CHECK(strstr(reconstructed, "#pragma vertex main") &&
+               strstr(reconstructed, "#pragma fragment main"));
+    free(reconstructed);
+    reconstructed = NULL;
+    GoldenRecord invalid_record = bundle.records[0];
+    invalid_record.bytecode_size = 8U;
+    reconstructed_result = record_result_init(true);
+    reconstructed = reconstruct_stage_source(
+        &invalid_record, &k_stages[0], &reconstructed_result);
+    SELF_CHECK(!reconstructed && strcmp(reconstructed_result.decode, "fail") == 0 &&
+               strcmp(reconstructed_result.emission, "not_run") == 0 &&
+               strcmp(reconstructed_result.compilation, "not_run") == 0);
     golden_bundle_free(&bundle);
     trailing = (uint8_t*)malloc(fixture.size + 1U);
     SELF_CHECK(trailing != NULL);
@@ -1902,6 +2087,7 @@ static bool run_self_test(void) {
     succeeded = true;
 
 cleanup:
+    free(reconstructed);
     free(trailing);
     golden_bundle_free(&bundle);
     common_file_bytes_dispose(&fixture);
@@ -1944,6 +2130,34 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    FILE* report = options.report_path ? fopen(options.report_path, "wx") : NULL;
+    if (options.report_path && !report) {
+        fprintf(stderr, "golden verifier: cannot create report: %s\n",
+                strerror(errno));
+        unity_compiler_broker_destroy(broker);
+        string_list_free(&cases);
+        return 1;
+    }
+    if (report) {
+        UnityCompilerToolchainProvenance provenance;
+        bool available = unity_compiler_broker_get_toolchain_provenance(
+            broker, &provenance);
+        char compiler_hash[65] = "", environment_hash[65] = "";
+        if (available) {
+            common_sha256_digest_to_hex(provenance.compiler_fingerprint,
+                                        compiler_hash);
+            common_sha256_digest_to_hex(provenance.environment_fingerprint,
+                                        environment_hash);
+        }
+        fprintf(report,
+                "{\"event\":\"run\",\"schema\":\"dxbc-golden-baseline-v1\","
+                "\"mode\":\"%s\",\"discovered_cases\":%zu,"
+                "\"authority\":\"legacy_fixture_controls\","
+                "\"whole_shader_certificate\":\"not_requested\","
+                "\"compiler_sha256\":\"%s\",\"environment_sha256\":\"%s\"}\n",
+                options.reconstruct ? "reconstruct" : "retained_source",
+                cases.count, compiler_hash, environment_hash);
+    }
     printf("Found %zu golden test cases. Reusing one compiler session.\n",
            cases.count);
     puts("============================================================");
@@ -1954,7 +2168,7 @@ int main(int argc, char** argv) {
         fflush(stdout);
         bool assembly_only_match = false;
         if (verify_case(broker, options.golden_dir, cases.values[index],
-                        &assembly_only_match)) {
+                        options.reconstruct, report, &assembly_only_match)) {
             puts(" [PASS]");
         } else {
             puts(assembly_only_match ? " [FAIL: ASSEMBLY-ONLY]" : " [FAIL]");
@@ -1975,6 +2189,16 @@ int main(int argc, char** argv) {
                 "observed %" PRIu64 "\n",
                 stats.compiler_process_starts);
         ++failures;
+    }
+    if (report) {
+        fprintf(report, "{\"event\":\"end\",\"cases\":%zu,\"failed_cases\":%zu}\n",
+                cases.count, failures);
+        bool report_failed = ferror(report) != 0;
+        if (fclose(report) != 0) report_failed = true;
+        if (report_failed) {
+            fprintf(stderr, "golden verifier: report write failed\n");
+            ++failures;
+        }
     }
     unity_compiler_broker_destroy(broker);
     string_list_free(&cases);

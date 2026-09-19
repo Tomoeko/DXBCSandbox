@@ -585,6 +585,19 @@ bool unity_compiler_compile_contract_response(
     const UnityCompilerSnippetCompileRequest* request,
     UnityCompilerBinaryResponse* out_response);
 
+/* Diagnostic-preserving compatibility request. The fixed legacy controls are
+ * retained; this does not supply an exact preprocess/variant contract. */
+bool unity_compiler_compile_response(
+    UnityCompilerChannel* channel, const char* snippet_src,
+    const char* shader_name, int shader_type, int platform, uint64_t reqs,
+    char** keywords, int keyword_count, char** defines, int define_count,
+    UnityCompilerBinaryResponse* out_response);
+
+/* Consume an initialized response, returning owned bytes only for clean
+ * success. Frees diagnostics and reflection on every path; sets outputs. */
+uint8_t* unity_compiler_binary_response_take_clean_data(
+    UnityCompilerBinaryResponse* response, size_t* out_size, char** out_error);
+
 /*
  * Returns the resolved toolchain and content fingerprints without starting
  * UnityShaderCompiler.  Resolution is controlled by, in descending priority:

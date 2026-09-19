@@ -3143,23 +3143,43 @@ static uint8_t* unity_compiler_compile_request_internal(
         }
         return NULL;
     }
+    return unity_compiler_binary_response_take_clean_data(
+        &response, out_size, out_error);
+}
+
+uint8_t* unity_compiler_binary_response_take_clean_data(
+    UnityCompilerBinaryResponse* response, size_t* out_size, char** out_error) {
+    if (out_size) *out_size = 0U;
+    if (out_error) *out_error = NULL;
+    if (!response) return NULL;
+    if (!out_size) {
+        unity_compiler_binary_response_free(response);
+        return NULL;
+    }
     if (!unity_compiler_response_status_is_clean_success(
-            &response.status)) {
+            &response->status)) {
         if (out_error) {
             *out_error = unity_compiler_response_status_format(
-                &response.status,
-                response.status.compiler_success
+                &response->status,
+                response->status.compiler_success
                     ? "Unity compiler returned diagnostics"
                     : "Unknown compiler error");
         }
-        unity_compiler_binary_response_free(&response);
+        unity_compiler_binary_response_free(response);
         return NULL;
     }
-    uint8_t* data = response.data;
-    size_t size = response.size;
-    response.data = NULL;
-    response.size = 0U;
-    unity_compiler_binary_response_free(&response);
+    if (response->size != 0U && !response->data) {
+        if (out_error) {
+            *out_error = strdup("Unity compiler response has no payload");
+        }
+        unity_compiler_binary_response_free(response);
+        return NULL;
+    }
+    uint8_t* data = response->data;
+    size_t size = response->size;
+    response->data = NULL;
+    response->size = 0U;
+    unity_compiler_binary_response_free(response);
     if (!data) {
         data = (uint8_t*)malloc(1U);
         if (!data) return NULL;
@@ -3458,26 +3478,16 @@ bool unity_compiler_compile_contract_response(
         channel, &wire_request, out_response);
 }
 
-uint8_t* unity_compiler_compile(
-    UnityCompilerChannel* channel,
-    const char* snippet_src,
-    const char* shader_name,
-    int shader_type,
-    int platform,
-    uint64_t reqs,
-    char** keywords,
-    int keyword_count,
-    char** defines,
-    int define_count,
-    size_t* out_size,
-    char** out_error) {
-    if (out_size) *out_size = 0;
-    if (out_error) *out_error = NULL;
-    if (!shader_name) {
-        return NULL;
-    }
+bool unity_compiler_compile_response(
+    UnityCompilerChannel* channel, const char* snippet_src,
+    const char* shader_name, int shader_type, int platform, uint64_t reqs,
+    char** keywords, int keyword_count, char** defines, int define_count,
+    UnityCompilerBinaryResponse* out_response) {
+    if (!out_response) return false;
+    unity_compiler_binary_response_init(out_response);
+    if (!shader_name) return false;
     char* legacy_source_directory = get_shader_file_path(shader_name);
-    if (!legacy_source_directory) return NULL;
+    if (!legacy_source_directory) return false;
     UnityCompilerCompileRequest request = {
         .command = "compileSnippet",
         .toolchain_configuration = UNITY_TOOLCHAIN_CONFIGURATION,
@@ -3506,10 +3516,32 @@ uint8_t* unity_compiler_compile(
         .program_start = 0,
         .snippet_contract = NULL,
     };
-    uint8_t* result = unity_compiler_compile_request_internal(
-        channel, &request, out_size, out_error);
+    bool result = unity_compiler_compile_request_response_internal(
+        channel, &request, out_response);
     free(legacy_source_directory);
     return result;
+}
+
+uint8_t* unity_compiler_compile(
+    UnityCompilerChannel* channel, const char* snippet_src,
+    const char* shader_name, int shader_type, int platform, uint64_t reqs,
+    char** keywords, int keyword_count, char** defines, int define_count,
+    size_t* out_size, char** out_error) {
+    if (out_size) *out_size = 0U;
+    if (out_error) *out_error = NULL;
+    if (!out_size) return NULL;
+    UnityCompilerBinaryResponse response;
+    if (!unity_compiler_compile_response(
+            channel, snippet_src, shader_name, shader_type, platform, reqs,
+            keywords, keyword_count, defines, define_count, &response)) {
+        if (out_error) {
+            *out_error = strdup("Unity compiler transport or protocol failure");
+        }
+        unity_compiler_binary_response_free(&response);
+        return NULL;
+    }
+    return unity_compiler_binary_response_take_clean_data(
+        &response, out_size, out_error);
 }
 
 uint64_t unity_compiler_variant_requirements(

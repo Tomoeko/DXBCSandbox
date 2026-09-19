@@ -438,6 +438,12 @@ if(BUILD_TESTING)
         # normalizer without discovering or launching UnityShaderCompiler.
         add_test(NAME unity_golden_verifier_units COMMAND
             unity_golden_verifier --self-test)
+        add_test(NAME unity_golden_baseline_accounting COMMAND
+            "${CMAKE_COMMAND}"
+            "-DVERIFIER=$<TARGET_FILE:unity_golden_verifier>"
+            "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/unlit_color"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_golden_baseline.cmake")
 
         if(DXBCSANDBOX_REGISTER_LIVE_UNITY_TESTS)
             add_test(NAME unity_precision_collision_live

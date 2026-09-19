@@ -665,6 +665,20 @@ static bool verify_oversized_source_live_process_lifecycle(
         broker, &authority));
     CHECK(authority.status ==
           UNITY_COMPILER_VALID_APIS_AUTHORITY_MATCHED);
+    UnityCompilerBinaryResponse response;
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    CHECK(unity_compiler_broker_compile_response(
+        broker, "new-uncached-request", "Fixture", 0, 4, 0U,
+        NULL, 0, NULL, 0, &response));
+    CHECK(response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS);
+    CHECK(!unity_compiler_response_status_is_clean_success(&response.status));
+    unity_compiler_binary_response_free(&response);
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
+    CHECK(!unity_compiler_broker_compile_response(
+        broker, "invalid-array", "Fixture", 0, 4, 0U,
+        NULL, 1, NULL, 0, &response));
+    CHECK(response.data == NULL && response.status.diagnostic_count == 0U);
+    unity_compiler_binary_response_free(&response);
     unity_compiler_broker_destroy(broker);
 
     CHECK(unlink(glslang_path) == 0);
