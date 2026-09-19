@@ -989,18 +989,8 @@ static void detect_typed_integer_loop_bounds(HLSLEmitterContext *ctx) {
             continue;
         }
 
-        int loop_depth = 1;
-        int endloop_idx = -1;
-        for (int index = loop_idx + 3;
-             index < program->instruction_count; index++) {
-            const USILOpcode opcode = program->instructions[index].opcode;
-            if (opcode == USIL_OP_LOOP) {
-                loop_depth++;
-            } else if (opcode == USIL_OP_ENDLOOP && --loop_depth == 0) {
-                endloop_idx = index;
-                break;
-            }
-        }
+        const int endloop_idx =
+            ctx->cfg.instruction_flow ? ctx->cfg.instruction_flow[loop_idx].end : -1;
         const unsigned int predicate_mask = 1u << predicate_lane;
         if (endloop_idx < 0 ||
             (!compiler_temp_lane_is_never_read_after(

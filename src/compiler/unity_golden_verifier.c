@@ -2597,27 +2597,46 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     static const struct {
         const char *name;
         const char *body;
-        bool shared, partial, conditional;
+        bool shared, partial, conditional, loop;
     } fixtures[] = {
-        {"nested", "float4 product = value * value.wzyx; return product * value.zwxy;",
+        {"nested", "float4 product = value * value.wzyx; return product * value.zwxy;", false,
          false, false, false},
-        {"shared", "float4 product = value * value.yzwx; return product + product.zwxy;",
+        {"shared", "float4 product = value * value.yzwx; return product + product.zwxy;", true,
+         false, false, false},
+        {"partial", "float4 product = value * value.wzyx; return product + product.zwxy;", true,
          true, false, false},
-        {"partial", "float4 product = value * value.wzyx; return product + product.zwxy;",
-         true, true, false},
-        {"branch", "float4 result; [branch] if (asuint(flags.x)) result = value * value.yzwx; "
-         "else result = value * value.zwxy; return result * value;", true, false, true},
-        {"zero-branch", "float4 result = value; [branch] if (!asuint(flags.x)) "
-         "result = value * value.yzwx; return result * value;", true, false, true},
-        {"nested-branch", "float4 result; [branch] if (asuint(flags.x)) { "
+        {"branch",
+         "float4 result; [branch] if (asuint(flags.x)) result = value * value.yzwx; "
+         "else result = value * value.zwxy; return result * value;",
+         true, false, true, false},
+        {"zero-branch",
+         "float4 result = value; [branch] if (!asuint(flags.x)) "
+         "result = value * value.yzwx; return result * value;",
+         true, false, true, false},
+        {"nested-branch",
+         "float4 result; [branch] if (asuint(flags.x)) { "
          "[branch] if(asuint(flags.y)) result = value * value.yzwx; "
          "else result = value * value.wxyz; } else result = value * value.zwxy; "
-         "return result * value;", true, false, true}
-    };
+         "return result * value;",
+         true, false, true, false},
+        {"counted-loop",
+         "float4 result = value; [loop] for(uint i=0u;i<asuint(flags.x);++i) "
+         "result = result * value.yzwx; return result;",
+         true, false, false, true},
+        {"counted-loop-tail",
+         "float4 result = value; [loop] for(uint i=0u;i<asuint(flags.y);++i) "
+         "result = result * value.yzwx; return result * value;",
+         true, false, false, true},
+        {"counted-loop-two-values",
+         "float4 result = value, second = value.yzwx; "
+         "[loop] for(uint i=0u;i<asuint(flags.w);++i) { result = result * second; "
+         "second = second * value; } return result * second;",
+         true, false, false, true}};
     if (shape < 0 || (size_t)shape >= sizeof(fixtures) / sizeof(fixtures[0]))
         return false;
     const bool shared = fixtures[shape].shared, partial = fixtures[shape].partial;
-    const bool conditional = fixtures[shape].conditional;
+    const bool conditional = fixtures[shape].conditional, loop = fixtures[shape].loop;
+    const bool structured = conditional || loop;
     bool succeeded = false;
     USILProgram program = {0};
     uint8_t *bytes = NULL;
@@ -2628,10 +2647,9 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     StringBuilder seed;
     sb_init(&seed);
     sb_append(&seed, "#pragma vertex main\n#pragma fragment main\n");
-    sb_appendf(&seed, "float4 main(float4 value : %s%s) : %s {\n",
-               stage == 0 ? "POSITION" : "TEXCOORD0",
-               conditional ? ", float4 flags : TEXCOORD1" : "",
-               stage == 0 ? "SV_POSITION" : "SV_Target");
+    sb_appendf(
+        &seed, "float4 main(float4 value : %s%s) : %s {\n", stage == 0 ? "POSITION" : "TEXCOORD0",
+        structured ? ", float4 flags : TEXCOORD1" : "", stage == 0 ? "SV_POSITION" : "SV_Target");
     sb_append(&seed, fixtures[shape].body);
     sb_append(&seed, "\n}\n");
     SELF_CHECK(sb_ok(&seed));
@@ -2672,7 +2690,7 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
                    hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
         flags.shader_name = "ExpressionFixture";
     }
-    if (conditional) {
+    if (structured) {
         const char *baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
         fixture.corrupt_candidate = true;
         SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
@@ -2704,8 +2722,9 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     const char *accepted = hlsl_lift_transaction_artifact(transaction)->source;
     SELF_CHECK(!strstr(accepted, "float4 r") && !strstr(accepted, "u_xlat_temp"));
     SELF_CHECK(shared == (strstr(accepted, "const float4 dxbc_value_") != NULL));
-    if (conditional) {
-        SELF_CHECK(strstr(accepted, "float4 dxbc_merge_") && strstr(accepted, "[branch] if ("));
+    if (structured) {
+        SELF_CHECK(strstr(accepted, "float4 dxbc_merge_") &&
+                   strstr(accepted, loop ? "[loop] for (uint" : "[branch] if ("));
         char case_hash[65];
         hash_hex(seed.buf, seed.len, case_hash);
         report_lift(report, case_hash, 0, 0, &result, 2);
@@ -2781,7 +2800,7 @@ int main(int argc, char** argv) {
             run_live_lift_fixture(broker, 1, false, report) &&
             run_live_lift_fixture(broker, 0, true, report) &&
             run_live_lift_fixture(broker, 1, true, report);
-        for (int shape = 0; passed && shape < 6; ++shape)
+        for (int shape = 0; passed && shape < 9; ++shape)
             for (int stage = 0; passed && stage < 2; ++stage)
                 passed = run_live_expression_fixture(broker, stage, shape, report);
         if (report)

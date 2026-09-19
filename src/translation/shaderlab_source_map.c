@@ -84,6 +84,7 @@ bool shaderlab_expression_source_map_matches_source(const ShaderLabExpressionSou
             case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
             case HLSL_EXPRESSION_ORIGIN_RETURN:
             case HLSL_EXPRESSION_ORIGIN_CONTROL:
+            case HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL:
                 if (origin->source_begin >= origin->source_end || origin->source_end > source->len)
                     return false;
                 break;

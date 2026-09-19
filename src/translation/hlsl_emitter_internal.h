@@ -414,9 +414,10 @@ bool hlsl_volume_slice_sampling_lift_matches(const USILProgram* program);
 void emit_exact_structural_helpers(HLSLEmitterContext* ctx);
 void emit_instructions(HLSLEmitterContext* ctx);
 bool emit_high_level_expressions(HLSLEmitterContext* ctx);
-bool emit_high_level_conditionals(HLSLEmitterContext *ctx);
+bool emit_high_level_structured(HLSLEmitterContext *ctx);
 void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx);
 /* Shared closed float4 contracts and compiler inverse AST construction. */
+bool hlsl_lift_operand_is_plain(const DXBCOperand *value);
 bool hlsl_float4_program_supported(HLSLEmitterContext *ctx);
 bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int instruction);
 bool hlsl_float4_append_output(HLSLEmitterContext *ctx, const DXBCOperand *destination);

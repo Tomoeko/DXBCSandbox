@@ -62,7 +62,6 @@ bool hlsl_float4_program_supported(HLSLEmitterContext *ctx) {
         program->cbuffer_count || program->texture_count || program->sampler_count ||
         program->uav_count || program->icb_value_count || program->indexable_temp_count ||
         program->index_range_count || program->patch_constant_count || ctx->use_uint_temps ||
-        ctx->compiler_model.replacement_count ||
         (program->has_global_flags && program->global_flags != 1u))
         return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
     for (int kind = 0; kind < 2; ++kind) {
@@ -75,6 +74,11 @@ bool hlsl_float4_program_supported(HLSLEmitterContext *ctx) {
         }
     }
     return true;
+}
+
+bool hlsl_lift_operand_is_plain(const DXBCOperand *value) {
+    return value && !value->min_precision && !value->has_abs && !value->has_neg &&
+           !value->rel_op0 && !value->rel_op1 && !value->rel_op2 && !value->extended_token_count;
 }
 
 bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int index) {
@@ -93,8 +97,7 @@ bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int index) {
         return reject(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     for (int operand = 0; operand < inst->operand_count; ++operand) {
         const DXBCOperand *value = &inst->operands[operand];
-        if (value->min_precision || value->has_abs || value->has_neg || value->rel_op0 ||
-            value->rel_op1 || value->rel_op2 || value->extended_token_count)
+        if (!hlsl_lift_operand_is_plain(value))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         if (operand && value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_INPUT &&
             value->type != OPERAND_TYPE_IMMEDIATE32)
@@ -107,6 +110,8 @@ static bool validate_expressions(HLSLEmitterContext *ctx,
                                  unsigned uses[EXPRESSION_INSTRUCTION_LIMIT]) {
     if (!hlsl_float4_program_supported(ctx))
         return false;
+    if (ctx->compiler_model.replacement_count)
+        return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
     const USILProgram *program = ctx->program;
     bool written_outputs[HLSL_SM5_IO_REGISTER_COUNT] = {0};
     for (int index = 0; index < program->instruction_count; ++index) {
@@ -278,6 +283,16 @@ bool hlsl_float4_append_output(HLSLEmitterContext *ctx, const DXBCOperand *desti
     return formatted && sb_ok(ctx->sb);
 }
 
+static uint8_t instruction_destination_lanes(const USILProgram *program,
+                                             const USILInstruction *instruction) {
+    USILOperandUseInfo use;
+    if (instruction->operand_count < 1 ||
+        !usil_instruction_operand_use(program, instruction, 0, &use) ||
+        use.use != USIL_OPERAND_USE_DESTINATION)
+        return 0;
+    return usil_operand_destination_lane_mask(&instruction->operands[0]);
+}
+
 void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx) {
     HLSLExpressionSourceMap *map = ctx->expression_source_map;
     if (map) {
@@ -291,17 +306,17 @@ void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx) {
                 origin->kind = HLSL_EXPRESSION_ORIGIN_NOP;
             else if (inst->opcode == USIL_OP_RET)
                 origin->kind = HLSL_EXPRESSION_ORIGIN_RETURN;
-            else if (inst->opcode != USIL_OP_IF && inst->opcode != USIL_OP_ELSE &&
-                     inst->opcode != USIL_OP_ENDIF)
-                origin->destination_lanes = usil_operand_destination_lane_mask(&inst->operands[0]);
+            else
+                origin->destination_lanes = instruction_destination_lanes(ctx->program, inst);
         }
     }
 }
 
 bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
     for (int index = 0; index < ctx->program->instruction_count; ++index)
-        if (ctx->program->instructions[index].opcode == USIL_OP_IF)
-            return emit_high_level_conditionals(ctx);
+        if (ctx->program->instructions[index].opcode == USIL_OP_IF ||
+            ctx->program->instructions[index].opcode == USIL_OP_LOOP)
+            return emit_high_level_structured(ctx);
     unsigned uses[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     ASTExpr *pending[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     ASTExpr *roots[EXPRESSION_INSTRUCTION_LIMIT] = {0};
@@ -384,8 +399,7 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
             return false;
         const bool expression = inst->opcode == USIL_OP_MOV || inst->opcode == USIL_OP_ADD ||
                                 inst->opcode == USIL_OP_MUL;
-        const uint8_t lanes =
-            expression ? usil_operand_destination_lane_mask(&inst->operands[0]) : 0;
+        const uint8_t lanes = instruction_destination_lanes(program, inst);
         if (origin->destination_lanes != lanes)
             return false;
         switch (origin->kind) {
@@ -397,6 +411,16 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
             if (inst->opcode != USIL_OP_IF && inst->opcode != USIL_OP_ELSE &&
                 inst->opcode != USIL_OP_ENDIF)
                 return false;
+            break;
+        case HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL:
+            if (inst->opcode == USIL_OP_MOV || inst->opcode == USIL_OP_UGE ||
+                inst->opcode == USIL_OP_IADD) {
+                if (!lanes || (lanes & (lanes - 1)) || inst->operands[0].type != OPERAND_TYPE_TEMP)
+                    return false;
+            } else if (inst->opcode != USIL_OP_LOOP && inst->opcode != USIL_OP_BREAKC &&
+                       inst->opcode != USIL_OP_ENDLOOP) {
+                return false;
+            }
             break;
         case HLSL_EXPRESSION_ORIGIN_RETURN:
             if (inst->opcode != USIL_OP_RET || index + 1 != map->count)
@@ -435,6 +459,8 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
         return "return";
     case HLSL_EXPRESSION_ORIGIN_CONTROL:
         return "control";
+    case HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL:
+        return "loop-control";
     default:
         return "unmapped";
     }
@@ -442,5 +468,5 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
 
 bool hlsl_expression_origin_has_span(HLSLExpressionOriginKind kind) {
     return kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION || kind == HLSL_EXPRESSION_ORIGIN_RETURN ||
-           kind == HLSL_EXPRESSION_ORIGIN_CONTROL;
+           kind == HLSL_EXPRESSION_ORIGIN_CONTROL || kind == HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL;
 }

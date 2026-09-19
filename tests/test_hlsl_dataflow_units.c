@@ -1499,6 +1499,169 @@ static bool check_conditional_emission(void) {
     return true;
 }
 
+static bool check_counted_loop_emission(void) {
+    USILInstruction instructions[10] = {0};
+    instructions[0] = move(emission_reg(OPERAND_TYPE_TEMP, 0), emission_reg(OPERAND_TYPE_INPUT, 0));
+    instructions[1] = move(emission_reg(OPERAND_TYPE_TEMP, 1),
+                           (DXBCOperand){.type = OPERAND_TYPE_IMMEDIATE32, .imm_value_count = 1});
+    instructions[1].operands[0].destination_mask = 0x10;
+    instructions[2].opcode = USIL_OP_LOOP;
+    instructions[3] = (USILInstruction){.opcode = USIL_OP_UGE, .operand_count = 3};
+    instructions[3].operands[0] = emission_reg(OPERAND_TYPE_TEMP, 1);
+    instructions[3].operands[0].destination_mask = 0x20;
+    instructions[3].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 1);
+    instructions[3].operands[1].swizzle_mode = 2;
+    instructions[3].operands[2] = emission_reg(OPERAND_TYPE_INPUT, 1);
+    /* The UGE writes .y, so an identity source swizzle reads bound.y, not .x. */
+    instructions[4] = (USILInstruction){.opcode = USIL_OP_BREAKC,
+                                        .operand_count = 1,
+                                        .condition_test = DXBC_INSTRUCTION_TEST_NONZERO};
+    instructions[4].operands[0] = emission_reg(OPERAND_TYPE_TEMP, 1);
+    instructions[4].operands[0].swizzle_mode = 2;
+    instructions[4].operands[0].swizzle[0] = 1;
+    instructions[5] = (USILInstruction){.opcode = USIL_OP_MUL, .operand_count = 3};
+    instructions[5].operands[0] = instructions[5].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    instructions[5].operands[2] = emission_reg(OPERAND_TYPE_INPUT, 0);
+    for (int lane = 0; lane < 4; ++lane)
+        instructions[5].operands[2].swizzle[lane] = (uint8_t)((lane + 1) % 4);
+    instructions[6] = (USILInstruction){.opcode = USIL_OP_IADD, .operand_count = 3};
+    instructions[6].operands[0] = instructions[1].operands[0];
+    instructions[6].operands[1] = instructions[3].operands[1];
+    instructions[6].operands[2] =
+        (DXBCOperand){.type = OPERAND_TYPE_IMMEDIATE32, .imm_value_count = 1, .imm_values = {1}};
+    instructions[7].opcode = USIL_OP_ENDLOOP;
+    instructions[8] =
+        move(emission_reg(OPERAND_TYPE_OUTPUT, 0), emission_reg(OPERAND_TYPE_TEMP, 0));
+    instructions[9].opcode = USIL_OP_RET;
+    DXBCSignatureElement inputs[2] = {
+        {.semantic_name = "TEXCOORD", .component_type = 3, .mask = 15, .rw_mask = 15},
+        {.semantic_name = "TEXCOORD",
+         .semantic_index = 1,
+         .register_id = 1,
+         .component_type = 3,
+         .mask = 15,
+         .rw_mask = 2}};
+    DXBCSignatureElement output = {
+        .semantic_name = "SV_Target", .component_type = 3, .system_value = 64, .mask = 15};
+    USILProgram program = {.shader_type_model = "ps_5_0",
+                           .instructions = instructions,
+                           .instruction_count = 10,
+                           .instruction_alloc = 10,
+                           .temp_count = 2,
+                           .inputs = inputs,
+                           .input_count = 2,
+                           .input_alloc = 2,
+                           .outputs = &output,
+                           .output_count = 1,
+                           .output_alloc = 1,
+                           .has_stage_contract = true,
+                           .program_type = DXBC_PROGRAM_TYPE_PIXEL,
+                           .shader_model_major = 5};
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLExpressionSourceMap map;
+    options.expression_source_map = &map;
+    HLSLEmitDiagnostic diagnostic;
+    StringBuilder source;
+    sb_init(&source);
+    bool emitted = hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
+                                                     &diagnostic);
+    if (!emitted)
+        fprintf(stderr, "Loop emission: %s at instruction %d, phase %d\n",
+                hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index,
+                (int)diagnostic.phase);
+    CHECK(emitted);
+    CHECK(strstr(source.buf, "const uint dxbc_initial_i1 = 0u;"));
+    CHECK(strstr(source.buf, "float4 dxbc_merge_i3_r0 = dxbc_value_i0;"));
+    CHECK(strstr(source.buf, "[loop] for (uint dxbc_index_i2 = dxbc_initial_i1; dxbc_index_i2 < "
+                             "asuint((v1.y)); ++dxbc_index_i2)"));
+    CHECK(strstr(source.buf, "dxbc_merge_i3_r0 = dxbc_value_i5;"));
+    CHECK(!strstr(source.buf, "dxbc_merge_i3_r1") && !strstr(source.buf, "float4 r"));
+    CHECK(hlsl_expression_source_map_matches(&map, &program, source.buf));
+    CHECK(map.origins[1].kind == HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL &&
+          map.origins[1].destination_lanes == 1 && map.origins[3].destination_lanes == 2);
+    CHECK(map.origins[2].destination_lanes == 0 && map.origins[4].destination_lanes == 0);
+    CHECK(map.origins[2].source_begin == map.origins[3].source_begin &&
+          map.origins[3].source_end == map.origins[4].source_end &&
+          map.origins[4].source_begin == map.origins[6].source_begin);
+    sb_free(&source);
+    USILInstruction saved[10];
+    memcpy(saved, instructions, sizeof(saved));
+    for (int mutation = 0; mutation < 10; ++mutation) {
+        if (mutation == 0)
+            instructions[6].operands[2].imm_values[0] = 2;
+        if (mutation == 1)
+            instructions[3].opcode = USIL_OP_IGE;
+        if (mutation == 2)
+            instructions[4].condition_test = DXBC_INSTRUCTION_TEST_ZERO;
+        if (mutation == 3)
+            instructions[1] = (USILInstruction){.opcode = USIL_OP_NOP};
+        if (mutation == 4)
+            instructions[6].operands[1] = emission_reg(OPERAND_TYPE_INPUT, 0);
+        if (mutation == 5)
+            instructions[8].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 1);
+        if (mutation == 6)
+            instructions[5].precise_mask = 1;
+        if (mutation == 7)
+            instructions[5].operands[0].destination_mask = 0x70;
+        if (mutation == 8)
+            instructions[3].operands[2].min_precision = 1;
+        if (mutation == 9) {
+            instructions[5].opcode = USIL_OP_DERIV_RTX;
+            instructions[5].operand_count = 2;
+        }
+        sb_init(&source);
+        CHECK(!hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+        CHECK(!map.complete);
+        sb_free(&source);
+        memcpy(instructions, saved, sizeof(saved));
+    }
+    /* Every distinct lane packing must preserve the scalar counter, predicate,
+     * and the comparison's logical bound lane. Nonzero bit initializers remain
+     * candidates only: concrete acceptance still requires the baseline gate. */
+    for (int counter = 0; counter < 4; ++counter) {
+        for (int predicate = 0; predicate < 4; ++predicate) {
+            if (counter == predicate)
+                continue;
+            instructions[1].operands[0].destination_mask = 0x10u << counter;
+            instructions[3].operands[0].destination_mask = 0x10u << predicate;
+            instructions[3].operands[1].swizzle[0] = (uint8_t)counter;
+            instructions[4].operands[0].swizzle[0] = (uint8_t)predicate;
+            instructions[6].operands[0].destination_mask = 0x10u << counter;
+            instructions[6].operands[1].swizzle[0] = (uint8_t)counter;
+            inputs[1].rw_mask = (uint8_t)(1u << predicate);
+            for (int initial = 0; initial < 3; ++initial) {
+                instructions[1].operands[1].imm_values[0] =
+                    initial == 2 ? UINT32_MAX : (uint32_t)initial;
+                sb_init(&source);
+                CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+                CHECK(hlsl_expression_source_map_matches(&map, &program, source.buf));
+                char bound[24];
+                snprintf(bound, sizeof(bound), "asuint((v1.%c))", "xyzw"[predicate]);
+                CHECK(strstr(source.buf, bound));
+                CHECK(map.origins[1].destination_lanes == (1u << counter));
+                CHECK(map.origins[3].destination_lanes == (1u << predicate));
+                sb_free(&source);
+            }
+        }
+    }
+    memcpy(instructions, saved, sizeof(saved));
+    inputs[1].rw_mask = 2;
+    instructions[1].operands[1].imm_values[0] = UINT32_MAX;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strstr(source.buf, "dxbc_initial_i1 = 4294967295u;"));
+    sb_free(&source);
+    const char *reserved = "dxbc_index_i2";
+    options.reserved_preprocessor_identifiers = &reserved;
+    options.reserved_preprocessor_identifier_count = 1;
+    sb_init(&source);
+    CHECK(!hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
+                                             &diagnostic));
+    CHECK(diagnostic.reason == HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY && !map.complete);
+    sb_free(&source);
+    return true;
+}
+
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
@@ -1506,7 +1669,8 @@ int main(void) {
         !check_control_region_proofs() || !check_exhaustive_postdominance() ||
         !check_long_dominator_chain() || !check_copy_candidates() || !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
-        !check_expression_emission() || !check_conditional_emission())
+        !check_expression_emission() || !check_conditional_emission() ||
+        !check_counted_loop_emission())
         return 1;
     puts("HLSL dataflow contracts passed");
     return 0;

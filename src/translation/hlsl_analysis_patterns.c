@@ -499,20 +499,14 @@ void detect_loop_patterns(HLSLEmitterContext* ctx) {
             if (comparison_opcode && exact_break_operand) {
                 // Find loop counter register
                 const DXBCOperand *loop_counter = &next1->operands[1];
-                // Find matching ENDLOOP
-                int depth = 1;
-                int end_idx = -1;
-                for (int k = i + 3; k < program->instruction_count; k++) {
-                    if (program->instructions[k].opcode == USIL_OP_LOOP) depth++;
-                    else if (program->instructions[k].opcode == USIL_OP_ENDLOOP) {
-                        depth--;
-                        if (depth == 0) {
-                            end_idx = k;
-                            break;
-                        }
-                    }
-                }
-                if (end_idx == -1) continue;
+                /* The CFG owns structured-flow matching. Reusing its map
+                 * also keeps nested SWITCH/IF scopes under one authority. */
+                if (!ctx->cfg.instruction_flow ||
+                    ctx->cfg.instruction_count != program->instruction_count)
+                    continue;
+                int end_idx = ctx->cfg.instruction_flow[i].end;
+                if (end_idx <= i || end_idx >= program->instruction_count)
+                    continue;
 
                 // Search for a presentation-only increment lift.  Recompile
                 // mode leaves the decoded latch instruction in place; only
