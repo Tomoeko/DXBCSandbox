@@ -367,6 +367,160 @@ static bool check_flow_structure_validation(void) {
     return true;
 }
 
+static bool check_control_region_proofs(void) {
+    USILInstruction instructions[12] = {0};
+    const USILOpcode branch[] = {USIL_OP_IF, USIL_OP_NOP, USIL_OP_ELSE, USIL_OP_NOP,
+                                USIL_OP_ENDIF, USIL_OP_NOP, USIL_OP_RET};
+    for (size_t i = 0; i < sizeof(branch) / sizeof(branch[0]); ++i)
+        instructions[i].opcode = branch[i];
+    USILProgram program = {.instructions = instructions, .instruction_count = 7};
+    HLSLEmitterContext ctx = {.program = &program};
+    HLSLIfRegion region;
+    CHECK(build_control_flow_graph(&ctx) && compute_dominance(&ctx.cfg));
+    CHECK(ctx.cfg.instruction_count == 7);
+    CHECK(ctx.cfg.instruction_flow[0].end == 4);
+    CHECK(ctx.cfg.instruction_flow[0].alternate == 2);
+    CHECK(ctx.cfg.instruction_flow[1].parent == 0);
+    CHECK(ctx.cfg.instruction_flow[3].parent == 2);
+    CHECK(ctx.cfg.instruction_flow[4].jump_scope == 0);
+    CHECK(ctx.cfg.instruction_flow[5].parent == -1);
+    CHECK(hlsl_cfg_if_region(&ctx, 0, &region));
+    CHECK(region.header_block == ctx.cfg.instruction_block[0]);
+    CHECK(region.true_block == ctx.cfg.instruction_block[1]);
+    CHECK(region.false_block == ctx.cfg.instruction_block[3]);
+    CHECK(region.join_block == ctx.cfg.instruction_block[5]);
+    CHECK(region.else_instruction == 2 && region.end_instruction == 4);
+    CHECK(hlsl_cfg_must_reach(&ctx.cfg, region.header_block, region.join_block));
+    CHECK(hlsl_cfg_must_reach(&ctx.cfg, region.true_block, region.join_block));
+    CHECK(!hlsl_cfg_dominates(&ctx.cfg, region.true_block, region.join_block));
+    CHECK(!hlsl_cfg_must_reach(&ctx.cfg, region.header_block, region.true_block));
+    CHECK(!hlsl_cfg_if_region(&ctx, 1, &region));
+    CHECK(!hlsl_cfg_if_region(&ctx, -1, &region));
+    CHECK(!hlsl_cfg_if_region(&ctx, 0, NULL));
+    CHECK(!hlsl_cfg_must_reach(&ctx.cfg, -1, region.join_block));
+    CHECK(!hlsl_cfg_dominates(&ctx.cfg, 0, ctx.cfg.block_count));
+    free_control_flow_graph(&ctx);
+    CHECK(!ctx.cfg.instruction_flow && !ctx.cfg.instruction_count);
+
+    /* Missing ELSE has the header itself as one of the join's predecessors. */
+    instructions[2].opcode = USIL_OP_NOP;
+    CHECK(build_control_flow_graph(&ctx) && compute_dominance(&ctx.cfg));
+    CHECK(hlsl_cfg_if_region(&ctx, 0, &region));
+    CHECK(region.else_instruction == -1 && region.false_block == region.join_block);
+    free_control_flow_graph(&ctx);
+    instructions[2].opcode = USIL_OP_ELSE;
+
+    /* Both conditional termination and unconditional return defeat a merge
+     * proof. DISCARD still has a continuing edge for the reaching-value SSA. */
+    for (int conditional = 0; conditional < 2; ++conditional) {
+        instructions[1].opcode = conditional ? USIL_OP_DISCARD : USIL_OP_RET;
+        CHECK(build_control_flow_graph(&ctx) && compute_dominance(&ctx.cfg));
+        const HLSLBasicBlock *exit = &ctx.cfg.blocks[ctx.cfg.instruction_block[1]];
+        CHECK(exit->may_exit && exit->successor_count == conditional);
+        HLSLIfRegion unchanged = region;
+        CHECK(!hlsl_cfg_if_region(&ctx, 0, &region));
+        CHECK(memcmp(&unchanged, &region, sizeof(region)) == 0);
+        CHECK(!hlsl_cfg_must_reach(&ctx.cfg, ctx.cfg.instruction_block[0],
+                                 ctx.cfg.instruction_block[5]));
+        free_control_flow_graph(&ctx);
+    }
+
+    /* An exit-reachable loop may run forever. Post-dominance of only finite
+     * paths would incorrectly authorize lifting the outer IF to its join. */
+    const USILOpcode looping[] = {USIL_OP_IF, USIL_OP_LOOP, USIL_OP_BREAKC,
+                                 USIL_OP_ENDLOOP, USIL_OP_ELSE, USIL_OP_NOP,
+                                 USIL_OP_ENDIF, USIL_OP_RET};
+    for (size_t i = 0; i < sizeof(looping) / sizeof(looping[0]); ++i)
+        instructions[i].opcode = looping[i];
+    program.instruction_count = 8;
+    CHECK(build_control_flow_graph(&ctx) && compute_dominance(&ctx.cfg));
+    CHECK(!hlsl_cfg_if_region(&ctx, 0, &region));
+    CHECK(hlsl_cfg_dominates(&ctx.cfg, 0, ctx.cfg.instruction_block[7]));
+    CHECK(!hlsl_cfg_must_reach(&ctx.cfg, 0, ctx.cfg.instruction_block[7]));
+    CHECK(hlsl_cfg_must_reach(&ctx.cfg, ctx.cfg.instruction_block[1],
+                             ctx.cfg.instruction_block[2]));
+    free_control_flow_graph(&ctx);
+
+    instructions[2].opcode = USIL_OP_NOP; /* No loop exit: join still reachable via ELSE. */
+    CHECK(build_control_flow_graph(&ctx) && compute_dominance(&ctx.cfg));
+    CHECK(!hlsl_cfg_if_region(&ctx, 0, &region));
+    CHECK(!hlsl_cfg_must_reach(&ctx.cfg, 0, ctx.cfg.instruction_block[7]));
+    free_control_flow_graph(&ctx);
+
+    /* A conditional whose lexical join is outside the instruction stream has
+     * no material merge value to own. The CFG records program fallthrough. */
+    instructions[0].opcode = USIL_OP_IF;
+    instructions[1].opcode = USIL_OP_ENDIF;
+    program.instruction_count = 2;
+    CHECK(build_control_flow_graph(&ctx) && compute_dominance(&ctx.cfg));
+    CHECK(ctx.cfg.blocks[0].may_exit && ctx.cfg.blocks[1].may_exit);
+    CHECK(!hlsl_cfg_if_region(&ctx, 0, &region));
+    free_control_flow_graph(&ctx);
+
+    instructions[0].opcode = USIL_OP_RET;
+    instructions[1].opcode = USIL_OP_IF;
+    instructions[2].opcode = USIL_OP_ENDIF;
+    instructions[3].opcode = USIL_OP_RET;
+    program.instruction_count = 4;
+    CHECK(build_control_flow_graph(&ctx) && compute_dominance(&ctx.cfg));
+    CHECK(!hlsl_cfg_if_region(&ctx, 1, &region));
+    CHECK(!hlsl_cfg_must_reach(&ctx.cfg, 1, 1));
+    CHECK(!hlsl_cfg_dominates(&ctx.cfg, 1, 1));
+    free_control_flow_graph(&ctx);
+    return true;
+}
+
+/* Independent bounded-path oracle: a walk of N edges avoiding target in an
+ * N-node graph contains a cycle. Enumerating paths rather than reverse fixed
+ * points checks termination, self-edges, fan-out, and reconvergence together. */
+static bool all_short_paths_reach(const HLSLControlFlowGraph *cfg, int block, int target,
+                                  int length) {
+    if (block == target)
+        return true;
+    const HLSLBasicBlock *value = &cfg->blocks[block];
+    if (length == cfg->block_count || value->may_exit || !value->successor_count)
+        return false;
+    for (int edge = 0; edge < value->successor_count; ++edge)
+        if (!all_short_paths_reach(cfg, value->successors[edge], target, length + 1))
+            return false;
+    return true;
+}
+
+static bool check_exhaustive_postdominance(void) {
+    enum { N = 3, CHOICES = 1 << (N + 1), GRAPHS = CHOICES * CHOICES * CHOICES };
+    for (int graph = 0; graph < GRAPHS; ++graph) {
+        HLSLEmitterContext ctx = {0};
+        HLSLControlFlowGraph *cfg = &ctx.cfg;
+        cfg->block_count = N;
+        cfg->blocks = calloc(N, sizeof(*cfg->blocks));
+        cfg->successor_storage = calloc(N * N, sizeof(int));
+        cfg->predecessor_storage = calloc(N * N, sizeof(int));
+        CHECK(cfg->blocks && cfg->successor_storage && cfg->predecessor_storage);
+        for (int block = 0; block < N; ++block) {
+            cfg->blocks[block].successors = cfg->successor_storage + block * N;
+            cfg->blocks[block].predecessors = cfg->predecessor_storage + block * N;
+        }
+        for (int block = 0, choices = graph; block < N; ++block, choices /= CHOICES) {
+            const int mask = choices % CHOICES;
+            cfg->blocks[block].may_exit = (mask & (1 << N)) != 0;
+            for (int to = 0; to < N; ++to)
+                if (mask & (1 << to)) {
+                    cfg->blocks[block].successors[cfg->blocks[block].successor_count++] = to;
+                    cfg->blocks[to].predecessors[cfg->blocks[to].predecessor_count++] = block;
+                }
+        }
+        CHECK(compute_dominance(cfg));
+        for (int start = 0; start < N; ++start)
+            for (int target = 0; target < N; ++target) {
+                const bool expected = cfg->idom[start] >= 0 && cfg->idom[target] >= 0 &&
+                                      all_short_paths_reach(cfg, start, target, 0);
+                CHECK(hlsl_cfg_must_reach(cfg, start, target) == expected);
+            }
+        free_control_flow_graph(&ctx);
+    }
+    return true;
+}
+
 static bool check_long_dominator_chain(void) {
     /* Sequential diamonds keep source nesting shallow while producing a deep
      * dominator tree. Traversal must not depend on the C call-stack limit or
@@ -397,6 +551,8 @@ static bool check_long_dominator_chain(void) {
         CHECK(ctx.cfg.idom[block] >= 0);
     }
     CHECK(phis == BRANCHES);
+    CHECK(hlsl_cfg_must_reach(&ctx.cfg, 0, ctx.cfg.instruction_block[COUNT - 1]));
+    CHECK(!hlsl_cfg_must_reach(&ctx.cfg, ctx.cfg.block_count - 1, 0));
     dispose(&ctx);
     free(instructions);
     return true;
@@ -1193,6 +1349,7 @@ int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
         !check_switch_flow_and_scope() || !check_flow_structure_validation() ||
+        !check_control_region_proofs() || !check_exhaustive_postdominance() ||
         !check_long_dominator_chain() || !check_copy_candidates() || !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
         !check_expression_emission())

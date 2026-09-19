@@ -35,9 +35,13 @@ static bool is_boundary(USILOpcode opcode) {
  * instruction count without allocating a separate list for every block. */
 static bool add_successor(HLSLControlFlowGraph *cfg, int from, int instruction,
                           int instruction_count, size_t *edge_count) {
-    if (instruction == instruction_count)
+    if (from < 0 || from >= cfg->block_count)
+        return false;
+    if (instruction == instruction_count) {
+        cfg->blocks[from].may_exit = true;
         return true;
-    if (from < 0 || from >= cfg->block_count || instruction < 0 || instruction >= instruction_count)
+    }
+    if (instruction < 0 || instruction >= instruction_count)
         return false;
     int to = cfg->instruction_block[instruction];
     if (to < 0 || to >= cfg->block_count)
@@ -55,20 +59,10 @@ static bool add_successor(HLSLControlFlowGraph *cfg, int from, int instruction,
     return true;
 }
 
-typedef struct {
-    int end;
-    int alternate;
-    int parent;
-    int jump_scope;
-    int first_case;
-    int next_case;
-    bool has_default;
-} FlowStructure;
-
 /* Match once, preserving the nearest breakable scope independently from the
  * nearest loop. SWITCH inside LOOP must not turn its BREAK into a loop exit.
  * Shader Model 4/5 defines at most 64 nested flow-control constructs. */
-static bool match_flow_structure(const USILProgram *program, FlowStructure *flow) {
+static bool match_flow_structure(const USILProgram *program, HLSLInstructionFlow *flow) {
     enum { MAX_FLOW_DEPTH = 64 };
     int stack[MAX_FLOW_DEPTH];
     int last_case[MAX_FLOW_DEPTH];
@@ -143,13 +137,15 @@ bool build_control_flow_graph(HLSLEmitterContext *ctx) {
     if (count == 0)
         return true;
     if (!program->instructions || cfg->blocks || cfg->instruction_block || cfg->successor_storage ||
-        cfg->predecessor_storage ||
-        dxbc_size_multiply_overflows((size_t)count, sizeof(FlowStructure)) ||
+        cfg->predecessor_storage || cfg->instruction_flow ||
+        dxbc_size_multiply_overflows((size_t)count, sizeof(HLSLInstructionFlow)) ||
         dxbc_size_multiply_overflows((size_t)count, sizeof(HLSLBasicBlock)) ||
         dxbc_size_multiply_overflows((size_t)count, 3u * sizeof(int)))
         return false;
     bool *leader = calloc((size_t)count, sizeof(*leader));
-    FlowStructure *flow = calloc((size_t)count, sizeof(*flow));
+    HLSLInstructionFlow *flow = calloc((size_t)count, sizeof(*flow));
+    cfg->instruction_flow = flow;
+    cfg->instruction_count = count;
     cfg->instruction_block = malloc((size_t)count * sizeof(*cfg->instruction_block));
     cfg->successor_storage = malloc((size_t)count * 3u * sizeof(*cfg->successor_storage));
     cfg->blocks = calloc((size_t)count, sizeof(*cfg->blocks));
@@ -200,8 +196,10 @@ bool build_control_flow_graph(HLSLEmitterContext *ctx) {
         if (!add_successor(cfg, block, (target), count, &edge_count))                              \
             goto fail;                                                                             \
     } while (0)
-        if (opcode == USIL_OP_RET)
+        if (opcode == USIL_OP_RET) {
+            cfg->blocks[block].may_exit = true;
             continue;
+        }
         if (opcode == USIL_OP_SWITCH) {
             /* Keep the existing conservative single-path recognizer boundary,
              * even though SSA now receives every real dispatch edge. */
@@ -230,6 +228,7 @@ bool build_control_flow_graph(HLSLEmitterContext *ctx) {
                 cfg->blocks[block].has_ambiguous_flow = true;
             /* DISCARD's taken edge terminates; only fallthrough contributes
              * a reaching definition to a later instruction. */
+            cfg->blocks[block].may_exit = opcode == USIL_OP_DISCARD;
             EDGE(last + 1);
         }
 #undef EDGE
@@ -252,11 +251,9 @@ bool build_control_flow_graph(HLSLEmitterContext *ctx) {
         }
     }
     free(leader);
-    free(flow);
     return true;
 fail:
     free(leader);
-    free(flow);
     free_control_flow_graph(ctx);
     return false;
 }
@@ -285,6 +282,7 @@ void free_control_flow_graph(HLSLEmitterContext *ctx) {
     free(ctx->cfg.successor_storage);
     free(ctx->cfg.predecessor_storage);
     free(ctx->cfg.instruction_block);
+    free(ctx->cfg.instruction_flow);
     free(ctx->cfg.idom);
     if (ctx->cfg.df) {
         for (int i = 0; i < ctx->cfg.block_count; i++) {
@@ -453,4 +451,101 @@ bool analyze_block_nesting(HLSLEmitterContext *ctx) {
      * changes the active arm; it does not introduce another nested scope. */
     return ctx && ctx->cfg.block_count >= 0 &&
            (ctx->cfg.block_count == 0 || ctx->cfg.nesting != NULL);
+}
+
+bool hlsl_cfg_dominates(const HLSLControlFlowGraph *cfg, int dominator, int block) {
+    if (!cfg || !cfg->idom || dominator < 0 || dominator >= cfg->block_count || block < 0 ||
+        block >= cfg->block_count || cfg->idom[dominator] < 0 || cfg->idom[block] < 0)
+        return false;
+    for (int steps = 0; steps < cfg->block_count; ++steps) {
+        if (block == dominator)
+            return true;
+        int parent = cfg->idom[block];
+        if (parent < 0 || parent >= cfg->block_count || parent == block)
+            break;
+        block = parent;
+    }
+    return false;
+}
+
+bool hlsl_cfg_must_reach(const HLSLControlFlowGraph *cfg, int start, int target) {
+    if (!cfg || !cfg->blocks || !cfg->idom || start < 0 || start >= cfg->block_count ||
+        target < 0 || target >= cfg->block_count || cfg->idom[start] < 0 || cfg->idom[target] < 0 ||
+        dxbc_size_multiply_overflows((size_t)cfg->block_count, sizeof(int)))
+        return false;
+    if (start == target)
+        return true;
+    int *remaining = malloc((size_t)cfg->block_count * sizeof(*remaining));
+    int *queue = malloc((size_t)cfg->block_count * sizeof(*queue));
+    bool proven = false;
+    if (!remaining || !queue)
+        goto cleanup;
+    for (int block = 0; block < cfg->block_count; ++block)
+        remaining[block] = cfg->blocks[block].successor_count;
+
+    /* Least fixed point of "all successors are proven". Seeding only target
+     * is essential: an exit-reachable cycle is not a termination proof. Each
+     * block is queued once; reverse edges make the work linear in the graph. */
+    int head = 0, tail = 1;
+    queue[0] = target;
+    remaining[target] = 0;
+    while (head < tail) {
+        const HLSLBasicBlock *block = &cfg->blocks[queue[head++]];
+        for (int edge = 0; edge < block->predecessor_count; ++edge) {
+            const int predecessor = block->predecessors[edge];
+            if (predecessor < 0 || predecessor >= cfg->block_count)
+                goto cleanup;
+            if (cfg->idom[predecessor] < 0 || cfg->blocks[predecessor].may_exit ||
+                remaining[predecessor] <= 0)
+                continue;
+            if (--remaining[predecessor] == 0) {
+                if (predecessor == start) {
+                    proven = true;
+                    goto cleanup;
+                }
+                queue[tail++] = predecessor;
+            }
+        }
+    }
+cleanup:
+    free(remaining);
+    free(queue);
+    return proven;
+}
+
+bool hlsl_cfg_if_region(const HLSLEmitterContext *ctx, int instruction, HLSLIfRegion *region) {
+    if (!ctx || !ctx->program || !ctx->program->instructions || !region || instruction < 0 ||
+        instruction >= ctx->program->instruction_count ||
+        ctx->program->instructions[instruction].opcode != USIL_OP_IF)
+        return false;
+    const HLSLControlFlowGraph *cfg = &ctx->cfg;
+    if (!cfg->blocks || !cfg->instruction_flow || !cfg->instruction_block ||
+        cfg->instruction_count != ctx->program->instruction_count)
+        return false;
+    const HLSLInstructionFlow *flow = &cfg->instruction_flow[instruction];
+    if (flow->end <= instruction || flow->end >= cfg->instruction_count - 1)
+        return false;
+    HLSLIfRegion candidate = {
+        .header_block = cfg->instruction_block[instruction],
+        .true_block = cfg->instruction_block[instruction + 1],
+        .false_block =
+            cfg->instruction_block[(flow->alternate >= 0 ? flow->alternate : flow->end) + 1],
+        .join_block = cfg->instruction_block[flow->end + 1],
+        .else_instruction = flow->alternate,
+        .end_instruction = flow->end};
+    if (!hlsl_cfg_dominates(cfg, candidate.header_block, candidate.join_block) ||
+        !hlsl_cfg_must_reach(cfg, candidate.header_block, candidate.join_block))
+        return false;
+    for (int index = candidate.header_block + 1; index < candidate.join_block; ++index) {
+        const HLSLBasicBlock *block = &cfg->blocks[index];
+        if (!hlsl_cfg_dominates(cfg, candidate.header_block, index))
+            return false;
+        for (int edge = 0; edge < block->predecessor_count; ++edge) {
+            int predecessor = block->predecessors[edge];
+            if (predecessor < candidate.header_block || predecessor >= candidate.join_block)
+                return false;
+        }
+    }
+    *region = candidate;
+    return true;
 }
