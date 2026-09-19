@@ -432,7 +432,9 @@ bool unity_compiler_recycle_process(UnityCompilerChannel* channel);
  * graphics API selected later for compileSnippet. */
 typedef struct {
     const char* source;
-    const char* file_path;
+    /* Priority include search directory, passed verbatim to Unity. This is
+     * not a shader filename. Relative paths use the compiler working directory. */
+    const char* source_directory;
     const char* shader_name;
     bool surface_only;
     bool caching_preprocessor;

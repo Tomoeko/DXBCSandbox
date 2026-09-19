@@ -10,6 +10,21 @@
 #include <stdbool.h>
 #include <sys/stat.h>
 
+/* Retain the parent spelling of a nonempty POSIX source filename without
+ * resolving symlinks or '..'. The caller owns the result. */
+static inline char* test_source_directory(const char* source_path) {
+    if (!source_path || !source_path[0]) return NULL;
+    const char* separator = strrchr(source_path, '/');
+    if (!separator) return strdup(".");
+    size_t size = separator == source_path ? 1U : (size_t)(separator - source_path);
+    char* directory = malloc(size + 1U);
+    if (directory) {
+        memcpy(directory, source_path, size);
+        directory[size] = '\0';
+    }
+    return directory;
+}
+
 static inline bool find_repo_root_from_anchor(const char* anchor,
                                               char* out_path,
                                               size_t max_len) {

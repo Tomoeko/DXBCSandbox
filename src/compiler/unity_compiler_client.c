@@ -1365,17 +1365,12 @@ static bool get_toolchain_fingerprints(
     return true;
 }
 
-static char* request_search_root(const char* path, bool is_file) {
+static char* request_search_root(const char* path) {
     if (!path) return NULL;
     char* normalized = strdup(path);
     if (!normalized) return NULL;
     for (char* c = normalized; *c; ++c)
         if (*c == '\\') *c = '/';
-    if (is_file) {
-        char* separator = strrchr(normalized, '/');
-        if (!separator) normalized[0] = '\0';
-        else separator[separator == normalized ? 1 : 0] = '\0';
-    }
     if (normalized[0] == '/') return normalized;
     char* working_directory = getcwd(NULL, 0);
     if (!working_directory) {
@@ -1400,12 +1395,12 @@ static char* request_search_root(const char* path, bool is_file) {
 }
 
 static bool get_request_fingerprints(
-    UnityCompilerChannel* channel, const char* source_path, bool is_file,
+    UnityCompilerChannel* channel, const char* source_directory,
     uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE]) {
     if (!get_toolchain_fingerprints(channel, compiler_fingerprint, environment_fingerprint))
         return false;
-    char* root = request_search_root(source_path, is_file);
+    char* root = request_search_root(source_directory);
     if (!root) return false;
     if (channel->cache_source_lease) {
         const bool valid = usc_cache_toolchain_lease_validate(channel->cache_source_lease);
@@ -2416,37 +2411,23 @@ static bool contract_variant_programs_complete(
     return true;
 }
 
-static char* get_shader_file_path(const char* shader_name) {
-    static const char assets_prefix[] = "Assets/";
-    static const char packages_prefix[] = "Packages/";
-    static const char shader_suffix[] = ".shader";
+/* Compatibility calls carry a logical Shader name. Derive the historical
+ * Assets/Packages location, but pass only its parent as Unity's priority root. */
+static char* get_legacy_source_directory(const char* shader_name) {
     if (!shader_name) return NULL;
-
-    size_t shader_name_size = strlen(shader_name);
-    if (strncmp(shader_name, assets_prefix,
-                sizeof(assets_prefix) - 1U) == 0 ||
-        strncmp(shader_name, packages_prefix,
-                sizeof(packages_prefix) - 1U) == 0) {
-        if (shader_name_size == SIZE_MAX) return NULL;
-        char* path = (char*)malloc(shader_name_size + 1U);
-        if (!path) return NULL;
-        memcpy(path, shader_name, shader_name_size + 1U);
-        return path;
-    }
-
-    const size_t prefix_size = sizeof(assets_prefix) - 1U;
-    const size_t suffix_size = sizeof(shader_suffix) - 1U;
-    if (shader_name_size > SIZE_MAX - prefix_size - suffix_size - 1U) {
-        return NULL;
-    }
-    size_t path_size = prefix_size + shader_name_size + suffix_size;
-    char* path = (char*)malloc(path_size + 1U);
-    if (!path) return NULL;
-    memcpy(path, assets_prefix, prefix_size);
-    memcpy(path + prefix_size, shader_name, shader_name_size);
-    memcpy(path + prefix_size + shader_name_size, shader_suffix,
-           suffix_size + 1U);
-    return path;
+    const bool project_path = strncmp(shader_name, "Assets/", 7U) == 0 ||
+                              strncmp(shader_name, "Packages/", 9U) == 0;
+    const char* last = strrchr(shader_name, '/');
+    if (!last) return strdup("Assets");
+    const size_t prefix_size = project_path ? 0U : 7U;
+    const size_t parent_size = (size_t)(last - shader_name);
+    if (parent_size > SIZE_MAX - prefix_size - 1U) return NULL;
+    char* directory = malloc(prefix_size + parent_size + 1U);
+    if (!directory) return NULL;
+    if (prefix_size) memcpy(directory, "Assets/", prefix_size);
+    memcpy(directory + prefix_size, shader_name, parent_size);
+    directory[prefix_size + parent_size] = '\0';
+    return directory;
 }
 
 static bool preprocess_request_to_wire(
@@ -2456,7 +2437,7 @@ static bool preprocess_request_to_wire(
     char* include_paths[3],
     UnityCompilerPreprocessRequest* out_request) {
     if (!channel || !channel->configured || !input_request ||
-        !input_request->source || !input_request->file_path ||
+        !input_request->source || !input_request->source_directory ||
         !input_request->shader_name || !environment_fingerprint ||
         !include_paths || !out_request ||
         !valid_owned_string_array(input_request->keywords,
@@ -2470,7 +2451,7 @@ static bool preprocess_request_to_wire(
     UnityCompilerPreprocessRequest request = {
         .command = "preprocess",
         .source = input_request->source,
-        .file_path = input_request->file_path,
+        .source_directory = input_request->source_directory,
         .shader_name = input_request->shader_name,
         .surface_only = input_request->surface_only,
         .caching_preprocessor = input_request->caching_preprocessor,
@@ -2547,7 +2528,7 @@ bool unity_compiler_preprocess_contract_response(
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE];
     UnityCompilerPreprocessRequest request;
     if (!input_request ||
-        !get_request_fingerprints(channel, input_request->file_path, true,
+        !get_request_fingerprints(channel, input_request->source_directory,
                                   compiler_fingerprint, environment_fingerprint) ||
         !preprocess_request_to_wire(
             channel, input_request, environment_fingerprint,
@@ -2640,7 +2621,7 @@ bool unity_compiler_preprocess_contract_response(
     int fd = channel->socket_fd;
     if (!write_string(fd, request.command) ||
         !write_string(fd, request.source) ||
-        !write_string(fd, request.file_path) ||
+        !write_string(fd, request.source_directory) ||
         !write_string(fd, request.shader_name) ||
         !write_bool(fd, request.surface_only) ||
         !write_bool(fd, request.caching_preprocessor) ||
@@ -2981,8 +2962,8 @@ bool unity_compiler_preprocess(UnityCompilerChannel* channel,
                                const char* shader_name,
                                PreprocessResult* out_result) {
     if (!source || !shader_name || !out_result) return false;
-    char* file_path = get_shader_file_path(shader_name);
-    if (!file_path) {
+    char* source_directory = get_legacy_source_directory(shader_name);
+    if (!source_directory) {
         memset(out_result, 0, sizeof(*out_result));
         return false;
     }
@@ -2995,12 +2976,12 @@ bool unity_compiler_preprocess(UnityCompilerChannel* channel,
         !unity_compiler_session_capabilities_valid_apis(
             &capabilities, &valid_apis)) {
         memset(out_result, 0, sizeof(*out_result));
-        free(file_path);
+        free(source_directory);
         return false;
     }
     UnityCompilerShaderPreprocessRequest request = {
         .source = source,
-        .file_path = file_path,
+        .source_directory = source_directory,
         .shader_name = shader_name,
         .surface_only = false,
         .caching_preprocessor = true,
@@ -3013,7 +2994,7 @@ bool unity_compiler_preprocess(UnityCompilerChannel* channel,
     };
     bool result = unity_compiler_preprocess_contract(
         channel, &request, out_result);
-    free(file_path);
+    free(source_directory);
     return result;
 }
 
@@ -3048,7 +3029,7 @@ static bool unity_compiler_compile_request_response_internal(
     }
     uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE];
     uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE];
-    if (!get_request_fingerprints(channel, input_request->source_directory, false,
+    if (!get_request_fingerprints(channel, input_request->source_directory,
                                   compiler_fingerprint, environment_fingerprint)) {
         return false;
     }
@@ -3459,7 +3440,7 @@ bool unity_compiler_get_source_provenance(
     if (!out_provenance) return false;
     UnityCompilerToolchainProvenance provenance;
     if (!unity_compiler_get_toolchain_provenance(channel, &provenance) ||
-        !get_request_fingerprints(channel, source_root, false,
+        !get_request_fingerprints(channel, source_root,
                                   provenance.compiler_fingerprint,
                                   provenance.environment_fingerprint))
         return false;
@@ -3482,7 +3463,7 @@ bool unity_compiler_serialize_preprocess_request(
     memset(out_request_digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
     UnityCompilerToolchainProvenance provenance;
     if (!request ||
-        !get_request_fingerprints(channel, request->file_path, true,
+        !get_request_fingerprints(channel, request->source_directory,
                                   provenance.compiler_fingerprint,
                                   provenance.environment_fingerprint)) {
         return false;
@@ -3622,13 +3603,13 @@ bool unity_compiler_compile_response(
     if (!out_response) return false;
     unity_compiler_binary_response_init(out_response);
     if (!shader_name) return false;
-    char* legacy_source_directory = get_shader_file_path(shader_name);
+    char* legacy_source_directory = get_legacy_source_directory(shader_name);
     if (!legacy_source_directory) return false;
     UnityCompilerCompileRequest request = {
         .command = "compileSnippet",
         .toolchain_configuration = UNITY_TOOLCHAIN_CONFIGURATION,
         .snippet_source = snippet_src,
-        /* Preserve the historical wire request in the compatibility API. */
+        /* Preserve the logical Shader name and historical profile. */
         .source_directory = legacy_source_directory,
         .source_basename = shader_name,
         .pass_name = "",
@@ -3720,13 +3701,13 @@ char* unity_compiler_preprocess_expanded(
     int define_count
 ) {
     if (!channel || !snippet_src || !shader_name) return NULL;
-    char* file_path = get_shader_file_path(shader_name);
-    if (!file_path) return NULL;
+    char* source_directory = get_legacy_source_directory(shader_name);
+    if (!source_directory) return NULL;
     UnityCompilerCompileRequest request = {
         .command = "compileSnippet",
         .toolchain_configuration = UNITY_TOOLCHAIN_CONFIGURATION,
         .snippet_source = snippet_src,
-        .source_directory = file_path,
+        .source_directory = source_directory,
         .source_basename = shader_name,
         .pass_name = "",
         .caching_preprocessor = true,
@@ -3753,7 +3734,7 @@ char* unity_compiler_preprocess_expanded(
     char* error = NULL;
     uint8_t* expanded = unity_compiler_compile_request_internal(
         channel, &request, &expanded_size, &error);
-    free(file_path);
+    free(source_directory);
     free(error);
     if (!expanded || expanded_size == SIZE_MAX) {
         free(expanded);

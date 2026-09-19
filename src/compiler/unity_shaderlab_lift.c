@@ -135,7 +135,7 @@ static HLSLLiftStatus preprocess(LiftContext *context, UnityShaderLabLiftArtifac
     const UnityShaderLabLiftInput *input = context->input;
     const UnityCompilerShaderPreprocessRequest request = {
         .source = artifact->source.buf,
-        .file_path = input->source_path,
+        .source_directory = input->source_directory,
         .shader_name = input->shader->name,
         .caching_preprocessor = true,
         .build_platform = input->profile->build_platform,

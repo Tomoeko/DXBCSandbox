@@ -655,7 +655,7 @@ static bool encode_preprocess_request(
     const UnityCompilerPreprocessRequest* request,
     const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE]) {
     static const uint8_t schema[] =
-        "DXBCSandbox.UnityCompiler.preprocess.cache.v6";
+        "DXBCSandbox.UnityCompiler.preprocess.cache.v7";
     if (!sink || !request || !compiler_fingerprint) return false;
     compile_request_sink_buffer(sink, schema, sizeof(schema) - 1U);
     compile_request_sink_buffer(sink, compiler_fingerprint,
@@ -663,7 +663,7 @@ static bool encode_preprocess_request(
     compile_request_sink_u32(sink, 0x0C0BD1E4U);
     compile_request_sink_string(sink, request->command);
     compile_request_sink_string(sink, request->source);
-    compile_request_sink_string(sink, request->file_path);
+    compile_request_sink_string(sink, request->source_directory);
     compile_request_sink_string(sink, request->shader_name);
     compile_request_sink_u32(sink, request->surface_only ? 1U : 0U);
     compile_request_sink_u32(sink,

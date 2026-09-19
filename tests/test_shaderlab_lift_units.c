@@ -157,7 +157,7 @@ static bool preprocess_service(void *opaque, const UnityCompilerShaderPreprocess
                                UnityCompilerPreprocessResponse *response) {
     Service *service = opaque;
     ++service->preprocesses;
-    if (strcmp(request->file_path, service->fixture->input.source_path) ||
+    if (strcmp(request->source_directory, service->fixture->input.source_directory) ||
         strcmp(request->shader_name, service->fixture->shader.name) || !request->source)
         return false;
     const Failure failure =

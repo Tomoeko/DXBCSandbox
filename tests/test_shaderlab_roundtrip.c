@@ -1496,6 +1496,9 @@ static void certify_generated_d3d11_pass_domains(
 
             UnityGeneratedDomainReport report;
             unity_generated_domain_report_init(&report);
+            char* generated_directory = test_source_directory(generated_source_path);
+            char* original_directory = original_snippet
+                ? test_source_directory(original_source_path) : NULL;
             const UnityGeneratedDomainCertificationInput input = {
                 .shader = shader,
                 .pass = pass,
@@ -1505,17 +1508,19 @@ static void certify_generated_d3d11_pass_domains(
                 .d3d11_archive = archive,
                 .compile_profile = &g_effective_compile_profile,
                 .broker = broker,
-                .source_directory = generated_source_path,
+                .source_directory = generated_directory,
                 .source_basename = shader->name,
                 .pass_name = pass->name,
                 .original_source_directory = original_snippet
-                    ? original_source_path : NULL,
+                    ? original_directory : NULL,
                 .original_source_basename = original_snippet
                     ? shader->name : NULL,
             };
             if (pass_record) pass_record->certification_attempted = true;
             const UnityGeneratedDomainStatus certification_status =
                 unity_generated_domain_certify_d3d11(&input, &report);
+            free(original_directory);
+            free(generated_directory);
             generated_domain_counts_add_report(
                 &g_generated_domain, &report);
             generated_domain_counts_add_report(
@@ -2744,6 +2749,7 @@ static void save_failed_sources(
 typedef struct {
     UnityCompileAuthority authority;
     UnityCompilerSnippetCompileRequest request;
+    char* source_directory;
 } ExactCompileInvocation;
 
 static void exact_compile_invocation_init(ExactCompileInvocation* invocation) {
@@ -2754,6 +2760,8 @@ static void exact_compile_invocation_init(ExactCompileInvocation* invocation) {
 static void exact_compile_invocation_free(ExactCompileInvocation* invocation) {
     if (!invocation) return;
     unity_compile_authority_free(&invocation->authority);
+    free(invocation->source_directory);
+    invocation->source_directory = NULL;
     memset(&invocation->request, 0, sizeof(invocation->request));
 }
 
@@ -2795,9 +2803,11 @@ static UnityCompileAuthorityStatus prepare_exact_compile_invocation(
         &input, &invocation->authority);
     if (status != UNITY_COMPILE_AUTHORITY_OK) return status;
 
+    invocation->source_directory = test_source_directory(source_path);
+    if (!invocation->source_directory) return UNITY_COMPILE_AUTHORITY_OUT_OF_MEMORY;
     invocation->request = (UnityCompilerSnippetCompileRequest){
         .snippet_source = snippet->source,
-        .source_directory = source_path,
+        .source_directory = invocation->source_directory,
         .source_basename = shader->name,
         .pass_name = pass->name,
         .caching_preprocessor = true,
@@ -3136,7 +3146,7 @@ static bool oracle_preprocess_or_lookup(
         free(transcript);
         oracle_note_authority_failure();
         fprintf(stderr, "Preprocess authority request could not be "
-                        "serialized for %s\n", request->file_path);
+                        "serialized for %s\n", request->source_directory);
         return false;
     }
     uint8_t calculated_digest[ORACLE_PACK_DIGEST_SIZE];
@@ -3147,7 +3157,7 @@ static bool oracle_preprocess_or_lookup(
         oracle_note_authority_failure();
         fprintf(stderr, "Preprocess request transcript digest diverged "
                         "from the cache authority for %s\n",
-                request->file_path);
+                request->source_directory);
         return false;
     }
 
@@ -3184,7 +3194,7 @@ static bool oracle_preprocess_or_lookup(
             memset(out_result, 0, sizeof(*out_result));
             fprintf(stderr, "Preprocess oracle record failed transcript, "
                             "result, or typed-payload validation "
-                            "for %s\n", request->file_path);
+                            "for %s\n", request->source_directory);
             return false;
         }
         unity_compiler_free_preprocess(out_result);
@@ -3201,7 +3211,7 @@ static bool oracle_preprocess_or_lookup(
         free(transcript);
         oracle_note_authority_failure();
         fprintf(stderr, "Preprocess oracle lookup failed closed for %s: "
-                        "%s\n", request->file_path,
+                        "%s\n", request->source_directory,
                 oracle_pack_status_string(lookup));
         return false;
     }
@@ -3213,7 +3223,7 @@ static bool oracle_preprocess_or_lookup(
         free(transcript);
         oracle_note_authority_failure();
         fprintf(stderr, "Strict preprocess oracle miss for %s\n",
-                request->file_path);
+                request->source_directory);
         return false;
     }
 
@@ -3225,7 +3235,7 @@ static bool oracle_preprocess_or_lookup(
         oracle_note_authority_failure();
         fprintf(stderr, "Live compiler authority does not match the oracle "
                         "pack for preprocess fallback: %s\n",
-                request->file_path);
+                request->source_directory);
         return false;
     }
     if (!broker_preprocess_clean(
@@ -3286,7 +3296,7 @@ static bool oracle_preprocess_or_lookup(
             unity_compiler_free_preprocess(out_result);
             memset(out_result, 0, sizeof(*out_result));
             fprintf(stderr, "Could not capture preprocess authority for "
-                            "%s: %s\n", request->file_path,
+                            "%s: %s\n", request->source_directory,
                     oracle_pack_status_string(status));
             return false;
         }
@@ -4403,9 +4413,10 @@ static void process_shader_object(
         if (!orig_src_buf) {
             printf("    [FAIL] Failed to read original shader: %s\n", original_path);
         } else {
+            char* source_directory = test_source_directory(original_path);
             UnityCompilerShaderPreprocessRequest preprocess_request = {
                 .source = (const char*)orig_src_buf,
-                .file_path = original_path,
+                .source_directory = source_directory,
                 .shader_name = shader.name,
                 .surface_only = false,
                 .caching_preprocessor = true,
@@ -4423,6 +4434,7 @@ static void process_shader_object(
                     verification->original_preprocess_ok = true;
                 }
             }
+            free(source_directory);
         }
         free(orig_src_buf);
     } else if (!original_path) {
@@ -4486,9 +4498,10 @@ static void process_shader_object(
 
     PreprocessResult gen_prep;
     memset(&gen_prep, 0, sizeof(gen_prep));
+    char* source_directory = test_source_directory(shaderlab_path);
     UnityCompilerShaderPreprocessRequest generated_preprocess_request = {
         .source = (const char*)slab_src_buf,
-        .file_path = shaderlab_path,
+        .source_directory = source_directory,
         .shader_name = shader.name,
         .surface_only = false,
         .caching_preprocessor = true,
@@ -4496,10 +4509,11 @@ static void process_shader_object(
         .valid_apis = g_compile_profile.valid_apis,
     };
     ++g_generated_preprocess_authority_requests;
-    if (!oracle_preprocess_or_lookup(
-            broker, &generated_preprocess_request,
-            (long long)obj->path_id, "generated-shader-preprocess",
-            &gen_prep)) {
+    const bool generated_preprocessed = oracle_preprocess_or_lookup(
+        broker, &generated_preprocess_request, (long long)obj->path_id,
+        "generated-shader-preprocess", &gen_prep);
+    free(source_directory);
+    if (!generated_preprocessed) {
         printf("    [FAIL] Preprocessing generated ShaderLab failed: %s\n", shaderlab_path);
         record_unavailable_shader_variants(&shader, (long long)obj->path_id,
                                            FAILURE_DXBC_COMPILE);

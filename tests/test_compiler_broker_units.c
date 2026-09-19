@@ -339,7 +339,7 @@ static bool verify_contract_compile_requires_canonical_identity(void) {
 
     UnityCompilerShaderPreprocessRequest preprocess = {
         .source = "Shader \"Offline\" {}",
-        .file_path = "Assets/Offline.shader",
+        .source_directory = "Assets",
         .shader_name = "Offline",
     };
     transcript = NULL;

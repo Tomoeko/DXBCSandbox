@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     }
     UnityCompilerShaderPreprocessRequest preprocess_request = {
         .source = kShader,
-        .file_path = "Assets/Hidden/DXBCSandboxDiagnosticProbe.shader",
+        .source_directory = "Assets/Hidden",
         .shader_name = "Hidden/DXBCSandboxDiagnosticProbe",
         .surface_only = false,
         .caching_preprocessor = true,

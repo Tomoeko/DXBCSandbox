@@ -64,7 +64,7 @@ typedef struct {
 typedef struct {
     const char* command;
     const char* source;
-    const char* file_path;
+    const char* source_directory;
     const char* shader_name;
     bool surface_only;
     bool caching_preprocessor;

@@ -264,27 +264,14 @@ static int fake_consume_compile_request(
 }
 
 static int fake_shader_path_matches(
-    const char* shader_name, const char* file_path) {
-    static const char assets_prefix[] = "Assets/";
-    static const char packages_prefix[] = "Packages/";
-    static const char shader_suffix[] = ".shader";
-    if (!shader_name || !file_path) return 0;
-    if (strncmp(shader_name, assets_prefix,
-                sizeof(assets_prefix) - 1U) == 0 ||
-        strncmp(shader_name, packages_prefix,
-                sizeof(packages_prefix) - 1U) == 0) {
-        return strcmp(shader_name, file_path) == 0;
-    }
-    size_t shader_name_size = strlen(shader_name);
-    size_t prefix_size = sizeof(assets_prefix) - 1U;
-    size_t suffix_size = sizeof(shader_suffix) - 1U;
-    size_t file_path_size = strlen(file_path);
-    return file_path_size == prefix_size + shader_name_size + suffix_size &&
-           memcmp(file_path, assets_prefix, prefix_size) == 0 &&
-           memcmp(file_path + prefix_size, shader_name,
-                  shader_name_size) == 0 &&
-           memcmp(file_path + prefix_size + shader_name_size,
-                  shader_suffix, suffix_size + 1U) == 0;
+    const char* shader_name, const char* directory) {
+    /* Fixture expectations are independent of the client's path derivation. */
+    if (!shader_name || !directory) return 0;
+    if (strcmp(shader_name, "Assets/Nested/Fixture.shader") == 0)
+        return strcmp(directory, "Assets/Nested") == 0;
+    if (strncmp(shader_name, "Packages/", 9U) == 0)
+        return strcmp(directory, "Packages") == 0;
+    return strcmp(directory, "Assets") == 0;
 }
 
 static int run_fake_compiler(
@@ -444,7 +431,8 @@ static int run_fake_compiler(
                 status = "shader: 0 0 0";
             } else if (strcmp(name, "malformed-preprocess") == 0) {
                 status = "shader: 1 0 0 trailing";
-            } else if (strncmp(name, "verify-long-preprocess-", 23U) == 0 &&
+            } else if ((strncmp(name, "verify-long-preprocess-", 23U) == 0 ||
+                        strcmp(name, "Assets/Nested/Fixture.shader") == 0) &&
                        !path_matches) {
                 status = "shader: 0 0 0";
             } else if (strcmp(name, "legacy-session-valid-apis") == 0 &&
@@ -745,14 +733,13 @@ static int verify_source_root_cache(
     const UnityCompilerShaderPreprocessRequest* template_preprocess) {
     char directory[] = "/tmp/dxbc-source-authority.XXXXXX";
     CHECK(mkdtemp(directory) != NULL);
-    char file_path[PATH_MAX], header[PATH_MAX];
-    CHECK(snprintf(file_path, sizeof(file_path), "%s/Fixture.shader", directory) > 0);
+    char header[PATH_MAX];
     CHECK(snprintf(header, sizeof(header), "%s/UnityShaderVariables.cginc", directory) > 0);
     UnityCompilerSnippetCompileRequest request = *template_request;
     request.source_directory = directory;
     request.snippet_source = "source-authority-fixture";
     UnityCompilerShaderPreprocessRequest preprocess = *template_preprocess;
-    preprocess.file_path = file_path;
+    preprocess.source_directory = directory;
     preprocess.shader_name = "preprocess-success";
     uint8_t original_compile[32], original_preprocess[32];
     UnityCompilerToolchainProvenance original;
@@ -1506,7 +1493,7 @@ int main(int argc, char** argv) {
     UnityCompilerPreprocessRequest preprocess_request = {
         .command = "preprocess",
         .source = "Shader \"Test\" {}",
-        .file_path = "Assets/Test.shader",
+        .source_directory = "Assets",
         .shader_name = "Test",
         .surface_only = false,
         .caching_preprocessor = true,
@@ -1546,7 +1533,7 @@ int main(int argc, char** argv) {
 } while (0)
     CHECK_PREPROCESS_CHANGE(changed.command = "preprocess2");
     CHECK_PREPROCESS_CHANGE(changed.source = "different");
-    CHECK_PREPROCESS_CHANGE(changed.file_path = "Assets/Other.shader");
+    CHECK_PREPROCESS_CHANGE(changed.source_directory = "Assets/Other");
     CHECK_PREPROCESS_CHANGE(changed.shader_name = "Other");
     CHECK_PREPROCESS_CHANGE(changed.surface_only = true);
     CHECK_PREPROCESS_CHANGE(changed.caching_preprocessor = false);
@@ -1845,7 +1832,7 @@ int main(int argc, char** argv) {
 
     UnityCompilerShaderPreprocessRequest public_preprocess_request = {
         .source = preprocess_request.source,
-        .file_path = preprocess_request.file_path,
+        .source_directory = preprocess_request.source_directory,
         .shader_name = preprocess_request.shader_name,
         .surface_only = preprocess_request.surface_only,
         .caching_preprocessor = preprocess_request.caching_preprocessor,
@@ -2138,7 +2125,7 @@ int main(int argc, char** argv) {
           offline_capability_channel.socket_fd == -1);
     UnityCompilerShaderPreprocessRequest offline_preprocess = {
         .source = "Shader \"Offline\" {}",
-        .file_path = "Assets/Offline.shader",
+        .source_directory = "Assets",
         .shader_name = "offline-cache-only-miss",
         .surface_only = false,
         .caching_preprocessor = true,
@@ -2430,7 +2417,7 @@ int main(int argc, char** argv) {
 
     UnityCompilerShaderPreprocessRequest fixture_preprocess = {
         .source = "Shader \"Fixture\" {}",
-        .file_path = "Assets/Fixture.shader",
+        .source_directory = "Assets",
         .shader_name = "primary-false",
         .surface_only = false,
         .caching_preprocessor = true,
@@ -2555,15 +2542,15 @@ int main(int argc, char** argv) {
     CHECK(memcmp(serialized_preprocess_digest, preprocess_controls_digest,
                  sizeof(preprocess_controls_digest)) == 0);
     fixture_preprocess.source = saved_preprocess_source;
-    const char *saved_preprocess_path = fixture_preprocess.file_path;
-    fixture_preprocess.file_path = "Assets/ChangedIdentity.shader";
+    const char *saved_preprocess_path = fixture_preprocess.source_directory;
+    fixture_preprocess.source_directory = "Assets/ChangedIdentity";
     CHECK(unity_compiler_preprocess_contract_response(
         &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
     CHECK(diagnosed_preprocess.has_request_identity);
     CHECK(memcmp(diagnosed_preprocess.controls_digest, preprocess_controls_digest,
                  sizeof(preprocess_controls_digest)) != 0);
     unity_compiler_preprocess_response_free(&diagnosed_preprocess);
-    fixture_preprocess.file_path = saved_preprocess_path;
+    fixture_preprocess.source_directory = saved_preprocess_path;
     CHECK(unsetenv("DXBC_USC_CACHE_DIR") == 0);
     CHECK(unity_compiler_preprocess_contract_response(
         &fixture_channel, &fixture_preprocess, &diagnosed_preprocess));
@@ -2573,6 +2560,7 @@ int main(int argc, char** argv) {
     CHECK(memcmp(diagnosed_preprocess.controls_digest, preprocess_controls_digest,
                  sizeof(preprocess_controls_digest)) == 0);
     unity_compiler_preprocess_response_free(&diagnosed_preprocess);
+    healthy_pid = fixture_channel.process_id;
     CHECK(setenv("DXBC_USC_CACHE_DIR", diagnostic_cache_dir, 1) == 0);
     CHECK(!unity_compiler_preprocess_contract(
         &fixture_channel, &fixture_preprocess, &fixture_result));
@@ -2596,6 +2584,10 @@ int main(int argc, char** argv) {
     CHECK(fixture_result.snippet_count == 0 && fixture_result.blob_len == 0U);
     unity_compiler_free_preprocess(&fixture_result);
     free(long_preprocess_name);
+    CHECK(unity_compiler_preprocess(
+        &fixture_channel, "Shader \"Nested\" {}",
+        "Assets/Nested/Fixture.shader", &fixture_result));
+    unity_compiler_free_preprocess(&fixture_result);
 
     CHECK(unity_compiler_preprocess_expanded(
               &fixture_channel, "compile-three-status", "Fixture", 0, 4,
@@ -2613,10 +2605,9 @@ int main(int argc, char** argv) {
     fixture_text = unity_compiler_preprocess_expanded(
         &fixture_channel, "verify-long-expanded-path", long_assets_name,
         0, 4, 0U, NULL, 0, NULL, 0);
-    /* A wire string can exceed filesystem limits, but an implicit include
-     * root that cannot be snapshotted is not compiler authority. Never shorten
-     * that path to an apparently valid directory. */
-    CHECK(fixture_text == NULL);
+    /* A long shader basename is independent of the include directory. */
+    CHECK(fixture_text && strcmp(fixture_text, "expanded fixture") == 0);
+    free(fixture_text);
     free(long_assets_name);
 
     size_t fixture_binary_size = 0U;
@@ -2635,9 +2626,9 @@ int main(int argc, char** argv) {
     fixture_binary = unity_compiler_compile(
         &fixture_channel, "verify-long-compile-path", long_package_name,
         0, 4, 0U, NULL, 0, NULL, 0, &fixture_binary_size, &fixture_error);
-    CHECK(fixture_binary == NULL && fixture_binary_size == 0U);
-    free(fixture_error);
-    fixture_error = NULL;
+    CHECK(fixture_binary && fixture_binary_size == sizeof("expanded fixture") - 1U);
+    CHECK(fixture_error == NULL);
+    free(fixture_binary);
     free(long_package_name);
 
     UnityCompilerSnippetCompileRequest diagnosed_compile_request = {
@@ -2658,6 +2649,15 @@ int main(int argc, char** argv) {
         .program_start = 0,
         .contract = &parsed_contract,
     };
+    char* long_directory = make_long_shader_name("Assets/", 4096U);
+    CHECK(long_directory != NULL);
+    UnityCompilerSnippetCompileRequest oversized_root = diagnosed_compile_request;
+    oversized_root.source_directory = long_directory;
+    UnityCompilerBinaryResponse oversized_response;
+    CHECK(!unity_compiler_compile_contract_response(
+        &fixture_channel, &oversized_root, &oversized_response));
+    unity_compiler_binary_response_free(&oversized_response);
+    free(long_directory);
     UnityCompilerSnippetCompileRequest reflected_compile_request =
         diagnosed_compile_request;
     reflected_compile_request.snippet_source = "reflection-records";
