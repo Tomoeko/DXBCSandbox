@@ -246,6 +246,7 @@ if(BUILD_TESTING)
     endif()
     dxbc_add_core_test(test_shaderlab_stage_units
         tests/test_shaderlab_stage_units.c shaderlab_stage_units)
+    target_sources(test_shaderlab_stage_units PRIVATE tests/test_shaderlab_fixture.c)
     target_compile_definitions(test_shaderlab_stage_units PRIVATE
         SHADERLAB_STAGE_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/unlit_color/target.bin"
         SHADERLAB_EXPRESSION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
@@ -435,6 +436,16 @@ if(BUILD_TESTING)
         target_link_libraries(test_shaderlab_mapping_units PRIVATE
             unity_compiler_support dxbc_build_options)
         add_test(NAME shaderlab_mapping_units COMMAND test_shaderlab_mapping_units)
+
+        add_executable(test_shaderlab_lift_units
+            tests/test_shaderlab_lift_units.c tests/test_shaderlab_fixture.c)
+        target_include_directories(test_shaderlab_lift_units PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(test_shaderlab_lift_units PRIVATE
+            SHADERLAB_EXPRESSION_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
+        target_link_libraries(test_shaderlab_lift_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME shaderlab_lift_units COMMAND test_shaderlab_lift_units)
 
         add_executable(test_generated_domain_certifier_units
             tests/test_generated_domain_certifier_units.c)

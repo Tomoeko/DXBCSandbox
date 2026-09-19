@@ -1,5 +1,6 @@
 #include "translation/shaderlab_emitter_internal.h"
 #include "dxbc/dxbc_hash.h"
+#include "test_shaderlab_fixture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,13 +46,6 @@ static uint32_t read_u32_le(const uint8_t *bytes) {
          ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
 }
 
-static void write_u32_le(uint8_t *bytes, size_t *cursor, uint32_t value) {
-  bytes[(*cursor)++] = (uint8_t)value;
-  bytes[(*cursor)++] = (uint8_t)(value >> 8);
-  bytes[(*cursor)++] = (uint8_t)(value >> 16);
-  bytes[(*cursor)++] = (uint8_t)(value >> 24);
-}
-
 static uint8_t *read_fixture_path(const char *path, size_t *out_size) {
   FILE *file = fopen(path, "rb");
   if (!file || fseek(file, 0, SEEK_END) != 0) return NULL;
@@ -87,48 +81,6 @@ static const uint8_t *find_first_dxbc(const uint8_t *bytes, size_t size,
     }
   }
   return NULL;
-}
-
-static uint8_t *build_variant_blob(const uint8_t *dxbc, size_t dxbc_size,
-                                   int32_t program_type,
-                                   const char *keyword, size_t *out_size) {
-  if (!dxbc || !out_size || dxbc_size > UINT32_MAX) return NULL;
-  const size_t keyword_size = keyword ? strlen(keyword) : 0u;
-  if (keyword_size > UINT32_MAX) return NULL;
-  const size_t padded_keyword_size = (keyword_size + 3u) & ~(size_t)3u;
-  const size_t padded_dxbc_size = (dxbc_size + 3u) & ~(size_t)3u;
-  if (padded_keyword_size < keyword_size || padded_dxbc_size < dxbc_size ||
-      padded_keyword_size > SIZE_MAX - padded_dxbc_size - 44u) {
-    return NULL;
-  }
-  const size_t size = 40u + (keyword ? 4u + padded_keyword_size : 0u) +
-                      padded_dxbc_size;
-  uint8_t *blob = (uint8_t *)calloc(size, 1u);
-  if (!blob) return NULL;
-  size_t cursor = 0;
-  write_u32_le(blob, &cursor, UNITY_2021_3_PLAYER_BLOB_VERSION);
-  write_u32_le(blob, &cursor, (uint32_t)program_type);
-  write_u32_le(blob, &cursor, 0u);
-  write_u32_le(blob, &cursor, 0u);
-  write_u32_le(blob, &cursor, 2u);
-  write_u32_le(blob, &cursor, 0u);
-  write_u32_le(blob, &cursor, keyword ? 1u : 0u);
-  if (keyword) {
-    write_u32_le(blob, &cursor, (uint32_t)keyword_size);
-    memcpy(blob + cursor, keyword, keyword_size);
-    cursor += padded_keyword_size;
-  }
-  write_u32_le(blob, &cursor, (uint32_t)dxbc_size);
-  memcpy(blob + cursor, dxbc, dxbc_size);
-  cursor += padded_dxbc_size;
-  write_u32_le(blob, &cursor, 0u);
-  write_u32_le(blob, &cursor, 0u);
-  if (cursor != size) {
-    free(blob);
-    return NULL;
-  }
-  *out_size = size;
-  return blob;
 }
 
 static uint8_t *clone_dxbc_with_shader_model(const uint8_t *dxbc,
@@ -567,9 +519,9 @@ static int test_canonical_exact_predicates(void) {
   size_t default_size = 0;
   size_t feature_size = 0;
   uint8_t *default_blob =
-      build_variant_blob(dxbc, dxbc_size, 15, NULL, &default_size);
+      test_shaderlab_variant_blob(dxbc, dxbc_size, 15, NULL, &default_size);
   uint8_t *feature_blob =
-      build_variant_blob(dxbc, dxbc_size, 15, "FEATURE_B", &feature_size);
+      test_shaderlab_variant_blob(dxbc, dxbc_size, 15, "FEATURE_B", &feature_size);
   CHECK(default_blob != NULL);
   CHECK(feature_blob != NULL);
   CHECK(default_size <= INT32_MAX);
@@ -876,7 +828,7 @@ static int test_sparse_shaped_planned_stage_aliases(void) {
   const uint8_t *dxbc = find_first_dxbc(fixture, fixture_size, &dxbc_size);
   CHECK(dxbc != NULL);
   size_t blob_size = 0;
-  uint8_t *blob = build_variant_blob(dxbc, dxbc_size, 15, NULL, &blob_size);
+  uint8_t *blob = test_shaderlab_variant_blob(dxbc, dxbc_size, 15, NULL, &blob_size);
   CHECK(blob != NULL && blob_size <= INT32_MAX);
   uint8_t *segments[] = {blob};
   int segment_lengths[] = {(int)blob_size};
@@ -1118,9 +1070,9 @@ static int test_two_stage_symbolic_selectors_are_exhaustive(void) {
 
   size_t vertex_blob_size = 0;
   size_t fragment_blob_size = 0;
-  uint8_t *vertex_blob = build_variant_blob(
+  uint8_t *vertex_blob = test_shaderlab_variant_blob(
       vertex_dxbc, vertex_dxbc_size, 15, NULL, &vertex_blob_size);
-  uint8_t *fragment_blob = build_variant_blob(
+  uint8_t *fragment_blob = test_shaderlab_variant_blob(
       fragment_dxbc, fragment_dxbc_size, 17, NULL,
       &fragment_blob_size);
   CHECK(vertex_blob != NULL && fragment_blob != NULL);
@@ -1335,7 +1287,7 @@ static int test_high_level_shaderlab_candidate(void) {
     common_sha256(dxbc, dxbc_size, target_digests[stage]);
     cursor = (size_t)(dxbc - fixture) + dxbc_size;
     size_t blob_size = 0;
-    segments[stage] = build_variant_blob(dxbc, dxbc_size, stage ? 17 : 15,
+    segments[stage] = test_shaderlab_variant_blob(dxbc, dxbc_size, stage ? 17 : 15,
                                          NULL, &blob_size);
     CHECK(segments[stage] != NULL && blob_size <= INT32_MAX);
     segment_lengths[stage] = (int)blob_size;
@@ -1480,7 +1432,7 @@ static int test_high_level_shaderlab_candidate(void) {
   const uint8_t *dxbc = find_first_dxbc(unsupported, unsupported_size, &dxbc_size);
   CHECK(dxbc != NULL);
   size_t blob_size = 0;
-  segments[2] = build_variant_blob(dxbc, dxbc_size, 15, NULL, &blob_size);
+  segments[2] = test_shaderlab_variant_blob(dxbc, dxbc_size, 15, NULL, &blob_size);
   CHECK(segments[2] != NULL && blob_size <= INT32_MAX);
   segment_lengths[2] = (int)blob_size;
   entries[2] = (BlobEntry){0, (int32_t)blob_size, 2};
@@ -1656,9 +1608,9 @@ static int test_target_authority_is_strict_and_typed(void) {
   size_t sm4_blob_size = 0;
   size_t sm5_blob_size = 0;
   uint8_t *sm4_blob =
-      build_variant_blob(sm4, sm4_size, 15, NULL, &sm4_blob_size);
+      test_shaderlab_variant_blob(sm4, sm4_size, 15, NULL, &sm4_blob_size);
   uint8_t *sm5_blob =
-      build_variant_blob(sm5, sm4_size, 16, NULL, &sm5_blob_size);
+      test_shaderlab_variant_blob(sm5, sm4_size, 16, NULL, &sm5_blob_size);
   CHECK(sm4_blob != NULL && sm5_blob != NULL);
   CHECK(sm4_blob_size <= INT32_MAX && sm5_blob_size <= INT32_MAX);
   uint8_t *segments[] = {sm4_blob, sm5_blob};
@@ -1841,7 +1793,7 @@ static int test_target_authority_is_strict_and_typed(void) {
   bad_dxbc[4] ^= 1u;
   size_t bad_blob_size = 0;
   uint8_t *bad_blob =
-      build_variant_blob(bad_dxbc, sm4_size, 15, NULL, &bad_blob_size);
+      test_shaderlab_variant_blob(bad_dxbc, sm4_size, 15, NULL, &bad_blob_size);
   CHECK(bad_blob != NULL && bad_blob_size <= INT32_MAX);
   uint8_t *bad_segments[] = {bad_blob};
   int bad_segment_lengths[] = {(int)bad_blob_size};
@@ -1859,7 +1811,7 @@ static int test_target_authority_is_strict_and_typed(void) {
   prefixed_dxbc[0] = 0;
   memcpy(prefixed_dxbc + 1u, sm4, sm4_size);
   size_t prefixed_blob_size = 0;
-  uint8_t *prefixed_blob = build_variant_blob(
+  uint8_t *prefixed_blob = test_shaderlab_variant_blob(
       prefixed_dxbc, sm4_size + 1u, 15, NULL, &prefixed_blob_size);
   CHECK(prefixed_blob != NULL && prefixed_blob_size <= INT32_MAX);
   uint8_t *prefixed_segments[] = {prefixed_blob};
