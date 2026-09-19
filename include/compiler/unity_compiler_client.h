@@ -519,6 +519,14 @@ typedef struct UnityCompilerBinaryResponse {
     size_t reflection_record_count;
     uint8_t* data;
     size_t size;
+    /* Locally derived request identity, never trusted from cached payloads.
+     * Both digests use the existing canonical cache authority encoding.
+     * controls_digest differs only by encoding an empty snippet_source, so
+     * lifting can require every other byte-affecting input to stay fixed.
+     * Presence identifies an attempted request, not compiler success. */
+    bool has_request_identity;
+    uint8_t request_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t controls_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
 } UnityCompilerBinaryResponse;
 
 typedef enum {

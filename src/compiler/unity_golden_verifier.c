@@ -1609,6 +1609,9 @@ static HLSLLiftStatus compile_lift_mode(void *context, const USILProgram *progra
         job->stage->id, 4, job->requirements, job->keywords,
         (int)job->keyword_count, job->defines, (int)job->define_count, &response);
     artifact->cache_hit = response.status.from_cache;
+    artifact->has_request_identity = response.has_request_identity;
+    memcpy(artifact->request_digest, response.request_digest, sizeof(artifact->request_digest));
+    memcpy(artifact->controls_digest, response.controls_digest, sizeof(artifact->controls_digest));
     if (!available || response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS) {
         unity_compiler_binary_response_free(&response);
         return HLSL_LIFT_COMPILER_UNAVAILABLE;
@@ -1654,7 +1657,8 @@ static void report_lift(FILE *report, const char *case_hash, size_t record, int 
             "\"lift\":\"%s\",\"version\":%u,\"instruction\":%d,"
             "\"status\":\"%s\",\"precondition\":\"%s\",\"compared\":%s,"
             "\"comparison\":\"%s\",\"cache_hit\":%s,\"source_sha256\":\"%s\","
-            "\"output_sha256\":\"%s\"}\n",
+            "\"output_sha256\":\"%s\",\"request_sha256\":\"%s\","
+            "\"controls_sha256\":\"%s\"}\n",
             instruction < 0 ? "lift_baseline" : "lift", case_hash, record,
             lift_kind == 2   ? HLSL_HIGH_LEVEL_LIFT_ID
             : lift_kind == 1 ? HLSL_RESULT_LIFT_ID
@@ -1668,7 +1672,8 @@ static void report_lift(FILE *report, const char *case_hash, size_t record, int 
                              : hlsl_copy_lift_status_name(result->precondition),
             result->compared ? "true" : "false",
             result->compared ? dxbc_compare_status_name(result->comparison.status) : "not_run",
-            result->cache_hit ? "true" : "false", result->source_sha256, result->output_sha256);
+            result->cache_hit ? "true" : "false", result->source_sha256, result->output_sha256,
+            result->request_sha256, result->controls_sha256);
 }
 
 static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *flags,
@@ -1679,7 +1684,8 @@ static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *fl
     HLSLLiftServices services = {.compile = compile_lift,
                                  .monotonic_ms = lift_monotonic_ms,
                                  .context = &compiler,
-                                 .compile_high_level = compile_high_level};
+                                 .compile_high_level = compile_high_level,
+                                 .require_request_identity = true};
     HLSLLiftTransaction* transaction = NULL;
     HLSLLiftResult result;
     HLSLLiftStatus status = hlsl_lift_transaction_begin(baseline, target->bytecode,
@@ -2410,7 +2416,8 @@ static bool run_live_lift_fixture(UnityCompilerBroker* broker, int stage, bool f
     HLSLLiftServices services = {.compile = compile_live_lift_fixture,
                                  .monotonic_ms = lift_monotonic_ms,
                                  .context = &fixture,
-                                 .compile_high_level = compile_live_high_level_fixture};
+                                 .compile_high_level = compile_live_high_level_fixture,
+                                 .require_request_identity = true};
     HLSLLiftResult result;
     HLSLLiftStatus baseline_status = hlsl_lift_transaction_begin(
         &baseline, target.bytecode, target.bytecode_size,
@@ -2504,7 +2511,8 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     HLSLLiftServices services = {.compile = compile_lift,
                                  .monotonic_ms = lift_monotonic_ms,
                                  .context = &compiler,
-                                 .compile_high_level = compile_high_level};
+                                 .compile_high_level = compile_high_level,
+                                 .require_request_identity = true};
     HLSLLiftResult result;
     HLSLLiftStatus baseline_status =
         hlsl_lift_transaction_begin(&program, target.bytecode, target.bytecode_size, &services,
@@ -2513,6 +2521,15 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
         fprintf(stderr, "%s expression baseline: %s\n", k_stages[stage].name,
                 hlsl_lift_status_name(baseline_status));
     SELF_CHECK(baseline_status == HLSL_LIFT_VERIFIED);
+    if (!partial) {
+        const char *baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
+        flags.shader_name = "ExpressionFixtureChangedAuthority";
+        SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+                   HLSL_LIFT_AUTHORITY_MISMATCH);
+        SELF_CHECK(!result.compared &&
+                   hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
+        flags.shader_name = "ExpressionFixture";
+    }
     HLSLLiftStatus status = hlsl_lift_transaction_try_high_level(transaction, &result);
     if (partial) {
         SELF_CHECK(status == HLSL_LIFT_EMISSION_REJECTED);

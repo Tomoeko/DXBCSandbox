@@ -2916,6 +2916,16 @@ bool unity_compiler_preprocess(UnityCompilerChannel* channel,
     return result;
 }
 
+static bool compiler_fingerprint_has_value(const uint8_t *fingerprint);
+
+static void binary_response_request_identity(UnityCompilerBinaryResponse *response,
+                                             const uint8_t request_digest[USC_CACHE_DIGEST_SIZE],
+                                             const uint8_t controls_digest[USC_CACHE_DIGEST_SIZE]) {
+    memcpy(response->request_digest, request_digest, USC_CACHE_DIGEST_SIZE);
+    memcpy(response->controls_digest, controls_digest, USC_CACHE_DIGEST_SIZE);
+    response->has_request_identity = true;
+}
+
 static bool unity_compiler_compile_request_response_internal(
     UnityCompilerChannel* channel,
     const UnityCompilerCompileRequest* input_request,
@@ -2950,10 +2960,16 @@ static bool unity_compiler_compile_request_response_internal(
 
     const char* cache_dir = getenv("DXBC_USC_CACHE_DIR");
     uint8_t request_digest[USC_CACHE_DIGEST_SIZE];
+    uint8_t controls_digest[USC_CACHE_DIGEST_SIZE];
+    usc_cache_request_digest(&request, compiler_fingerprint, request_digest);
+    UnityCompilerCompileRequest controls = request;
+    controls.snippet_source = "";
+    usc_cache_request_digest(&controls, compiler_fingerprint, controls_digest);
+    if (!compiler_fingerprint_has_value(request_digest) ||
+        !compiler_fingerprint_has_value(controls_digest))
+        return false;
     bool cache_ready = false;
     if (cache_dir && cache_dir[0]) {
-        usc_cache_request_digest(&request, compiler_fingerprint,
-                                 request_digest);
         uint8_t* cached_data = NULL;
         size_t cached_size = 0;
         cache_ready = true;
@@ -2965,6 +2981,7 @@ static bool unity_compiler_compile_request_response_internal(
             if (!decoded) {
                 unity_compiler_binary_response_init(out_response);
             } else {
+                binary_response_request_identity(out_response, request_digest, controls_digest);
                 const bool toolchain_valid =
                     validate_existing_toolchain_authority(channel);
                 response_status_capture_valid_apis_authority(
@@ -2984,6 +3001,7 @@ static bool unity_compiler_compile_request_response_internal(
         }
     }
 
+    binary_response_request_identity(out_response, request_digest, controls_digest);
     if (compiler_cache_only_enabled()) {
         out_response->status.availability =
             UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS;

@@ -453,6 +453,8 @@ typedef struct {
     bool mutate;
     bool malformed;
     bool omit_source;
+    bool request_identity;
+    bool drift_controls;
     HLSLLiftStatus status;
 } TransactionFixture;
 
@@ -484,6 +486,10 @@ static HLSLLiftStatus transaction_compile(void *context, const USILProgram *prog
     memcpy(artifact->dxbc, transaction_target, sizeof(transaction_target));
     artifact->dxbc_size = sizeof(transaction_target);
     artifact->cache_hit = fixture->calls > 1u;
+    artifact->has_request_identity = fixture->request_identity;
+    memset(artifact->request_digest, (int)fixture->calls, sizeof(artifact->request_digest));
+    memset(artifact->controls_digest, fixture->drift_controls ? 2 : 1,
+           sizeof(artifact->controls_digest));
     /* A well-formed but wrong instruction must fail the exact gate. */
     if (fixture->mutate) {
         artifact->dxbc[52] = 58; /* NOP instead of RET. */
@@ -603,6 +609,35 @@ static bool check_transactions(void) {
         CHECK(hlsl_lift_transaction_try_copy(transaction, 0, &result) == expected);
         hlsl_lift_transaction_destroy(transaction);
     }
+    /* A byte-identical result cannot authorize changed compiler controls. */
+    services.require_request_identity = true;
+    services.compile_high_level = transaction_compile;
+    fixture = (TransactionFixture){0};
+    CHECK(hlsl_lift_transaction_begin(&program, transaction_target, sizeof(transaction_target),
+                                      &services, &limits, &transaction,
+                                      &result) == HLSL_LIFT_AUTHORITY_MISMATCH &&
+          !transaction);
+    fixture.request_identity = true;
+    CHECK(hlsl_lift_transaction_begin(&program, transaction_target, sizeof(transaction_target),
+                                      &services, &limits, &transaction,
+                                      &result) == HLSL_LIFT_VERIFIED);
+    CHECK(strlen(result.request_sha256) == 64 && strlen(result.controls_sha256) == 64);
+    baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
+    fixture.drift_controls = true;
+    CHECK(hlsl_lift_transaction_try_copy(transaction, 0, &result) == HLSL_LIFT_AUTHORITY_MISMATCH);
+    CHECK(!result.compared &&
+          hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+          HLSL_LIFT_AUTHORITY_MISMATCH);
+    fixture.drift_controls = false;
+    fixture.request_identity = false;
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
+          HLSL_LIFT_AUTHORITY_MISMATCH);
+    CHECK(!result.compared && result.request_sha256[0] == '\0');
+    fixture.request_identity = true;
+    CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) == HLSL_LIFT_VERIFIED);
+    CHECK(hlsl_lift_transaction_is_high_level(transaction));
+    hlsl_lift_transaction_destroy(transaction);
     return true;
 }
 

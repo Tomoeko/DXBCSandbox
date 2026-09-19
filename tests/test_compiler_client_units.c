@@ -1569,16 +1569,20 @@ int main(int argc, char** argv) {
     CHECK(unity_compiler_reflection_record_parse(
         "texbind: MainTex 0 1 2 3", &cached_reflection));
     UnityCompilerBinaryResponse binary_response = {
-        .status = {
-            .compiler_success = true,
-            .from_cache = false,
-            .diagnostics = &cached_diagnostic,
-            .diagnostic_count = 1U,
-        },
+        .status =
+            {
+                .compiler_success = true,
+                .from_cache = false,
+                .diagnostics = &cached_diagnostic,
+                .diagnostic_count = 1U,
+            },
         .reflection_records = &cached_reflection,
         .reflection_record_count = 1U,
-        .data = (uint8_t*)cached_binary,
+        .data = (uint8_t *)cached_binary,
         .size = sizeof(cached_binary),
+        .has_request_identity = true,
+        .request_digest = {1},
+        .controls_digest = {2},
     };
     uint8_t* encoded_response = NULL;
     size_t encoded_response_size = 0U;
@@ -1587,6 +1591,9 @@ int main(int argc, char** argv) {
     UnityCompilerBinaryResponse decoded_binary_response;
     CHECK(usc_cache_deserialize_binary_response(
         encoded_response, encoded_response_size, &decoded_binary_response));
+    CHECK(!decoded_binary_response.has_request_identity &&
+          decoded_binary_response.request_digest[0] == 0 &&
+          decoded_binary_response.controls_digest[0] == 0);
     CHECK(decoded_binary_response.status.compiler_success &&
           !decoded_binary_response.status.from_cache &&
           decoded_binary_response.status.diagnostic_count == 1U &&
@@ -2523,6 +2530,17 @@ int main(int argc, char** argv) {
           diagnosed_compile.size == sizeof(expected_diagnosed_binary) &&
           memcmp(diagnosed_compile.data, expected_diagnosed_binary,
                  sizeof(expected_diagnosed_binary)) == 0);
+    uint8_t *identity_transcript = NULL;
+    size_t identity_transcript_size = 0;
+    uint8_t identity_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t controls_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    CHECK(unity_compiler_serialize_compile_request(&fixture_channel, &diagnosed_compile_request,
+                                                   &identity_transcript, &identity_transcript_size,
+                                                   identity_digest));
+    free(identity_transcript);
+    CHECK(diagnosed_compile.has_request_identity &&
+          memcmp(identity_digest, diagnosed_compile.request_digest, sizeof(identity_digest)) == 0);
+    memcpy(controls_digest, diagnosed_compile.controls_digest, sizeof(controls_digest));
     CHECK(strcmp(diagnosed_compile.status.diagnostics[0].record,
                  "err: 13 14 15") == 0 &&
           strcmp(diagnosed_compile.status.diagnostics[0].message,
@@ -2530,12 +2548,30 @@ int main(int argc, char** argv) {
     unity_compiler_binary_response_free(&diagnosed_compile);
     CHECK(unity_compiler_compile_contract_response(
         &fixture_channel, &diagnosed_compile_request, &diagnosed_compile));
+    CHECK(diagnosed_compile.has_request_identity &&
+          memcmp(identity_digest, diagnosed_compile.request_digest, sizeof(identity_digest)) == 0 &&
+          memcmp(controls_digest, diagnosed_compile.controls_digest, sizeof(controls_digest)) == 0);
     CHECK(diagnosed_compile.status.compiler_success &&
           diagnosed_compile.status.from_cache &&
           diagnosed_compile.status.diagnostic_count == 1U &&
           diagnosed_compile.size == sizeof(expected_diagnosed_binary) &&
           memcmp(diagnosed_compile.data, expected_diagnosed_binary,
                  sizeof(expected_diagnosed_binary)) == 0);
+    unity_compiler_binary_response_free(&diagnosed_compile);
+
+    UnityCompilerSnippetCompileRequest changed_identity = diagnosed_compile_request;
+    changed_identity.snippet_source = "compile-success-info";
+    CHECK(unity_compiler_compile_contract_response(&fixture_channel, &changed_identity,
+                                                   &diagnosed_compile));
+    CHECK(diagnosed_compile.has_request_identity &&
+          memcmp(identity_digest, diagnosed_compile.request_digest, sizeof(identity_digest)) != 0 &&
+          memcmp(controls_digest, diagnosed_compile.controls_digest, sizeof(controls_digest)) == 0);
+    unity_compiler_binary_response_free(&diagnosed_compile);
+    changed_identity.source_basename = "ChangedIdentity.shader";
+    CHECK(unity_compiler_compile_contract_response(&fixture_channel, &changed_identity,
+                                                   &diagnosed_compile));
+    CHECK(diagnosed_compile.has_request_identity &&
+          memcmp(controls_digest, diagnosed_compile.controls_digest, sizeof(controls_digest)) != 0);
     unity_compiler_binary_response_free(&diagnosed_compile);
 
     /* The channel-wide expected validApis authority covers compileSnippet,
@@ -2781,8 +2817,9 @@ int main(int argc, char** argv) {
         &fixture_channel, "legacy-uncached-source", "Fixture", 0, 4, 0U,
         NULL, 0, NULL, 0, &legacy_response));
     CHECK(legacy_response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS);
-    CHECK(legacy_response.status.diagnostic_count == 0U);
+    CHECK(legacy_response.status.diagnostic_count == 0U && legacy_response.has_request_identity);
     unity_compiler_binary_response_free(&legacy_response);
+    CHECK(!legacy_response.has_request_identity);
     CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
 
     unity_compiler_binary_response_init(&legacy_response);

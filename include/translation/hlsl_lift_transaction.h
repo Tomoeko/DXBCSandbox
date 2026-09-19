@@ -19,7 +19,8 @@ typedef enum {
     HLSL_LIFT_INVALID_ARGUMENT,
     HLSL_LIFT_OUT_OF_MEMORY,
     HLSL_LIFT_CLOCK_UNAVAILABLE,
-    HLSL_LIFT_COMPOSITION_UNSUPPORTED
+    HLSL_LIFT_COMPOSITION_UNSUPPORTED,
+    HLSL_LIFT_AUTHORITY_MISMATCH
 } HLSLLiftStatus;
 
 /* The compile service transfers malloc-owned source and one complete released
@@ -33,6 +34,11 @@ typedef struct {
     uint8_t *dxbc;
     size_t dxbc_size;
     bool cache_hit;
+    /* Canonical compiler request and controls (request excluding source).
+     * Optional for standalone services; mandatory when required below. */
+    bool has_request_identity;
+    uint8_t request_digest[32];
+    uint8_t controls_digest[32];
 } HLSLLiftArtifact;
 
 typedef struct {
@@ -46,6 +52,7 @@ typedef struct {
      * clean compile; the transaction compares the complete output itself. */
     HLSLLiftStatus (*compile_high_level)(void *context, const USILProgram *program,
                                          uint64_t remaining_ms, HLSLLiftArtifact *artifact);
+    bool require_request_identity;
 } HLSLLiftServices;
 
 typedef struct {
@@ -64,6 +71,8 @@ typedef struct {
     bool cache_hit;
     char source_sha256[65];
     char output_sha256[65];
+    char request_sha256[65];
+    char controls_sha256[65];
 } HLSLLiftResult;
 
 typedef struct {

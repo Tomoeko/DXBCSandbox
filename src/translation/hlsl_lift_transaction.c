@@ -65,6 +65,15 @@ static HLSLLiftStatus work_status(HLSLLiftTransaction *transaction) {
     return transaction->stopped;
 }
 
+static bool artifact_request_identity_valid(const HLSLLiftArtifact *artifact) {
+    uint8_t request_bits = 0, controls_bits = 0;
+    for (size_t index = 0; index < sizeof(artifact->request_digest); ++index) {
+        request_bits |= artifact->request_digest[index];
+        controls_bits |= artifact->controls_digest[index];
+    }
+    return artifact->has_request_identity && request_bits && controls_bits;
+}
+
 static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USILProgram *program,
                                      HLSLLiftArtifact *artifact, HLSLLiftResult *result,
                                      bool high_level) {
@@ -87,6 +96,10 @@ static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USI
         hash_hex(artifact->source, strlen(artifact->source), result->source_sha256);
     if (artifact->dxbc && artifact->dxbc_size)
         hash_hex(artifact->dxbc, artifact->dxbc_size, result->output_sha256);
+    if (artifact->has_request_identity) {
+        common_sha256_digest_to_hex(artifact->request_digest, result->request_sha256);
+        common_sha256_digest_to_hex(artifact->controls_digest, result->controls_sha256);
+    }
     HLSLLiftStatus after = work_status(transaction);
     if (after != HLSL_LIFT_VERIFIED)
         return after;
@@ -108,6 +121,12 @@ static HLSLLiftStatus verify_program(HLSLLiftTransaction *transaction, const USI
     }
     if (!artifact->source || !artifact->source[0])
         return HLSL_LIFT_EMISSION_REJECTED;
+    if (((transaction->services.require_request_identity || artifact->has_request_identity) &&
+         !artifact_request_identity_valid(artifact)) ||
+        (transaction->accepted.has_request_identity &&
+         (!artifact->has_request_identity ||
+          memcmp(transaction->accepted.controls_digest, artifact->controls_digest, 32) != 0)))
+        return HLSL_LIFT_AUTHORITY_MISMATCH;
     result->compared = true;
     DXBCCompareStatus comparison =
         dxbc_compare_exact(transaction->target, transaction->target_size, artifact->dxbc,
@@ -316,6 +335,7 @@ const char *hlsl_lift_status_name(HLSLLiftStatus status) {
         STATUS(OUT_OF_MEMORY, "out-of-memory");
         STATUS(CLOCK_UNAVAILABLE, "clock-unavailable");
         STATUS(COMPOSITION_UNSUPPORTED, "composition-unsupported");
+        STATUS(AUTHORITY_MISMATCH, "authority-mismatch");
 #undef STATUS
     }
     return "unknown";
