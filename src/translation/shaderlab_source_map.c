@@ -42,17 +42,8 @@ bool shaderlab_expression_source_map_offset(ShaderLabExpressionSourceMap *map, s
         return false;
     for (size_t i = first_record; i < map->count; ++i) {
         HLSLExpressionSourceMap *instructions = &map->records[i].instructions;
-        if (instructions->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT)
+        if (!hlsl_expression_source_map_offset(instructions, offset))
             return false;
-        for (size_t j = 0; j < instructions->count; ++j) {
-            HLSLExpressionOrigin *origin = &instructions->origins[j];
-            if (!hlsl_expression_origin_has_span(origin->kind))
-                continue;
-            if (origin->source_begin > origin->source_end || origin->source_end > SIZE_MAX - offset)
-                return false;
-            origin->source_begin += offset;
-            origin->source_end += offset;
-        }
     }
     return true;
 }
@@ -78,24 +69,9 @@ bool shaderlab_expression_source_map_matches_source(const ShaderLabExpressionSou
             return false;
         for (size_t j = 0; j < instructions->count; ++j) {
             const HLSLExpressionOrigin *origin = &instructions->origins[j];
-            if (origin->instruction_index != (int)j || origin->destination_lanes > 15)
+            if (origin->instruction_index != (int)j || origin->destination_lanes > 15 ||
+                !hlsl_expression_origin_ranges_valid(origin, source->len))
                 return false;
-            switch (origin->kind) {
-            case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
-            case HLSL_EXPRESSION_ORIGIN_RETURN:
-            case HLSL_EXPRESSION_ORIGIN_CONTROL:
-            case HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL:
-                if (origin->source_begin >= origin->source_end || origin->source_end > source->len)
-                    return false;
-                break;
-            case HLSL_EXPRESSION_ORIGIN_DEAD:
-            case HLSL_EXPRESSION_ORIGIN_NOP:
-                if (origin->source_begin || origin->source_end)
-                    return false;
-                break;
-            default:
-                return false;
-            }
         }
     }
     return true;

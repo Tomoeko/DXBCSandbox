@@ -1272,12 +1272,19 @@ static int test_two_stage_symbolic_selectors_are_exhaustive(void) {
  * Full-container equality and finite rendering are separate live checks; this
  * test pins candidate selection, metadata reuse, and atomic rejection. */
 static int test_high_level_shaderlab_candidate(int shape) {
-  const bool conditional = shape == 1, loop = shape == 2;
+  static const struct {
+    const char *path, *name;
+    size_t instructions[2];
+  } fixtures[] = {
+    {SHADERLAB_EXPRESSION_TEST_FIXTURE, "Experiment/ExpressionFixture", {3, 3}},
+    {SHADERLAB_CONDITIONAL_TEST_FIXTURE, "Experiment/ConditionalFixture", {4, 11}},
+    {SHADERLAB_LOOP_TEST_FIXTURE, "Experiment/CountedLoopFixture", {4, 12}},
+    {SHADERLAB_FUNCTION_TEST_FIXTURE, "Experiment/FunctionFixture", {4, 6}}
+  };
+  CHECK(shape >= 0 && (size_t)shape < sizeof(fixtures) / sizeof(fixtures[0]));
+  const bool conditional = shape == 1, loop = shape == 2, function = shape == 3;
   size_t fixture_size = 0;
-  uint8_t *fixture = read_fixture_path(loop ? SHADERLAB_LOOP_TEST_FIXTURE :
-                                      conditional ? SHADERLAB_CONDITIONAL_TEST_FIXTURE :
-                                                    SHADERLAB_EXPRESSION_TEST_FIXTURE,
-                                      &fixture_size);
+  uint8_t *fixture = read_fixture_path(fixtures[shape].path, &fixture_size);
   CHECK(fixture != NULL);
   uint8_t *segments[3] = {NULL, NULL, NULL};
   int segment_lengths[3] = {0, 0, 0};
@@ -1316,8 +1323,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
   subshader.pass_count = 1;
   subshader.passes = passes;
   SerializedShader shader = {0};
-  shader.name = loop ? "Experiment/CountedLoopFixture" :
-                conditional ? "Experiment/ConditionalFixture" : "Experiment/ExpressionFixture";
+  shader.name = (char *)fixtures[shape].name;
   shader.subshader_count = 1;
   shader.subshaders = &subshader;
 
@@ -1341,14 +1347,15 @@ static int test_high_level_shaderlab_candidate(int shape) {
     CHECK(record->stage_index == (int)i && record->subprogram_index == 0);
     CHECK(record->blob_index == (int)i && record->hardware_tier_group == 3);
     CHECK(record->serialized_state == 0 &&
-          record->instructions.count == (loop ? (i ? 12u : 4u) : conditional ? (i ? 11u : 4u) : 3u));
+          record->instructions.count == fixtures[shape].instructions[i]);
     CHECK(memcmp(record->target_digest, target_digests[i], sizeof(record->target_digest)) == 0);
     for (size_t j = 0; j < record->instructions.count; ++j) {
       const HLSLExpressionOrigin *origin = &record->instructions.origins[j];
       CHECK(origin->source_begin >= strlen(prefix));
       CHECK(origin->source_end <= high.len);
       CHECK(high.buf[origin->source_begin] == '(' ||
-            high.buf[origin->source_begin] == ' ');
+            high.buf[origin->source_begin] == ' ' ||
+            origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION);
       if (origin->kind == HLSL_EXPRESSION_ORIGIN_RETURN)
         CHECK(high.buf[origin->source_end - 1] == '\n');
     }
@@ -1356,7 +1363,25 @@ static int test_high_level_shaderlab_candidate(int shape) {
   const HLSLExpressionSourceMap *fragment_map = &map.records[1].instructions;
   const HLSLExpressionOrigin *nested = &fragment_map->origins[0];
   const HLSLExpressionOrigin *outer = &fragment_map->origins[1];
-  if (loop) {
+  if (function) {
+    CHECK(count_text(high.buf, "float4 dxbc_mul_chain_right(") == 1u);
+    CHECK(count_text(high.buf, " = dxbc_mul_chain_right(") == 2u);
+    for (size_t i = 0; i < 4; ++i) {
+      const HLSLExpressionOrigin *origin = &fragment_map->origins[i];
+      CHECK(origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION);
+      CHECK(strncmp(high.buf + origin->source_begin, "dxbc_mul_chain_right(", 20) == 0);
+      CHECK(origin->definition_begin >= strlen(prefix) &&
+            origin->definition_end <= origin->source_begin);
+      const char *operation = i % 2u ? "(scale * product)" : "(left * right)";
+      CHECK(origin->definition_end - origin->definition_begin == strlen(operation));
+      CHECK(memcmp(high.buf + origin->definition_begin, operation, strlen(operation)) == 0);
+    }
+    HLSLExpressionOrigin saved = map.records[1].instructions.origins[0];
+    map.records[1].instructions.origins[0].definition_end = SIZE_MAX;
+    CHECK(!shaderlab_expression_source_map_matches_source(&map, &high));
+    map.records[1].instructions.origins[0] = saved;
+    CHECK(shaderlab_expression_source_map_matches_source(&map, &high));
+  } else if (loop) {
     CHECK(count_text(high.buf, "[loop] for (uint") == 1u);
     CHECK(count_text(high.buf, "float4 dxbc_merge_") == 2u);
     size_t controls = 0;
@@ -1414,7 +1439,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
     CHECK(shaderlab_expression_source_map_matches_source(&map, &high));
   }
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_OK);
-  if (!conditional && !loop)
+  if (!conditional && !loop && !function)
     CHECK(strstr(high.buf, "o0 = (((v1) * (v1.yzwx)) * (v1.zwxy));") != NULL);
   CHECK(strstr(high.buf, "float4 r0") == NULL);
   CHECK(count_text(high.buf, "Single exact planned variant") == 2u);
@@ -1889,6 +1914,7 @@ int main(void) {
   CHECK(test_high_level_shaderlab_candidate(0) == 0);
   CHECK(test_high_level_shaderlab_candidate(1) == 0);
   CHECK(test_high_level_shaderlab_candidate(2) == 0);
+  CHECK(test_high_level_shaderlab_candidate(3) == 0);
   CHECK(test_requirements_target_projection() == 0);
   CHECK(test_target_authority_is_strict_and_typed() == 0);
   CHECK(strcmp(shaderlab_stage_status_name(SHADERLAB_STAGE_OUTPUT_FAILED),

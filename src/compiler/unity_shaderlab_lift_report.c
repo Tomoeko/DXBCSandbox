@@ -138,10 +138,12 @@ static void source_map(StringBuilder *out, const ShaderLabExpressionSourceMap *m
                 sb_append_char(out, ',');
             sb_appendf(out,
                        "{\"kind\":\"%s\",\"instruction\":%d,\"source_instruction\":%" PRIu32
-                       ",\"destination_lanes\":%u,\"begin\":%zu,\"end\":%zu}",
+                       ",\"destination_lanes\":%u,\"begin\":%zu,\"end\":%zu,"
+                       "\"definition_begin\":%zu,\"definition_end\":%zu}",
                        hlsl_expression_origin_kind_name(origin->kind), origin->instruction_index,
                        origin->source_instruction_index, (unsigned)origin->destination_lanes,
-                       origin->source_begin, origin->source_end);
+                       origin->source_begin, origin->source_end, origin->definition_begin,
+                       origin->definition_end);
         }
         sb_append(out, "]}");
     }

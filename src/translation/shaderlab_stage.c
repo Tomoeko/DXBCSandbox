@@ -839,15 +839,10 @@ static void append_indented_source(StringBuilder *output,
     if (*cursor == '\n') ++cursor;
     const size_t line_end = (size_t)(cursor - source->buf);
     if (!sb_ok(output)) return;
-    /* Exclusive ends at a newline precede the next line's indentation;
-     * starts at that same boundary follow it. Keep those affinities distinct. */
-    for (size_t i = 0; map && i < original.count; ++i) {
-      const HLSLExpressionOrigin *origin = &original.origins[i];
-      if (!hlsl_expression_origin_has_span(origin->kind)) continue;
-      if (origin->source_begin >= line_begin && origin->source_begin < line_end)
-        map->origins[i].source_begin = output_begin + (origin->source_begin - line_begin);
-      if (origin->source_end > line_begin && origin->source_end <= line_end)
-        map->origins[i].source_end = output_begin + (origin->source_end - line_begin);
+    if (map && !hlsl_expression_source_map_rebase_line(map, &original, line_begin, line_end,
+                                                       output_begin)) {
+      output->failed = true;
+      return;
     }
   }
 }

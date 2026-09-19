@@ -1795,6 +1795,13 @@ bool hlsl_emit_with_options_diagnostic(
     goto cleanup;
   }
 
+  if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE && !emit_high_level_functions(&ctx)) {
+    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED,
+                   HLSL_EMIT_PHASE_STRUCTURAL_HELPER_EMISSION,
+                   HLSL_EMIT_REASON_LOWERING_FAILED);
+    goto cleanup;
+  }
+
   // 4. Emit Input/Output structures
   emit_io_structs(&ctx, input_struct, output_struct);
   if (!sb_ok(sb)) {

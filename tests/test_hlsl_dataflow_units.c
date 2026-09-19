@@ -1662,6 +1662,125 @@ static bool check_counted_loop_emission(void) {
     return true;
 }
 
+static bool check_function_emission(void) {
+    USILInstruction instructions[6] = {0};
+    for (int i = 0; i < 5; ++i)
+        instructions[i] = (USILInstruction){.opcode = USIL_OP_MUL, .operand_count = 3};
+    for (int chain = 0; chain < 2; ++chain) {
+        USILInstruction *first = &instructions[chain * 2], *second = first + 1;
+        first->operands[0] = second->operands[0] = emission_reg(OPERAND_TYPE_TEMP, chain);
+        first->operands[1] = emission_reg(OPERAND_TYPE_INPUT, chain);
+        first->operands[2] = emission_reg(OPERAND_TYPE_INPUT, 1 - chain);
+        second->operands[1] = first->operands[0];
+        second->operands[2] = emission_reg(OPERAND_TYPE_INPUT, chain);
+    }
+    instructions[4].operands[0] = emission_reg(OPERAND_TYPE_OUTPUT, 0);
+    instructions[4].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 0);
+    instructions[4].operands[2] = emission_reg(OPERAND_TYPE_TEMP, 1);
+    instructions[5].opcode = USIL_OP_RET;
+    DXBCSignatureElement inputs[2] = {
+        {.semantic_name = "TEXCOORD", .component_type = 3, .mask = 15, .rw_mask = 15},
+        {.semantic_name = "TEXCOORD",
+         .semantic_index = 1,
+         .register_id = 1,
+         .component_type = 3,
+         .mask = 15,
+         .rw_mask = 15}};
+    DXBCSignatureElement output = {
+        .semantic_name = "SV_Target", .component_type = 3, .system_value = 64, .mask = 15};
+    USILProgram program = {.shader_type_model = "ps_5_0",
+                           .instructions = instructions,
+                           .instruction_count = 6,
+                           .instruction_alloc = 6,
+                           .temp_count = 2,
+                           .inputs = inputs,
+                           .input_count = 2,
+                           .input_alloc = 2,
+                           .outputs = &output,
+                           .output_count = 1,
+                           .output_alloc = 1,
+                           .has_stage_contract = true,
+                           .program_type = DXBC_PROGRAM_TYPE_PIXEL,
+                           .shader_model_major = 5};
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLExpressionSourceMap map;
+    options.expression_source_map = &map;
+    StringBuilder source;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(hlsl_expression_source_map_matches(&map, &program, source.buf));
+    CHECK(strstr(source.buf, "float4 dxbc_mul_chain_") &&
+          strstr(source.buf, "const float4 dxbc_value_i1 = dxbc_mul_chain_") &&
+          strstr(source.buf, "const float4 dxbc_value_i3 = dxbc_mul_chain_"));
+    for (int i = 0; i < 4; ++i) {
+        const HLSLExpressionOrigin *origin = &map.origins[i];
+        CHECK(origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION);
+        CHECK(origin->definition_begin < origin->definition_end &&
+              origin->definition_end < origin->source_begin);
+        CHECK(strncmp(source.buf + origin->source_begin, "dxbc_mul_chain_", 15) == 0);
+        CHECK(source.buf[origin->definition_begin] == '(');
+    }
+    CHECK(map.origins[0].source_begin == map.origins[1].source_begin);
+    CHECK(map.origins[2].source_begin == map.origins[3].source_begin);
+    CHECK(map.origins[0].source_end < map.origins[2].source_begin);
+    CHECK(map.origins[0].definition_begin == map.origins[2].definition_begin);
+    CHECK(map.origins[1].definition_begin == map.origins[3].definition_begin);
+    HLSLExpressionSourceMap original = map;
+    for (int mutation = 0; mutation < 4; ++mutation) {
+        if (mutation == 0)
+            map.origins[0].definition_end = SIZE_MAX;
+        if (mutation == 1)
+            map.origins[0].definition_begin = map.origins[0].definition_end;
+        if (mutation == 2)
+            map.origins[0].kind = HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+        if (mutation == 3)
+            map.origins[4].definition_end = 1;
+        CHECK(!hlsl_expression_source_map_matches(&map, &program, source.buf));
+        map = original;
+    }
+    CHECK(!hlsl_expression_source_map_offset(&map, SIZE_MAX));
+    CHECK(memcmp(&map, &original, sizeof(map)) == 0);
+    CHECK(hlsl_expression_source_map_offset(&map, 17));
+    for (int i = 0; i < 4; ++i) {
+        CHECK(map.origins[i].source_begin == original.origins[i].source_begin + 17);
+        CHECK(map.origins[i].definition_begin == original.origins[i].definition_begin + 17);
+    }
+    sb_free(&source);
+    /* One identity-swizzled producer use changed: only one reusable chain
+     * remains, so both helpers disappear while ordinary expressions remain. */
+    instructions[1].operands[1].swizzle[0] = 1;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(!strstr(source.buf, "dxbc_mul_chain_"));
+    for (size_t i = 0; i < map.count; ++i)
+        CHECK(!map.origins[i].definition_begin && !map.origins[i].definition_end);
+    sb_free(&source);
+    instructions[1].operands[1].swizzle[0] = 0;
+    /* Immediate scale arguments use the opposite compiler inverse signature.
+     * Keep the product's side in the outer operation; never commute it here. */
+    DXBCOperand scale0 = instructions[1].operands[2], scale1 = instructions[3].operands[2];
+    instructions[1].operands[2] = instructions[3].operands[2] =
+        (DXBCOperand){.type = OPERAND_TYPE_IMMEDIATE32,
+                      .imm_value_count = 1,
+                      .imm_values = {UINT32_C(0x3f000000)}};
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(strstr(source.buf, "float4 dxbc_mul_chain_left("));
+    CHECK(strstr(source.buf, "return (product * scale);"));
+    CHECK(hlsl_expression_source_map_matches(&map, &program, source.buf));
+    sb_free(&source);
+    instructions[1].operands[2] = scale0;
+    instructions[3].operands[2] = scale1;
+    const char *reserved = "dxbc_mul_chain_right";
+    options.reserved_preprocessor_identifiers = &reserved;
+    options.reserved_preprocessor_identifier_count = 1;
+    sb_init(&source);
+    CHECK(!hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
+    CHECK(!map.complete);
+    sb_free(&source);
+    return true;
+}
+
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
@@ -1670,7 +1789,7 @@ int main(void) {
         !check_long_dominator_chain() || !check_copy_candidates() || !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
         !check_expression_emission() || !check_conditional_emission() ||
-        !check_counted_loop_emission())
+        !check_counted_loop_emission() || !check_function_emission())
         return 1;
     puts("HLSL dataflow contracts passed");
     return 0;

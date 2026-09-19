@@ -70,7 +70,7 @@ generation currently return `include-authority-unavailable`.
 
 `unity_golden_verifier --high-level --report results.jsonl` tests an opt-in
 float4 expression lift for bounded vertex/fragment programs and structured
-conditionals and counted loops.
+conditionals, counted loops, and repeated pure multiplication helpers.
 Each accepted candidate must reproduce its entire target DXBC container;
 unsupported candidates retain verified low-level output. Extraction's
 `--high-level` checks every local D3D11 pass/state/tier under the supplied

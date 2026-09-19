@@ -106,8 +106,8 @@ bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int index) {
     return true;
 }
 
-static bool validate_expressions(HLSLEmitterContext *ctx,
-                                 unsigned uses[EXPRESSION_INSTRUCTION_LIMIT]) {
+bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
+                                      unsigned uses[EXPRESSION_INSTRUCTION_LIMIT]) {
     if (!hlsl_float4_program_supported(ctx))
         return false;
     if (ctx->compiler_model.replacement_count)
@@ -215,6 +215,7 @@ typedef struct {
     HLSLExpressionSourceMap *map;
     ASTExpr **roots;
     uint64_t owners;
+    bool function;
 } ExpressionSpanContext;
 
 static bool record_expression_span(void *context, const ASTExpr *expression, size_t begin,
@@ -226,7 +227,8 @@ static bool record_expression_span(void *context, const ASTExpr *expression, siz
         HLSLExpressionOrigin *origin = &trace->map->origins[index];
         if (origin->kind != HLSL_EXPRESSION_ORIGIN_UNMAPPED || begin >= end)
             return false;
-        origin->kind = HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+        origin->kind =
+            trace->function ? HLSL_EXPRESSION_ORIGIN_FUNCTION : HLSL_EXPRESSION_ORIGIN_EXPRESSION;
         origin->source_begin = begin;
         origin->source_end = end;
     }
@@ -241,7 +243,8 @@ static bool finish_expression_origins(ExpressionSpanContext *trace, bool dead) {
             HLSLExpressionOrigin *origin = &trace->map->origins[index];
             if (dead)
                 origin->kind = HLSL_EXPRESSION_ORIGIN_DEAD;
-            else if (origin->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION)
+            else if (origin->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
+                     origin->kind != HLSL_EXPRESSION_ORIGIN_FUNCTION)
                 return false;
         }
         trace->roots[index] = NULL;
@@ -321,8 +324,11 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
     ASTExpr *pending[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     ASTExpr *roots[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     uint64_t pending_owners[EXPRESSION_INSTRUCTION_LIMIT] = {0};
-    if (!validate_expressions(ctx, uses))
+    if (!hlsl_float4_validate_expressions(ctx, uses))
         return false;
+    for (int index = 0; index < ctx->program->instruction_count; ++index)
+        if (ctx->float4_functions.group[index] >= 0)
+            uses[index] = 2; /* Keep each call result at its original instruction site. */
     hlsl_expression_source_map_begin(ctx);
     HLSLExpressionSourceMap *map = ctx->expression_source_map;
     bool success = false;
@@ -331,17 +337,35 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
         ctx->current_instruction_index = index;
         if (inst->opcode == USIL_OP_NOP || inst->opcode == USIL_OP_RET)
             continue;
+        if (index + 1 < ctx->program->instruction_count &&
+            ctx->float4_functions.group[index + 1] >= 0)
+            continue; /* The following call owns this single-use producer. */
         uint64_t owners = UINT64_C(1) << index;
-        ASTExpr *left = source_expression(ctx, index, 1, uses, pending, pending_owners, &owners);
-        ASTExpr *right =
-            inst->opcode == USIL_OP_MOV
-                ? NULL
-                : source_expression(ctx, index, 2, uses, pending, pending_owners, &owners);
-        ASTExpr *expression = hlsl_float4_operation(ctx, index, left, right);
+        const int group = ctx->float4_functions.group[index];
+        ASTExpr *expression = NULL;
+        if (group >= 0) {
+            owners |= UINT64_C(1) << (index - 1);
+            expression = hlsl_float4_function_call(ctx, index);
+            roots[index - 1] = expression;
+            for (int operation = 0; map && operation < 2; ++operation) {
+                HLSLExpressionOrigin *origin = &map->origins[index - 1 + operation];
+                origin->definition_begin = ctx->float4_functions.definition_begin[group][operation];
+                origin->definition_end = ctx->float4_functions.definition_end[group][operation];
+            }
+        } else {
+            ASTExpr *left =
+                source_expression(ctx, index, 1, uses, pending, pending_owners, &owners);
+            ASTExpr *right =
+                inst->opcode == USIL_OP_MOV
+                    ? NULL
+                    : source_expression(ctx, index, 2, uses, pending, pending_owners, &owners);
+            expression = hlsl_float4_operation(ctx, index, left, right);
+        }
         if (!expression)
             goto cleanup;
         roots[index] = expression;
-        ExpressionSpanContext trace = {.map = map, .roots = roots, .owners = owners};
+        ExpressionSpanContext trace = {
+            .map = map, .roots = roots, .owners = owners, .function = group >= 0};
         const DXBCOperand *destination = &inst->operands[0];
         if (destination->type == OPERAND_TYPE_TEMP && uses[index] <= 1) {
             if (uses[index]) {
@@ -403,6 +427,11 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
         if (origin->destination_lanes != lanes)
             return false;
         switch (origin->kind) {
+        case HLSL_EXPRESSION_ORIGIN_FUNCTION:
+            if (inst->opcode != USIL_OP_MUL || lanes != 15 ||
+                inst->operands[0].type != OPERAND_TYPE_TEMP)
+                return false;
+            break;
         case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
             if (!expression || lanes != 15)
                 return false;
@@ -437,11 +466,7 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
         default:
             return false;
         }
-        const bool emitted = hlsl_expression_origin_has_span(origin->kind);
-        if (emitted) {
-            if (origin->source_begin >= origin->source_end || origin->source_end > source_length)
-                return false;
-        } else if (origin->source_begin || origin->source_end)
+        if (!hlsl_expression_origin_ranges_valid(origin, source_length))
             return false;
     }
     return true;
@@ -461,6 +486,8 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
         return "control";
     case HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL:
         return "loop-control";
+    case HLSL_EXPRESSION_ORIGIN_FUNCTION:
+        return "function";
     default:
         return "unmapped";
     }
@@ -468,5 +495,74 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
 
 bool hlsl_expression_origin_has_span(HLSLExpressionOriginKind kind) {
     return kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION || kind == HLSL_EXPRESSION_ORIGIN_RETURN ||
-           kind == HLSL_EXPRESSION_ORIGIN_CONTROL || kind == HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL;
+           kind == HLSL_EXPRESSION_ORIGIN_CONTROL || kind == HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL ||
+           kind == HLSL_EXPRESSION_ORIGIN_FUNCTION;
+}
+
+bool hlsl_expression_origin_ranges_valid(const HLSLExpressionOrigin *origin, size_t source_length) {
+    if (!origin)
+        return false;
+    if (hlsl_expression_origin_has_span(origin->kind)) {
+        if (origin->source_begin >= origin->source_end || origin->source_end > source_length)
+            return false;
+    } else if ((origin->kind != HLSL_EXPRESSION_ORIGIN_NOP &&
+                origin->kind != HLSL_EXPRESSION_ORIGIN_DEAD) ||
+               origin->source_begin || origin->source_end) {
+        return false;
+    }
+    if (origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION)
+        return origin->definition_begin < origin->definition_end &&
+               origin->definition_end <= origin->source_begin;
+    return !origin->definition_begin && !origin->definition_end;
+}
+
+bool hlsl_expression_source_map_offset(HLSLExpressionSourceMap *map, size_t offset) {
+    if (!map || !map->complete || map->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT)
+        return false;
+    for (size_t i = 0; i < map->count; ++i) {
+        const HLSLExpressionOrigin *origin = &map->origins[i];
+        if (!hlsl_expression_origin_ranges_valid(origin, SIZE_MAX - offset))
+            return false;
+    }
+    for (size_t i = 0; i < map->count; ++i) {
+        HLSLExpressionOrigin *origin = &map->origins[i];
+        if (!hlsl_expression_origin_has_span(origin->kind))
+            continue;
+        origin->source_begin += offset;
+        origin->source_end += offset;
+        if (origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION) {
+            origin->definition_begin += offset;
+            origin->definition_end += offset;
+        }
+    }
+    return true;
+}
+
+bool hlsl_expression_source_map_rebase_line(HLSLExpressionSourceMap *map,
+                                            const HLSLExpressionSourceMap *original,
+                                            size_t line_begin, size_t line_end,
+                                            size_t output_begin) {
+    if (!map || !original || !original->complete || map->count != original->count ||
+        original->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT || line_begin > line_end ||
+        output_begin > SIZE_MAX - (line_end - line_begin))
+        return false;
+    for (size_t i = 0; i < original->count; ++i) {
+        const HLSLExpressionOrigin *from = &original->origins[i];
+        HLSLExpressionOrigin *to = &map->origins[i];
+        if (!hlsl_expression_origin_has_span(from->kind))
+            continue;
+        const size_t starts[] = {from->source_begin, from->definition_begin};
+        const size_t ends[] = {from->source_end, from->definition_end};
+        size_t *to_starts[] = {&to->source_begin, &to->definition_begin};
+        size_t *to_ends[] = {&to->source_end, &to->definition_end};
+        const int ranges = from->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION ? 2 : 1;
+        for (int range = 0; range < ranges; ++range) {
+            /* A newline end precedes new indentation; a start follows it. */
+            if (starts[range] >= line_begin && starts[range] < line_end)
+                *to_starts[range] = output_begin + starts[range] - line_begin;
+            if (ends[range] > line_begin && ends[range] <= line_end)
+                *to_ends[range] = output_begin + ends[range] - line_begin;
+        }
+    }
+    return true;
 }

@@ -1523,15 +1523,10 @@ static char *emit_stage_with_options(const USILProgram *program, const GoldenSta
     const size_t source_offset = harness.len + strlen(stage->define_prefix);
     sb_append(&harness, source.buf);
     if (sb_ok(&harness)) output = build_stage_source(harness.buf, stage);
-    if (output && options && options->expression_source_map) {
-        HLSLExpressionSourceMap *map = options->expression_source_map;
-        for (size_t index = 0; index < map->count; ++index) {
-            HLSLExpressionOrigin *origin = &map->origins[index];
-            if (hlsl_expression_origin_has_span(origin->kind)) {
-                origin->source_begin += source_offset;
-                origin->source_end += source_offset;
-            }
-        }
+    if (output && options && options->expression_source_map &&
+        !hlsl_expression_source_map_offset(options->expression_source_map, source_offset)) {
+        free(output);
+        output = NULL;
     }
     sb_free(&harness);
     result->reason = output ? "emitted" : "source_allocation_failed";
@@ -1793,12 +1788,14 @@ static void verify_copy_lifts(UnityCompilerBroker *broker, const GoldenFlags *fl
                     "\"record\":%zu,\"lift\":\"%s\",\"version\":%u,\"instruction\":%d,"
                     "\"source_instruction\":%" PRIu32 ",\"destination_lanes\":%u,"
                     "\"kind\":\"%s\",\"begin\":%zu,\"end\":%zu,"
+                    "\"definition_begin\":%zu,\"definition_end\":%zu,"
                     "\"source_sha256\":\"%s\",\"request_sha256\":\"%s\"}\n",
                     case_hash, record, HLSL_HIGH_LEVEL_LIFT_ID, HLSL_HIGH_LEVEL_LIFT_VERSION,
                     origin->instruction_index, origin->source_instruction_index,
                     (unsigned)origin->destination_lanes,
                     hlsl_expression_origin_kind_name(origin->kind), origin->source_begin,
-                    origin->source_end, source_hash, request_hash);
+                    origin->source_end, origin->definition_begin, origin->definition_end,
+                    source_hash, request_hash);
         }
     }
     printf(" [copy lifts: %zu/%zu]", stats.accepted, stats.candidates);
@@ -2424,8 +2421,13 @@ static HLSLLiftStatus compile_live_high_level_fixture(void *context, const USILP
         compile_live_lift_fixture_mode(context, program, remaining_ms, artifact, true);
     const LiveLiftFixture *fixture = context;
     if (status == HLSL_LIFT_VERIFIED && fixture->corrupt_source_map &&
-        artifact->expression_source_map)
-        artifact->expression_source_map->origins[0].source_end = SIZE_MAX;
+        artifact->expression_source_map) {
+        HLSLExpressionOrigin *origin = &artifact->expression_source_map->origins[0];
+        if (origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION)
+            origin->definition_end = SIZE_MAX;
+        else
+            origin->source_end = SIZE_MAX;
+    }
     return status;
 }
 
@@ -2592,51 +2594,64 @@ cleanup:
     return succeeded;
 }
 
+static const struct {
+    const char *name;
+    const char *body;
+    enum {
+        FIXTURE_INLINE,
+        FIXTURE_SHARED,
+        FIXTURE_PARTIAL,
+        FIXTURE_BRANCH,
+        FIXTURE_LOOP,
+        FIXTURE_FUNCTION
+    } kind;
+} k_expression_fixtures[] = {
+    {"nested", "float4 product = value * value.wzyx; return product * value.zwxy;", FIXTURE_INLINE},
+    {"shared", "float4 product = value * value.yzwx; return product + product.zwxy;",
+     FIXTURE_SHARED},
+    {"partial", "float4 product = value * value.wzyx; return product + product.zwxy;",
+     FIXTURE_PARTIAL},
+    {"branch",
+     "float4 result; [branch] if (asuint(flags.x)) result = value * value.yzwx; "
+     "else result = value * value.zwxy; return result * value;",
+     FIXTURE_BRANCH},
+    {"zero-branch",
+     "float4 result = value; [branch] if (!asuint(flags.x)) "
+     "result = value * value.yzwx; return result * value;",
+     FIXTURE_BRANCH},
+    {"nested-branch",
+     "float4 result; [branch] if (asuint(flags.x)) { "
+     "[branch] if(asuint(flags.y)) result = value * value.yzwx; "
+     "else result = value * value.wxyz; } else result = value * value.zwxy; "
+     "return result * value;",
+     FIXTURE_BRANCH},
+    {"counted-loop",
+     "float4 result = value; [loop] for(uint i=0u;i<asuint(flags.x);++i) "
+     "result = result * value.yzwx; return result;",
+     FIXTURE_LOOP},
+    {"counted-loop-tail",
+     "float4 result = value; [loop] for(uint i=0u;i<asuint(flags.y);++i) "
+     "result = result * value.yzwx; return result * value;",
+     FIXTURE_LOOP},
+    {"counted-loop-two-values",
+     "float4 result = value, second = value.yzwx; "
+     "[loop] for(uint i=0u;i<asuint(flags.w);++i) { result = result * second; "
+     "second = second * value; } return result * second;",
+     FIXTURE_LOOP},
+    {"shared-function",
+     "float4 p=value * value.yzwx; float4 q=p * flags; "
+     "float4 r=flags.zwxy * value.wzyx; float4 s=r * value; return q * s;",
+     FIXTURE_FUNCTION}};
+
 static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, int shape,
                                         FILE *report) {
-    static const struct {
-        const char *name;
-        const char *body;
-        bool shared, partial, conditional, loop;
-    } fixtures[] = {
-        {"nested", "float4 product = value * value.wzyx; return product * value.zwxy;", false,
-         false, false, false},
-        {"shared", "float4 product = value * value.yzwx; return product + product.zwxy;", true,
-         false, false, false},
-        {"partial", "float4 product = value * value.wzyx; return product + product.zwxy;", true,
-         true, false, false},
-        {"branch",
-         "float4 result; [branch] if (asuint(flags.x)) result = value * value.yzwx; "
-         "else result = value * value.zwxy; return result * value;",
-         true, false, true, false},
-        {"zero-branch",
-         "float4 result = value; [branch] if (!asuint(flags.x)) "
-         "result = value * value.yzwx; return result * value;",
-         true, false, true, false},
-        {"nested-branch",
-         "float4 result; [branch] if (asuint(flags.x)) { "
-         "[branch] if(asuint(flags.y)) result = value * value.yzwx; "
-         "else result = value * value.wxyz; } else result = value * value.zwxy; "
-         "return result * value;",
-         true, false, true, false},
-        {"counted-loop",
-         "float4 result = value; [loop] for(uint i=0u;i<asuint(flags.x);++i) "
-         "result = result * value.yzwx; return result;",
-         true, false, false, true},
-        {"counted-loop-tail",
-         "float4 result = value; [loop] for(uint i=0u;i<asuint(flags.y);++i) "
-         "result = result * value.yzwx; return result * value;",
-         true, false, false, true},
-        {"counted-loop-two-values",
-         "float4 result = value, second = value.yzwx; "
-         "[loop] for(uint i=0u;i<asuint(flags.w);++i) { result = result * second; "
-         "second = second * value; } return result * second;",
-         true, false, false, true}};
-    if (shape < 0 || (size_t)shape >= sizeof(fixtures) / sizeof(fixtures[0]))
+    if (shape < 0 ||
+        (size_t)shape >= sizeof(k_expression_fixtures) / sizeof(k_expression_fixtures[0]))
         return false;
-    const bool shared = fixtures[shape].shared, partial = fixtures[shape].partial;
-    const bool conditional = fixtures[shape].conditional, loop = fixtures[shape].loop;
-    const bool structured = conditional || loop;
+    const int kind = k_expression_fixtures[shape].kind;
+    const bool shared = kind != FIXTURE_INLINE, partial = kind == FIXTURE_PARTIAL;
+    const bool loop = kind == FIXTURE_LOOP, function = kind == FIXTURE_FUNCTION;
+    const bool structured = kind == FIXTURE_BRANCH || loop;
     bool succeeded = false;
     USILProgram program = {0};
     uint8_t *bytes = NULL;
@@ -2647,10 +2662,11 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     StringBuilder seed;
     sb_init(&seed);
     sb_append(&seed, "#pragma vertex main\n#pragma fragment main\n");
-    sb_appendf(
-        &seed, "float4 main(float4 value : %s%s) : %s {\n", stage == 0 ? "POSITION" : "TEXCOORD0",
-        structured ? ", float4 flags : TEXCOORD1" : "", stage == 0 ? "SV_POSITION" : "SV_Target");
-    sb_append(&seed, fixtures[shape].body);
+    sb_appendf(&seed, "float4 main(float4 value : %s%s) : %s {\n",
+               stage == 0 ? "POSITION" : "TEXCOORD0",
+               (structured || function) ? ", float4 flags : TEXCOORD1" : "",
+               stage == 0 ? "SV_POSITION" : "SV_Target");
+    sb_append(&seed, k_expression_fixtures[shape].body);
     sb_append(&seed, "\n}\n");
     SELF_CHECK(sb_ok(&seed));
     bytes = unity_compiler_broker_compile(broker, seed.buf, "ExpressionFixture", stage, 4, 0, NULL,
@@ -2690,7 +2706,7 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
                    hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
         flags.shader_name = "ExpressionFixture";
     }
-    if (structured) {
+    if (structured || function) {
         const char *baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
         fixture.corrupt_candidate = true;
         SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
@@ -2717,21 +2733,25 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     }
     if (status != HLSL_LIFT_VERIFIED)
         fprintf(stderr, "%s %s expression: %s\n", k_stages[stage].name,
-                fixtures[shape].name, hlsl_lift_status_name(status));
+                k_expression_fixtures[shape].name, hlsl_lift_status_name(status));
     SELF_CHECK(status == HLSL_LIFT_VERIFIED);
     const char *accepted = hlsl_lift_transaction_artifact(transaction)->source;
-    SELF_CHECK(!strstr(accepted, "float4 r") && !strstr(accepted, "u_xlat_temp"));
+    SELF_CHECK(!strstr(accepted, "\n    float4 r") && !strstr(accepted, "u_xlat_temp"));
     SELF_CHECK(shared == (strstr(accepted, "const float4 dxbc_value_") != NULL));
-    if (structured) {
-        SELF_CHECK(strstr(accepted, "float4 dxbc_merge_") &&
-                   strstr(accepted, loop ? "[loop] for (uint" : "[branch] if ("));
+    if (structured || function) {
+        if (function)
+            SELF_CHECK(strstr(accepted, "float4 dxbc_mul_chain_right(") &&
+                       strstr(accepted, "const float4 dxbc_value_i3 = dxbc_mul_chain_right("));
+        else
+            SELF_CHECK(strstr(accepted, "float4 dxbc_merge_") &&
+                       strstr(accepted, loop ? "[loop] for (uint" : "[branch] if ("));
         char case_hash[65];
         hash_hex(seed.buf, seed.len, case_hash);
         report_lift(report, case_hash, 0, 0, &result, 2);
         report_lift_steps(report, case_hash, 0, transaction);
     }
     printf("%s: decoded %s expression reproduced complete target DXBC\n", k_stages[stage].name,
-           fixtures[shape].name);
+           k_expression_fixtures[shape].name);
     succeeded = true;
 cleanup:
     if (!succeeded && error)
@@ -2800,7 +2820,9 @@ int main(int argc, char** argv) {
             run_live_lift_fixture(broker, 1, false, report) &&
             run_live_lift_fixture(broker, 0, true, report) &&
             run_live_lift_fixture(broker, 1, true, report);
-        for (int shape = 0; passed && shape < 9; ++shape)
+        for (int shape = 0; passed && (size_t)shape < sizeof(k_expression_fixtures) /
+                                                          sizeof(k_expression_fixtures[0]);
+             ++shape)
             for (int stage = 0; passed && stage < 2; ++stage)
                 passed = run_live_expression_fixture(broker, stage, shape, report);
         if (report)

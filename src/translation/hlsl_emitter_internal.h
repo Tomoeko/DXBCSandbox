@@ -225,6 +225,16 @@ typedef bool HLSLTempLaneFlags[4];
 typedef uint8_t HLSLTempLaneStorage[4];
 typedef int HLSLRegisterPermutation[4];
 
+/* At most two pure two-MUL signatures: the product precedes or follows the
+ * scale in the outer operation. A group is emitted only for repeated uses. */
+typedef struct {
+    int group[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
+    int scale_operand[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
+    unsigned use_count[2];
+    size_t definition_begin[2][2];
+    size_t definition_end[2][2];
+} HLSLFloat4FunctionPlan;
+
 typedef struct HLSLEmitterContext {
     const USILProgram* program;
     HLSLEmitDiagnostic* diagnostic;
@@ -241,6 +251,7 @@ typedef struct HLSLEmitterContext {
     const char* const* reserved_preprocessor_identifiers;
     size_t reserved_preprocessor_identifier_count;
     HLSLExpressionSourceMap *expression_source_map;
+    HLSLFloat4FunctionPlan float4_functions;
     int current_instruction_index;
     bool is_formatting_dest;
     int indent;
@@ -414,6 +425,10 @@ bool hlsl_volume_slice_sampling_lift_matches(const USILProgram* program);
 void emit_exact_structural_helpers(HLSLEmitterContext* ctx);
 void emit_instructions(HLSLEmitterContext* ctx);
 bool emit_high_level_expressions(HLSLEmitterContext* ctx);
+bool emit_high_level_functions(HLSLEmitterContext *ctx);
+ASTExpr *hlsl_float4_function_call(HLSLEmitterContext *ctx, int instruction);
+bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
+                                     unsigned uses[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT]);
 bool emit_high_level_structured(HLSLEmitterContext *ctx);
 void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx);
 /* Shared closed float4 contracts and compiler inverse AST construction. */

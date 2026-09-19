@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 3U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 4U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 64
 
 typedef enum {
@@ -26,7 +26,8 @@ typedef enum {
     HLSL_EXPRESSION_ORIGIN_NOP,
     HLSL_EXPRESSION_ORIGIN_RETURN,
     HLSL_EXPRESSION_ORIGIN_CONTROL,
-    HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL
+    HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL,
+    HLSL_EXPRESSION_ORIGIN_FUNCTION
 } HLSLExpressionOriginKind;
 
 typedef struct {
@@ -36,6 +37,10 @@ typedef struct {
     uint8_t destination_lanes;
     size_t source_begin;
     size_t source_end; /* Exclusive byte offset in the emitter's output builder. */
+    /* FUNCTION only: this instruction's operation in the shared definition.
+     * source_begin/end instead identify this particular call site. */
+    size_t definition_begin;
+    size_t definition_end;
 } HLSLExpressionOrigin;
 
 /* One record per decoded instruction for the bounded float4 lift. Nested
@@ -44,7 +49,8 @@ typedef struct {
  * return block. CONTROL owns structured syntax and its proved phi declarations
  * and edge assignments. LOOP_CONTROL maps initialization and latch assignments;
  * the LOOP/UGE/BREAKC/IADD induction shares its for-header span. Other
- * declarations/ABI tokens are not instruction-owned spans.
+ * declarations/ABI tokens are not instruction-owned spans. FUNCTION maps both
+ * the call site and the instruction's operation in a shared helper definition.
  * This is provenance, never an independent correctness certificate. */
 typedef struct HLSLExpressionSourceMap {
     HLSLExpressionOrigin origins[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
@@ -58,6 +64,15 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                                         const USILProgram *program, const char *source);
 const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind);
 bool hlsl_expression_origin_has_span(HLSLExpressionOriginKind kind);
+/* Shared range handling for harness prefixes and ShaderLab indentation.
+ * Offset failure leaves the map unchanged. Line rebasing reads an immutable
+ * original snapshot and updates only boundaries on the specified line. */
+bool hlsl_expression_source_map_offset(HLSLExpressionSourceMap *map, size_t offset);
+bool hlsl_expression_source_map_rebase_line(HLSLExpressionSourceMap *map,
+    const HLSLExpressionSourceMap *original, size_t line_begin, size_t line_end,
+    size_t output_begin);
+bool hlsl_expression_origin_ranges_valid(const HLSLExpressionOrigin *origin,
+                                         size_t source_length);
 
 typedef enum HLSLEmitMode {
     /* Emit from the decoded instruction stream without source-level semantic
@@ -69,7 +84,7 @@ typedef enum HLSLEmitMode {
      * with higher-level Unity/source constructs to improve readability. */
     HLSL_EMIT_MODE_READABLE = 1,
 
-    /* Verification-eligible candidate, never a certificate by itself. v3
+    /* Verification-eligible candidate, never a certificate by itself. v4
      * retains v1's at most 64 SM4/5 vertex/pixel instructions using full
      * float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP. It also
      * admits structured IF/ELSE/ENDIF with scalar input/temp bit conditions,
@@ -79,6 +94,11 @@ typedef enum HLSLEmitMode {
      * UGE/BREAKC_NZ against immutable input bits, a unit IADD latch, and complete
      * float4 carried values. Control SSA must have no other uses. Nested loops,
      * branches inside loops, early exits and unresolved/partial phi inputs reject.
+     * Repeated straight-line two-MUL chains with immutable arguments and
+     * identity single-use producer lanes may share a float4 value helper;
+     * each call result remains named at its original site. No captures or
+     * resource/ABI changes are allowed. Shared definitions and individual
+     * call sites both retain instruction spans.
      * No buffers/resources/effects/precision controls or partial definitions.
      * Straight-line single-use expressions are nested once; shared values have
      * typed deterministic names. Unsupported input fails instead of silently using
