@@ -215,6 +215,8 @@ static int test_contract_attestation(void) {
               &fixture.shader, &fixture.pass, &fixture.plan,
               &fixture.contract, &report) ==
           UNITY_GENERATED_DOMAIN_CONTRACT_ROW_MALFORMED);
+    CHECK(report.keyword_families[0][0].expected_valid);
+    CHECK(!report.keyword_families[0][0].observed_valid);
 
     static const char* const duplicate[] = {"__ A", "__ A"};
     CHECK(unity_compiler_snippet_contract_set_variant_combinations(
@@ -224,6 +226,10 @@ static int test_contract_attestation(void) {
               &fixture.shader, &fixture.pass, &fixture.plan,
               &fixture.contract, &report) ==
           UNITY_GENERATED_DOMAIN_CONTRACT_ROW_DUPLICATE);
+    CHECK(report.keyword_families[0][0].expected_valid);
+    CHECK(report.keyword_families[0][0].observed_valid);
+    CHECK(memcmp(report.keyword_families[0][0].expected_digest,
+                 report.keyword_families[0][0].observed_digest, 32) != 0);
 
     CHECK(unity_compiler_snippet_contract_set_variant_combinations(
         &fixture.contract, 0, UNITY_KEYWORD_VARIANTS_USER_GLOBAL,
@@ -408,11 +414,26 @@ static int test_user_axis_option_order_is_attested(void) {
     CHECK(unity_generated_domain_attest_contract(
               &shader, &pass, &plan, &contract, &report) ==
           UNITY_GENERATED_DOMAIN_OK);
+    uint8_t expected_family[32];
+    memcpy(expected_family, report.keyword_families[0][0].expected_digest, 32);
+    for (size_t family = 0; family < 3; ++family) {
+        CHECK(report.keyword_families[0][family].expected_valid);
+        CHECK(report.keyword_families[0][family].observed_valid);
+        CHECK(memcmp(report.keyword_families[0][family].expected_digest,
+                     report.keyword_families[0][family].observed_digest, 32) == 0);
+    }
+    CHECK(!report.keyword_families[1][0].expected_valid);
+    CHECK(!report.keyword_families[1][0].observed_valid);
     CHECK(unity_compiler_snippet_contract_set_variant_combinations(
         &contract, 0, UNITY_KEYWORD_VARIANTS_USER_GLOBAL, reversed, 1));
     CHECK(unity_generated_domain_attest_contract(
               &shader, &pass, &plan, &contract, &report) ==
           UNITY_GENERATED_DOMAIN_CONTRACT_ORDER_MISMATCH);
+    CHECK(report.keyword_families[0][0].expected_valid);
+    CHECK(report.keyword_families[0][0].observed_valid);
+    CHECK(memcmp(expected_family, report.keyword_families[0][0].expected_digest, 32) == 0);
+    CHECK(memcmp(expected_family, report.keyword_families[0][0].observed_digest, 32) != 0);
+    CHECK(!report.keyword_families[0][1].observed_valid);
 
     unity_generated_domain_report_free(&report);
     unity_compiler_snippet_contract_free(&contract);

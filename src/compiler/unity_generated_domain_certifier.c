@@ -638,6 +638,28 @@ static UnityGeneratedDomainStatus parse_contract_row(
     return UNITY_GENERATED_DOMAIN_OK;
 }
 
+static void keyword_hash_word(CommonSha256Context* hash, uint64_t value) {
+    uint8_t bytes[8];
+    for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(value >> (8U * i));
+    common_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+static void fingerprint_keyword_rows(const OrderedKeywordRow* rows, size_t count,
+                                     uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
+    CommonSha256Context hash;
+    common_sha256_init(&hash);
+    static const char domain[] = "DXBCSandbox.OrderedKeywordFamily.v1";
+    common_sha256_update(&hash, domain, sizeof(domain));
+    keyword_hash_word(&hash, count);
+    for (size_t row = 0; row < count; ++row) {
+        keyword_hash_word(&hash, rows[row].has_default);
+        keyword_hash_word(&hash, rows[row].count);
+        for (size_t word = 0; word < rows[row].count; ++word)
+            keyword_hash_word(&hash, rows[row].indices[word]);
+    }
+    common_sha256_final(&hash, digest);
+}
+
 static UnityGeneratedDomainStatus compare_contract_family(
     const SerializedShader* shader,
     const StageKeywordClassification* classification,
@@ -646,6 +668,13 @@ static UnityGeneratedDomainStatus compare_contract_family(
     const SnippetKeywordVariantSet* actual,
     UnityGeneratedDomainReport* report) {
     report->diagnostic.keyword_family = family;
+    UnityGeneratedKeywordFamilyEvidence* evidence =
+        &report->keyword_families[report->diagnostic.stage_index][family];
+    /* Inactive families have zero callback rows; the planner's single empty
+     * Cartesian identity row is not an emitted pragma or callback row. */
+    fingerprint_keyword_rows(expected->rows, expected->active ? expected->count : 0U,
+                             evidence->expected_digest);
+    evidence->expected_valid = true;
     if (!actual->present) {
         return fail_report(
             report, UNITY_GENERATED_DOMAIN_MISSING_PROGRAM_CONTRACT);
@@ -654,6 +683,10 @@ static UnityGeneratedDomainStatus compare_contract_family(
         if (expected->count != 1U || expected->rows[0].count != 0U) {
             return fail_report(
                 report, UNITY_GENERATED_DOMAIN_INVALID_GENERATED_STATE);
+        }
+        if (actual->combination_count == 0) {
+            fingerprint_keyword_rows(NULL, 0U, evidence->observed_digest);
+            evidence->observed_valid = true;
         }
         if (actual->combination_count != 0) {
             report->diagnostic.contract_row_index = 0U;
@@ -678,6 +711,8 @@ static UnityGeneratedDomainStatus compare_contract_family(
             &parsed[row], report);
         if (status != UNITY_GENERATED_DOMAIN_OK) goto cleanup;
     }
+    fingerprint_keyword_rows(parsed, actual_count, evidence->observed_digest);
+    evidence->observed_valid = true;
     for (size_t row = 0; row < actual_count; ++row) {
         for (size_t earlier = 0; earlier < row; ++earlier) {
             if (ordered_rows_equal(&parsed[row], &parsed[earlier])) {

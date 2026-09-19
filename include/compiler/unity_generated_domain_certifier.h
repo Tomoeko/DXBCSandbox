@@ -141,9 +141,20 @@ typedef struct {
     UnityGeneratedCompileProvenance original_provenance;
 } UnityGeneratedDomainCompilerResponseRecord;
 
+/* Ordered keyword-family projection only. This does not replace the alias,
+ * tier, cardinality or runtime-selection proofs. Indices refer to the bound
+ * target Shader keyword table. Missing/malformed callbacks remain invalid. */
+typedef struct {
+    bool expected_valid;
+    bool observed_valid;
+    uint8_t expected_digest[COMMON_SHA256_DIGEST_SIZE];
+    uint8_t observed_digest[COMMON_SHA256_DIGEST_SIZE];
+} UnityGeneratedKeywordFamilyEvidence;
+
 typedef struct {
     UnityGeneratedDomainStatus status;
     UnityGeneratedGLSLStatus glsl_status;
+    UnityGeneratedKeywordFamilyEvidence keyword_families[5][3];
     size_t active_stage_count;
     size_t attested_stage_count;
     size_t generated_state_count;
