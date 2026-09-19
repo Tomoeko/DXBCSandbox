@@ -11,6 +11,7 @@
 #include "translation/hlsl_use_def.h"
 #include "translation/hlsl_ssa.h"
 #include "translation/hlsl_ast.h"
+#include "translation/hlsl_literal.h"
 #include "translation/hlsl_value_analysis.h"
 #include "translation/dxbc_cbuffer_projection.h"
 #include "io/parameter_layout.h"
@@ -518,7 +519,6 @@ const char* resolve_builtin_cb_name_for_reg(const SerializedProgramParameters* p
 
 // Formatting / Printing Helpers (hlsl_emitter_format.c)
 void sb_append_spaces(StringBuilder* sb, int count);
-bool format_float_bits_hlsl(uint32_t bits, char* buf, size_t buf_sz);
 bool format_float(float f, char* buf, size_t buf_sz);
 bool format_immediate_hlsl_masked(const DXBCOperand* op, bool isInt,
                                   bool isUint, int write_mask, char* buf,

@@ -15,8 +15,11 @@ typedef enum {
     AST_EXPR_TERNARY,
     AST_EXPR_SWIZZLE,
     AST_EXPR_CALL,
-    AST_EXPR_CAST
+    AST_EXPR_CAST,
+    AST_EXPR_BITCAST
 } ASTExprKind;
+
+typedef enum { AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32 } ASTScalarType;
 
 typedef enum {
     AST_STMT_BLOCK,
@@ -43,8 +46,7 @@ typedef struct {
 typedef struct {
     uint32_t val[4];
     int components;
-    bool is_float;
-    bool is_uint;
+    ASTScalarType scalar_type;
 } ASTLiteral;
 
 typedef struct {
@@ -81,6 +83,11 @@ typedef struct {
     struct ASTExpr *sub;
 } ASTCastExpr;
 
+typedef struct {
+    ASTScalarType scalar_type;
+    struct ASTExpr *sub;
+} ASTBitcastExpr;
+
 typedef struct ASTExpr {
     ASTExprKind kind;
     union {
@@ -92,6 +99,7 @@ typedef struct ASTExpr {
         ASTSwizzleExpr swizzle;
         ASTCallExpr call;
         ASTCastExpr cast;
+        ASTBitcastExpr bitcast;
     } u;
 } ASTExpr;
 
@@ -128,25 +136,36 @@ typedef struct ASTStmt {
     } u;
 } ASTStmt;
 
-// AST Expression Constructors
-ASTExpr* ast_create_var(int ssa_var, int reg, int type, const char *name);
-ASTExpr* ast_create_literal_float(float f);
-ASTExpr* ast_create_literal_int(int i);
-ASTExpr* ast_create_unary(int op, ASTExpr *sub);
-ASTExpr* ast_create_binary(int op, ASTExpr *left, ASTExpr *right);
-ASTExpr* ast_create_ternary(ASTExpr *cond, ASTExpr *true_expr, ASTExpr *false_expr);
-ASTExpr* ast_create_swizzle(ASTExpr *sub, const int *swizzle, int count);
-ASTExpr* ast_create_call(const char *name, ASTExpr **args, int count);
-ASTExpr* ast_create_cast(const char *type_name, ASTExpr *sub);
+/* Successful constructors own their children; a failed constructor leaves
+ * ownership with the caller. Children form a tree and must not be shared.
+ * These nodes preserve source operations; they do not prove a DXBC lift. */
+ASTExpr *ast_create_var(int ssa_var, int reg, int type, const char *name);
+ASTExpr *ast_create_literal_bits(const uint32_t *bits, int components, ASTScalarType scalar_type);
+ASTExpr *ast_create_literal_float(float f);
+ASTExpr *ast_create_literal_int(int i);
+/* Operators are an explicitly admitted subset of USILOpcode: unary INEG/NOT;
+ * binary ADD/SUB/MUL/DIV/IADD/AND/OR/XOR/ISHL/ISHR/USHR. Comparisons that produce
+ * DXBC masks and multi-result integer operations require separate lowering.
+ * Callers must supply the correct HLSL operand types, including unsigned USHR
+ * inputs; this syntax layer is not a DXBC type/provenance analysis. */
+ASTExpr *ast_create_unary(int op, ASTExpr *sub);
+ASTExpr *ast_create_binary(int op, ASTExpr *left, ASTExpr *right);
+ASTExpr *ast_create_ternary(ASTExpr *cond, ASTExpr *true_expr, ASTExpr *false_expr);
+ASTExpr *ast_create_swizzle(ASTExpr *sub, const int *swizzle, int count);
+ASTExpr *ast_create_call(const char *name, ASTExpr **args, int count);
+ASTExpr *ast_create_cast(const char *type_name, ASTExpr *sub);
+/* Numeric conversion uses CAST; bit reinterpretation uses BITCAST. */
+ASTExpr *ast_create_bitcast(ASTScalarType scalar_type, ASTExpr *sub);
 void ast_free_expr(ASTExpr *expr);
 
 // AST Statement Constructors
-ASTStmt* ast_create_block(void);
-void ast_block_add(ASTStmt *block, ASTStmt *stmt);
-ASTStmt* ast_create_assign(ASTExpr *dest, ASTExpr *src);
-ASTStmt* ast_create_if(ASTExpr *cond, ASTStmt *true_body, ASTStmt *false_body);
-ASTStmt* ast_create_loop(ASTExpr *cond, ASTStmt *body);
-ASTStmt* ast_create_flow(ASTStmtKind kind);
+ASTStmt *ast_create_block(void);
+/* On failure the block is unchanged and the caller still owns stmt. */
+bool ast_block_add(ASTStmt *block, ASTStmt *stmt);
+ASTStmt *ast_create_assign(ASTExpr *dest, ASTExpr *src);
+ASTStmt *ast_create_if(ASTExpr *cond, ASTStmt *true_body, ASTStmt *false_body);
+ASTStmt *ast_create_loop(ASTExpr *cond, ASTStmt *body);
+ASTStmt *ast_create_flow(ASTStmtKind kind);
 void ast_free_stmt(ASTStmt *stmt);
 
 void ast_format_expr(const ASTExpr *expr, StringBuilder *sb);

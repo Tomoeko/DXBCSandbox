@@ -2154,9 +2154,9 @@ int main(void) {
     sb_init(&sb);
     ast_format_expr(long_cast, &sb);
     CHECK(sb_ok(&sb));
-    CHECK(sb.buf[0] == '(');
-    CHECK(strncmp(sb.buf + 1, long_ast_name, strlen(long_ast_name)) == 0);
-    CHECK(strcmp(sb.buf + 1 + strlen(long_ast_name), ")1") == 0);
+    CHECK(strncmp(sb.buf, "((", 2u) == 0);
+    CHECK(strncmp(sb.buf + 2, long_ast_name, strlen(long_ast_name)) == 0);
+    CHECK(strcmp(sb.buf + 2 + strlen(long_ast_name), ")(1))") == 0);
     sb_free(&sb);
     ast_free_expr(long_cast);
 
@@ -2165,7 +2165,7 @@ int main(void) {
     sb_init(&sb);
     ast_format_expr(wide_float, &sb);
     CHECK(sb_ok(&sb));
-    CHECK(sb.len > 40u);
+    CHECK(strstr(sb.buf, "e+38f") != NULL);
     sb_free(&sb);
     ast_free_expr(wide_float);
 
