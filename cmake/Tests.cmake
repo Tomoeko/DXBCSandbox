@@ -482,6 +482,13 @@ if(BUILD_TESTING)
             unity_compiler_support dxbc_build_options)
         add_test(NAME shaderlab_mapping_units COMMAND test_shaderlab_mapping_units)
 
+        add_executable(test_shaderlab_lift_capture_units tests/test_shaderlab_lift_capture_units.c)
+        target_compile_definitions(test_shaderlab_lift_capture_units PRIVATE
+            CAPTURE_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry"
+            CAPTURE_EMPTY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/release_shader/empty.assets")
+        target_link_libraries(test_shaderlab_lift_capture_units PRIVATE unity_compiler_support dxbc_build_options)
+        add_test(NAME shaderlab_lift_capture_units COMMAND test_shaderlab_lift_capture_units)
+
         add_executable(test_shaderlab_lift_units
             tests/test_shaderlab_lift_units.c tests/test_shaderlab_fixture.c)
         target_include_directories(test_shaderlab_lift_units PRIVATE
