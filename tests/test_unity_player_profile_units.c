@@ -5,6 +5,19 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#define TEST_PID() ((unsigned long)_getpid())
+#define TEST_MKDIR(path) _mkdir(path)
+#define TEST_RMDIR(path) _rmdir(path)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define TEST_PID() ((unsigned long)getpid())
+#define TEST_MKDIR(path) mkdir(path, 0700)
+#define TEST_RMDIR(path) rmdir(path)
+#endif
 
 #define CHECK(condition)                                                                           \
     do {                                                                                           \
@@ -73,10 +86,124 @@ static int check_evidence(const UnityPlayerProfileAuthority *authority,
     return 0;
 }
 
+static int check_package(const CommonFileBytes *bytes, const UnityCompileProfile *compiler,
+                          const WholeShaderSubjectDescriptor *subject) {
+    char root[128], file[192], alias[192], extra[192];
+    CHECK(snprintf(root, sizeof(root), "player-package-%lu", TEST_PID()) > 0);
+    CHECK(snprintf(file, sizeof(file), "%s/metadata", root) > 0);
+    CHECK(snprintf(alias, sizeof(alias), "%s/alias", root) > 0);
+    CHECK(snprintf(extra, sizeof(extra), "%s/additional", root) > 0);
+    CHECK(TEST_MKDIR(root) == 0);
+    CHECK(common_file_write_new_atomic(file, bytes->data, bytes->size) == COMMON_FILE_OK);
+    CHECK(common_file_write_new_atomic(alias, bytes->data, bytes->size) == COMMON_FILE_OK);
+    const ShaderRuntimeCaptureLimits bounds = {16U, 8U, 4U, 4096U, 1024U * 1024U,
+                                               4U * 1024U * 1024U};
+    UnityPlayerPackageAuthority *package = NULL, *other = NULL;
+    UnityPlayerPackageDiagnostic diagnostic;
+    CHECK(unity_player_package_capture_d3d11(root, "metadata", &bounds, compiler, 7U,
+                                              &package, &diagnostic) == UNITY_PLAYER_PACKAGE_OK);
+    CHECK(diagnostic.capture_status == SHADER_RUNTIME_CAPTURE_OK);
+    CHECK(diagnostic.profile_status == UNITY_PLAYER_PROFILE_OK);
+    UnityPlayerPackageSummary captured, repeated;
+    CHECK(unity_player_package_describe(package, &captured));
+    CHECK(captured.image.file_count == 2U && captured.image.total_bytes == bytes->size * 2U);
+    CHECK(memcmp(captured.player.profile_digest, subject->player_profile_digest, 32U) == 0);
+    CHECK(check_evidence(unity_player_package_profile(package), subject,
+                          WHOLE_SHADER_PLANE_PASS) == 0);
+    CHECK(unity_player_package_capture_d3d11(root, "metadata", &bounds, compiler, 7U,
+                                              &other, &diagnostic) == UNITY_PLAYER_PACKAGE_OK);
+    CHECK(unity_player_package_describe(other, &repeated));
+    CHECK(memcmp(captured.package_digest, repeated.package_digest, 32U) == 0);
+    unity_player_package_free(other);
+    CHECK(unity_player_package_capture_d3d11(root, "alias", &bounds, compiler, 7U,
+                                              &other, &diagnostic) == UNITY_PLAYER_PACKAGE_OK);
+    CHECK(unity_player_package_describe(other, &repeated));
+    CHECK(memcmp(captured.image.image_digest, repeated.image.image_digest, 32U) == 0);
+    CHECK(memcmp(captured.player.profile_digest, repeated.player.profile_digest, 32U) == 0);
+    CHECK(memcmp(captured.package_digest, repeated.package_digest, 32U) != 0);
+    unity_player_package_free(other);
+
+    CHECK(common_file_write_new_atomic(extra, "extra", 5U) == COMMON_FILE_OK);
+    CHECK(unity_player_package_capture_d3d11(root, "metadata", &bounds, compiler, 7U,
+                                              &other, &diagnostic) == UNITY_PLAYER_PACKAGE_OK);
+    CHECK(unity_player_package_describe(other, &repeated));
+    CHECK(memcmp(captured.player.profile_digest, repeated.player.profile_digest, 32U) == 0);
+    CHECK(memcmp(captured.image.image_digest, repeated.image.image_digest, 32U) != 0);
+    CHECK(memcmp(captured.package_digest, repeated.package_digest, 32U) != 0);
+    unity_player_package_free(other);
+    CHECK(unity_player_package_capture_d3d11(root, "additional", &bounds, compiler, 7U,
+                                              &other, &diagnostic) ==
+          UNITY_PLAYER_PACKAGE_PROFILE_REJECTED);
+    CHECK(!other && diagnostic.profile_status == UNITY_PLAYER_PROFILE_SERIALIZED_FILE_INVALID);
+    CHECK(unity_player_package_capture_d3d11(root, "absent", &bounds, compiler, 7U,
+                                              &other, &diagnostic) == UNITY_PLAYER_PACKAGE_METADATA_ABSENT);
+    CHECK(!other);
+    const char *invalid[] = {"../metadata", "./metadata", "/metadata", "nested/../metadata",
+                            "nested\\metadata", "", "metadata/"};
+    for (size_t i = 0U; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        CHECK(unity_player_package_capture_d3d11(root, invalid[i], &bounds, compiler, 7U,
+                                                  &other, &diagnostic) ==
+              UNITY_PLAYER_PACKAGE_INVALID_ARGUMENT);
+        CHECK(!other);
+    }
+    UnityCompileProfile changed = *compiler;
+    changed.d3d11_capabilities ^= 1U;
+    CHECK(unity_player_package_capture_d3d11(root, "metadata", &bounds, &changed, 7U,
+                                              &other, &diagnostic) == UNITY_PLAYER_PACKAGE_PROFILE_REJECTED);
+    CHECK(!other && diagnostic.profile_status == UNITY_PLAYER_PROFILE_CAPABILITIES_MISMATCH);
+    ShaderRuntimeCaptureLimits too_small = bounds;
+    too_small.max_total_bytes = bytes->size;
+    CHECK(unity_player_package_capture_d3d11(root, "metadata", &too_small, compiler, 7U,
+                                              &other, &diagnostic) == UNITY_PLAYER_PACKAGE_CAPTURE_FAILED);
+    CHECK(!other && diagnostic.capture_status == SHADER_RUNTIME_CAPTURE_LIMIT_EXCEEDED);
+    CHECK(unity_player_package_capture_d3d11(root, "metadata", &bounds, compiler, 8U,
+                                              &other, &diagnostic) == UNITY_PLAYER_PACKAGE_INVALID_ARGUMENT);
+    CHECK(!other);
+
+    CHECK(remove(extra) == 0 && remove(alias) == 0 && remove(file) == 0);
+    CHECK(TEST_RMDIR(root) == 0);
+    /* Sealed authorities retain identities after the files disappear. */
+    CHECK(unity_player_package_describe(package, &repeated));
+    CHECK(memcmp(captured.package_digest, repeated.package_digest, 32U) == 0);
+    CHECK(check_evidence(unity_player_package_profile(package), subject,
+                          WHOLE_SHADER_PLANE_PASS) == 0);
+    unity_player_package_free(package);
+    CHECK(!unity_player_package_profile(NULL) && !unity_player_package_describe(NULL, &repeated));
+    unity_player_package_free(NULL);
+    return 0;
+}
+
+static int live_package(const char *root, const char *metadata, const char *profile_path) {
+    UnityCompileProfile compiler;
+    unity_compile_profile_init(&compiler);
+    CHECK(unity_compile_profile_load(profile_path, &compiler) == UNITY_COMPILE_PROFILE_OK);
+    const ShaderRuntimeCaptureLimits bounds = {4096U, 512U, 32U, 4096U, 512U * 1024U * 1024U,
+                                               2U * 1024U * 1024U * 1024U};
+    UnityPlayerPackageAuthority *package = NULL;
+    UnityPlayerPackageDiagnostic diagnostic;
+    const UnityPlayerPackageStatus status = unity_player_package_capture_d3d11(
+        root, metadata, &bounds, &compiler, 7U, &package, &diagnostic);
+    CHECK(status == UNITY_PLAYER_PACKAGE_OK);
+    UnityPlayerPackageSummary summary;
+    CHECK(unity_player_package_describe(package, &summary));
+    const WholeShaderSubjectDescriptor subject = make_subject(&summary.player);
+    CHECK(check_evidence(unity_player_package_profile(package), &subject, WHOLE_SHADER_PLANE_PASS) == 0);
+    char image[65], player[65], membership[65];
+    common_sha256_digest_to_hex(summary.image.image_digest, image);
+    common_sha256_digest_to_hex(summary.player.profile_digest, player);
+    common_sha256_digest_to_hex(summary.package_digest, membership);
+    printf("package_files=%zu image=%s player=%s membership=%s\n", summary.image.file_count,
+           image, player, membership);
+    unity_player_package_free(package);
+    return 0;
+}
+
 /* Optional paths exercise the same capture against a real private player and
  * separately captured compiler profile without adding either artifact to Git. */
 int main(int argc, char **argv) {
-    CHECK(argc == 1 || argc == 3);
+    CHECK(argc == 1 || argc == 3 || argc == 4);
+    if (argc == 4)
+        return live_package(argv[1], argv[2], argv[3]);
     const char *input = argc == 3 ? argv[1] : DXBC_TEST_PLAYER_PROFILE;
     CommonFileBytes bytes = {0};
     CHECK(common_file_read_regular(input, SIZE_MAX, &bytes) == COMMON_FILE_OK);
@@ -104,6 +231,7 @@ int main(int argc, char **argv) {
     CHECK(memcmp(digest, captured.serialized_file_digest, 32U) == 0);
     CHECK(captured.selected_tiers == 7U);
     WholeShaderSubjectDescriptor descriptor = make_subject(&captured);
+    CHECK(check_package(&bytes, &compiler, &descriptor) == 0);
     CHECK(check_evidence(authority, &descriptor, WHOLE_SHADER_PLANE_PASS) == 0);
     descriptor.player_profile_digest[0] ^= 1U;
     CHECK(check_evidence(authority, &descriptor, WHOLE_SHADER_PLANE_FAIL) == 0);
