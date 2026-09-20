@@ -631,6 +631,110 @@ static bool check_copy_candidates(void) {
     return true;
 }
 
+/* Independent, deliberately tiny lane machine for generated MOV-only programs.
+ * It reads all sources before committing a write and rejects undefined lanes. */
+static bool evaluate_moves(const USILProgram *program, const uint32_t input[4],
+                            uint32_t output[4], unsigned *output_mask) {
+    uint32_t temporaries[2][4] = {{0}};
+    unsigned defined[2] = {0};
+    memset(output, 0, sizeof(uint32_t) * 4);
+    *output_mask = 0;
+    for (int i = 0; i < program->instruction_count; ++i) {
+        const USILInstruction *instruction = &program->instructions[i];
+        if (instruction->opcode == USIL_OP_RET)
+            return true;
+        if (instruction->opcode == USIL_OP_NOP)
+            continue;
+        if (instruction->opcode != USIL_OP_MOV || instruction->operand_count != 2)
+            return false;
+        const DXBCOperand *destination = &instruction->operands[0];
+        const DXBCOperand *source = &instruction->operands[1];
+        const unsigned mask = destination->destination_mask >> 4;
+        if (source->swizzle_mode != 1 || source->has_abs || source->has_neg ||
+            instruction->saturate || source->register_index < 0 || source->register_index >= 2 ||
+            destination->register_index < 0 || destination->register_index >= 2)
+            return false;
+        uint32_t values[4] = {0};
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            if (!(mask & (1U << lane)))
+                continue;
+            const unsigned selected = source->swizzle[lane];
+            if (selected >= 4)
+                return false;
+            if (source->type == OPERAND_TYPE_INPUT && source->register_index == 0) {
+                values[lane] = input[selected];
+            } else if (source->type == OPERAND_TYPE_TEMP &&
+                       (defined[source->register_index] & (1U << selected))) {
+                values[lane] = temporaries[source->register_index][selected];
+            } else {
+                return false;
+            }
+        }
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            if (!(mask & (1U << lane)))
+                continue;
+            if (destination->type == OPERAND_TYPE_OUTPUT && destination->register_index == 0) {
+                output[lane] = values[lane];
+                *output_mask |= 1U << lane;
+            } else if (destination->type == OPERAND_TYPE_TEMP) {
+                temporaries[destination->register_index][lane] = values[lane];
+                defined[destination->register_index] |= 1U << lane;
+            } else {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+static bool check_generated_copy_lanes(void) {
+    const uint32_t input[4] = {0x80000000U, 0x7fc01234U, 0x00000001U, 0xffffffffU};
+    unsigned cases = 0, admitted = 0;
+    for (unsigned stage = 0; stage < 2; ++stage)
+        for (unsigned model = 4; model <= 5; ++model)
+            for (unsigned mask = 1; mask < 16; ++mask)
+                for (unsigned selection = 0; selection < 256; ++selection) {
+                    USILInstruction instructions[4] = {0};
+                    instructions[0] = move(reg(OPERAND_TYPE_TEMP, 0, 0xf0),
+                                           reg(OPERAND_TYPE_INPUT, 0, 0));
+                    instructions[1] = move(reg(OPERAND_TYPE_TEMP, 1, (uint8_t)(mask << 4)),
+                                           reg(OPERAND_TYPE_TEMP, 0, 0));
+                    const unsigned output_lane = (selection >> 4) & 3U;
+                    const unsigned read_lane = selection & 3U;
+                    instructions[2] = move(reg(OPERAND_TYPE_OUTPUT, 0, (uint8_t)(0x10U << output_lane)),
+                                           reg(OPERAND_TYPE_TEMP, 1, 0));
+                    instructions[2].operands[1].swizzle[output_lane] = (uint8_t)read_lane;
+                    for (unsigned lane = 0; lane < 4; ++lane)
+                        instructions[1].operands[1].swizzle[lane] =
+                            (uint8_t)((selection >> (lane * 2)) & 3U);
+                    instructions[3].opcode = USIL_OP_RET;
+                    USILProgram program = {.instructions = instructions, .instruction_count = 4,
+                        .temp_count = 2, .has_stage_contract = true,
+                        .program_type = stage ? DXBC_PROGRAM_TYPE_PIXEL : DXBC_PROGRAM_TYPE_VERTEX,
+                        .shader_model_major = model};
+                    USILInstruction before[4];
+                    memcpy(before, instructions, sizeof(before));
+                    HLSLCopyLift *candidate = NULL;
+                    const HLSLCopyLiftStatus status = hlsl_copy_lift_create(&program, 1, &candidate);
+                    const bool defined = (mask & (1U << read_lane)) != 0;
+                    CHECK(status == (defined ? HLSL_COPY_LIFT_OK : HLSL_COPY_LIFT_UNDEFINED_SOURCE));
+                    CHECK((candidate != NULL) == defined);
+                    if (defined) {
+                        uint32_t baseline[4], lifted[4];
+                        unsigned baseline_mask, lifted_mask;
+                        CHECK(evaluate_moves(&program, input, baseline, &baseline_mask));
+                        CHECK(evaluate_moves(hlsl_copy_lift_program(candidate), input, lifted, &lifted_mask));
+                        CHECK(baseline_mask == lifted_mask && memcmp(baseline, lifted, sizeof(baseline)) == 0);
+                        ++admitted;
+                    }
+                    hlsl_copy_lift_destroy(candidate);
+                    CHECK(memcmp(before, instructions, sizeof(before)) == 0);
+                    ++cases;
+                }
+    CHECK(cases == 15360 && admitted == 8192);
+    return true;
+}
+
 static bool check_result_candidates(void) {
     USILInstruction instructions[5] = {0};
     instructions[0] = move(reg(OPERAND_TYPE_TEMP, 0, 0xf0), reg(OPERAND_TYPE_INPUT, 0, 0));
@@ -1940,7 +2044,8 @@ int main(void) {
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
         !check_switch_flow_and_scope() || !check_flow_structure_validation() ||
         !check_control_region_proofs() || !check_exhaustive_postdominance() ||
-        !check_long_dominator_chain() || !check_copy_candidates() || !check_result_candidates() ||
+        !check_long_dominator_chain() || !check_copy_candidates() || !check_generated_copy_lanes() ||
+        !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
         !check_expression_emission() || !check_conditional_emission() ||
         !check_counted_loop_emission() || !check_function_emission() || !check_unity_uv_emission())

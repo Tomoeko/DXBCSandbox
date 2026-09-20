@@ -289,6 +289,83 @@ static bool verify_real_container_roundtrip(void) {
     return true;
 }
 
+static uint32_t mutation_random(uint32_t *state) {
+    *state = *state * UINT32_C(1664525) + UINT32_C(1013904223);
+    return *state;
+}
+
+/* Deterministic bounded fuzzing, distinct from compiler-backed certification.
+ * Raw corruptions exercise the outer gates. Rehashed copies reach malformed
+ * chunk/token/operand handling; production inputs and comparators are unchanged. */
+static bool verify_mutation_properties(void) {
+    uint8_t synthetic[SYNTHETIC_SIZE];
+    CHECK(make_synthetic(synthetic));
+    size_t fixture_size = 0;
+    uint8_t *fixture = read_file(DXBC_DOCUMENT_TEST_FIXTURE, &fixture_size);
+    CHECK(fixture);
+    DXBCContainerView fixture_view;
+    CHECK(dxbc_container_view_first(fixture, fixture_size, &fixture_view));
+    CHECK(fixture_view.size <= 65536);
+    const uint8_t *seeds[] = {synthetic, fixture_view.data};
+    const size_t lengths[] = {sizeof(synthetic), fixture_view.size};
+    uint32_t state = UINT32_C(0x6d350b79);
+    unsigned accepted = 0, rejected = 0, semantic = 0;
+    for (unsigned seed = 0; seed < 2; ++seed) {
+        uint8_t *bytes = malloc(lengths[seed]);
+        CHECK(bytes);
+        for (unsigned iteration = 0; iteration < 10000; ++iteration) {
+            memcpy(bytes, seeds[seed], lengths[seed]);
+            const unsigned changes = 1 + (mutation_random(&state) >> 28) % 4;
+            for (unsigned change = 0; change < changes; ++change) {
+                const size_t offset = mutation_random(&state) % lengths[seed];
+                bytes[offset] ^= (uint8_t)(1U << ((mutation_random(&state) >> 24) & 7U));
+            }
+            const size_t size = iteration % 4 == 0 ?
+                mutation_random(&state) % lengths[seed] : lengths[seed];
+            if (iteration % 2 && size >= 32)
+                (void)refresh_hash(bytes, size); /* Broken outer headers may be unhashable. */
+            const size_t allocations_before = g_allocations_count;
+            const size_t bytes_before = g_allocated_bytes;
+            DXBCDocument document;
+            DXBCDocumentDiagnostic diagnostic;
+            dxbc_document_init(&document);
+            if (dxbc_document_parse(&document, bytes, size, &diagnostic)) {
+                uint8_t *serialized = NULL;
+                size_t serialized_size = 0;
+                CHECK(dxbc_document_serialize_exact(&document, &serialized, &serialized_size, &diagnostic));
+                CHECK(serialized_size == size && memcmp(bytes, serialized, size) == 0);
+                mem_free(serialized, serialized_size);
+                ++accepted;
+                DXBCContainer first, second;
+                const bool first_ok = dxbc_document_decode_semantic(&document, &first);
+                const bool second_ok = dxbc_document_decode_semantic(&document, &second);
+                CHECK(first_ok == second_ok);
+                if (first_ok) {
+                    CHECK(first.instruction_count == second.instruction_count);
+                    CHECK(first.input_signature_count == second.input_signature_count);
+                    CHECK(first.output_signature_count == second.output_signature_count);
+                    ++semantic;
+                }
+                dxbc_free(&first);
+                dxbc_free(&second);
+            } else {
+                CHECK(document.owned_bytes == NULL);
+                CHECK(diagnostic.code != DXBC_DOCUMENT_OK);
+                ++rejected;
+            }
+            dxbc_document_free(&document);
+            CHECK(g_allocations_count == allocations_before && g_allocated_bytes == bytes_before);
+        }
+        free(bytes);
+    }
+    free(fixture);
+    CHECK(accepted > 100 && rejected > 100 && semantic > 100);
+    CHECK(accepted + rejected == 20000);
+    printf("Mutation cases: 20000, lossless accepted: %u, rejected: %u, semantic accepted: %u\n",
+           accepted, rejected, semantic);
+    return true;
+}
+
 static bool run_all_tests(void) {
     const size_t allocation_count = g_allocations_count;
     const size_t allocated_bytes = g_allocated_bytes;
@@ -296,6 +373,7 @@ static bool run_all_tests(void) {
     CHECK(verify_structured_failures());
     CHECK(verify_unsupported_reason());
     CHECK(verify_real_container_roundtrip());
+    CHECK(verify_mutation_properties());
     CHECK(g_allocations_count == allocation_count);
     CHECK(g_allocated_bytes == allocated_bytes);
     return true;
