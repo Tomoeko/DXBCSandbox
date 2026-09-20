@@ -131,6 +131,45 @@ static int test_runtime_score_and_serialized_order(void) {
     return 0;
 }
 
+static int test_all_eligibility_states(void) {
+    /* Independent two-bit score oracle. Include duplicate rows: byte-identical
+     * programs cannot reveal which alias won, and ties must preserve order.
+     * Eligibility ranges over every subset, including no supported rows. */
+    const uint16_t keywords[] = {0, 1};
+    const ShaderLabVariantState states[] = {
+        {NULL, 0}, {keywords, 1}, {keywords + 1, 1}, {keywords, 2}};
+    const unsigned rows[] = {0, 1, 2, 3, 3};
+    ShaderLabVariantCandidate candidates[5];
+    for (unsigned eligible = 0; eligible < 32; ++eligible) {
+        for (unsigned request = 0; request < 4; ++request) {
+            size_t expected = SIZE_MAX;
+            int32_t expected_score = INT32_MIN;
+            for (size_t i = 0; i < 5; ++i) {
+                candidates[i].state = states[rows[i]];
+                candidates[i].supported = (eligible & (1U << i)) != 0;
+                int32_t score = 0;
+                for (unsigned bit = 1; bit <= 2; bit <<= 1)
+                    if (rows[i] & bit)
+                        score += (request & bit) ? 1 : -16;
+                if (candidates[i].supported && score > expected_score) {
+                    expected = i;
+                    expected_score = score;
+                }
+            }
+            size_t selected = 0;
+            int32_t score = 0;
+            const bool found = shaderlab_variant_select_best(&states[request], &states[3],
+                                                              candidates, 5, &selected, &score);
+            CHECK(found == (expected != SIZE_MAX));
+            if (found)
+                CHECK(selected == expected && score == expected_score);
+            else
+                CHECK(selected == SIZE_MAX && score == INT32_MIN);
+        }
+    }
+    return 0;
+}
+
 static int test_pinned_domain_shapes_and_ambiguity(void) {
     ShaderLabBuiltinVariantDomain domain;
     CHECK(shaderlab_builtin_variant_domain_get(
@@ -459,6 +498,7 @@ static int test_domain_rows_are_unique(void) {
 int main(void) {
     if (test_pass_mask_and_canonical_states() != 0) return 1;
     if (test_runtime_score_and_serialized_order() != 0) return 1;
+    if (test_all_eligibility_states() != 0) return 1;
     if (test_pinned_domain_shapes_and_ambiguity() != 0) return 1;
     if (test_sparse_builtin_membership() != 0) return 1;
     if (test_exact_compiler_exclusion_rules() != 0) return 1;

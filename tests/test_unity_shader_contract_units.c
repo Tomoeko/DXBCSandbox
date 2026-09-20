@@ -115,6 +115,15 @@ static int check_live(const UnityShaderContractOptions *options) {
     CHECK(status == UNITY_SHADER_CONTRACT_CAPTURED && contract);
     CHECK(report.source_published && report.import.gate.bundle_published);
     CHECK(report.constructed_plane_mask == WHOLE_SHADER_D3D11_LOGICAL_REQUIRED_MASK);
+    const bool native_requested = options->native != NULL;
+    if (native_requested) {
+        printf("native=%s process=%s exit=%d file=%s input=%zu target=%d candidate=%d binding=%d\n",
+               unity_native_runtime_status_name(report.native_status),
+               common_process_status_name(report.native.process_status), report.native.exit_code,
+               common_file_status_name(report.native.file_status), report.native.input_index,
+               report.native.target_status, report.native.candidate_status, report.native.binding);
+        CHECK(report.native_status == UNITY_NATIVE_RUNTIME_OK);
+    }
     const UnityShaderLabLiftArtifact *accepted =
         unity_shaderlab_lift_accepted(unity_shader_contract_lift(contract));
     CHECK(accepted && accepted->high_level && accepted->unity_uv_helpers);
@@ -131,7 +140,7 @@ static int check_live(const UnityShaderContractOptions *options) {
                whole_shader_plane_status_name(summary->status),
                (unsigned long long)summary->matched_item_count,
                (unsigned long long)summary->expected_item_count);
-        CHECK(summary->status == (plane == WHOLE_SHADER_PLANE_RUNTIME_SELECTION
+        CHECK(summary->status == (plane == WHOLE_SHADER_PLANE_RUNTIME_SELECTION && !native_requested
                                       ? WHOLE_SHADER_PLANE_UNAVAILABLE
                                       : WHOLE_SHADER_PLANE_PASS));
         CHECK(memcmp(summary->subject_digest, subject_digest, 32) == 0);
@@ -141,10 +150,15 @@ static int check_live(const UnityShaderContractOptions *options) {
     CHECK(report.certificate.d3d11_byte_equivalence_certified);
     CHECK(report.certificate.importer_acceptance_certified);
     CHECK(report.certificate.release_object_equivalence_certified);
-    CHECK(!report.certificate.d3d11_logical_equivalence_certified);
+    CHECK(report.certificate.d3d11_logical_equivalence_certified == native_requested);
     CHECK(!report.certificate.source_identity_certified &&
           !report.certificate.universal_visual_equivalence_certified);
-    CHECK(report.certificate.status == WHOLE_SHADER_CERTIFICATE_REQUESTED_PLANE_UNAVAILABLE);
+    CHECK(report.certificate.status == (native_requested
+              ? WHOLE_SHADER_CERTIFICATE_OK : WHOLE_SHADER_CERTIFICATE_REQUESTED_PLANE_UNAVAILABLE));
+    CHECK(!report.certificate.finite_pixel_observations_certified &&
+          !report.certificate.empirical_visual_equivalence_certified);
+    CHECK(report.selection.availability == (native_requested
+              ? UNITY_SHADER_SELECTION_AVAILABLE : UNITY_SHADER_SELECTION_NATIVE_UNAVAILABLE));
     CommonFileBytes published = {0};
     CHECK(common_file_read_regular(options->candidate_source_path, SIZE_MAX, &published) ==
           COMMON_FILE_OK);
@@ -165,13 +179,14 @@ static int check_live(const UnityShaderContractOptions *options) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 1 && argc != 8) {
+    if (argc != 1 && argc != 8 && argc != 13) {
         fprintf(stderr,
-                "Usage: %s [TARGET PROFILE PROJECT INCLUDES EDITOR PLAYER_ROOT OUTPUT_PREFIX]\n",
+                "Usage: %s [TARGET PROFILE PROJECT INCLUDES EDITOR PLAYER_ROOT OUTPUT_PREFIX "
+                "[PYTHON CLIENT SSH_CONFIG POLICY JOBS]]\n",
                 argv[0]);
         return 2;
     }
-    const bool live = argc == 8;
+    const bool live = argc >= 8;
     TypeTreeSchemaRegistry registry;
     typetree_schema_registry_init(&registry);
     CHECK(typetree_schema_registry_import_file_replace(&registry, CONTRACT_REGISTRY) ==
@@ -231,6 +246,20 @@ int main(int argc, char **argv) {
     options.bundle.backend = UNITY_SHADER_BUNDLE_BACKEND_D3D11;
     options.bundle.warning_policy = UNITY_SHADER_IMPORT_WARNINGS_FAIL;
     options.bundle.keep_policy = UNITY_SHADER_IMPORT_KEEP_ALWAYS;
+    char observations[4096];
+    UnityNativeRuntimeOptions native = {0};
+    if (argc == 13) {
+        CHECK(strlen(prefix) + 14 < sizeof(observations));
+        snprintf(observations, sizeof(observations), "%s.observations", prefix);
+        native.python = argv[8];
+        native.client_directory = argv[9];
+        native.ssh_config = argv[10];
+        native.policy_path = argv[11];
+        native.jobs_path = argv[12];
+        native.output_path = observations;
+        native.timeout_ms = 180000;
+        options.native = &native;
+    }
     const int result = live ? check_live(&options) : check_boundaries(&options);
     unity_compiler_broker_destroy(broker);
     shader_catalog_dispose(&catalog);

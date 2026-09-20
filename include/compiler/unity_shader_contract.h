@@ -28,6 +28,10 @@ typedef struct {
     const char *player_root;
     const char *player_metadata_path;
     ShaderRuntimeCaptureLimits player_limits;
+    /* Optional authenticated native retrieval. Catalogs/records/registry/player
+     * are replaced with this coordinator's actual owners. NULL keeps the
+     * runtime-selection plane explicitly unavailable. */
+    const UnityNativeRuntimeOptions *native;
 } UnityShaderContractOptions;
 
 typedef struct {
@@ -40,6 +44,9 @@ typedef struct {
     bool source_published;
     UnityShaderBundleEvidenceStatus import_status;
     UnityShaderBundleEvidenceDiagnostic import;
+    UnityNativeRuntimeStatus native_status;
+    UnityNativeRuntimeDiagnostic native;
+    UnityShaderSelectionEvidenceReport selection;
     uint64_t constructed_plane_mask;
     WholeShaderEvidenceSummary planes[WHOLE_SHADER_PLANE_COUNT];
     WholeShaderCertificateReport certificate;
@@ -52,9 +59,10 @@ typedef struct {
  * shares one subject; the complete D3D11 logical mask is always requested.
  *
  * CAPTURED means evidence collection completed, not equivalence. Inspect the
- * derived certificate and per-plane outcomes. Runtime selection currently has
- * no connected production authority and therefore yields explicit UNAVAILABLE.
- * There is no switch to promote package membership or finite pixels to it.
+ * derived certificate and per-plane outcomes. Runtime selection requires both
+ * authenticated native capture and strict closed selection congruence under
+ * unity_shaderlab_lift_runtime_conditions(). Missing capture stays UNAVAILABLE;
+ * finite observations alone never establish that logical plane.
  * Failed calls leave output NULL. Published source/bundle/logs remain available
  * for diagnosis, with their individual status recorded; they are not a partial
  * whole-shader certificate. Borrowed inputs must remain valid during the call. */

@@ -78,6 +78,19 @@ static int check_dependency_boundaries(ShaderObject *object) {
             (TypeTreeValue *)typetree_find_child(&subshaders->array_val.elements[0], "m_Passes");
         CHECK(passes && passes->array_val.count);
         TypeTreeValue *pass = &passes->array_val.elements[0];
+        /* Whole-shader closure admits V/F only. A parseable added graphics
+         * stage must remain unavailable even when its rows copy known bytes. */
+        const TypeTreeValue *vertex = typetree_find_child(pass, "progVertex");
+        CHECK(vertex);
+        const char *const excluded_stages[] = {"progGeometry", "progHull", "progDomain"};
+        for (size_t i = 0; i < 3; ++i) {
+            TypeTreeValue *stage = (TypeTreeValue *)typetree_find_child(pass, excluded_stages[i]);
+            CHECK(stage);
+            TypeTreeValue added = *vertex;
+            added.name = stage->name;
+            CHECK(check_dependency_mutation(object, stage, &added,
+                                            UNITY_SHADER_DEPENDENCIES_UNSUPPORTED_PASS) == 0);
+        }
         const char *const text_fields[] = {"m_UseName", "m_TextureName", "m_State/zTest/name"};
         for (size_t i = 0; i < sizeof(text_fields) / sizeof(text_fields[0]); ++i)
             CHECK(check_text_dependency(object, pass, text_fields[i], "ExternalInput",
@@ -207,6 +220,17 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture, const Shader
               capture, subject, WHOLE_SHADER_PLANE_RUNTIME_SELECTION, &invalid) ==
           WHOLE_SHADER_EVIDENCE_INVALID_PLANE);
     CHECK(!invalid);
+    UnityShaderSelectionEvidenceReport selection;
+    WholeShaderEvidence *runtime = NULL;
+    CHECK(unity_shaderlab_lift_capture_selection_evidence(
+              capture, catalog, catalog->records, registry, NULL, NULL, subject, &runtime,
+              &selection) == WHOLE_SHADER_EVIDENCE_OK);
+    WholeShaderEvidenceSummary runtime_summary;
+    CHECK(whole_shader_evidence_describe(runtime, &runtime_summary) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(runtime_summary.status == WHOLE_SHADER_PLANE_UNAVAILABLE &&
+          selection.availability == UNITY_SHADER_SELECTION_NATIVE_UNAVAILABLE);
+    whole_shader_evidence_free(runtime);
+    runtime = NULL;
     printf("domain=pass dxbc=pass diagnostics=pass bindings=pass compile_items=%llu\n",
            (unsigned long long)a.expected_item_count);
     for (size_t mutation = 0; mutation < 16; ++mutation) {
@@ -267,6 +291,10 @@ static int check_evidence(const UnityShaderLabLiftCapture *capture, const Shader
                                                          WHOLE_SHADER_PLANE_FULL_DXBC, &invalid) ==
               WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
         CHECK(!invalid);
+        CHECK(unity_shaderlab_lift_capture_selection_evidence(
+                  capture, catalog, catalog->records, registry, NULL, NULL, mismatch, &runtime,
+                  &selection) == WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+        CHECK(!runtime);
         whole_shader_subject_free(mismatch);
     }
     WholeShaderEvidence *structure = NULL;

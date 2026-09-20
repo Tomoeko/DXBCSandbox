@@ -58,6 +58,15 @@ typedef struct {
     uint8_t authority_digest[32];
 } UnityNativeRuntimeSummary;
 
+typedef enum {
+    UNITY_NATIVE_BINDING_NONE = 0,
+    UNITY_NATIVE_BINDING_PLAYER_MEMBERSHIP,
+    UNITY_NATIVE_BINDING_DEPLOYMENT,
+    UNITY_NATIVE_BINDING_PACKAGE_MANIFEST,
+    UNITY_NATIVE_BINDING_TARGET_BUNDLE,
+    UNITY_NATIVE_BINDING_CANDIDATE_BUNDLE
+} UnityNativeRuntimeBinding;
+
 typedef struct {
     CommonProcessStatus process_status;
     int exit_code;
@@ -65,6 +74,7 @@ typedef struct {
     ShaderCatalogObjectStatus target_status;
     ShaderCatalogObjectStatus candidate_status;
     size_t input_index; /* SIZE_MAX unless a held input failed. */
+    UnityNativeRuntimeBinding binding;
 } UnityNativeRuntimeDiagnostic;
 
 /* Invoke D3D11Validation's authenticated collector, binding both bundle hashes

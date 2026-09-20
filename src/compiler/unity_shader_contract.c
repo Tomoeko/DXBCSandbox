@@ -9,6 +9,7 @@ struct UnityShaderContract {
     UnityShaderLabLiftCapture *lift;
     UnityShaderBundleAuthority *import;
     UnityPlayerPackageAuthority *player;
+    UnityNativeRuntime *native;
     WholeShaderSubject *subject;
     WholeShaderEvidence *planes[WHOLE_SHADER_PLANE_COUNT];
 };
@@ -21,6 +22,7 @@ void unity_shader_contract_free(UnityShaderContract *contract) {
     whole_shader_subject_free(contract->subject);
     unity_shader_bundle_authority_free(contract->import);
     unity_player_package_free(contract->player);
+    unity_native_runtime_free(contract->native);
     unity_shaderlab_lift_capture_free(contract->lift);
     free(contract);
 }
@@ -50,6 +52,9 @@ static void initialize_report(UnityShaderContractReport *report) {
     report->import.gate.unity_exit_code = -1;
     report->import.catalog_status = SHADER_CATALOG_INVALID_ARGUMENT;
     report->import.object_status = SHADER_CATALOG_OBJECT_INVALID_ARGUMENT;
+    report->native_status = UNITY_NATIVE_RUNTIME_INVALID_ARGUMENT;
+    report->native.exit_code = -1;
+    report->native.input_index = SIZE_MAX;
     for (unsigned plane = 0; plane < WHOLE_SHADER_PLANE_COUNT; ++plane) {
         report->planes[plane].plane = (WholeShaderVerificationPlane)plane;
         report->planes[plane].status =
@@ -72,12 +77,19 @@ static bool bind_subject(UnityShaderContract *contract) {
         return false;
     memcpy(descriptor.player_profile_digest, player.player.profile_digest, 32);
     memcpy(descriptor.candidate_release_digest, imported.release_digest, 32);
+    UnityNativeRuntimeSummary native = {0};
+    if (contract->native) {
+        if (!unity_native_runtime_describe(contract->native, &native))
+            return false;
+        memcpy(descriptor.runtime_environment_digest, native.native_environment_digest, 32);
+    }
     CommonSha256Context hash;
     common_sha256_init(&hash);
-    static const char domain[] = "DXBCSandbox.ShaderContractProducer.v1";
+    static const char domain[] = "DXBCSandbox.ShaderContractProducer.v2";
     common_sha256_update(&hash, domain, sizeof(domain));
     common_sha256_update(&hash, imported.authority_digest, 32);
     common_sha256_update(&hash, player.package_digest, 32);
+    common_sha256_update(&hash, native.authority_digest, 32);
     common_sha256_final(&hash, descriptor.producer_fingerprint);
     return whole_shader_subject_create(&contract->subject, &descriptor) == WHOLE_SHADER_SUBJECT_OK;
 }
@@ -129,20 +141,10 @@ static bool collect_evidence(UnityShaderContract *contract,
             &dependencies) != WHOLE_SHADER_EVIDENCE_OK)
         return false;
 
-    WholeShaderSubjectDescriptor descriptor;
-    if (whole_shader_subject_describe(subject, &descriptor) != WHOLE_SHADER_SUBJECT_OK)
-        return false;
-    WholeShaderNonpassEvidenceDescriptor runtime = {0};
-    runtime.plane = WHOLE_SHADER_PLANE_RUNTIME_SELECTION;
-    runtime.producer = "shader-contract";
-    runtime.producer_version = 1;
-    runtime.expected_item_count = 1;
-    runtime.reason_code = 1;
-    memcpy(runtime.authority_digest, descriptor.producer_fingerprint, 32);
-    static const char reason[] = "Runtime environment and selection authority is unavailable";
-    common_sha256(reason, sizeof(reason), runtime.reason_digest);
-    if (whole_shader_evidence_create_unavailable(&contract->planes[runtime.plane], subject,
-                                                 &runtime) != WHOLE_SHADER_EVIDENCE_OK)
+    if (unity_shaderlab_lift_capture_selection_evidence(
+            contract->lift, candidate, candidate->records, registry, contract->player,
+            contract->native, subject, &contract->planes[WHOLE_SHADER_PLANE_RUNTIME_SELECTION],
+            &report->selection) != WHOLE_SHADER_EVIDENCE_OK)
         return false;
 
     WholeShaderCertificateInput *input = NULL;
@@ -226,6 +228,22 @@ UnityShaderContractStatus unity_shader_contract_capture(const UnityShaderContrac
                                                         &contract->import, &report->import);
     if (report->import_status != UNITY_SHADER_BUNDLE_EVIDENCE_OK)
         goto failure;
+    if (options->native) {
+        const ShaderCatalog *candidate = unity_shader_bundle_authority_catalog(contract->import);
+        if (!candidate || candidate->record_count != 1)
+            goto failure;
+        UnityNativeRuntimeOptions native = *options->native;
+        native.target_catalog = options->lift.catalog;
+        native.target_record = options->lift.record;
+        native.candidate_catalog = candidate;
+        native.candidate_record = candidate->records;
+        native.registry = options->lift.registry;
+        native.player = contract->player;
+        report->native_status =
+            unity_native_runtime_capture(&native, &contract->native, &report->native);
+        /* Retrieval failure remains visible while the other ten independently
+         * produced planes are retained. No stale native capture is reused. */
+    }
     report->status = UNITY_SHADER_CONTRACT_SUBJECT_UNAVAILABLE;
     if (!bind_subject(contract))
         goto failure;

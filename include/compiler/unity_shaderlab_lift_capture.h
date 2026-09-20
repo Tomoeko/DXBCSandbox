@@ -6,6 +6,7 @@
 #include "app/whole_shader_evidence.h"
 #include "compiler/unity_shaderlab_lift.h"
 #include "compiler/unity_shader_dependency_closure.h"
+#include "compiler/unity_native_runtime.h"
 #include "translation/shaderlab_structural_certificate.h"
 
 typedef struct UnityShaderLabLiftCapture UnityShaderLabLiftCapture;
@@ -128,6 +129,48 @@ WholeShaderEvidenceStatus unity_shaderlab_lift_capture_dependency_evidence(
     const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
     const WholeShaderSubject *subject, WholeShaderEvidence **output,
     UnityShaderDependencyEvidenceReport *report);
+
+typedef enum {
+    UNITY_SHADER_SELECTION_NOT_EVALUATED = 0,
+    UNITY_SHADER_SELECTION_AVAILABLE,
+    UNITY_SHADER_SELECTION_NATIVE_UNAVAILABLE,
+    UNITY_SHADER_SELECTION_STRUCTURE_UNAVAILABLE,
+    UNITY_SHADER_SELECTION_DEPENDENCIES_UNAVAILABLE
+} UnityShaderSelectionAvailability;
+
+typedef struct {
+    ShaderCatalogObjectStatus source_status;
+    ShaderCatalogObjectReport candidate;
+    ShaderLabStructuralDiagnostic candidate_structure;
+    UnityShaderDependencyReport candidate_dependencies;
+    UnityShaderSelectionAvailability availability;
+} UnityShaderSelectionEvidenceReport;
+
+/* The exact conditional runtime contract, included in the captured subject's
+ * scope digest. Selection history includes corresponding cache/unsupported-row
+ * states and identical load/device outcomes, not an assumption that every row
+ * is supported. Extension inactivity is a precondition throughout execution;
+ * sampled native counters cannot establish it between observations. */
+const char *unity_shaderlab_lift_runtime_conditions(void);
+
+/* Closed selection congruence for the captured, resource-free V/F scope.
+ * Independently decode the candidate and compare its complete ordered parsed
+ * form, exact payload, schema and dependency inventory with captured target
+ * values. Identical released data in the same pinned engine, under the defined
+ * runtime contract above, preserves corresponding pass/variant decisions and
+ * state transitions. This proves equality conditionally for all such histories;
+ * it does not infer a winning ordinal or universal eligibility from draw bytes.
+ *
+ * The opaque native capture must bind both actual releases and this captured
+ * player. Missing native/structural/dependency authority yields UNAVAILABLE;
+ * changed admitted data yields FAIL. Subject or native binding errors yield no
+ * evidence. The other ten logical planes remain independently required. */
+WholeShaderEvidenceStatus unity_shaderlab_lift_capture_selection_evidence(
+    const UnityShaderLabLiftCapture *capture, const ShaderCatalog *candidate_catalog,
+    const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
+    const UnityPlayerPackageAuthority *player, const UnityNativeRuntime *native,
+    const WholeShaderSubject *subject, WholeShaderEvidence **output,
+    UnityShaderSelectionEvidenceReport *report);
 
 void unity_shaderlab_lift_capture_free(UnityShaderLabLiftCapture *capture);
 

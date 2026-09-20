@@ -280,12 +280,19 @@ UnityNativeRuntimeStatus unity_native_runtime_capture(const UnityNativeRuntimeOp
     UnityNativeRuntimeSummary *summary = &runtime->summary;
     status = unity_native_runtime_inspect(captured.data, captured.size, options->player, summary);
     common_file_bytes_dispose(&captured);
+    if (status == UNITY_NATIVE_RUNTIME_BINDING_MISMATCH)
+        diagnostic->binding = UNITY_NATIVE_BINDING_PLAYER_MEMBERSHIP;
     if (status != UNITY_NATIVE_RUNTIME_OK)
         goto cleanup;
-    if (memcmp(summary->deployment_digest, views[6].captured_sha256, 32) != 0 ||
-        memcmp(summary->package_manifest_digest, views[8].captured_sha256, 32) != 0 ||
-        memcmp(summary->target_artifact_digest, target.source_artifact_digest, 32) != 0 ||
-        memcmp(summary->candidate_artifact_digest, candidate.source_artifact_digest, 32) != 0) {
+    if (memcmp(summary->deployment_digest, views[6].captured_sha256, 32) != 0)
+        diagnostic->binding = UNITY_NATIVE_BINDING_DEPLOYMENT;
+    else if (memcmp(summary->package_manifest_digest, views[8].captured_sha256, 32) != 0)
+        diagnostic->binding = UNITY_NATIVE_BINDING_PACKAGE_MANIFEST;
+    else if (memcmp(summary->target_artifact_digest, target.source_artifact_digest, 32) != 0)
+        diagnostic->binding = UNITY_NATIVE_BINDING_TARGET_BUNDLE;
+    else if (memcmp(summary->candidate_artifact_digest, candidate.source_artifact_digest, 32) != 0)
+        diagnostic->binding = UNITY_NATIVE_BINDING_CANDIDATE_BUNDLE;
+    if (diagnostic->binding != UNITY_NATIVE_BINDING_NONE) {
         status = UNITY_NATIVE_RUNTIME_BINDING_MISMATCH;
         goto cleanup;
     }

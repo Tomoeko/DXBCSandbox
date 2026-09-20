@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "compiler/unity_native_runtime_internal.h"
+#include "compiler/unity_shaderlab_lift_capture.h"
 #include "common/string_builder.h"
 #include "dxbc/dxbc_parser.h"
 #include "dxbc/usbd.h"
@@ -161,7 +162,82 @@ static int portable(void) {
     return 0;
 }
 
-static int live(char **argv) {
+static int selection(const UnityNativeRuntime *native, const UnityPlayerPackageAuthority *player,
+                      const UnityCompileProfile *profile, const ShaderCatalog *target,
+                      const ShaderCatalog *candidate, const TypeTreeSchemaRegistry *registry,
+                      const char *project, const char *includes) {
+    UnityCompilerBroker *broker = unity_compiler_broker_create_lazy(project, includes);
+    CHECK(broker);
+    HLSLLiftLimits budget = {2, 128, 60000};
+    UnityShaderLabLiftCaptureInput input = {
+        .catalog = target, .record = target->records, .registry = registry, .profile = profile,
+        .broker = broker, .source_path = "Assets/Contract.shader", .source_directory = project,
+        .source_basename = "Contract.shader", .limits = &budget};
+    UnityShaderLabLiftCapture *capture = NULL;
+    UnityShaderLabLiftCaptureReport captured;
+    CHECK(unity_shaderlab_lift_capture(&input, &capture, &captured) == UNITY_SHADERLAB_CAPTURE_OK);
+    UnityNativeRuntimeSummary observed;
+    UnityPlayerPackageSummary package;
+    CHECK(unity_native_runtime_describe(native, &observed));
+    CHECK(unity_player_package_describe(player, &package));
+    WholeShaderSubjectDescriptor descriptor;
+    CHECK(unity_shaderlab_lift_capture_subject(capture, &descriptor));
+    memcpy(descriptor.player_profile_digest, package.player.profile_digest, 32);
+    memcpy(descriptor.runtime_environment_digest, observed.native_environment_digest, 32);
+    memcpy(descriptor.candidate_release_digest, observed.candidate_release_digest, 32);
+    memcpy(descriptor.producer_fingerprint, observed.authority_digest, 32);
+    WholeShaderSubject *subject = NULL;
+    CHECK(whole_shader_subject_create(&subject, &descriptor) == WHOLE_SHADER_SUBJECT_OK);
+    WholeShaderEvidence *evidence = NULL;
+    UnityShaderSelectionEvidenceReport report;
+    CHECK(unity_shaderlab_lift_capture_selection_evidence(
+              capture, candidate, candidate->records, registry, player, native, subject,
+              &evidence, &report) == WHOLE_SHADER_EVIDENCE_OK);
+    WholeShaderEvidenceSummary summary;
+    CHECK(whole_shader_evidence_describe(evidence, &summary) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(summary.status == WHOLE_SHADER_PLANE_PASS && summary.matched_item_count == 4);
+    whole_shader_evidence_free(evidence);
+    evidence = NULL;
+    for (unsigned mutation = 0; mutation < 9; ++mutation) {
+        WholeShaderSubjectDescriptor changed = descriptor;
+        uint8_t *digests[] = {changed.runtime_environment_digest, changed.player_profile_digest,
+            changed.candidate_release_digest, changed.target_object_payload_digest,
+            changed.schema_authority_digest, changed.verification_scope_digest,
+            changed.dependency_map_digest, changed.compiler_session_digest,
+            changed.candidate_source_digest};
+        digests[mutation][0] ^= 1;
+        WholeShaderSubject *wrong = NULL;
+        CHECK(whole_shader_subject_create(&wrong, &changed) == WHOLE_SHADER_SUBJECT_OK);
+        CHECK(unity_shaderlab_lift_capture_selection_evidence(
+                  capture, candidate, candidate->records, registry, player, native, wrong,
+                  &evidence, &report) == WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+        CHECK(!evidence);
+        whole_shader_subject_free(wrong);
+    }
+    CHECK(unity_shaderlab_lift_capture_selection_evidence(
+              capture, candidate, candidate->records, registry, NULL, native, subject,
+              &evidence, &report) == WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+    CHECK(!evidence);
+    ShaderCatalogRecord unowned = *candidate->records;
+    CHECK(unity_shaderlab_lift_capture_selection_evidence(
+              capture, candidate, &unowned, registry, player, native, subject,
+              &evidence, &report) == WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT);
+    CHECK(!evidence);
+    CHECK(unity_shaderlab_lift_capture_selection_evidence(
+              capture, candidate, candidate->records, registry, player, NULL, subject,
+              &evidence, &report) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(whole_shader_evidence_describe(evidence, &summary) == WHOLE_SHADER_EVIDENCE_OK);
+    CHECK(summary.status == WHOLE_SHADER_PLANE_UNAVAILABLE &&
+          report.availability == UNITY_SHADER_SELECTION_NATIVE_UNAVAILABLE);
+    whole_shader_evidence_free(evidence);
+    whole_shader_subject_free(subject);
+    unity_shaderlab_lift_capture_free(capture);
+    unity_compiler_broker_destroy(broker);
+    puts("selection=pass binding-negatives=11 missing-native=unavailable");
+    return 0;
+}
+
+static int live(int argc, char **argv) {
     UnityCompileProfile profile;
     unity_compile_profile_init(&profile);
     CHECK(unity_compile_profile_load(argv[4], &profile) == UNITY_COMPILE_PROFILE_OK);
@@ -200,6 +276,9 @@ static int live(char **argv) {
     common_sha256_digest_to_hex(summary.authority_digest, hex);
     printf("observations=%u pairs=%u members=%u authority=%s\n", summary.observation_count,
            summary.equal_pair_count, summary.member_count, hex);
+    if (argc == 13)
+        CHECK(selection(runtime, player, &profile, &target, &candidate, &registry,
+                         argv[11], argv[12]) == 0);
     unity_native_runtime_free(runtime);
     runtime = NULL;
     CHECK(unity_native_runtime_capture(&input, &runtime, &diagnostic) == UNITY_NATIVE_RUNTIME_OUTPUT_EXISTS);
@@ -214,8 +293,8 @@ static int live(char **argv) {
 int main(int argc, char **argv) {
     if (argc == 1)
         return portable();
-    if (argc == 11)
-        return live(argv);
-    fprintf(stderr, "Usage: %s [TARGET CANDIDATE PLAYER_ROOT PROFILE PYTHON CLIENT SSH_CONFIG POLICY JOBS OUTPUT]\n", argv[0]);
+    if (argc == 11 || argc == 13)
+        return live(argc, argv);
+    fprintf(stderr, "Usage: %s [TARGET CANDIDATE PLAYER_ROOT PROFILE PYTHON CLIENT SSH_CONFIG POLICY JOBS OUTPUT [PROJECT INCLUDES]]\n", argv[0]);
     return 2;
 }

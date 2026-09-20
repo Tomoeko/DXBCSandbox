@@ -89,8 +89,10 @@ OraclePack results are valid only for their recorded inputs and toolchain.
 With compiler and bundle support enabled, the `unity_shader_contract` C API
 coordinates accepted-source compilation, isolated import, release comparisons,
 and captured player metadata under one subject. It requests every D3D11 logical
-plane; runtime selection is currently unavailable, so a collected contract
-cannot yet certify whole-shader logical equivalence.
+plane. Optional authenticated native capture enables a conservative closed
+selection-congruence check. A logical certificate applies only when all eleven
+planes pass under the [defined runtime conditions](VERIFICATION.md); missing
+native authority leaves selection unavailable.
 
 The `unity_native_runtime` API retrieves authenticated D3D11Validation
 observations through its headless SSH worker. It binds the released bundles and

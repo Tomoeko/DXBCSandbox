@@ -13,6 +13,19 @@ struct UnityShaderLabLiftCapture {
     UnityShaderLabLiftCaptureReport authority;
 };
 
+const char *unity_shaderlab_lift_runtime_conditions(void) {
+    return "Closed resource-free vertex/fragment selection, version 1. "
+           "Use the same captured D3D11 player and device environment. Supply identical defined "
+           "vertex and built-in fog inputs, global/local keyword values and keyword-space mappings, "
+           "hardware tier, capabilities, quality, LOD, pass requests and render state. "
+           "Start from corresponding shader selection caches and unsupported states; apply the "
+           "same ordered requests with identical blob-load and device-creation outcomes. "
+           "No shader replacement, external keyword/variant extension or identity-observing "
+           "callback may intervene during those requests. Code and dependencies remain unchanged. "
+           "Native observations establish only their recorded samples, not these preconditions "
+           "for arbitrary future execution.";
+}
+
 void unity_shaderlab_lift_capture_free(UnityShaderLabLiftCapture *capture) {
     if (!capture)
         return;
@@ -67,8 +80,12 @@ static WholeShaderSubjectStatus capture_subject(UnityShaderLabLiftCapture *captu
     common_sha256_update(&hash, capture->result->source_directory_digest, 32);
     common_sha256_update(&hash, capture->result->source_basename_digest, 32);
     common_sha256_final(&hash, descriptor.compiler_session_digest);
-    static const char scope[] = "DXBCSandbox.AllEmittedLocalD3D11Passes.FullGeneratedDomain.v1";
-    common_sha256(scope, sizeof(scope), descriptor.verification_scope_digest);
+    static const char scope[] = "DXBCSandbox.AllEmittedLocalD3D11Passes.FullGeneratedDomain.v2";
+    const char *conditions = unity_shaderlab_lift_runtime_conditions();
+    common_sha256_init(&hash);
+    common_sha256_update(&hash, scope, sizeof(scope));
+    common_sha256_update(&hash, conditions, strlen(conditions) + 1);
+    common_sha256_final(&hash, descriptor.verification_scope_digest);
     if (capture->authority.dependencies.status == UNITY_SHADER_DEPENDENCIES_OK) {
         static const char dependencies[] = "DXBCSandbox.CapturedLift.DependencyMap.v1";
         common_sha256_init(&hash);
@@ -454,6 +471,122 @@ WholeShaderEvidenceStatus unity_shaderlab_lift_capture_dependency_evidence(
         memcpy(descriptor.authority_digest, authority, 32);
         status = whole_shader_evidence_create_comparison(output, subject, &descriptor);
     }
+cleanup:
+    shader_object_dispose(&candidate);
+    return status;
+}
+
+WholeShaderEvidenceStatus unity_shaderlab_lift_capture_selection_evidence(
+    const UnityShaderLabLiftCapture *capture, const ShaderCatalog *candidate_catalog,
+    const ShaderCatalogRecord *candidate_record, const TypeTreeSchemaRegistry *registry,
+    const UnityPlayerPackageAuthority *player, const UnityNativeRuntime *native,
+    const WholeShaderSubject *subject, WholeShaderEvidence **output,
+    UnityShaderSelectionEvidenceReport *report) {
+    if (output)
+        *output = NULL;
+    if (!report)
+        return WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
+    memset(report, 0, sizeof(*report));
+    report->source_status = SHADER_CATALOG_OBJECT_INVALID_ARGUMENT;
+    report->candidate_structure.status = SHADERLAB_STRUCTURE_INVALID_ARGUMENT;
+    report->candidate_dependencies.status = UNITY_SHADER_DEPENDENCIES_INVALID_ARGUMENT;
+    if (!output || !capture || !candidate_catalog || !candidate_record ||
+        !subject_matches_capture(capture, subject))
+        return WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
+    ShaderObject candidate;
+    shader_object_init(&candidate);
+    WholeShaderEvidenceStatus status = WHOLE_SHADER_EVIDENCE_INVALID_ARGUMENT;
+    WholeShaderSubjectDescriptor descriptor;
+    if (!capture_candidate(candidate_catalog, candidate_record, registry, subject, &candidate,
+                           &report->candidate, &report->source_status) ||
+        whole_shader_subject_describe(subject, &descriptor) != WHOLE_SHADER_SUBJECT_OK)
+        goto cleanup;
+
+    UnityNativeRuntimeSummary observed = {0};
+    UnityPlayerPackageSummary package;
+    if (!native) {
+        report->availability = UNITY_SHADER_SELECTION_NATIVE_UNAVAILABLE;
+    } else if (!unity_native_runtime_describe(native, &observed) ||
+               !unity_player_package_describe(player, &package) ||
+               memcmp(observed.target_release_digest, capture->authority.target.release_digest, 32) ||
+               memcmp(observed.candidate_release_digest, report->candidate.release_digest, 32) ||
+               memcmp(observed.player_package_digest, package.package_digest, 32) ||
+               memcmp(descriptor.player_profile_digest, package.player.profile_digest, 32) ||
+               memcmp(capture->authority.profile_digest, package.player.compiler_profile_digest, 32) ||
+               memcmp(descriptor.runtime_environment_digest, observed.native_environment_digest, 32)) {
+        goto cleanup;
+    } else {
+        report->availability = UNITY_SHADER_SELECTION_AVAILABLE;
+    }
+    (void)shaderlab_structural_certify(&candidate, &report->candidate_structure);
+    (void)unity_shader_dependency_closure(&candidate, &report->candidate_dependencies);
+    if (report->availability == UNITY_SHADER_SELECTION_AVAILABLE &&
+        (!capture->authority.structural_digest_valid ||
+         report->candidate_structure.status != SHADERLAB_STRUCTURE_OK))
+        report->availability = UNITY_SHADER_SELECTION_STRUCTURE_UNAVAILABLE;
+    if (report->availability == UNITY_SHADER_SELECTION_AVAILABLE &&
+        (capture->authority.dependencies.status != UNITY_SHADER_DEPENDENCIES_OK ||
+         report->candidate_dependencies.status != UNITY_SHADER_DEPENDENCIES_OK))
+        report->availability = UNITY_SHADER_SELECTION_DEPENDENCIES_UNAVAILABLE;
+
+    uint8_t authority[32], subject_digest[32];
+    if (whole_shader_subject_digest(subject, subject_digest) != WHOLE_SHADER_SUBJECT_OK)
+        goto cleanup;
+    CommonSha256Context hash;
+    common_sha256_init(&hash);
+    static const char domain[] = "DXBCSandbox.ClosedSelectionCongruence.Authority.v1";
+    common_sha256_update(&hash, domain, sizeof(domain));
+    common_sha256_update(&hash, subject_digest, 32);
+    common_sha256_update(&hash, capture->authority.target.release_digest, 32);
+    common_sha256_update(&hash, report->candidate.release_digest, 32);
+    common_sha256_update(&hash, observed.authority_digest, 32);
+    common_sha256_final(&hash, authority);
+    if (report->availability != UNITY_SHADER_SELECTION_AVAILABLE) {
+        WholeShaderNonpassEvidenceDescriptor missing = {
+            .plane = WHOLE_SHADER_PLANE_RUNTIME_SELECTION,
+            .producer = "dxbc-closed-selection-congruence",
+            .producer_version = 1,
+            .expected_item_count = 4,
+            .reason_code = (uint32_t)report->availability,
+        };
+        static const char *const reasons[] = {
+            "not-evaluated", "available", "native-capture-unavailable", "ordered-structure-unavailable",
+            "closed-dependencies-unavailable"};
+        memcpy(missing.authority_digest, authority, 32);
+        const char *reason = reasons[report->availability];
+        common_sha256(reason, strlen(reason), missing.reason_digest);
+        status = whole_shader_evidence_create_unavailable(output, subject, &missing);
+        goto cleanup;
+    }
+
+    /* Congruence preserves every ordered row, including aliases with identical
+     * DXBC. It quantifies over corresponding unsupported/cache states instead
+     * of asserting that compiler acceptance makes every row runtime-eligible.
+     * The complete payload comparison deliberately admits no normalization. */
+    WholeShaderEvidenceComparisonItem items[4] = {0};
+    static const char *const identities[] = {
+        "complete-release-payload", "schema", "ordered-parsed-form", "closed-dependencies"};
+    for (size_t i = 0; i < 4; ++i)
+        common_sha256(identities[i], strlen(identities[i]), items[i].identity_digest);
+    memcpy(items[0].expected_digest, capture->authority.target.payload_digest, 32);
+    memcpy(items[0].observed_digest, report->candidate.payload_digest, 32);
+    memcpy(items[1].expected_digest, capture->authority.target.schema_digest, 32);
+    memcpy(items[1].observed_digest, report->candidate.schema_digest, 32);
+    memcpy(items[2].expected_digest, capture->authority.structural_digest, 32);
+    if (!typetree_value_digest(typetree_find_child(&candidate.root, "m_ParsedForm"),
+                               items[2].observed_digest))
+        goto cleanup;
+    memcpy(items[3].expected_digest, capture->authority.dependencies.digest, 32);
+    memcpy(items[3].observed_digest, report->candidate_dependencies.digest, 32);
+    WholeShaderComparisonEvidenceDescriptor evidence = {
+        .plane = WHOLE_SHADER_PLANE_RUNTIME_SELECTION,
+        .producer = "dxbc-closed-selection-congruence",
+        .producer_version = 1,
+        .items = items,
+        .item_count = 4,
+    };
+    memcpy(evidence.authority_digest, authority, 32);
+    status = whole_shader_evidence_create_comparison(output, subject, &evidence);
 cleanup:
     shader_object_dispose(&candidate);
     return status;
