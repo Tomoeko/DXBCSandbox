@@ -9,6 +9,8 @@ typedef struct {
     char *relative_path;
     size_t discovered_index;
     CommonFileView view;
+    size_t size;
+    uint8_t content_digest[32];
     bool opened;
 } RuntimeFile;
 
@@ -208,17 +210,17 @@ shader_runtime_capture_begin(const char *root, const ShaderRuntimeCaptureLimits 
             goto failure;
         }
         file->opened = true;
-        uint8_t digest[32];
-        if (!common_file_view_sha256(&file->view, digest)) {
+        if (!common_file_view_sha256(&file->view, file->content_digest)) {
             diagnostic->file_index = i;
             status = SHADER_RUNTIME_CAPTURE_FILE_UNAVAILABLE;
             goto failure;
         }
-        capture->summary.total_bytes += file->view.size;
+        file->size = file->view.size;
+        capture->summary.total_bytes += file->size;
         hash_u64(&hash, strlen(file->relative_path));
         common_sha256_update(&hash, file->relative_path, strlen(file->relative_path));
-        hash_u64(&hash, file->view.size);
-        common_sha256_update(&hash, digest, sizeof(digest));
+        hash_u64(&hash, file->size);
+        common_sha256_update(&hash, file->content_digest, sizeof(file->content_digest));
     }
     capture->summary.file_count = capture->file_count;
     common_sha256_final(&hash, capture->summary.image_digest);
@@ -277,6 +279,38 @@ bool shader_runtime_capture_describe(const ShaderRuntimeCapture *capture,
         return false;
     *summary = capture->summary;
     return true;
+}
+
+bool shader_runtime_capture_find_file(const ShaderRuntimeCapture *capture,
+                                      const char *relative_path,
+                                      ShaderRuntimeFileIdentity *identity) {
+    if (!capture || !capture->sealed || !relative_path || !identity)
+        return false;
+    size_t length = 0U;
+    while (relative_path[length]) {
+        if (length == capture->discovery_options.max_path_bytes)
+            return false;
+        ++length;
+    }
+    if (common_relative_path_validate_utf8(relative_path, length).status != COMMON_RELATIVE_PATH_OK)
+        return false;
+    size_t begin = 0U, end = capture->file_count;
+    while (begin < end) {
+        const size_t middle = begin + (end - begin) / 2U;
+        const RuntimeFile *file = &capture->files[middle];
+        const int order = strcmp(relative_path, file->relative_path);
+        if (order < 0) {
+            end = middle;
+        } else if (order > 0) {
+            begin = middle + 1U;
+        } else {
+            identity->relative_path = file->relative_path;
+            identity->size = file->size;
+            memcpy(identity->content_digest, file->content_digest, sizeof(file->content_digest));
+            return true;
+        }
+    }
+    return false;
 }
 
 const char *shader_runtime_capture_status_name(ShaderRuntimeCaptureStatus status) {

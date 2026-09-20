@@ -105,6 +105,12 @@ UnityPlayerPackageStatus unity_player_package_capture_d3d11(
     UnityPlayerPackageAuthority **output, UnityPlayerPackageDiagnostic *diagnostic);
 bool unity_player_package_describe(const UnityPlayerPackageAuthority *authority,
                                    UnityPlayerPackageSummary *summary);
+/* Exact member of this revalidated package; no second filesystem capture.
+ * The returned path is borrowed until the package is freed. Failure leaves
+ * identity untouched. This alone does not associate a file with an execution. */
+bool unity_player_package_find_file(const UnityPlayerPackageAuthority *authority,
+                                    const char *relative_path,
+                                    ShaderRuntimeFileIdentity *identity);
 /* Borrowed opaque profile; valid only until the package authority is freed. */
 const UnityPlayerProfileAuthority *
 unity_player_package_profile(const UnityPlayerPackageAuthority *authority);

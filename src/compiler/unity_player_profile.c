@@ -12,6 +12,7 @@ struct UnityPlayerProfileAuthority {
 
 struct UnityPlayerPackageAuthority {
     UnityPlayerProfileAuthority *profile;
+    ShaderRuntimeCapture *capture;
     UnityPlayerPackageSummary summary;
 };
 
@@ -31,6 +32,7 @@ void unity_player_package_free(UnityPlayerPackageAuthority *authority) {
     if (!authority)
         return;
     unity_player_profile_free(authority->profile);
+    shader_runtime_capture_free(authority->capture);
     free(authority);
 }
 
@@ -45,6 +47,12 @@ bool unity_player_package_describe(const UnityPlayerPackageAuthority *authority,
 const UnityPlayerProfileAuthority *
 unity_player_package_profile(const UnityPlayerPackageAuthority *authority) {
     return authority ? authority->profile : NULL;
+}
+
+bool unity_player_package_find_file(const UnityPlayerPackageAuthority *authority,
+                                    const char *relative_path,
+                                    ShaderRuntimeFileIdentity *identity) {
+    return authority && shader_runtime_capture_find_file(authority->capture, relative_path, identity);
 }
 
 const char *unity_player_package_status_name(UnityPlayerPackageStatus status) {
@@ -137,6 +145,8 @@ UnityPlayerPackageStatus unity_player_package_capture_d3d11(
     common_sha256_update(&hash, metadata_path, name_size);
     common_sha256_update(&hash, authority->summary.player.profile_digest, 32U);
     common_sha256_final(&hash, authority->summary.package_digest);
+    authority->capture = capture;
+    capture = NULL;
     *output = authority;
     authority = NULL;
 cleanup:

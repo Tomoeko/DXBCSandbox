@@ -107,6 +107,19 @@ static int check_package(const CommonFileBytes *bytes, const UnityCompileProfile
     UnityPlayerPackageSummary captured, repeated;
     CHECK(unity_player_package_describe(package, &captured));
     CHECK(captured.image.file_count == 2U && captured.image.total_bytes == bytes->size * 2U);
+    ShaderRuntimeFileIdentity member, alias_member;
+    CHECK(unity_player_package_find_file(package, "metadata", &member));
+    CHECK(unity_player_package_find_file(package, "alias", &alias_member));
+    CHECK(member.size == bytes->size && alias_member.size == bytes->size);
+    CHECK(strcmp(member.relative_path, "metadata") == 0);
+    CHECK(strcmp(alias_member.relative_path, "alias") == 0);
+    CHECK(memcmp(member.content_digest, captured.player.serialized_file_digest, 32U) == 0);
+    CHECK(memcmp(member.content_digest, alias_member.content_digest, 32U) == 0);
+    const ShaderRuntimeFileIdentity retained = member;
+    CHECK(!unity_player_package_find_file(NULL, "metadata", &member));
+    CHECK(!unity_player_package_find_file(package, "../metadata", &member));
+    CHECK(!unity_player_package_find_file(package, "metadata", NULL));
+    CHECK(memcmp(&member, &retained, sizeof(member)) == 0);
     CHECK(memcmp(captured.player.profile_digest, subject->player_profile_digest, 32U) == 0);
     CHECK(check_evidence(unity_player_package_profile(package), subject,
                           WHOLE_SHADER_PLANE_PASS) == 0);
@@ -124,10 +137,14 @@ static int check_package(const CommonFileBytes *bytes, const UnityCompileProfile
     unity_player_package_free(other);
 
     CHECK(common_file_write_new_atomic(extra, "extra", 5U) == COMMON_FILE_OK);
+    CHECK(!unity_player_package_find_file(package, "additional", &member));
+    CHECK(memcmp(&member, &retained, sizeof(member)) == 0);
     CHECK(unity_player_package_capture_d3d11(root, "metadata", &bounds, compiler, 7U,
                                               &other, &diagnostic) == UNITY_PLAYER_PACKAGE_OK);
     CHECK(unity_player_package_describe(other, &repeated));
     CHECK(memcmp(captured.player.profile_digest, repeated.player.profile_digest, 32U) == 0);
+    CHECK(unity_player_package_find_file(other, "additional", &member));
+    CHECK(member.size == 5U);
     CHECK(memcmp(captured.image.image_digest, repeated.image.image_digest, 32U) != 0);
     CHECK(memcmp(captured.package_digest, repeated.package_digest, 32U) != 0);
     unity_player_package_free(other);
@@ -165,6 +182,9 @@ static int check_package(const CommonFileBytes *bytes, const UnityCompileProfile
     /* Sealed authorities retain identities after the files disappear. */
     CHECK(unity_player_package_describe(package, &repeated));
     CHECK(memcmp(captured.package_digest, repeated.package_digest, 32U) == 0);
+    CHECK(unity_player_package_find_file(package, "metadata", &member));
+    CHECK(member.relative_path == retained.relative_path && member.size == retained.size);
+    CHECK(memcmp(member.content_digest, retained.content_digest, 32U) == 0);
     CHECK(check_evidence(unity_player_package_profile(package), subject,
                           WHOLE_SHADER_PLANE_PASS) == 0);
     unity_player_package_free(package);

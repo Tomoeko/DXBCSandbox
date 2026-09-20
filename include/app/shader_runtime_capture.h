@@ -41,6 +41,13 @@ typedef struct {
     uint8_t image_digest[32];
 } ShaderRuntimeImageSummary;
 
+typedef struct {
+    /* Borrowed until the capture is freed. */
+    const char *relative_path;
+    size_t size;
+    uint8_t content_digest[32];
+} ShaderRuntimeFileIdentity;
+
 /* Own the complete shader-validation package directory, with no extension
  * filter. Every bound must be nonzero. Strict shared discovery rejects links,
  * special files and traversal limits. File views hold immutable snapshots and
@@ -69,6 +76,13 @@ shader_runtime_capture_finish(ShaderRuntimeCapture *capture,
                               ShaderRuntimeCaptureDiagnostic *diagnostic);
 bool shader_runtime_capture_describe(const ShaderRuntimeCapture *capture,
                                      ShaderRuntimeImageSummary *summary);
+/* Look up an exact portable path only after successful finish. Identity comes
+ * from the same held bytes and revalidation as image_digest; no file is reopened.
+ * It describes the captured point in time, not the path's current contents.
+ * Invalid/absent paths and unsealed captures leave identity untouched. */
+bool shader_runtime_capture_find_file(const ShaderRuntimeCapture *capture,
+                                      const char *relative_path,
+                                      ShaderRuntimeFileIdentity *identity);
 void shader_runtime_capture_free(ShaderRuntimeCapture *capture);
 const char *shader_runtime_capture_status_name(ShaderRuntimeCaptureStatus status);
 

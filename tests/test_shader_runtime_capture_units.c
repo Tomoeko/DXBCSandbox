@@ -43,6 +43,11 @@ static int capture_image(const char *root, ShaderRuntimeImageSummary *summary) {
     const ShaderRuntimeImageSummary before = untouched;
     CHECK(!shader_runtime_capture_describe(capture, &untouched));
     CHECK(memcmp(&untouched, &before, sizeof(before)) == 0);
+    ShaderRuntimeFileIdentity identity;
+    memset(&identity, 0xa5, sizeof(identity));
+    const ShaderRuntimeFileIdentity unopened = identity;
+    CHECK(!shader_runtime_capture_find_file(capture, "a.bin", &identity));
+    CHECK(memcmp(&identity, &unopened, sizeof(identity)) == 0);
     const char *path = NULL;
     const uint8_t *data = NULL;
     size_t size = SIZE_MAX;
@@ -56,6 +61,32 @@ static int capture_image(const char *root, ShaderRuntimeImageSummary *summary) {
     CHECK(!shader_runtime_capture_file(capture, 0U, &path, &data, &size));
     CHECK(shader_runtime_capture_describe(capture, summary));
     CHECK(summary->file_count == 2U && summary->total_bytes == 3U);
+    CHECK(shader_runtime_capture_find_file(capture, "a.bin", &identity));
+    uint8_t expected[32];
+    common_sha256("abc", 3U, expected);
+    CHECK(strcmp(identity.relative_path, "a.bin") == 0 && identity.size == 3U);
+    CHECK(memcmp(identity.content_digest, expected, sizeof(expected)) == 0);
+    const char *borrowed = identity.relative_path;
+    CHECK(shader_runtime_capture_find_file(capture, "nested/z.bin", &identity));
+    common_sha256(NULL, 0U, expected);
+    CHECK(strcmp(identity.relative_path, "nested/z.bin") == 0 && identity.size == 0U);
+    CHECK(memcmp(identity.content_digest, expected, sizeof(expected)) == 0);
+    const ShaderRuntimeFileIdentity unchanged = identity;
+    const char *invalid[] = {NULL, "", "A.bin", "absent", "0.bin", "z.bin", "nested",
+                            "../a.bin", "./a.bin", "/a.bin", "nested/../a.bin",
+                            "nested\\z.bin", "a.bin/", "a.bin//", "\xff"};
+    for (size_t i = 0U; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        CHECK(!shader_runtime_capture_find_file(capture, invalid[i], &identity));
+        CHECK(memcmp(&identity, &unchanged, sizeof(identity)) == 0);
+    }
+    char oversized[4098];
+    memset(oversized, 'a', sizeof(oversized) - 1U);
+    oversized[sizeof(oversized) - 1U] = '\0';
+    CHECK(!shader_runtime_capture_find_file(capture, oversized, &identity));
+    CHECK(!shader_runtime_capture_find_file(NULL, "a.bin", &identity));
+    CHECK(!shader_runtime_capture_find_file(capture, "a.bin", NULL));
+    CHECK(memcmp(&identity, &unchanged, sizeof(identity)) == 0);
+    CHECK(strcmp(borrowed, "a.bin") == 0);
     CHECK(shader_runtime_capture_finish(capture, &diagnostic) == SHADER_RUNTIME_CAPTURE_CLOSED);
     CHECK(shader_runtime_capture_describe(capture, &untouched));
     CHECK(memcmp(summary->image_digest, untouched.image_digest, 32U) == 0);
@@ -81,6 +112,11 @@ static int reject_finish(ShaderRuntimeCapture *capture) {
           SHADER_RUNTIME_CAPTURE_INPUT_CHANGED);
     CHECK(!shader_runtime_capture_describe(capture, &summary));
     CHECK(memcmp(&summary, &before, sizeof(summary)) == 0);
+    ShaderRuntimeFileIdentity identity;
+    memset(&identity, 0xa5, sizeof(identity));
+    const ShaderRuntimeFileIdentity untouched = identity;
+    CHECK(!shader_runtime_capture_find_file(capture, "a.bin", &identity));
+    CHECK(memcmp(&identity, &untouched, sizeof(identity)) == 0);
     CHECK(shader_runtime_capture_finish(capture, &diagnostic) == SHADER_RUNTIME_CAPTURE_CLOSED);
     shader_runtime_capture_free(capture);
     return 0;
