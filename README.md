@@ -92,6 +92,11 @@ and captured player metadata under one subject. It requests every D3D11 logical
 plane; runtime selection is currently unavailable, so a collected contract
 cannot yet certify whole-shader logical equivalence.
 
+The `unity_native_runtime` API retrieves authenticated D3D11Validation
+observations through its headless SSH worker. It binds the released bundles and
+player package and compares complete bound stages and raw pixels for six paired
+fixtures. Those finite observations remain separate from runtime-selection proof.
+
 ## Limits and layout
 
 - Parsing targets explicitly supported Unity 2021.3 schemas, not every version.

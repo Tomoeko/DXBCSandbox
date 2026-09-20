@@ -47,6 +47,7 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         src/compiler/unity_compiler_session_report.c
         src/compiler/unity_reflection_certificate.c
         src/compiler/unity_generated_domain_certifier.c
+        src/compiler/unity_native_runtime.c
         src/compiler/unity_shaderlab_mapping.c
         src/compiler/unity_shaderlab_lift_capture.c
         src/compiler/unity_shader_dependency_closure.c

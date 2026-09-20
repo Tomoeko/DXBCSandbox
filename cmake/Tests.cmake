@@ -485,6 +485,14 @@ if(BUILD_TESTING)
             unity_compiler_support dxbc_build_options)
         add_test(NAME shaderlab_mapping_units COMMAND test_shaderlab_mapping_units)
 
+        add_executable(test_unity_native_runtime_units tests/test_unity_native_runtime_units.c)
+        target_include_directories(test_unity_native_runtime_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_unity_native_runtime_units PRIVATE unity_compiler_support dxbc_build_options)
+        target_compile_definitions(test_unity_native_runtime_units PRIVATE
+            NATIVE_TEST_METADATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/player_profile/metadata.assets"
+            NATIVE_TEST_DXBC="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/unity_uv_shaderlab/target.bin"
+            NATIVE_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry")
+        add_test(NAME unity_native_runtime_units COMMAND test_unity_native_runtime_units)
         if(TARGET unity_shader_contract)
             add_executable(test_unity_shader_contract_units tests/test_unity_shader_contract_units.c)
             target_link_libraries(test_unity_shader_contract_units PRIVATE unity_shader_contract dxbc_build_options)

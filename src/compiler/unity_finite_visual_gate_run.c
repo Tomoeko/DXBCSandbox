@@ -7,6 +7,7 @@
 #include "compiler/unity_finite_visual_gate.h"
 
 #include "common/file_io.h"
+#include "common/process.h"
 #include "common/sha256.h"
 
 #include <errno.h>
@@ -24,7 +25,6 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -464,123 +464,6 @@ static bool prepare_project(const UnityFiniteVisualGateOptions* options,
     return true;
 }
 
-#ifdef _WIN32
-static bool append_windows_argument(char** command, size_t* size,
-                                    size_t* capacity, const char* argument) {
-    size_t needed = 3U;
-    for (const char* at = argument; *at; ++at) {
-        needed += (*at == '"' || *at == '\\') ? 2U : 1U;
-    }
-    if (*size > SIZE_MAX - needed) return false;
-    size_t target = *size + needed;
-    if (target > *capacity) {
-        size_t grown = *capacity == 0U ? 256U : *capacity;
-        while (grown < target) {
-            if (grown > SIZE_MAX / 2U) { grown = target; break; }
-            grown *= 2U;
-        }
-        char* allocation = (char*)realloc(*command, grown);
-        if (!allocation) return false;
-        *command = allocation;
-        *capacity = grown;
-    }
-    if (*size != 0U) (*command)[(*size)++] = ' ';
-    (*command)[(*size)++] = '"';
-    size_t slashes = 0U;
-    for (const char* at = argument;; ++at) {
-        if (*at == '\\') { ++slashes; continue; }
-        if (*at == '"') {
-            while (slashes-- != 0U) {
-                (*command)[(*size)++] = '\\';
-                (*command)[(*size)++] = '\\';
-            }
-            (*command)[(*size)++] = '\\';
-            (*command)[(*size)++] = '"';
-            slashes = 0U;
-            continue;
-        }
-        if (*at == '\0') {
-            while (slashes != 0U) {
-                (*command)[(*size)++] = '\\';
-                (*command)[(*size)++] = '\\';
-                --slashes;
-            }
-            break;
-        }
-        while (slashes-- != 0U) (*command)[(*size)++] = '\\';
-        slashes = 0U;
-        (*command)[(*size)++] = *at;
-    }
-    (*command)[(*size)++] = '"';
-    (*command)[*size] = '\0';
-    return true;
-}
-
-static bool launch_unity(const char* const* arguments, int* exit_code) {
-    char* command = NULL;
-    size_t size = 0U;
-    size_t capacity = 0U;
-    for (size_t index = 0U; arguments[index]; ++index) {
-        if (!append_windows_argument(&command, &size, &capacity,
-                                     arguments[index])) {
-            free(command);
-            return false;
-        }
-    }
-    wchar_t* application = common_windows_utf8_to_wide(arguments[0]);
-    wchar_t* wide_command = common_windows_utf8_to_wide(command);
-    free(command);
-    if (!application || !wide_command) {
-        free(application);
-        free(wide_command);
-        return false;
-    }
-    STARTUPINFOW startup;
-    PROCESS_INFORMATION process;
-    memset(&startup, 0, sizeof(startup));
-    memset(&process, 0, sizeof(process));
-    startup.cb = sizeof(startup);
-    BOOL created = CreateProcessW(application, wide_command, NULL, NULL,
-                                  FALSE, 0U, NULL, NULL, &startup, &process);
-    free(application);
-    free(wide_command);
-    if (!created) return false;
-    bool success = WaitForSingleObject(process.hProcess, INFINITE) ==
-        WAIT_OBJECT_0;
-    DWORD code = 0U;
-    if (success) success = GetExitCodeProcess(process.hProcess, &code) != 0;
-    (void)CloseHandle(process.hThread);
-    (void)CloseHandle(process.hProcess);
-    if (!success || code > INT_MAX) return false;
-    *exit_code = (int)code;
-    return true;
-}
-#else
-static bool launch_unity(const char* const* arguments, int* exit_code) {
-    pid_t child = fork();
-    if (child < 0) return false;
-    if (child == 0) {
-        if (strchr(arguments[0], '/')) {
-            execv(arguments[0], (char* const*)arguments);
-        } else {
-            execvp(arguments[0], (char* const*)arguments);
-        }
-        _exit(127);
-    }
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) return false;
-    }
-    if (WIFEXITED(status)) {
-        *exit_code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        *exit_code = 128 + WTERMSIG(status);
-    } else {
-        return false;
-    }
-    return true;
-}
-#endif
 
 static const char* backend_force_argument(UnityFiniteVisualBackend backend) {
     switch (backend) {
@@ -718,7 +601,7 @@ UnityFiniteVisualGateStatus unity_finite_visual_gate_run(
         "-dxbc-finite-bridge-sha256", files.bridge_sha,
         NULL,
     };
-    if (!launch_unity(arguments, &out_result->unity_exit_code)) {
+    if (common_process_run(arguments, 0, &out_result->unity_exit_code) != COMMON_PROCESS_OK) {
         status = UNITY_FINITE_VISUAL_GATE_PROCESS_FAILED;
         goto done;
     }
