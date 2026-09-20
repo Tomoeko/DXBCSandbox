@@ -485,6 +485,17 @@ if(BUILD_TESTING)
             unity_compiler_support dxbc_build_options)
         add_test(NAME shaderlab_mapping_units COMMAND test_shaderlab_mapping_units)
 
+        if(TARGET unity_shader_contract)
+            add_executable(test_unity_shader_contract_units tests/test_unity_shader_contract_units.c)
+            target_link_libraries(test_unity_shader_contract_units PRIVATE unity_shader_contract dxbc_build_options)
+            target_compile_definitions(test_unity_shader_contract_units PRIVATE
+                CONTRACT_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry"
+                CONTRACT_EMPTY="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/release_shader/empty.assets"
+                CONTRACT_PLAYER_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/player_profile"
+                CONTRACT_BRIDGE="${CMAKE_CURRENT_SOURCE_DIR}/resources/unity/Editor/DXBCShaderBundleGate.cs")
+            add_test(NAME unity_shader_contract_units COMMAND test_unity_shader_contract_units)
+        endif()
+
         add_executable(test_shaderlab_lift_capture_units tests/test_shaderlab_lift_capture_units.c)
         target_compile_definitions(test_shaderlab_lift_capture_units PRIVATE
             CAPTURE_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry"

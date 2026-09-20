@@ -65,6 +65,14 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         PUBLIC dxbc_core dxbc_compile_profile Threads::Threads
         PRIVATE dxbc_build_options)
 
+    if(DXBCSANDBOX_BUILD_UNITY_BUNDLE_GATE)
+        add_library(unity_shader_contract STATIC src/compiler/unity_shader_contract.c)
+        add_library(DXBCSandbox::unity_shader_contract ALIAS unity_shader_contract)
+        target_include_directories(unity_shader_contract PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(unity_shader_contract PUBLIC unity_compiler_support unity_shader_bundle_gate
+            PRIVATE dxbc_build_options)
+    endif()
+
     if(DXBCSANDBOX_BUILD_ASSET_CLI)
         foreach(_dxbc_asset_cli dxbc_sandbox_cli asset_client_cli)
             target_compile_definitions(${_dxbc_asset_cli} PRIVATE DXBCSANDBOX_CLI_UNITY_COMPILER=1)

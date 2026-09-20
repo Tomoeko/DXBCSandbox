@@ -86,6 +86,12 @@ path and use isolated projects. Their installed C# bridges live in
 verification with explicit compile-profile authority. Cached or captured
 OraclePack results are valid only for their recorded inputs and toolchain.
 
+With compiler and bundle support enabled, the `unity_shader_contract` C API
+coordinates accepted-source compilation, isolated import, release comparisons,
+and captured player metadata under one subject. It requests every D3D11 logical
+plane; runtime selection is currently unavailable, so a collected contract
+cannot yet certify whole-shader logical equivalence.
+
 ## Limits and layout
 
 - Parsing targets explicitly supported Unity 2021.3 schemas, not every version.
