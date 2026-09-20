@@ -23,4 +23,25 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: >-
+          ctest --test-dir build -C Release --output-on-failure
+          --output-junit "${{ runner.temp }}/dxbc-tests.xml"
+      - name: Annotate failed tests
+        if: failure()
+        shell: python
+        env:
+          TEST_RESULTS: ${{ runner.temp }}/dxbc-tests.xml
+        run: |
+          import os
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          results = pathlib.Path(os.environ['TEST_RESULTS'])
+          if results.is_file():
+              for case in ET.parse(results).iter('testcase'):
+                  if case.find('failure') is None and case.find('error') is None:
+                      continue
+                  output = case.findtext('system-out', '')
+                  text = case.get('name', 'Unknown test') + '\n' + output[:8000]
+                  text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print('::error title=Test failed::' + text)
