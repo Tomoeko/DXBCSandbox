@@ -106,9 +106,10 @@ static int check_live(const UnityShaderContractOptions *options) {
     UnityShaderContractReport report;
     const UnityShaderContractStatus status =
         unity_shader_contract_capture(options, &contract, &report);
-    printf("contract=%s player=%s lift=%d source=%d import=%s gate=%s\n",
+    printf("contract=%s player=%s lift=%d transaction=%s source=%d import=%s gate=%s\n",
            unity_shader_contract_status_name(status),
            unity_player_package_status_name(report.player_status), report.lift_status,
+           hlsl_lift_status_name(report.lift.lift_status),
            report.source_status, unity_shader_bundle_evidence_status_name(report.import_status),
            unity_shader_bundle_gate_status_name(report.import.gate_status));
     CHECK(status == UNITY_SHADER_CONTRACT_CAPTURED && contract);

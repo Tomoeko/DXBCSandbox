@@ -1070,6 +1070,14 @@ static UnityGeneratedDomainStatus attest_stage(
         }
         free(covered);
     } else {
+        /* The explicit planner proves an identical ordered product, not an
+         * arbitrary alias map. Recheck that invariant at the independent
+         * certificate boundary; equal DXBC would otherwise conceal a changed
+         * in-range alias. Symbolic Boolean domains use their separate proof. */
+        if (stage->generated_state_count != stage->state_count) {
+            status = fail_report(report, UNITY_GENERATED_DOMAIN_PLAN_AUTHORITY_MISMATCH);
+            goto cleanup;
+        }
         for (size_t state_index = 0;
              state_index < stage->generated_state_count; ++state_index) {
             report->diagnostic.generated_state_index = state_index;
@@ -1085,6 +1093,18 @@ static UnityGeneratedDomainStatus attest_stage(
                     stage->generated_aliases[state_index];
                 status = fail_report(
                     report, UNITY_GENERATED_DOMAIN_ALIAS_OUT_OF_RANGE);
+                goto cleanup;
+            }
+            const ShaderLabVariantState *ordered = &stage->ordered_states[state_index];
+            const ShaderLabVariantState *generated = &stage->generated_states[state_index];
+            if (!shaderlab_variant_state_is_canonical(ordered) ||
+                stage->generated_aliases[state_index] != state_index ||
+                ordered->keyword_count != generated->keyword_count ||
+                (ordered->keyword_count &&
+                 memcmp(ordered->keyword_indices, generated->keyword_indices,
+                        ordered->keyword_count * sizeof(*ordered->keyword_indices)) != 0)) {
+                report->diagnostic.aliased_state_index = stage->generated_aliases[state_index];
+                status = fail_report(report, UNITY_GENERATED_DOMAIN_PLAN_AUTHORITY_MISMATCH);
                 goto cleanup;
             }
             for (size_t earlier = 0; earlier < state_index; ++earlier) {

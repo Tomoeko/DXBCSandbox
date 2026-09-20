@@ -194,7 +194,33 @@ static int test_contract_attestation(void) {
     CHECK(report.glsl_status ==
           UNITY_GENERATED_GLSL_UNAVAILABLE_NO_PRECISION_AUTHORITY);
 
+    /* Even equal program bytes cannot excuse a changed generated-to-serialized
+     * alias. Explicit domains preserve the planner's entire ordered sequence. */
+    for (size_t row = 0; row < 4; ++row) {
+        fixture.aliases[row] = (row + 1) % 4;
+        CHECK(unity_generated_domain_attest_contract(
+                  &fixture.shader, &fixture.pass, &fixture.plan,
+                  &fixture.contract, &report) == UNITY_GENERATED_DOMAIN_PLAN_AUTHORITY_MISMATCH);
+        fixture.aliases[row] = row;
+    }
+    fixture.aliases[1] = 4;
+    CHECK(unity_generated_domain_attest_contract(
+              &fixture.shader, &fixture.pass, &fixture.plan,
+              &fixture.contract, &report) == UNITY_GENERATED_DOMAIN_ALIAS_OUT_OF_RANGE);
+    fixture.aliases[1] = 1;
+    const ShaderLabVariantState saved = fixture.ordered[1];
+    fixture.ordered[1] = fixture.ordered[2];
+    CHECK(unity_generated_domain_attest_contract(
+              &fixture.shader, &fixture.pass, &fixture.plan,
+              &fixture.contract, &report) == UNITY_GENERATED_DOMAIN_PLAN_AUTHORITY_MISMATCH);
+    fixture.ordered[1] = saved;
+
     ShaderLabPassStageVariantPlan* stage = &fixture.plan.stages[0];
+    --stage->generated_state_count;
+    CHECK(unity_generated_domain_attest_contract(
+              &fixture.shader, &fixture.pass, &fixture.plan,
+              &fixture.contract, &report) == UNITY_GENERATED_DOMAIN_PLAN_AUTHORITY_MISMATCH);
+    ++stage->generated_state_count;
     stage->generated_domain_is_symbolic_boolean = true;
     stage->generated_states = NULL;
     stage->generated_aliases = NULL;

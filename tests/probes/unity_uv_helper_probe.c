@@ -53,6 +53,64 @@ static void print_digest(const char *name, const uint8_t digest[32]) {
     printf(" %s=%s", name, hex);
 }
 
+static bool check_mutations(UnityCompilerBroker *broker,
+                            const UnityCompilerSnippetCompileRequest *original,
+                            const char *baseline_source, const DXBCContainerView *baseline,
+                            const uint8_t controls[32]) {
+    static const char expression[] = "(uv * st.xyxy + st.zwzw)";
+    const struct {
+        const char *name;
+        const char *replacement;
+        bool equal;
+    } cases[] = {
+        {"offset-lanes", "(uv * st.xyxy + st.wzwz)", false},
+        {"sign", "(uv * st.xyxy - st.zwzw)", false},
+        {"bit-cast", "float4(asuint(uv * st.xyxy + st.zwzw))", false},
+        /* First establish a same-byte zero control, then change exactly that
+         * literal. No reference fixture or comparison boundary is rewritten. */
+        {"constant-zero-control", "(uv * st.xyxy + st.zwzw + 0.0)", true},
+        {"constant-one", "(uv * st.xyxy + st.zwzw + 1.0)", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        StringBuilder source;
+        sb_init(&source);
+        const char *cursor = baseline_source;
+        size_t replacements = 0;
+        for (const char *found; (found = strstr(cursor, expression)) != NULL;) {
+            sb_append_len(&source, cursor, (size_t)(found - cursor));
+            sb_append(&source, cases[i].replacement);
+            cursor = found + strlen(expression);
+            ++replacements;
+        }
+        sb_append(&source, cursor);
+        UnityCompilerSnippetCompileRequest request = *original;
+        request.snippet_source = source.buf;
+        UnityCompilerBinaryResponse response;
+        unity_compiler_binary_response_init(&response);
+        DXBCContainerView actual;
+        bool valid = sb_ok(&source) && replacements == 2 &&
+                     clean_compile(broker, &request, &response) &&
+                     memcmp(controls, response.controls_digest, 32) == 0 &&
+                     dxbc_container_view_first(response.data, response.size, &actual);
+        DXBCCompareResult report;
+        DXBCCompareStatus comparison = DXBC_COMPARE_INVALID_ARGUMENT;
+        if (valid) {
+            comparison = dxbc_compare_exact(baseline->data, baseline->size, actual.data,
+                                             actual.size, &report);
+            valid = comparison != DXBC_COMPARE_INVALID_ARGUMENT &&
+                    comparison != DXBC_COMPARE_EXPECTED_INVALID &&
+                    comparison != DXBC_COMPARE_ACTUAL_INVALID &&
+                    ((comparison == DXBC_COMPARE_EQUAL) == cases[i].equal);
+        }
+        printf(" %s=%s", cases[i].name, valid ? dxbc_compare_status_name(comparison) : "failed");
+        unity_compiler_binary_response_free(&response);
+        sb_free(&source);
+        if (!valid)
+            return false;
+    }
+    return true;
+}
+
 static bool check_state(UnityCompilerBroker *broker, const PreprocessedSnippet *snippet,
                         const UnityCompileProfile *profile, const char *directory,
                         const char *baseline_source, int stage, bool stereo) {
@@ -70,13 +128,10 @@ static bool check_state(UnityCompilerBroker *broker, const PreprocessedSnippet *
     };
     UnityCompileAuthority authority;
     unity_compile_authority_init(&authority);
-    UnityCompilerBinaryResponse expanded, candidate, baseline, wrong;
+    UnityCompilerBinaryResponse expanded, candidate, baseline;
     unity_compiler_binary_response_init(&expanded);
     unity_compiler_binary_response_init(&candidate);
     unity_compiler_binary_response_init(&baseline);
-    unity_compiler_binary_response_init(&wrong);
-    StringBuilder changed;
-    sb_init(&changed);
     bool success = false;
     if (unity_compile_authority_build(&input, &authority) != UNITY_COMPILE_AUTHORITY_OK)
         goto done;
@@ -113,46 +168,25 @@ static bool check_state(UnityCompilerBroker *broker, const PreprocessedSnippet *
     if (!clean_compile(broker, &request, &baseline) ||
         memcmp(candidate.controls_digest, baseline.controls_digest, 32))
         goto done;
-    DXBCContainerView candidate_view, baseline_view, wrong_view;
+    DXBCContainerView candidate_view, baseline_view;
     DXBCCompareResult comparison;
     if (!dxbc_container_view_first(candidate.data, candidate.size, &candidate_view) ||
         !dxbc_container_view_first(baseline.data, baseline.size, &baseline_view) ||
         dxbc_compare_exact(baseline_view.data, baseline_view.size, candidate_view.data,
                            candidate_view.size, &comparison) != DXBC_COMPARE_EQUAL)
         goto done;
-    /* Change both stage offsets honestly; at least this lane mutation must
-     * fail exact production under the otherwise identical request controls. */
-    sb_append(&changed, baseline_source);
-    if (!sb_ok(&changed))
-        goto done;
-    size_t mutations = 0;
-    for (char *at = changed.buf; (at = strstr(at, "st.zwzw")) != NULL; at += 7) {
-        memcpy(at + 3, "wzwz", 4);
-        ++mutations;
-    }
-    request.snippet_source = changed.buf;
-    if (mutations != 2 || !clean_compile(broker, &request, &wrong) ||
-        memcmp(candidate.controls_digest, wrong.controls_digest, 32) ||
-        !dxbc_container_view_first(wrong.data, wrong.size, &wrong_view))
-        goto done;
-    const DXBCCompareStatus wrong_status = dxbc_compare_exact(
-        baseline_view.data, baseline_view.size, wrong_view.data, wrong_view.size, &comparison);
-    if (wrong_status == DXBC_COMPARE_EQUAL || wrong_status == DXBC_COMPARE_EXPECTED_INVALID ||
-        wrong_status == DXBC_COMPARE_ACTUAL_INVALID ||
-        wrong_status == DXBC_COMPARE_INVALID_ARGUMENT)
+    if (!check_mutations(broker, &request, baseline_source, &baseline_view, candidate.controls_digest))
         goto done;
     print_digest("compile", evidence.compile_request_digest);
     print_digest("preprocess", evidence.preprocess_request_digest);
     print_digest("expansion", evidence.expansion.expansion_digest);
     print_digest("controls", candidate.controls_digest);
-    printf(" exact_bytes=%zu helper_cache=%d candidate_cache=%d baseline_cache=%d mutation=%s",
+    printf(" exact_bytes=%zu helper_cache=%d candidate_cache=%d baseline_cache=%d",
            candidate_view.size, expanded.status.from_cache, candidate.status.from_cache,
-           baseline.status.from_cache, dxbc_compare_status_name(wrong_status));
+           baseline.status.from_cache);
     success = true;
 done:
     printf(" result=%s\n", success ? "pass" : "fail");
-    sb_free(&changed);
-    unity_compiler_binary_response_free(&wrong);
     unity_compiler_binary_response_free(&baseline);
     unity_compiler_binary_response_free(&candidate);
     unity_compiler_binary_response_free(&expanded);
