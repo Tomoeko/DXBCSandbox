@@ -32,6 +32,7 @@ set(IO_SOURCES
     src/app/whole_shader_subject.c
     src/app/whole_shader_evidence.c
     src/app/whole_shader_certificate.c
+    src/app/shader_runtime_capture.c
     src/app/release_shader_object_certificate.c
     src/app/release_shader_evidence.c
     src/app/release_shader_certificate_job.c

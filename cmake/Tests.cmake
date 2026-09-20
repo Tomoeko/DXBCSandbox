@@ -54,6 +54,9 @@ if(BUILD_TESTING)
 
     dxbc_add_core_test(test_shader_common_units
         tests/test_shader_common_units.c shader_common_units)
+    dxbc_add_core_test(test_shader_runtime_capture_units
+        tests/test_shader_runtime_capture_units.c shader_runtime_capture_units)
+    target_link_libraries(test_shader_runtime_capture_units PRIVATE UnityCommon::test_support)
     dxbc_add_core_test(test_executable_resource_integration
         tests/test_executable_resource_integration.c
         executable_resource_integration)
