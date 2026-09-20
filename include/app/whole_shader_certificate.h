@@ -146,7 +146,11 @@ typedef struct {
 } WholeShaderCertificateReport;
 
 /* Opaque input accepting only typed evidence objects. There is intentionally
- * no JSON/report deserializer capable of setting PASS. */
+ * no JSON/report deserializer capable of setting PASS. Partial subjects may
+ * collect evidence, but a runtime-selection PASS requires nonzero player,
+ * dependency, released-candidate and runtime-environment coordinates. Their
+ * presence is necessary, not sufficient: the runtime producer must establish
+ * their association and selection contract independently. */
 WholeShaderCertificateStatus whole_shader_certificate_input_create(
     WholeShaderCertificateInput** out_input,
     const WholeShaderSubject* subject, uint64_t requested_plane_mask);

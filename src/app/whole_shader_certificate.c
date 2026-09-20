@@ -20,11 +20,17 @@ struct WholeShaderCertificateInput {
     uint8_t subject_digest[WHOLE_SHADER_CERTIFICATE_DIGEST_SIZE];
     uint64_t requested_plane_mask;
     uint64_t present_plane_mask;
+    bool runtime_subject_authority_missing;
     StoredPlaneEvidence planes[WHOLE_SHADER_PLANE_COUNT];
 };
 
 static uint64_t all_plane_mask(void) {
     return (UINT64_C(1) << WHOLE_SHADER_PLANE_COUNT) - UINT64_C(1);
+}
+
+static bool digest_is_zero(const uint8_t digest[WHOLE_SHADER_CERTIFICATE_DIGEST_SIZE]) {
+    static const uint8_t zero[WHOLE_SHADER_CERTIFICATE_DIGEST_SIZE] = {0};
+    return memcmp(digest, zero, sizeof(zero)) == 0;
 }
 
 static WholeShaderVerificationPlane first_set_plane(uint64_t mask) {
@@ -116,6 +122,16 @@ WholeShaderCertificateStatus whole_shader_certificate_input_create(
     }
     input->format_version = WHOLE_SHADER_CERTIFICATE_FORMAT_VERSION;
     input->requested_plane_mask = requested_plane_mask;
+    WholeShaderSubjectDescriptor descriptor;
+    if (whole_shader_subject_describe(subject, &descriptor) != WHOLE_SHADER_SUBJECT_OK) {
+        free(input);
+        return WHOLE_SHADER_CERTIFICATE_SUBJECT_AUTHORITY_MISSING;
+    }
+    input->runtime_subject_authority_missing =
+        digest_is_zero(descriptor.runtime_environment_digest) ||
+        digest_is_zero(descriptor.player_profile_digest) ||
+        digest_is_zero(descriptor.dependency_map_digest) ||
+        digest_is_zero(descriptor.candidate_release_digest);
     *out_input = input;
     return WHOLE_SHADER_CERTIFICATE_OK;
 }
@@ -216,7 +232,16 @@ WholeShaderCertificateStatus whole_shader_certificate_evaluate(
                           WHOLE_SHADER_PLANE_REFLECTION_BINDING);
     reject_split_coverage(input, report, WHOLE_SHADER_PLANE_RUNTIME_INPUTS,
                           WHOLE_SHADER_PLANE_EMPIRICAL_PIXELS);
-    if (report->invalid_plane_mask != 0U) {
+    const uint64_t runtime_bit = WHOLE_SHADER_PLANE_BIT(WHOLE_SHADER_PLANE_RUNTIME_SELECTION);
+    if ((report->passed_plane_mask & runtime_bit) && input->runtime_subject_authority_missing) {
+        /* Missing coordinates are allowed while collecting partial evidence,
+         * but a runtime PASS must identify the independently captured context. */
+        report->passed_plane_mask &= ~runtime_bit;
+        report->invalid_plane_mask |= runtime_bit;
+        report->status = WHOLE_SHADER_CERTIFICATE_SUBJECT_AUTHORITY_MISSING;
+        report->first_problem_plane = WHOLE_SHADER_PLANE_RUNTIME_SELECTION;
+        report->first_problem_status = WHOLE_SHADER_PLANE_PASS;
+    } else if (report->invalid_plane_mask != 0U) {
         report->status = WHOLE_SHADER_CERTIFICATE_PLANE_EVIDENCE_INVALID;
         report->first_problem_plane = first_set_plane(report->invalid_plane_mask);
         report->first_problem_status =
