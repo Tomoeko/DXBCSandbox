@@ -711,7 +711,7 @@ static bool check_generated_copy_lanes(void) {
                     USILProgram program = {.instructions = instructions, .instruction_count = 4,
                         .temp_count = 2, .has_stage_contract = true,
                         .program_type = stage ? DXBC_PROGRAM_TYPE_PIXEL : DXBC_PROGRAM_TYPE_VERTEX,
-                        .shader_model_major = model};
+                        .shader_model_major = (uint8_t)model};
                     USILInstruction before[4];
                     memcpy(before, instructions, sizeof(before));
                     HLSLCopyLift *candidate = NULL;
