@@ -112,8 +112,10 @@ linked vertex/hull/domain/fragment passes admit independently validated empty
 Globals metadata, preserving each stage's declaration and read scope. Custom
 scalar and scalar-array patch constants also admit bounded fork phases and a
 one-instance join phase that reads earlier fork-owned constants. Hull and domain
-stages share the retained patch layout. Packed vector patch constants, join-to-join
-reads and patch-resource reads remain unsupported.
+stages share the retained patch layout. Disjoint signature-backed `float2` and
+`float3` patch fields use their original component and phase ownership. Precise
+patch arithmetic, vector arrays, join-to-join reads and patch-resource reads remain
+unsupported.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,
@@ -142,6 +144,12 @@ column-major float4x4 reads with live expanded declarations, full-container equa
 and reflection. Replay checks owned models and the active compiler/include lease.
 Legacy half storage requires an explicit captured contract and a matching request
 profile. These observations grant no emitted AST or whole-source quality authority.
+The opaque `shaderlab_emitted_matrix_uses_capture` and
+`unity_emitted_matrix_attachment_capture` APIs retain actual formatted matrix ASTs
+and join their owned read inventory to the normal compiler request's declaration
+receipts. Their initial scope is one ordinary vertex/fragment pass. Replay checks
+source, typed models, ASTs, instruction owners and the active compiler lease;
+these observations preserve the existing source-quality gaps.
 Extraction reports historical bounded source inventories for ordinary high-level
 artifacts and binds the published view to the accepted file's size and hash.
 These snapshots preserve quality gaps and remain separate from compiler acceptance;
@@ -155,7 +163,11 @@ A bounded `compute_source_candidate_build` API reconstructs complete kernel doma
 with their captured names, keywords and group dimensions. It supports resource-free
 RET/barrier bodies and a typed `Texture2D<uint4>` load / `RWTexture2D<uint4>` store
 path with dispatch coordinates, unsigned addition, bitwise operations and logical
-shifts. A 16-byte structured load/store path uses an explicit `uint4` bit
+shifts. A single `RWTexture2D<uint4>` also admits one complete read and final store
+with the same physical SSA address producer, including proven replicated lanes
+of its unsigned operation. Both access operands retain their original lane owners.
+Coherent UAVs, multiple retained reads and partial typed reads remain unsupported.
+A 16-byte structured load/store path uses an explicit `uint4` bit
 representation, preserving the actual index, byte window and memory-effect order. Release metadata does not retain the original
 structured element type; that declaration gap keeps whole source quality `mixed`
 even when the unsigned entry bodies are `clean`. These memory paths require one

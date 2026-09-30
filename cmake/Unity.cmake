@@ -47,6 +47,7 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
         src/compiler/unity_hlsl_expansion.c
         src/compiler/unity_hlsl_cbuffer_inventory.c
         src/compiler/unity_hlsl_matrix_declaration.c
+        src/compiler/unity_emitted_matrix_attachment.c
         src/compiler/unity_compiler_session_report.c
         src/compiler/unity_reflection_certificate.c
         src/compiler/unity_generated_domain_certifier.c

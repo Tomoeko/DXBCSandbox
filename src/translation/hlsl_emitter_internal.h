@@ -260,6 +260,7 @@ typedef struct HLSLEmitterContext {
     const char* const* reserved_preprocessor_identifiers;
     size_t reserved_preprocessor_identifier_count;
     HLSLExpressionSourceMap *expression_source_map;
+    struct HLSLMatrixUseCapture *matrix_use_capture; /* Private owned factory only. */
     HLSLSourceQualityAnalysis *source_quality_analysis;
     const ASTExpr *source_quality_root;
     int source_quality_instruction;
@@ -563,6 +564,10 @@ typedef struct {
     /* Scope opt-in: compose pure, independently owned SSA definitions into a
      * natural vector. Each definition is materialized at its original site. */
     bool compose_disjoint_temp_lanes;
+    /* Optional selected-compiler spelling for a stage-proven scalar ADD. The
+     * callback retains the decoded children; it cannot reorder or reassociate
+     * reads. Other scopes keep their existing source-order policy. */
+    bool (*ordered_add_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
     const HLSLInstructionOwners *omitted_instructions;
     bool (*destination_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
     bool (*append_destination)(HLSLEmitterContext *ctx, int instruction, void *context);

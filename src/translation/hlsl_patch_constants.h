@@ -10,18 +10,20 @@ typedef struct {
     HLSLPatchFieldKind kind;
     const char *semantic;
     uint32_t semantic_index;
-    uint8_t first_register, count;
+    uint8_t first_register, count, width, mask;
 } HLSLPatchField;
-/* A canonical scalar/array representation of actual PCSG rows. Packed vectors
- * remain outside this boundary: no register-to-field aliasing is guessed. */
+/* Actual PCSG fields own disjoint physical lanes. Custom packed vectors are
+ * one float2/float3 field; vector arrays remain outside this boundary. */
 typedef struct {
     HLSLPatchField fields[HLSL_PATCH_CONSTANT_LIMIT];
-    uint8_t field_count, row_count;
-    int8_t register_field[HLSL_PATCH_CONSTANT_LIMIT];
-    uint8_t register_element[HLSL_PATCH_CONSTANT_LIMIT];
+    uint8_t field_count, row_count, signature_count;
+    int8_t lane_field[HLSL_PATCH_CONSTANT_LIMIT][4];
+    uint8_t lane_element[HLSL_PATCH_CONSTANT_LIMIT][4];
+    uint8_t lane_component[HLSL_PATCH_CONSTANT_LIMIT][4];
+    uint8_t register_mask[HLSL_PATCH_CONSTANT_LIMIT];
     bool has_custom;
 } HLSLPatchLayout;
-bool hlsl_patch_scalar_layout(const USILProgram *program, HLSLPatchLayout *layout);
-bool hlsl_patch_static_scalar_operand(const HLSLPatchLayout *layout,
-                                     const DXBCOperand *operand);
+bool hlsl_patch_layout(const USILProgram *program, HLSLPatchLayout *layout);
+bool hlsl_patch_static_operand(const HLSLPatchLayout *layout,
+                              const DXBCOperand *operand);
 #endif

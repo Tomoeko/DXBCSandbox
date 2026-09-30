@@ -503,6 +503,148 @@ static bool check_typed_effect_rejections(void) {
     compute_source_candidate_dispose(&candidate); return true;
 }
 
+/* An independently authored raw token grammar retains one actual UINT4 UAV
+ * read and final write. Same-address authority comes from SSA, not spelling. */
+static const uint32_t uav_read_words[] = {
+    INSTRUCTION(106, 1) | (1u << 11u),
+    INSTRUCTION(156, 4) | (3u << 11u), UINT32_C(0x0011e000), 0, UINT32_C(0x4444),
+    INSTRUCTION(95, 2), UINT32_C(0x00020032),
+    INSTRUCTION(104, 2), 2,
+    INSTRUCTION(155, 4), 4, 4, 1,
+    INSTRUCTION(30, 9), UINT32_C(0x00100032), 0, UINT32_C(0x00020046),
+    UINT32_C(0x00004002), 1, 2, 0, 0,
+    INSTRUCTION(163, 7), UINT32_C(0x001000f2), 1, UINT32_C(0x00100e46), 0,
+    UINT32_C(0x0011ee46), 0,
+    INSTRUCTION(30, 10), UINT32_C(0x001000f2), 1, UINT32_C(0x00100e46), 1,
+    UINT32_C(0x00004002), 1, 2, 3, 4,
+    INSTRUCTION(164, 7), UINT32_C(0x0011e0f2), 0, UINT32_C(0x00100e46), 0,
+    UINT32_C(0x00100e46), 1,
+    INSTRUCTION(62, 1)
+};
+
+static bool uav_read_fixture(Fixture *fixture) {
+    CHECK(typed_fixture(fixture));
+    CHECK(typed_code(fixture, uav_read_words, COUNT(uav_read_words)));
+    for (size_t kernel = 0; kernel < 2; ++kernel) {
+        for (size_t variant = 0; variant < 4; ++variant) {
+            fixture->variants[kernel][variant].textures = NULL;
+            fixture->variants[kernel][variant].texture_count = 0;
+        }
+    }
+    return true;
+}
+
+static bool check_uav_read_candidate(void) {
+    const struct { uint32_t opcode; const char *syntax; bool unary; } operations[] = {
+        {30, " + ", false}, {1, " & ", false}, {60, " | ", false},
+        {87, " ^ ", false}, {59, "~", true}, {41, " << ", false}, {85, " >> ", false}
+    };
+    for (size_t index = 0; index < COUNT(operations); ++index) {
+        Fixture fixture; CHECK(uav_read_fixture(&fixture));
+        uint32_t words[COUNT(uav_read_words)]; memcpy(words, uav_read_words, sizeof(words));
+        size_t count = COUNT(words);
+        words[29] = INSTRUCTION(operations[index].opcode, operations[index].unary ? 5 : 10);
+        if (operations[index].unary) {
+            memmove(words + 34, uav_read_words + 39, (COUNT(words) - 39) * sizeof(*words));
+            count -= 5;
+        }
+        CHECK(typed_code(&fixture, words, count));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        CHECK(candidate.domain_complete && candidate.variant_count == 8 && candidate.resource_count == 1);
+        CHECK(candidate.source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+            candidate.source_quality.counts.resource_declarations == 1 &&
+            candidate.source_quality.counts.sibling_declaration_witnesses == 8);
+        CHECK(strstr(candidate.source.buf, "RWTexture2D<uint4> OutputTexels;") &&
+            strstr(candidate.source.buf, "OutputTexels.Load(int2(") &&
+            strstr(candidate.source.buf, operations[index].syntax));
+        CHECK(!strstr(candidate.source.buf, "InputTexels") && !strstr(candidate.source.buf, "int3("));
+        for (size_t row = 0; row < candidate.variant_count; ++row) {
+            const ComputeSourceVariant *entry = &candidate.variants[row];
+            CHECK(entry->expression_count == 3 && entry->memory_effect_count == 2 &&
+                entry->entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+            CHECK(entry->memory_effects[0].opcode == USIL_OP_LD_UAV_TYPED &&
+                entry->memory_effects[1].opcode == USIL_OP_STORE_UAV_TYPED &&
+                entry->memory_effects[0].binding_register == 0 && entry->memory_effects[1].binding_register == 0 &&
+                entry->memory_effects[0].instruction_index < entry->memory_effects[1].instruction_index);
+        }
+        memset(fixture.bytes, 0, sizeof(fixture.bytes));
+        StringBuilder retained; sb_init(&retained); ast_format_expr(candidate.variants[0].expressions[2], &retained);
+        CHECK(sb_ok(&retained) && strstr(retained.buf, "OutputTexels.Load(int2(")); sb_free(&retained);
+        compute_source_candidate_dispose(&candidate);
+    }
+    /* Copying a retained resource value does not require an arithmetic node. */
+    Fixture copy; CHECK(uav_read_fixture(&copy));
+    uint32_t copy_words[COUNT(uav_read_words)]; memcpy(copy_words, uav_read_words, sizeof(copy_words));
+    memmove(copy_words + 29, uav_read_words + 39, (COUNT(copy_words) - 39) * sizeof(*copy_words));
+    CHECK(typed_code(&copy, copy_words, COUNT(copy_words) - 10));
+    ComputeSourceCandidate copied; compute_source_candidate_init(&copied);
+    CHECK(compute_source_candidate_build(&copy.object, &copied, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(copied.variants[0].memory_effect_count == 2 && strstr(copied.source.buf, "OutputTexels.Load(int2("));
+    compute_source_candidate_dispose(&copied);
+    const struct { size_t word; uint32_t value; } negatives[] = {
+        {4, UINT32_C(0x5555)}, /* A float declaration grants no UINT4 view. */
+        {1, INSTRUCTION(156, 4) | (3u << 11u) | (1u << 16u)}, /* Coherent UAV. */
+        {23, UINT32_C(0x00100072)}, /* Partial resource result. */
+        {27, UINT32_C(0x0011e006)}, /* Broadcast the same resource word. */
+        {27, UINT32_C(0x0011e1b6)}, /* Reverse actual component order. */
+        {40, UINT32_C(0x0011e032)}, /* Partial final store. */
+        {28, 1}, /* Foreign read binding. */
+        {22, INSTRUCTION(163, 7) | (1u << 13u)}, /* Saturation. */
+        {25, UINT32_C(0x00100416)}, /* Same register, different read address. */
+        {43, 1}, /* Resource value cannot impersonate its coordinate producer. */
+        {29, INSTRUCTION(0, 10)}, /* Float arithmetic. */
+        {29, INSTRUCTION(42, 10)} /* Signed shift. */
+    };
+    for (size_t index = 0; index < COUNT(negatives); ++index) {
+        Fixture fixture; CHECK(uav_read_fixture(&fixture));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        uint32_t words[COUNT(uav_read_words)]; memcpy(words, uav_read_words, sizeof(words));
+        words[negatives[index].word] = negatives[index].value;
+        CHECK(typed_code(&fixture, words, COUNT(words)));
+        CHECK(expect_failure(&fixture, &candidate, index == 6 || index == 7 ?
+            COMPUTE_SOURCE_STAGE_CONTRACT_FAILED : COMPUTE_SOURCE_EMISSION_FAILED));
+        compute_source_candidate_dispose(&candidate);
+    }
+    for (unsigned scenario = 0; scenario < 5; ++scenario) {
+        Fixture fixture; CHECK(uav_read_fixture(&fixture));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        uint32_t words[COUNT(uav_read_words) + 10];
+        size_t count = COUNT(uav_read_words);
+        memcpy(words, uav_read_words, sizeof(uav_read_words));
+        if (scenario == 0) {
+            /* A retained read cannot disappear behind a pure redefinition. */
+            const uint32_t overwrite[] = {INSTRUCTION(54, 8), UINT32_C(0x001000f2), 1,
+                UINT32_C(0x00004002), 1, 2, 3, 4};
+            memcpy(words + 29, overwrite, sizeof(overwrite));
+            memmove(words + 37, uav_read_words + 39, (count - 39) * sizeof(*words)); count -= 2;
+        } else if (scenario == 1) {
+            /* A shared read cannot be expanded twice within one expression. */
+            words[29] = INSTRUCTION(30, 7); words[34] = UINT32_C(0x00100e46); words[35] = 1;
+            memmove(words + 36, uav_read_words + 39, (count - 39) * sizeof(*words)); count -= 3;
+        } else if (scenario == 2) {
+            memcpy(words + 29, uav_read_words + 22, 7 * sizeof(*words));
+            memcpy(words + 36, uav_read_words + 29, (count - 29) * sizeof(*words)); count += 7;
+        } else if (scenario == 3) {
+            /* Physical coordinate register equality does not survive a new
+             * SSA definition between the read and write. */
+            const uint32_t overwrite[] = {INSTRUCTION(30, 10), UINT32_C(0x00100032), 0,
+                UINT32_C(0x00100e46), 0, UINT32_C(0x00004002), 1, 2, 0, 0};
+            memcpy(words + 29, overwrite, sizeof(overwrite));
+            memcpy(words + 39, uav_read_words + 29, (count - 29) * sizeof(*words)); count += 10;
+        } else {
+            memmove(words + 30, uav_read_words + 29, (count - 29) * sizeof(*words));
+            words[29] = INSTRUCTION(190, 1) | (8u << 11u); ++count;
+        }
+        CHECK(typed_code(&fixture, words, count));
+        CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+        compute_source_candidate_dispose(&candidate);
+    }
+    return true;
+}
+
 
 /* Controlled structured declaration/load/store words. The byte stride does
  * not retain the original element type, so the source exposes uint4 bits and
@@ -906,8 +1048,146 @@ static bool check_owned_quality_resolver(void) {
     return true;
 }
 
+/* Independently varied address ownership cases qualify the initial same-UAV
+ * boundary. Equal values do not replace the actual SSA coordinate contract. */
+static bool check_same_uav_address_ownership(void) {
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        Fixture fixture; CHECK(uav_read_fixture(&fixture));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        uint32_t words[COUNT(uav_read_words) + 10];
+        memcpy(words, uav_read_words, sizeof(uav_read_words));
+        size_t count = COUNT(uav_read_words);
+        if (scenario < 2) {
+            /* Only one consumed coordinate lane receives a new SSA owner.
+             * The other lane still has its original definition. */
+            const uint32_t overwrite[] = {INSTRUCTION(30, 10),
+                scenario ? UINT32_C(0x00100022) : UINT32_C(0x00100012), 0,
+                UINT32_C(0x00100e46), 0, UINT32_C(0x00004002), 1, 2, 0, 0};
+            memcpy(words + 29, overwrite, sizeof(overwrite));
+            memcpy(words + 39, uav_read_words + 29, (count - 29) * sizeof(*words)); count += 10;
+        } else if (scenario == 2) {
+            /* A distinct MOV alias is not the unchanged address producer. */
+            const uint32_t alias[] = {INSTRUCTION(54, 5), UINT32_C(0x00100032), 2,
+                UINT32_C(0x00100e46), 0};
+            words[8] = 3;
+            memcpy(words + 29, alias, sizeof(alias));
+            memcpy(words + 34, uav_read_words + 29, (count - 29) * sizeof(*words)); count += 5;
+            words[48] = 2; /* Final store address r2.xy, read address r0.xy. */
+        } else {
+            /* The UAV result overwrites the original coordinate register.
+             * Its resource-value owner cannot become the store address. */
+            words[24] = 0; words[33] = 0;
+        }
+        CHECK(typed_code(&fixture, words, count));
+        CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+        compute_source_candidate_dispose(&candidate);
+    }
+    for (unsigned scenario = 0; scenario < 5; ++scenario) {
+        Fixture fixture; CHECK(uav_read_fixture(&fixture));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        uint32_t words[80]; size_t count = 13;
+        memcpy(words, uav_read_words, count * sizeof(*words));
+        const bool immediate = scenario >= 2;
+        if (immediate) {
+            const uint32_t load[] = {INSTRUCTION(163, 10), UINT32_C(0x001000f2), 1,
+                UINT32_C(0x00004002), 11, 17, 0, 0, UINT32_C(0x0011ee46), 0};
+            memcpy(words + count, load, sizeof(load)); count += COUNT(load);
+        } else {
+            const uint32_t load[] = {INSTRUCTION(163, 6), UINT32_C(0x001000f2), 1,
+                UINT32_C(0x00020046), UINT32_C(0x0011ee46), 0};
+            memcpy(words + count, load, sizeof(load)); count += COUNT(load);
+        }
+        memcpy(words + count, uav_read_words + 29, 10 * sizeof(*words)); count += 10;
+        if (immediate) {
+            const uint32_t store[] = {INSTRUCTION(164, 10), UINT32_C(0x0011e0f2), 0,
+                UINT32_C(0x00004002), scenario == 3 ? 12u : 11u, scenario == 4 ? 18u : 17u, 0, 0,
+                UINT32_C(0x00100e46), 1};
+            memcpy(words + count, store, sizeof(store)); count += COUNT(store);
+        } else {
+            const uint32_t store[] = {INSTRUCTION(164, 6), UINT32_C(0x0011e0f2), 0,
+                scenario == 1 ? UINT32_C(0x00020016) : UINT32_C(0x00020046),
+                UINT32_C(0x00100e46), 1};
+            memcpy(words + count, store, sizeof(store)); count += COUNT(store);
+        }
+        words[count++] = INSTRUCTION(62, 1);
+        CHECK(typed_code(&fixture, words, count));
+        if (scenario == 1 || scenario >= 3) {
+            /* Builtin xy/yx or one immediate coordinate word differs. */
+            CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+        } else {
+            CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+            CHECK(candidate.source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+            CHECK(candidate.variants[0].memory_effect_count == 2 && candidate.resource_count == 1);
+            CHECK(strstr(candidate.source.buf, "OutputTexels.Load(int2("));
+        }
+        compute_source_candidate_dispose(&candidate);
+    }
+    return true;
+}
+
+static bool check_replicated_uav_address_lanes(void) {
+    for (unsigned scenario = 0; scenario < 11; ++scenario) {
+        Fixture fixture; CHECK(uav_read_fixture(&fixture));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        uint32_t words[COUNT(uav_read_words) + 8];
+        memcpy(words, uav_read_words, sizeof(uav_read_words));
+        size_t count = COUNT(uav_read_words);
+        /* One real IADD writes xyzw from threadId.xyyy + uint4(1,2,2,2).
+         * The load selects xw (or xz); the store selects xy. */
+        words[14] = UINT32_C(0x001000f2);
+        words[16] = UINT32_C(0x00020546);
+        words[20] = 2; words[21] = 2;
+        words[25] = scenario == 1 ? UINT32_C(0x00100a86) : UINT32_C(0x00100fc6);
+        if (scenario == 2) words[21] = 3; /* Unequal literal bits. */
+        if (scenario == 3) words[16] = UINT32_C(0x00020946); /* W consumes threadId.z. */
+        if (scenario == 4) words[14] = UINT32_C(0x00100072); /* W has no definition. */
+        if (scenario == 5) {
+            /* A new owner for only Y breaks the address despite equal bits. */
+            const uint32_t overwrite[] = {INSTRUCTION(54, 8), UINT32_C(0x00100022), 0,
+                UINT32_C(0x00004002), 0, 2, 0, 0};
+            memcpy(words + 29, overwrite, sizeof(overwrite));
+            memcpy(words + 37, uav_read_words + 29, (count - 29) * sizeof(*words)); count += 8;
+        }
+        if (scenario == 6) words[25] = UINT32_C(0x00100006); /* XX differs from XY. */
+        if (scenario == 7 || scenario == 8) {
+            words[13] = INSTRUCTION(41, 9);
+            if (scenario == 8) words[21] = 3; /* Only the shift count differs. */
+        }
+        if (scenario == 9 || scenario == 10) {
+            const uint32_t address[] = {
+                INSTRUCTION(54, 4), UINT32_C(0x001000f2), 2, UINT32_C(0x00020546),
+                INSTRUCTION(30, 10), UINT32_C(0x001000f2), 0,
+                scenario == 9 ? UINT32_C(0x00100546) : UINT32_C(0x00100e46), 2,
+                UINT32_C(0x00004002), 1, 2, 2, 2
+            };
+            /* The same selected TEMP input and SSA owner qualify. Different
+             * selected input lanes remain outside this one-producer proof,
+             * even when the earlier MOV happens to replicate their values. */
+            words[8] = 3;
+            memcpy(words + 13, address, sizeof(address));
+            memcpy(words + 27, uav_read_words + 22, (count - 22) * sizeof(*words)); count += 5;
+            words[30] = UINT32_C(0x00100fc6);
+        }
+        CHECK(typed_code(&fixture, words, count));
+        if (scenario != 0 && scenario != 1 && scenario != 7 && scenario != 9) {
+            CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+        } else {
+            CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+            CHECK(candidate.source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                candidate.variant_count == 8 && candidate.variants[0].memory_effect_count == 2);
+            CHECK(strstr(candidate.source.buf, "OutputTexels.Load(int2(") &&
+                !strstr(candidate.source.buf, ".xwww") && !strstr(candidate.source.buf, ".xyzw"));
+        }
+        compute_source_candidate_dispose(&candidate);
+    }
+    return true;
+}
+
 int main(void) {
-    return check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_replicated_uav_address_lanes() && check_same_uav_address_ownership() && check_uav_read_candidate() && check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }

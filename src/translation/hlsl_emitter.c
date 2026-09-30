@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/hlsl_emitted_matrix_uses_internal.h"
 #include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include <limits.h>
@@ -1844,7 +1845,7 @@ static bool hlsl_emit_with_options_impl(
     const SerializedProgramParameters *params,
     const SerializedProgramParameters *common_params,
     const HLSLEmitNames *names, const HLSLEmitOptions *options,
-    HLSLEmitDiagnostic *diagnostic) {
+    HLSLMatrixUseCapture *matrix_capture, HLSLEmitDiagnostic *diagnostic) {
   hlsl_emit_diagnostic_init(diagnostic);
   if (options && options->expression_source_map)
     memset(options->expression_source_map, 0, sizeof(*options->expression_source_map));
@@ -1951,6 +1952,7 @@ static bool hlsl_emit_with_options_impl(
   ctx.reserved_preprocessor_identifier_count =
       options ? options->reserved_preprocessor_identifier_count : 0;
   ctx.expression_source_map = options ? options->expression_source_map : NULL;
+  ctx.matrix_use_capture = matrix_capture;
   ctx.unity_uv_helper = options && options->unity_uv_helper;
   ctx.readable_screen_pos_helper = readable_screen_pos_helper;
   ctx.readable_screen_pos_mul_y_idx = -1;
@@ -2247,12 +2249,12 @@ cleanup:
   return success;
 }
 
-bool hlsl_emit_with_options_diagnostic(
+static bool emit_with_diagnostic_and_capture(
     const USILProgram *program, StringBuilder *sb,
     const SerializedProgramParameters *params,
     const SerializedProgramParameters *common_params,
     const HLSLEmitNames *names, const HLSLEmitOptions *options,
-    HLSLEmitDiagnostic *diagnostic) {
+    HLSLMatrixUseCapture *matrix_capture, HLSLEmitDiagnostic *diagnostic) {
   HLSLEmitDiagnostic local_diagnostic;
   HLSLEmitDiagnostic *failure = diagnostic;
   HLSLSourceQualityResult *quality = options ? options->source_quality : NULL;
@@ -2265,7 +2267,7 @@ bool hlsl_emit_with_options_diagnostic(
     quality->classification = HLSL_SOURCE_QUALITY_FAILED;
   }
   bool success = hlsl_emit_with_options_impl(program, sb, params, common_params,
-                                             names, options, failure);
+                                             names, options, matrix_capture, failure);
   if (quality) {
     quality->emission_status = failure->status;
     if (!success) {
@@ -2277,6 +2279,21 @@ bool hlsl_emit_with_options_diagnostic(
     }
   }
   return success;
+}
+
+bool hlsl_emit_with_options_diagnostic(
+    const USILProgram *program, StringBuilder *output,
+    const SerializedProgramParameters *current, const SerializedProgramParameters *common,
+    const HLSLEmitNames *names, const HLSLEmitOptions *options, HLSLEmitDiagnostic *diagnostic) {
+  return emit_with_diagnostic_and_capture(program, output, current, common, names, options, NULL, diagnostic);
+}
+
+bool hlsl_emit_with_matrix_capture(
+    const USILProgram *program, StringBuilder *output,
+    const SerializedProgramParameters *current, const SerializedProgramParameters *common,
+    const HLSLEmitNames *names, const HLSLEmitOptions *options,
+    HLSLMatrixUseCapture *capture, HLSLEmitDiagnostic *diagnostic) {
+  return capture && emit_with_diagnostic_and_capture(program, output, current, common, names, options, capture, diagnostic);
 }
 
 bool hlsl_emit_with_options(const USILProgram *program, StringBuilder *sb,

@@ -323,6 +323,13 @@ if(BUILD_TESTING)
         shaderlab_variant_plan_units)
     dxbc_add_core_test(test_shaderlab_source_units
         tests/test_shaderlab_source_units.c shaderlab_source_units)
+    dxbc_add_core_test(test_subprogram_parameters_equal_units
+        tests/test_subprogram_parameters_equal_units.c subprogram_parameters_equal_units)
+    dxbc_add_core_test(test_shaderlab_emitted_matrix_uses_units
+        tests/test_shaderlab_emitted_matrix_uses_units.c shaderlab_emitted_matrix_uses_units)
+    target_sources(test_shaderlab_emitted_matrix_uses_units PRIVATE tests/test_shaderlab_fixture.c)
+    target_compile_definitions(test_shaderlab_emitted_matrix_uses_units PRIVATE
+        MATRIX_USES_PIXEL_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
     dxbc_add_core_test(test_shaderlab_source_quality_units
         tests/test_shaderlab_source_quality_units.c shaderlab_source_quality_units)
     target_sources(test_shaderlab_source_quality_units PRIVATE
@@ -520,6 +527,15 @@ if(BUILD_TESTING)
         target_link_libraries(test_unity_hlsl_expansion_units PRIVATE
             unity_compiler_support dxbc_build_options)
         add_test(NAME unity_hlsl_expansion_units COMMAND test_unity_hlsl_expansion_units)
+
+        add_executable(test_unity_emitted_matrix_attachment_units
+            tests/test_unity_emitted_matrix_attachment_units.c tests/test_shaderlab_fixture.c)
+        target_include_directories(test_unity_emitted_matrix_attachment_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_unity_emitted_matrix_attachment_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        target_compile_definitions(test_unity_emitted_matrix_attachment_units PRIVATE
+            EMITTED_MATRIX_ABSENCE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
+        add_test(NAME unity_emitted_matrix_attachment_units COMMAND test_unity_emitted_matrix_attachment_units)
 
         add_executable(test_unity_hlsl_matrix_declaration_units tests/test_unity_hlsl_matrix_declaration_units.c)
         target_include_directories(test_unity_hlsl_matrix_declaration_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

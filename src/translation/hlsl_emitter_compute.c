@@ -464,7 +464,8 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
                 return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
         return true;
     }
-    if (instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_STORE_UAV_TYPED) {
+    const bool uav_read = instruction->opcode == USIL_OP_LD_UAV_TYPED;
+    if (instruction->opcode != USIL_OP_LD && !uav_read && instruction->opcode != USIL_OP_STORE_UAV_TYPED) {
         if (instruction->opcode != USIL_OP_MOV && !uint_operation(instruction->opcode) &&
             instruction->opcode != USIL_OP_RET)
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_OPCODE);
@@ -488,7 +489,7 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
     USILEffectFlags effects;
     if (!usil_instruction_effects(ctx->program, instruction, &effects) ||
-        effects != (instruction->opcode == USIL_OP_LD ? USIL_EFFECT_RESOURCE_READ : USIL_EFFECT_EXTERNAL_WRITE))
+        effects != (instruction->opcode == USIL_OP_LD || uav_read ? USIL_EFFECT_RESOURCE_READ : USIL_EFFECT_EXTERNAL_WRITE))
         return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
     if (instruction->opcode == USIL_OP_STORE_UAV_TYPED) {
         USILMemoryAccess memory;
@@ -506,12 +507,22 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
             destination->has_abs || destination->has_neg || destination->min_precision ||
             destination->rel_op0 || destination->rel_op1 || destination->rel_op2 ||
             destination->extended_token_count || destination->extended_tokens ||
-            !operand_plain(resource) || resource->type != OPERAND_TYPE_RESOURCE ||
+            !operand_plain(resource) || resource->type != (uav_read ? OPERAND_TYPE_UAV : OPERAND_TYPE_RESOURCE) ||
             !static_indices(resource, 1) || resource->swizzle_mode != 1u)
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
         for (unsigned lane = 0; lane < 4; ++lane)
             if (usil_operand_source_component(resource, (int)lane) != (int)lane)
                 return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+        if (uav_read) {
+            USILMemoryAccess memory;
+            if (!usil_instruction_memory_access(ctx->program, instruction, &memory) ||
+                memory.kind != USIL_MEMORY_TYPED || memory.space != USIL_MEMORY_UNORDERED_ACCESS ||
+                memory.address_lanes != 3u || memory.destination_lanes != 15u ||
+                memory.memory_component_lanes != 15u || !memory.reads || memory.writes ||
+                memory.atomic || memory.globally_coherent || memory.rasterizer_ordered ||
+                memory.has_order_preserving_counter)
+                return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+        }
     }
     const DXBCOperand *address = &instruction->operands[1];
     if (!operand_plain(address))
@@ -591,7 +602,8 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
         if (!expression) { ast_free_expr(left); ast_free_expr(right); return NULL; }
         return memory_origin(plan, expression, definition, lanes, AST_SCALAR_UINT32, width);
     }
-    if ((instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_STRUCTURED) ||
+    if ((instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_STRUCTURED &&
+         instruction->opcode != USIL_OP_LD_UAV_TYPED) ||
         lanes != usil_operand_destination_lane_mask(&instruction->operands[0]) ||
         definition != plan->load) return NULL;
     /* Direct SSA use counts do not expose duplication through a shared pure
@@ -630,6 +642,15 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
         project |= width != 4u;
         location = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
         binding_operand = memory.binding_operand;
+    } else if (instruction->opcode == USIL_OP_LD_UAV_TYPED) {
+        USILMemoryAccess memory;
+        if (!usil_instruction_memory_access(plan->ctx->program, instruction, &memory)) return NULL;
+        ASTExpr *coordinates = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
+        ASTExpr *arguments[] = {coordinates};
+        location = coordinates ? ast_create_call("int2", arguments, 1) : NULL;
+        if (!location) { ast_free_expr(coordinates); return NULL; }
+        location = memory_origin(plan, location, definition, memory.address_lanes, AST_SCALAR_SINT32, 2);
+        binding_operand = memory.binding_operand;
     } else {
         if (!memory_zero_lane(plan, definition, 1, 2, depth + 1, &literal_owner, &literal_lanes)) return NULL;
         ASTExpr *coordinates = memory_operand(plan, definition, 1, 3u, depth + 1);
@@ -643,7 +664,8 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
     }
     if (!location) return NULL;
     const DXBCOperand *resource = &instruction->operands[binding_operand];
-    const HLSLComputeTypedResource *binding = typed_binding(plan->typed, false, (uint32_t)resource->register_index);
+    const HLSLComputeTypedResource *binding = typed_binding(plan->typed,
+        instruction->opcode == USIL_OP_LD_UAV_TYPED, (uint32_t)resource->register_index);
     if (!binding) { ast_free_expr(location); return NULL; }
     char method[264];
     int size = snprintf(method, sizeof(method), "%s.Load", binding->name);
@@ -800,6 +822,78 @@ static void emit_typed_declarations(HLSLEmitterContext *ctx, const HLSLComputeTy
     sb_append(ctx->sb, "\n");
 }
 
+/* Replicated result lanes are equal only when this same pure UINT32 producer
+ * consumes identical values for both lanes. This is one instruction, not an
+ * alias search or a comparison of independently computed expressions. */
+static bool uint_result_lanes_equal(HLSLEmitterContext *ctx, int definition,
+                                    int first, int second) {
+    if (definition < 0 || definition >= ctx->program->instruction_count ||
+        first < 0 || first >= 4 || second < 0 || second >= 4) return false;
+    const USILInstruction *instruction = &ctx->program->instructions[definition];
+    USILEffectFlags effects;
+    if (!uint_operation(instruction->opcode) ||
+        !usil_instruction_effects(ctx->program, instruction, &effects) || effects != USIL_EFFECT_NONE)
+        return false;
+    const uint8_t mask = usil_operand_destination_lane_mask(&instruction->operands[0]);
+    if (!(mask & (1u << first)) || !(mask & (1u << second))) return false;
+    for (int operand_index = 1; operand_index < instruction->operand_count; ++operand_index) {
+        const DXBCOperand *source = &instruction->operands[operand_index];
+        if (!operand_plain(source)) return false;
+        const int left = usil_operand_source_component(source, first);
+        const int right = usil_operand_source_component(source, second);
+        if (source->type == OPERAND_TYPE_IMMEDIATE32) {
+            const int a = source->imm_value_count == 1 ? 0 : left;
+            const int b = source->imm_value_count == 1 ? 0 : right;
+            if (a < 0 || b < 0 || a >= source->immediate_word_count || b >= source->immediate_word_count ||
+                source->immediate_words[a] != source->immediate_words[b]) return false;
+        } else {
+            if (left < 0 || left != right) return false;
+            if (source->type == OPERAND_TYPE_TEMP) {
+                const int owner = hlsl_operand_definition(ctx, definition, operand_index, first);
+                if (owner < 0 || owner != hlsl_operand_definition(ctx, definition, operand_index, second))
+                    return false;
+            } else if (source->type != OPERAND_TYPE_INPUT_THREAD_ID) return false;
+        }
+    }
+    return true;
+}
+
+/* One unchanged physical address producer owns both accesses. Distinct lanes
+ * may refer to a proven replicated UINT32 result of that same instruction;
+ * the emitted operands retain their original selected-lane provenance. */
+static bool same_typed_uav_address(HLSLEmitterContext *ctx, int load, int store) {
+    const USILInstruction *read = &ctx->program->instructions[load];
+    const USILInstruction *write = &ctx->program->instructions[store];
+    USILMemoryAccess read_access, write_access;
+    if (!usil_instruction_memory_access(ctx->program, read, &read_access) ||
+        !usil_instruction_memory_access(ctx->program, write, &write_access) ||
+        read_access.register_id != write_access.register_id ||
+        read_access.address_lanes != write_access.address_lanes) return false;
+    const DXBCOperand *left = &read->operands[read_access.address_operand];
+    const DXBCOperand *right = &write->operands[write_access.address_operand];
+    if (left->type != right->type) return false;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!(read_access.address_lanes & (1u << lane))) continue;
+        const int first = usil_operand_source_component(left, lane);
+        const int second = usil_operand_source_component(right, lane);
+        if (left->type == OPERAND_TYPE_IMMEDIATE32) {
+            const int a = left->imm_value_count == 1 ? 0 : first;
+            const int b = right->imm_value_count == 1 ? 0 : second;
+            if (a < 0 || b < 0 || a >= left->imm_value_count || b >= right->imm_value_count ||
+                left->imm_values[a] != right->imm_values[b]) return false;
+        } else {
+            if (first < 0 || second < 0) return false;
+            if (left->type == OPERAND_TYPE_TEMP) {
+                const int owner = hlsl_operand_definition(ctx, load, read_access.address_operand, lane);
+                if (left->register_index != right->register_index || owner < 0 ||
+                    owner != hlsl_operand_definition(ctx, store, write_access.address_operand, lane)) return false;
+                if (first != second && !uint_result_lanes_equal(ctx, owner, first, second)) return false;
+            } else if (left->type != OPERAND_TYPE_INPUT_THREAD_ID || first != second) return false;
+        }
+    }
+    return true;
+}
+
 static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTypedSource *typed) {
     ComputeMemoryPlan plan = {.ctx = ctx, .typed = typed, .store = -1, .load = -1};
     const USILProgram *program = ctx->program;
@@ -809,12 +903,17 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
             if (plan.store >= 0 || index != program->instruction_count - 2)
                 return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             plan.store = index;
-        } else if (instruction->opcode == USIL_OP_LD || instruction->opcode == USIL_OP_LD_STRUCTURED) {
+        } else if (instruction->opcode == USIL_OP_LD || instruction->opcode == USIL_OP_LD_STRUCTURED ||
+                   instruction->opcode == USIL_OP_LD_UAV_TYPED) {
             if (plan.load >= 0) return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             plan.load = index;
         }
     }
-    if (plan.store < 0 || (program->texture_count != (plan.load >= 0))) return reject_stage(ctx);
+    const bool uav_read = plan.load >= 0 && program->instructions[plan.load].opcode == USIL_OP_LD_UAV_TYPED;
+    if (plan.store < 0 || (program->texture_count != (plan.load >= 0 && !uav_read))) return reject_stage(ctx);
+    if (uav_read && (program->texture_count || typed->resource_count != 1u || plan.load >= plan.store ||
+        program->instructions[plan.store].opcode != USIL_OP_STORE_UAV_TYPED ||
+        !same_typed_uav_address(ctx, plan.load, plan.store))) return reject_stage(ctx);
     if (plan.load >= 0) {
         for (int index = plan.load + 1; index < plan.store; ++index) {
             USILEffectFlags effects;

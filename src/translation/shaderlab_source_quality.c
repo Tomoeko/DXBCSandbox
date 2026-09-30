@@ -394,7 +394,7 @@ static bool summarize_inventory(ShaderLabSourceQualityInventory *inventory) {
 
 static ShaderLabSourceQualityStatus emit_inventory(const ShaderLabSourceQualityRequest *request,
     StringBuilder *source, ShaderLabSourceQualityInventory *inventory,
-    ShaderLabSourceQualityDiagnostic *diagnostic) {
+    struct ShaderLabEmittedMatrixUses *matrix_uses, ShaderLabSourceQualityDiagnostic *diagnostic) {
     ShaderLabSourceQualityStatus status = validate_scope(request);
     if (status != SHADERLAB_SOURCE_QUALITY_OK) return status;
     if (request->object) {
@@ -404,7 +404,7 @@ static ShaderLabSourceQualityStatus emit_inventory(const ShaderLabSourceQualityR
         }
         inventory->has_structural_authority = true;
     }
-    ShaderLabSourceQualityCapture capture = {.inventory = inventory};
+    ShaderLabSourceQualityCapture capture = {.inventory = inventory, .matrix_uses = matrix_uses};
     if (!shaderlab_emit_high_level_candidate_inventory(request->shader, request->archive, source,
             &inventory->entries, &capture, &diagnostic->emission))
         return capture.failed ? SHADERLAB_SOURCE_QUALITY_ALLOCATION_FAILED : SHADERLAB_SOURCE_QUALITY_EMISSION_FAILED;
@@ -422,9 +422,9 @@ static ShaderLabSourceQualityStatus emit_inventory(const ShaderLabSourceQualityR
     return SHADERLAB_SOURCE_QUALITY_OK;
 }
 
-ShaderLabSourceQualityStatus shaderlab_source_quality_emit(const ShaderLabSourceQualityRequest *request,
+ShaderLabSourceQualityStatus shaderlab_source_quality_emit_with_matrix_capture(const ShaderLabSourceQualityRequest *request,
     StringBuilder *source, ShaderLabSourceQualityInventory *destination,
-    ShaderLabSourceQualityDiagnostic *diagnostic) {
+    struct ShaderLabEmittedMatrixUses *matrix_uses, ShaderLabSourceQualityDiagnostic *diagnostic) {
     ShaderLabSourceQualityDiagnostic local = {0};
     if (!diagnostic) diagnostic = &local;
     memset(diagnostic, 0, sizeof(*diagnostic));
@@ -435,7 +435,7 @@ ShaderLabSourceQualityStatus shaderlab_source_quality_emit(const ShaderLabSource
     StringBuilder generated;
     sb_init(&generated);
     ShaderLabSourceQualityInventory inventory = {0};
-    ShaderLabSourceQualityStatus status = emit_inventory(request, &generated, &inventory, diagnostic);
+    ShaderLabSourceQualityStatus status = emit_inventory(request, &generated, &inventory, matrix_uses, diagnostic);
     if (status == SHADERLAB_SOURCE_QUALITY_OK) {
         /* Transfer the complete builder, avoiding a late append failure after
          * the inventory's already successful transaction. */
@@ -450,6 +450,12 @@ ShaderLabSourceQualityStatus shaderlab_source_quality_emit(const ShaderLabSource
     shaderlab_source_quality_inventory_dispose(&inventory);
     diagnostic->status = status;
     return status;
+}
+
+ShaderLabSourceQualityStatus shaderlab_source_quality_emit(
+    const ShaderLabSourceQualityRequest *request, StringBuilder *source,
+    ShaderLabSourceQualityInventory *destination, ShaderLabSourceQualityDiagnostic *diagnostic) {
+    return shaderlab_source_quality_emit_with_matrix_capture(request, source, destination, NULL, diagnostic);
 }
 
 static bool receipts_equal(const ShaderLabSourceSyntaxReceipt *a, const ShaderLabSourceSyntaxReceipt *b) {
@@ -607,7 +613,7 @@ ShaderLabSourceQualityStatus shaderlab_source_quality_inventory_analyze(
     StringBuilder expected;
     sb_init(&expected);
     ShaderLabSourceQualityInventory canonical = {0};
-    ShaderLabSourceQualityStatus status = emit_inventory(request, &expected, &canonical, diagnostic);
+    ShaderLabSourceQualityStatus status = emit_inventory(request, &expected, &canonical, NULL, diagnostic);
     if (status != SHADERLAB_SOURCE_QUALITY_OK) goto cleanup;
     status = SHADERLAB_SOURCE_QUALITY_INVENTORY_MISMATCH;
     if (source->len != expected.len || memcmp(source->buf, expected.buf, expected.len) ||

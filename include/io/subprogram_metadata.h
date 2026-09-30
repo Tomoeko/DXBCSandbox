@@ -169,10 +169,24 @@ void serialized_program_parameters_free(SerializedProgramParameters* params);
 bool serialized_program_parameters_copy(SerializedProgramParameters* dest,
                                         const SerializedProgramParameters* src);
 
+/* Full typed ordered equality, including dormant fields, structure members,
+ * roles, precision/layout words and resource extras. Requires valid decoded
+ * models; invalid shapes reject. String-pool/allocation identity is ignored.
+ * This is observation replay support, not schema or source authority. */
+bool serialized_program_parameters_equal(const SerializedProgramParameters *left,
+                                         const SerializedProgramParameters *right);
+
 // Deserializes a subprogram header from the stream
 bool subprogram_metadata_parse_variant(ByteStream* stream,
                                        PlayerSubProgramMetadata* out_sub);
 void subprogram_metadata_free_variant(PlayerSubProgramMetadata* sub);
+/* Complete ordered wire-model equality, including opaque header words,
+ * source-map word, bytecode, bindings and keyword order. Both valid models
+ * must satisfy the existing receipt bounds (4096 keywords/bindings, 64 MiB
+ * bytecode). No pointer-identity shortcut or keyword normalization occurs. */
+bool subprogram_metadata_variant_equal(const PlayerSubProgramMetadata *left,
+                                      const PlayerSubProgramMetadata *right);
+
 /* Player blob keyword names and TypeTree subprogram keyword names describe
  * sets. Their storage orders are independent in Unity 2021.3. Exact matching
  * therefore requires duplicate-free set equality, not positional equality. */

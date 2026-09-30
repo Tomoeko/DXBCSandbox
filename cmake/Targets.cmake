@@ -106,6 +106,7 @@ set(DXBC_SOURCES
     src/translation/shaderlab_emitter.c
     src/translation/shaderlab_source_map.c
     src/translation/shaderlab_source_quality.c
+    src/translation/shaderlab_emitted_matrix_uses.c
     src/translation/shaderlab_stage.c
     src/translation/shaderlab_state.c
     src/translation/shaderlab_structural_certificate.c

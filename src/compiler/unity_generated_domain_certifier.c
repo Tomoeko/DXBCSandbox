@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "compiler/unity_generated_domain_certifier.h"
+#include "compiler/unity_generated_owned_request_internal.h"
 
 #include "common/shader_stage.h"
 #include "common/sha256.h"
@@ -1491,7 +1492,9 @@ static UnityGeneratedDomainStatus certify_variant_reflection(
     int subprogram_index, const PlayerSubProgramMetadata* player,
     const UnityCompilerBinaryResponse* response,
     UnityGeneratedDomainCompilerResponseRecord* response_record,
-    UnityGeneratedDomainReport* report) {
+    UnityGeneratedDomainReport* report,
+    const UnityGeneratedOwnedRequestObserver *observer,
+    const UnityGeneratedOwnedRequest *owned_request) {
     if (!input || !input->pass || !input->d3d11_archive || !player ||
         !response || !report || stage_index < 0 || stage_index >= 6 ||
         subprogram_index < 0 ||
@@ -1545,12 +1548,26 @@ static UnityGeneratedDomainStatus certify_variant_reflection(
         unity_reflection_certify_d3d11_bindings(
             player, common, residual, response->reflection_records,
             response->reflection_record_count, &certificate);
+    bool observation_valid = true;
+    if (observer && (certificate_status == UNITY_REFLECTION_CERTIFICATE_OK ||
+                     certificate_status == UNITY_REFLECTION_CERTIFICATE_COMPATIBLE)) {
+        if (!observer->observe || !owned_request) {
+            observation_valid = false;
+        } else {
+            UnityGeneratedOwnedRequest actual = *owned_request;
+            actual.current = residual ? residual : common;
+            actual.common = common;
+            observation_valid = observer->observe(observer->context, &actual);
+        }
+    }
     serialized_program_parameters_free(&binary_parameters);
     report->diagnostic.reflection_certificate = certificate;
     if (response_record) {
         response_record->reflection_certificate_present = true;
         response_record->reflection_certificate = certificate;
     }
+    if (!observation_valid)
+        return fail_report(report, UNITY_GENERATED_DOMAIN_PLAN_AUTHORITY_MISMATCH);
     if (certificate_status == UNITY_REFLECTION_CERTIFICATE_OK) {
         ++report->runtime_binding_attested_compile_count;
         return UNITY_GENERATED_DOMAIN_OK;
@@ -1651,9 +1668,9 @@ static void record_compile_provenance(
     }
 }
 
-UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
+static UnityGeneratedDomainStatus certify_with_owned_requests(
     const UnityGeneratedDomainCertificationInput* input,
-    UnityGeneratedDomainReport* report) {
+    const UnityGeneratedOwnedRequestObserver *observer, UnityGeneratedDomainReport* report) {
     if (!report) return UNITY_GENERATED_DOMAIN_INVALID_ARGUMENT;
     const bool has_any_original_source = input &&
         (input->original_snippet || input->original_source_directory ||
@@ -1672,7 +1689,8 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
         !input->source_directory[0] || !input->source_basename ||
         !input->source_basename[0] || !input->pass_name ||
         (has_any_original_source && !has_complete_original_source) ||
-        (!input->compile_callback && !input->broker)) {
+        (!input->compile_callback && !input->broker) ||
+        (observer && (!observer->observe || input->compile_callback || !input->broker))) {
         unity_generated_domain_report_free(report);
         return fail_report(report, UNITY_GENERATED_DOMAIN_INVALID_ARGUMENT);
     }
@@ -1932,9 +1950,15 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
                         report, UNITY_GENERATED_DOMAIN_DXBC_MISMATCH);
                 }
 
+                const UnityGeneratedOwnedRequest owned_request = {
+                    .stage_index = stage_index, .hardware_tier_group = tier,
+                    .subprogram_index = subprogram_index,
+                    .generated_state_index = generated_state, .aliased_state_index = alias,
+                    .request = &request, .player = &player,
+                    .target = reference.data, .target_size = reference.size};
                 status = certify_variant_reflection(
                     input, stage_index, subprogram_index, &player,
-                    &response, response_record, report);
+                    &response, response_record, report, observer, &owned_request);
                 if (status != UNITY_GENERATED_DOMAIN_OK) {
                     unity_compiler_binary_response_free(&response);
                     unity_compile_authority_free(&authority);
@@ -2087,6 +2111,18 @@ UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
     report->status = UNITY_GENERATED_DOMAIN_OK;
     report->diagnostic.status = UNITY_GENERATED_DOMAIN_OK;
     return UNITY_GENERATED_DOMAIN_OK;
+}
+
+UnityGeneratedDomainStatus unity_generated_domain_certify_d3d11(
+    const UnityGeneratedDomainCertificationInput *input, UnityGeneratedDomainReport *report) {
+    return certify_with_owned_requests(input, NULL, report);
+}
+
+UnityGeneratedDomainStatus unity_generated_domain_certify_owned_requests(
+    const UnityGeneratedDomainCertificationInput *input,
+    const UnityGeneratedOwnedRequestObserver *observer, UnityGeneratedDomainReport *report) {
+    if (!observer) return UNITY_GENERATED_DOMAIN_INVALID_ARGUMENT;
+    return certify_with_owned_requests(input, observer, report);
 }
 
 const char* unity_generated_domain_status_name(

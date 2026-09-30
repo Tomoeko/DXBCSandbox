@@ -18,6 +18,7 @@ typedef struct ShaderLabSourceQualityCapture {
     size_t body_count;
     size_t cursor;
     bool failed;
+    struct ShaderLabEmittedMatrixUses *matrix_uses;
 } ShaderLabSourceQualityCapture;
 
 bool shaderlab_source_quality_capture_receipt(
@@ -36,5 +37,10 @@ bool shaderlab_emit_high_level_candidate_inventory(
     StringBuilder *source, ShaderLabExpressionSourceMap *map,
     ShaderLabSourceQualityCapture *capture,
     ShaderLabCandidateDiagnostic *diagnostic);
+
+ShaderLabSourceQualityStatus shaderlab_source_quality_emit_with_matrix_capture(
+    const ShaderLabSourceQualityRequest *request, StringBuilder *source,
+    ShaderLabSourceQualityInventory *destination,
+    struct ShaderLabEmittedMatrixUses *matrix_uses, ShaderLabSourceQualityDiagnostic *diagnostic);
 
 #endif

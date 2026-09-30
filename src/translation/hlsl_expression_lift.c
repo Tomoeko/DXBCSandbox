@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/hlsl_emitted_matrix_uses_internal.h"
 #include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include "hlsl_matrix_lift.h"
@@ -861,12 +862,14 @@ typedef struct {
     ASTExpr **roots;
     HLSLInstructionOwners owners;
     bool function;
+    HLSLMatrixUseCapture *matrix_capture;
 } ExpressionSpanContext;
 
 static bool record_expression_span(void *context, const ASTExpr *expression, size_t begin,
                                    size_t end) {
     ExpressionSpanContext *trace = context;
-    for (size_t index = 0; index < trace->map->count; ++index) {
+    if (!hlsl_matrix_uses_span(trace->matrix_capture, expression, begin, end)) return false;
+    for (size_t index = 0; trace->map && index < trace->map->count; ++index) {
         if (!hlsl_instruction_owners_contains(&trace->owners, (int)index) || trace->roots[index] != expression)
             continue;
         HLSLExpressionOrigin *origin = &trace->map->origins[index];
@@ -897,6 +900,18 @@ static bool finish_expression_origins(ExpressionSpanContext *trace, bool dead) {
     return true;
 }
 
+/* The selected compiler's identity-multiply spelling retains an ADD's
+ * decoded child order. This constructs a candidate inverse, not an independent
+ * floating-point equivalence proof. Complete compiler equality is required. */
+static ASTExpr *ordered_add_expression(ASTExpr *left, ASTExpr *right) {
+    const uint32_t one_bits = UINT32_C(0x3f800000);
+    ASTExpr *one = ast_create_literal_bits(&one_bits, 1, AST_SCALAR_FLOAT32);
+    ASTExpr *arguments[3] = {left, one, right};
+    ASTExpr *expression = one ? ast_create_call("mad", arguments, 3) : NULL;
+    if (!expression) ast_free_expr(one);
+    return expression;
+}
+
 /* Always consumes both children, including on allocation failure. */
 ASTExpr *hlsl_float4_operation(HLSLEmitterContext *ctx, int index, ASTExpr *left, ASTExpr *right) {
     const USILInstruction *inst = &ctx->program->instructions[index];
@@ -906,12 +921,7 @@ ASTExpr *hlsl_float4_operation(HLSLEmitterContext *ctx, int index, ASTExpr *left
     const unsigned width = operation_width(lanes, left, right, NULL);
     ASTExpr *expression = NULL;
     if (compiler_add_uses_mad(inst)) {
-        const uint32_t one_bits = UINT32_C(0x3f800000);
-        ASTExpr *one = ast_create_literal_bits(&one_bits, 1, AST_SCALAR_FLOAT32);
-        ASTExpr *arguments[3] = {left, one, right};
-        expression = ast_create_call("mad", arguments, 3);
-        if (!expression)
-            ast_free_expr(one);
+        expression = ordered_add_expression(left, right);
     } else {
         bool swap = compiler_model_swaps_binary_operands(ctx, index);
         expression = ast_create_binary(inst->opcode, swap ? right : left, swap ? left : right);
@@ -924,8 +934,21 @@ ASTExpr *hlsl_float4_operation(HLSLEmitterContext *ctx, int index, ASTExpr *left
 }
 
 static ASTExpr *vector_operation(HLSLEmitterContext *ctx, int index, ASTExpr *left,
-                                 ASTExpr *right, ASTExpr *third) {
+                                 ASTExpr *right, ASTExpr *third,
+                                 const HLSLPureExpressionScope *scope) {
     const USILOpcode opcode = ctx->program->instructions[index].opcode;
+    if (opcode == USIL_OP_ADD && scope && scope->ordered_add_supported &&
+        scope->ordered_add_supported(ctx, index, scope->context)) {
+        const uint8_t lanes = usil_operand_destination_lane_mask(
+            &ctx->program->instructions[index].operands[0]);
+        ASTExpr *expression = left && right && expression_width(left) == 1 &&
+            expression_width(right) == 1 ? ordered_add_expression(left, right) : NULL;
+        if (!expression) {
+            ast_free_expr(left);
+            ast_free_expr(right);
+        }
+        return logical_expression(ctx, expression, index, lanes, 1);
+    }
     const char *intrinsic = float_intrinsic(opcode);
     if (intrinsic) {
         const USILInstruction *instruction = &ctx->program->instructions[index];
@@ -1074,6 +1097,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
         goto cleanup;
     for (int index = first; index < end; ++index) {
         if (!matrix_plans[index].expression) continue;
+        if (!hlsl_matrix_uses_plan(ctx, &matrix_plans[index])) goto cleanup;
         for (int claimed = index; claimed <= matrix_plans[index].end_instruction; ++claimed)
             matrix_starts[claimed] = index;
     }
@@ -1171,7 +1195,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
                 ASTExpr *third = inst->opcode == USIL_OP_MAD
                     ? source_expression(ctx, index, 3, uses, pending, pending_owners, &owners,
                                         logical_widths, scope) : NULL;
-                expression = vector_operation(ctx, index, left, right, third);
+                expression = vector_operation(ctx, index, left, right, third, scope);
             }
         }
         if (!expression)
@@ -1182,7 +1206,8 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
                 usil_operand_destination_lane_mask(&inst->operands[0]));
         roots[index] = expression;
         ExpressionSpanContext trace = {
-            .map = map, .roots = roots, .owners = owners, .function = group >= 0};
+            .map = map, .roots = roots, .owners = owners, .function = group >= 0,
+            .matrix_capture = ctx->matrix_use_capture};
         const DXBCOperand *destination = &inst->operands[0];
         unsigned inline_nodes = 0;
         if (destination->type == OPERAND_TYPE_TEMP && uses[index] == 1 &&
@@ -1224,7 +1249,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
         }
         if (!hlsl_source_quality_observe_expression(ctx, expression, index))
             ctx->sb->failed = true;
-        ast_format_expr_traced(expression, ctx->sb, map ? record_expression_span : NULL, &trace);
+        ast_format_expr_traced(expression, ctx->sb, map || ctx->matrix_use_capture ? record_expression_span : NULL, &trace);
         if (!finish_expression_origins(&trace, false))
             ctx->sb->failed = true;
         sb_append(ctx->sb, ";\n");

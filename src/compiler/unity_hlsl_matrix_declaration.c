@@ -81,12 +81,7 @@ static bool keywords_copy(char ***out, char *const *values, int count) {
         if (!((*out)[index] = copy_text(values[index]))) return false;
     return true;
 }
-static bool keywords_equal(char *const *left, int left_count, char *const *right, int right_count) {
-    if (!keywords_shape(right, right_count) || left_count != right_count) return false;
-    for (int index = 0; index < left_count; ++index)
-        if (strcmp(left[index], right[index])) return false;
-    return true;
-}
+
 static bool request_copy(UnityHlslMatrixDeclarationReceipt *receipt,
                          const UnityCompilerSnippetCompileRequest *request) {
     receipt->request = *request;
@@ -131,53 +126,7 @@ static bool player_copy(PlayerSubProgramMetadata *out, const PlayerSubProgramMet
     }
     return true;
 }
-static bool player_equal(const PlayerSubProgramMetadata *left, const PlayerSubProgramMetadata *right) {
-    if (!player_shape(right) || left->version != right->version || left->dialect != right->dialect ||
-        left->program_type != right->program_type || left->has_player_blob_header != right->has_player_blob_header ||
-        memcmp(left->player_header_words, right->player_header_words, sizeof(left->player_header_words)) ||
-        left->source_map != right->source_map || left->bytecode_length != right->bytecode_length ||
-        memcmp(left->bytecode, right->bytecode, left->bytecode_length) || left->binding_count != right->binding_count ||
-        !keywords_equal(left->local_keywords, left->local_keyword_count, right->local_keywords, right->local_keyword_count) ||
-        !keywords_equal(left->global_keywords, left->global_keyword_count, right->global_keywords, right->global_keyword_count)) return false;
-    for (int index = 0; index < left->binding_count; ++index)
-        if (left->bindings[index].channel != right->bindings[index].channel ||
-            left->bindings[index].component != right->bindings[index].component) return false;
-    return true;
-}
-/* Compare typed fields rather than allocation addresses, pools or C padding. */
-static bool variable_equal(const SerializedVariable *left, const SerializedVariable *right) {
-    return right->name && !strcmp(left->name, right->name) &&
-        !memcmp(left->layout, right->layout, sizeof(left->layout));
-}
-static bool parameters_equal(const SerializedProgramParameters *left, const SerializedProgramParameters *right) {
-    if (!right || left->version != right->version || left->dialect != right->dialect ||
-        left->is_binary != right->is_binary || left->cb_count != right->cb_count || left->res_count != right->res_count ||
-        (right->cb_count && !right->constant_buffers) || (right->res_count && !right->resources)) return false;
-    for (int index = 0; index < left->cb_count; ++index) {
-        const SerializedConstantBuffer *a = &left->constant_buffers[index], *b = &right->constant_buffers[index];
-        if (!b->name || strcmp(a->name, b->name) || a->role != b->role || a->size != b->size ||
-            a->has_is_partial != b->has_is_partial || a->is_partial != b->is_partial ||
-            a->var_count != b->var_count || a->struct_count != b->struct_count ||
-            (b->var_count && !b->variables) || (b->struct_count && !b->struct_params)) return false;
-        for (int field = 0; field < a->var_count; ++field)
-            if (!variable_equal(&a->variables[field], &b->variables[field])) return false;
-        for (int structure = 0; structure < a->struct_count; ++structure) {
-            const SerializedStructParam *sa = &a->struct_params[structure], *sb = &b->struct_params[structure];
-            if (!sb->name || strcmp(sa->name, sb->name) || memcmp(sa->layout, sb->layout, sizeof(sa->layout)) ||
-                sa->member_count != sb->member_count || (sb->member_count && !sb->members)) return false;
-            for (int member = 0; member < sa->member_count; ++member)
-                if (!variable_equal(&sa->members[member], &sb->members[member])) return false;
-        }
-    }
-    for (int index = 0; index < left->res_count; ++index) {
-        const SerializedResourceParam *a = &left->resources[index], *b = &right->resources[index];
-        if (!b->name || strcmp(a->name, b->name) || a->bind_type != b->bind_type || a->bind_index != b->bind_index ||
-            a->array_size != b->array_size || a->dimension != b->dimension || a->sampler_index != b->sampler_index ||
-            a->multisampled != b->multisampled || a->original_index != b->original_index ||
-            a->sampler_state != b->sampler_state || memcmp(a->extra, b->extra, sizeof(a->extra))) return false;
-    }
-    return true;
-}
+
 
 void unity_hlsl_matrix_declaration_free(UnityHlslMatrixDeclarationReceipt *receipt) {
     if (!receipt) return;
@@ -452,11 +401,11 @@ bool unity_hlsl_matrix_declaration_replay(UnityCompilerBroker *broker,
     const UnityHlslMatrixDeclarationReceipt *receipt, const UnityHlslMatrixDeclarationInput *input) {
     if (!broker || !receipt || !input || !request_shape(input->request) || !player_shape(input->player) ||
         !input->target || input->legacy_half_contract != receipt->summary.legacy_half_contract ||
-        !precision_authority(input) || !player_equal(&receipt->player, input->player) ||
+        !precision_authority(input) || !subprogram_metadata_variant_equal(&receipt->player, input->player) ||
         !bytes_equal(receipt->target, receipt->target_size, input->target, input->target_size) ||
         receipt->has_current != (input->current_parameters != NULL) || receipt->has_common != (input->common_parameters != NULL) ||
-        (receipt->has_current && !parameters_equal(&receipt->current, input->current_parameters)) ||
-        (receipt->has_common && !parameters_equal(&receipt->common, input->common_parameters))) return false;
+        (receipt->has_current && !serialized_program_parameters_equal(&receipt->current, input->current_parameters)) ||
+        (receipt->has_common && !serialized_program_parameters_equal(&receipt->common, input->common_parameters))) return false;
     uint8_t *profile = NULL; size_t profile_size = 0;
     bool profile_matches = unity_compile_profile_serialize(input->profile, &profile, &profile_size) == UNITY_COMPILE_PROFILE_OK &&
         bytes_equal(receipt->profile_bytes, receipt->profile_size, profile, profile_size);

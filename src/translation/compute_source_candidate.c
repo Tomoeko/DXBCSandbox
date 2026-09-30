@@ -311,12 +311,14 @@ static ComputeSourceStatus emit_variant(const ComputeShaderObject *object,
     if (binding_count) {
         for (int index = 0; index < program.instruction_count; ++index) {
             const USILInstruction *instruction = &program.instructions[index];
-            if (instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_STORE_UAV_TYPED &&
+            if (instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_UAV_TYPED &&
+                instruction->opcode != USIL_OP_STORE_UAV_TYPED &&
                 instruction->opcode != USIL_OP_LD_STRUCTURED && instruction->opcode != USIL_OP_STORE_STRUCTURED) continue;
             USILEffectFlags effects;
             if (evidence->memory_effect_count >= 2u || !usil_instruction_effects(&program, instruction, &effects)) goto cleanup;
             int binding_operand = instruction->opcode == USIL_OP_LD ? 2 : 0;
-            if (instruction->opcode == USIL_OP_LD_STRUCTURED || instruction->opcode == USIL_OP_STORE_STRUCTURED) {
+            if (instruction->opcode == USIL_OP_LD_UAV_TYPED || instruction->opcode == USIL_OP_LD_STRUCTURED ||
+                instruction->opcode == USIL_OP_STORE_STRUCTURED) {
                 USILMemoryAccess memory;
                 if (!usil_instruction_memory_access(&program, instruction, &memory)) goto cleanup;
                 binding_operand = memory.binding_operand;

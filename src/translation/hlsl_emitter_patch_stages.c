@@ -14,8 +14,9 @@ enum { POINT_TYPE, FACTOR_TYPE, PATCH_FUNCTION, PATCH_VARIABLE, FACTOR_VARIABLE,
 typedef struct {
     HLSLPatchLayout layout;
     HLSLDomainShape shape;
-    int phase, phase_field[PATCH_PHASE_LIMIT], producer[HLSL_PATCH_CONSTANT_LIMIT];
-    uint32_t declared_reads[PATCH_PHASE_LIMIT];
+    int phase, phase_field[PATCH_PHASE_LIMIT], phase_component[PATCH_PHASE_LIMIT];
+    int producer[HLSL_PATCH_CONSTANT_LIMIT][4];
+    uint8_t declared_reads[PATCH_PHASE_LIMIT][HLSL_PATCH_CONSTANT_LIMIT];
     uint8_t point_read_masks[PATCH_PHASE_LIMIT];
     HLSLInstructionOwners index_transports;
     char names[PATCH_NAME_COUNT][96], field_names[HLSL_PATCH_CONSTANT_LIMIT][96];
@@ -42,7 +43,7 @@ static bool ordinary_contract(const USILProgram *p, PatchPlan *plan, bool hull) 
         !memchr(p->shader_type_model, 0, sizeof(p->shader_type_model)) ||
         strcmp(p->shader_type_model, hull ? "hs_5_0" : "ds_5_0") ||
         !hlsl_domain_shape(p->tessellation.domain, &plan->shape) ||
-        !hlsl_patch_scalar_layout(p, &plan->layout) || !plan->layout.has_custom ||
+        !hlsl_patch_layout(p, &plan->layout) || !plan->layout.has_custom ||
         !p->tessellation.input_control_point_count || p->tessellation.input_control_point_count > 32 ||
         p->input_count != 1 || p->output_count != 1 || p->input_alloc < 1 || p->output_alloc < 1 ||
         !p->inputs || !p->outputs || !position(p->inputs) || !position(p->outputs) ||
@@ -98,7 +99,8 @@ static bool hull_contract(const USILProgram *p, PatchPlan *plan) {
     float maximum;
     memcpy(&maximum, &p->tessellation.max_tessellation_factor_bits, 4);
     if (!isfinite(maximum) || maximum < 1 || maximum > 64) return false;
-    for (unsigned reg = 0; reg < HLSL_PATCH_CONSTANT_LIMIT; ++reg) plan->producer[reg] = -1;
+    for (unsigned reg = 0; reg < HLSL_PATCH_CONSTANT_LIMIT; ++reg)
+        for (unsigned lane = 0; lane < 4; ++lane) plan->producer[reg][lane] = -1;
     for (unsigned phase = 0; phase < PATCH_PHASE_LIMIT; ++phase) plan->phase_field[phase] = -1;
     bool join = false;
     int next = 0;
@@ -124,7 +126,8 @@ static bool hull_contract(const USILProgram *p, PatchPlan *plan) {
         next = s->end_instruction_index;
     }
     if (next != p->instruction_count) return false;
-    uint32_t outputs = 0, instances = 0, point_inputs = 0;
+    uint8_t outputs[HLSL_PATCH_CONSTANT_LIMIT] = {0};
+    uint32_t instances = 0, point_inputs = 0;
     for (int index = 0; index < p->signature_declaration_count; ++index) {
         const USILSignatureDeclaration *d = &p->signature_declarations[index];
         int phase = phase_owner(p, d->source_instruction_index);
@@ -145,25 +148,34 @@ static bool hull_contract(const USILProgram *p, PatchPlan *plan) {
         } else if (d->operand_type == OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
             if (s->kind != DXBC_HULL_PHASE_JOIN || d->kind != USIL_SIGNATURE_DECL_INPUT ||
                 d->has_system_value || d->has_array_element_count || !d->has_signature_register ||
-                d->mask != 1 || d->register_id >= plan->layout.row_count ||
-                (plan->declared_reads[phase] & (UINT32_C(1) << d->register_id))) return false;
-            plan->declared_reads[phase] |= UINT32_C(1) << d->register_id;
+                !d->mask || d->register_id >= plan->layout.row_count ||
+                (d->mask & (uint8_t)~plan->layout.register_mask[d->register_id]) ||
+                (plan->declared_reads[phase][d->register_id] & d->mask)) return false;
+            plan->declared_reads[phase][d->register_id] |= d->mask;
         } else if (d->operand_type == OPERAND_TYPE_OUTPUT) {
-            if (!d->has_signature_register || d->has_array_element_count || d->mask != 1 ||
-                d->register_id >= plan->layout.row_count || (outputs & (UINT32_C(1) << d->register_id))) return false;
-            int field = plan->layout.register_field[d->register_id];
+            if (!d->has_signature_register || d->has_array_element_count || !d->mask ||
+                (d->mask & (uint8_t)(d->mask - 1u)) || d->register_id >= plan->layout.row_count ||
+                (outputs[d->register_id] & d->mask)) return false;
+            unsigned lane = 0;
+            while (!(d->mask & (1u << lane))) ++lane;
+            int field = plan->layout.lane_field[d->register_id][lane];
+            if (field < 0) return false;
             const HLSLPatchField *f = &plan->layout.fields[field];
+            const unsigned component = plan->layout.lane_component[d->register_id][lane];
+            const unsigned element = plan->layout.lane_element[d->register_id][lane];
             if (f->kind == HLSL_PATCH_CUSTOM ? (d->kind != USIL_SIGNATURE_DECL_OUTPUT || d->has_system_value) :
                 (d->kind != USIL_SIGNATURE_DECL_OUTPUT_SIV || !d->has_system_value ||
-                 d->system_value_name != (f->kind == HLSL_PATCH_OUTER ? plan->shape.raw_outer_siv_names[plan->layout.register_element[d->register_id]] :
-                    plan->shape.raw_inner_siv_names[plan->layout.register_element[d->register_id]]))) return false;
-            if ((plan->phase_field[phase] >= 0 && plan->phase_field[phase] != field) || s->instance_count != f->count) return false;
-            plan->phase_field[phase] = field;
-            plan->producer[d->register_id] = phase;
-            outputs |= UINT32_C(1) << d->register_id;
+                 d->system_value_name != (f->kind == HLSL_PATCH_OUTER ? plan->shape.raw_outer_siv_names[element] :
+                    plan->shape.raw_inner_siv_names[element]))) return false;
+            if ((plan->phase_field[phase] >= 0 && (plan->phase_field[phase] != field ||
+                plan->phase_component[phase] != (int)component)) || s->instance_count != f->count) return false;
+            plan->phase_field[phase] = field; plan->phase_component[phase] = (int)component;
+            plan->producer[d->register_id][lane] = phase;
+            outputs[d->register_id] |= d->mask;
         } else return false;
     }
-    if (outputs != (plan->layout.row_count == 32 ? UINT32_MAX : (UINT32_C(1) << plan->layout.row_count) - 1u)) return false;
+    for (unsigned reg = 0; reg < plan->layout.row_count; ++reg)
+        if (outputs[reg] != plan->layout.register_mask[reg]) return false;
     uint32_t ranges = 0;
     for (int index = 0; index < p->index_range_count; ++index) {
         const USILIndexRange *r = &p->index_ranges[index];
@@ -189,10 +201,15 @@ static bool hull_contract(const USILProgram *p, PatchPlan *plan) {
         if (!!(ranges & (UINT32_C(1) << phase)) != (f->count > 1) ||
             !!(instances & (UINT32_C(1) << phase)) != (f->count > 1)) return false;
         for (unsigned reg = 0; reg < plan->layout.row_count; ++reg) {
-            if (reg >= f->first_register && reg < (unsigned)f->first_register + f->count && plan->producer[reg] != (int)phase) return false;
-            if (plan->declared_reads[phase] & (UINT32_C(1) << reg)) {
-                const int producer = plan->producer[reg];
-                if (producer < 0 || producer >= (int)phase || p->tessellation.phases[producer].kind != DXBC_HULL_PHASE_FORK) return false;
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                if (plan->layout.lane_field[reg][lane] == field &&
+                    plan->layout.lane_component[reg][lane] == plan->phase_component[phase] &&
+                    plan->producer[reg][lane] != (int)phase) return false;
+                if (plan->declared_reads[phase][reg] & (1u << lane)) {
+                    const int producer = plan->producer[reg][lane];
+                    if (producer < 0 || producer >= (int)phase ||
+                        p->tessellation.phases[producer].kind != DXBC_HULL_PHASE_FORK) return false;
+                }
             }
         }
     }
@@ -203,7 +220,7 @@ static bool domain_contract(const USILProgram *p, PatchPlan *plan) {
         p->tessellation.partitioning || p->tessellation.output_primitive || p->tessellation.has_max_tessellation_factor ||
         p->tessellation.max_tessellation_factor_bits || p->index_range_count) return false;
     unsigned location = 0, points = 0, output = 0;
-    uint32_t reads = 0;
+    uint8_t reads[HLSL_PATCH_CONSTANT_LIMIT] = {0};
     for (int index = 0; index < p->signature_declaration_count; ++index) {
         const USILSignatureDeclaration *d = &p->signature_declarations[index];
         if (d->has_interpolation || d->has_system_value || d->stream_index || d->interpolation_mode) {
@@ -219,14 +236,16 @@ static bool domain_contract(const USILProgram *p, PatchPlan *plan) {
                 !d->has_array_element_count || d->array_element_count != p->tessellation.input_control_point_count || d->mask != 15) return false;
         } else if (d->operand_type == OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
             if (d->kind != USIL_SIGNATURE_DECL_INPUT || !d->has_signature_register || d->has_array_element_count ||
-                d->mask != 1 || d->register_id >= plan->layout.row_count || (reads & (UINT32_C(1) << d->register_id))) return false;
-            reads |= UINT32_C(1) << d->register_id;
+                !d->mask || d->register_id >= plan->layout.row_count ||
+                (d->mask & (uint8_t)~plan->layout.register_mask[d->register_id]) ||
+                (reads[d->register_id] & d->mask)) return false;
+            reads[d->register_id] |= d->mask;
         } else if (d->operand_type == OPERAND_TYPE_OUTPUT) {
             if (output++ || d->kind != USIL_SIGNATURE_DECL_OUTPUT_SIV || !d->has_signature_register || d->register_id ||
                 d->has_array_element_count || d->mask != 15) return false;
         } else return false;
     }
-    plan->declared_reads[0] = reads;
+    memcpy(plan->declared_reads[0], reads, sizeof(reads));
     plan->point_read_masks[0] = (uint8_t)location;
     return location && points && output && p->instructions[p->instruction_count - 1].opcode == USIL_OP_RET;
 }
@@ -263,6 +282,14 @@ static bool claim_index(HLSLEmitterContext *ctx, PatchPlan *plan, int definition
     }
     return false;
 }
+static uint8_t phase_destination_mask(const PatchPlan *plan) {
+    const int field = plan->phase_field[plan->phase];
+    const unsigned reg = plan->layout.fields[field].first_register;
+    for (unsigned lane = 0; lane < 4; ++lane)
+        if (plan->layout.lane_field[reg][lane] == field &&
+            plan->layout.lane_component[reg][lane] == plan->phase_component[plan->phase]) return (uint8_t)(1u << lane);
+    return 0;
+}
 static bool destination_supported(HLSLEmitterContext *ctx, int index, void *opaque) {
     PatchPlan *plan = opaque;
     const DXBCOperand *o = &ctx->program->instructions[index].operands[0];
@@ -274,7 +301,8 @@ static bool destination_supported(HLSLEmitterContext *ctx, int index, void *opaq
     const HLSLPatchField *f = &plan->layout.fields[plan->phase_field[plan->phase]];
     if (o->type != OPERAND_TYPE_OUTPUT || o->register_index_dim != 1 || o->swizzle_mode || o->min_precision ||
         o->has_abs || o->has_neg || o->extended_token_count || o->extended_tokens || o->rel_op1 || o->rel_op2 ||
-        usil_operand_destination_lane_mask(o) != 1 || o->register_index != f->first_register) return false;
+        usil_operand_destination_lane_mask(o) != phase_destination_mask(plan) ||
+        o->register_index != f->first_register) return false;
     if (f->count == 1) return hlsl_lift_operand_is_plain(o) && o->index_has_immediate[0] &&
         !o->index_representations[0] && !o->index_value_exceeds_int[0] && o->index_values[0] == f->first_register;
     return o->rel_op0 && !o->index_value_exceeds_int[0] &&
@@ -290,16 +318,22 @@ static bool source_supported(HLSLEmitterContext *ctx, int index, int operand, vo
     DXBCOperand o = *original;
     if (!hlsl_float_source_modifier_supported(&o)) return false;
     o.has_abs = o.has_neg = false; o.extended_tokens = NULL; o.extended_token_count = 0;
-    if (o.type == OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
-        if (!hlsl_patch_static_scalar_operand(&plan->layout, &o) || !hlsl_lift_operand_is_plain(&o) ||
-            !(plan->declared_reads[plan->phase] & (UINT32_C(1) << o.register_index))) return false;
-        return p->program_type == DXBC_PROGRAM_TYPE_DOMAIN ||
-            (p->tessellation.phases[plan->phase].kind == DXBC_HULL_PHASE_JOIN &&
-             plan->producer[o.register_index] < plan->phase && plan->producer[o.register_index] >= 0 &&
-             p->tessellation.phases[plan->producer[o.register_index]].kind == DXBC_HULL_PHASE_FORK);
-    }
     USILOperandUseInfo use;
     if (!usil_instruction_operand_use(p, &p->instructions[index], operand, &use) || use.use != USIL_OPERAND_USE_SOURCE) return false;
+    if (o.type == OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
+        if (!hlsl_patch_static_operand(&plan->layout, &o)) return false;
+        for (unsigned lane = 0; lane < 4; ++lane) if (use.source_lane_mask & (1u << lane)) {
+            const int selected = usil_operand_source_component(&o, (int)lane);
+            if (selected < 0 || selected >= 4 || plan->layout.lane_field[o.register_index][selected] < 0 ||
+                !(plan->declared_reads[plan->phase][o.register_index] & (1u << selected))) return false;
+            if (p->program_type == DXBC_PROGRAM_TYPE_HULL) {
+                const int producer = plan->producer[o.register_index][selected];
+                if (p->tessellation.phases[plan->phase].kind != DXBC_HULL_PHASE_JOIN || producer < 0 || producer >= plan->phase ||
+                    p->tessellation.phases[producer].kind != DXBC_HULL_PHASE_FORK) return false;
+            }
+        }
+        return use.source_lane_mask != 0;
+    }
     if (o.type == OPERAND_TYPE_DOMAIN_LOCATION) {
         if (p->program_type != DXBC_PROGRAM_TYPE_DOMAIN || !hlsl_lift_operand_is_plain(&o) || o.register_index_dim || o.extended_tokens) return false;
         for (unsigned lane = 0; lane < 4; ++lane) if (use.source_lane_mask & (1u << lane)) {
@@ -318,11 +352,64 @@ static bool source_supported(HLSLEmitterContext *ctx, int index, int operand, vo
         return hlsl_lift_operand_is_plain(&o) && o.register_index == (int)o.index_values[0] &&
             o.index_has_immediate[0] && !o.index_representations[0] &&
             !o.index_value_exceeds_int[0] && o.index_values[0] < p->tessellation.input_control_point_count;
-    return !o.register_index && p->tessellation.phases[plan->phase].kind == DXBC_HULL_PHASE_FORK &&
+    if (p->tessellation.phases[plan->phase].kind != DXBC_HULL_PHASE_FORK) return false;
+    if (!o.rel_op0) return p->tessellation.phases[plan->phase].instance_count == 1 &&
+        hlsl_lift_operand_is_plain(&o) && o.register_index == (int)o.index_values[0] &&
+        o.index_has_immediate[0] && !o.index_representations[0] && !o.index_value_exceeds_int[0] &&
+        o.index_values[0] < p->tessellation.input_control_point_count;
+    return !o.register_index &&
         p->tessellation.phases[plan->phase].instance_count <= p->tessellation.input_control_point_count &&
         o.index_representations[0] == 2 && !o.index_has_immediate[0] && !o.index_values[0] &&
         !o.index_value_exceeds_int[0] && o.rel_op0 && scalar_temp(p, o.rel_op0, false) &&
         claim_index(ctx, plan, hlsl_relative_operand_definition(ctx, index, operand, 0), index);
+}
+/* Resource-free scalar HULL reads have the same selected-compiler ADD
+ * ordering corner as two independently read TEMP lanes. Keep both decoded
+ * children in place using the existing mad(left, 1, right) candidate spelling.
+ * This is deliberately unavailable to DOMAIN, factors, scalar arrays, relative
+ * reads, modifiers, mixed source classes and precision-qualified operations. */
+static bool ordered_add_supported(HLSLEmitterContext *ctx, int index, void *opaque) {
+    PatchPlan *plan = opaque;
+    const USILProgram *p = ctx->program;
+    if (p->program_type != DXBC_PROGRAM_TYPE_HULL || index < 0 ||
+        index >= p->instruction_count || plan->phase < 0 ||
+        (size_t)plan->phase >= p->tessellation.phase_count) return false;
+    const USILHullPhase *phase = &p->tessellation.phases[plan->phase];
+    const USILInstruction *instruction = &p->instructions[index];
+    const uint8_t lanes = usil_operand_destination_lane_mask(&instruction->operands[0]);
+    if (index < phase->first_instruction_index || index >= phase->end_instruction_index ||
+        instruction->opcode != USIL_OP_ADD || instruction->operand_count != 3 ||
+        !lanes || (lanes & (uint8_t)(lanes - 1u)) || instruction->precise_mask || instruction->saturate ||
+        instruction->condition_test != DXBC_INSTRUCTION_TEST_NONE || phase->instance_count != 1 ||
+        (instruction->operands[0].type != OPERAND_TYPE_TEMP && instruction->operands[0].type != OPERAND_TYPE_OUTPUT)) return false;
+    unsigned demanded = 0;
+    while (!(lanes & (1u << demanded))) ++demanded;
+    int selected[2];
+    for (int operand = 1; operand <= 2; ++operand) {
+        const DXBCOperand *source = &instruction->operands[operand];
+        USILOperandUseInfo use;
+        if (!source_supported(ctx, index, operand, plan) || !hlsl_lift_operand_is_plain(source) ||
+            source->extended_token_count || source->extended_tokens || source->min_precision ||
+            !usil_instruction_operand_use(p, instruction, operand, &use) ||
+            use.use != USIL_OPERAND_USE_SOURCE || use.source_lane_mask != lanes) return false;
+        selected[operand - 1] = usil_operand_source_component(source, (int)demanded);
+        if (selected[operand - 1] < 0 || selected[operand - 1] > 3) return false;
+    }
+    const DXBCOperand *left = &instruction->operands[1], *right = &instruction->operands[2];
+    if (left->type != right->type) return false;
+    if (left->type == OPERAND_TYPE_INPUT_CONTROL_POINT) {
+        const int field = plan->phase_field[plan->phase];
+        return phase->kind == DXBC_HULL_PHASE_FORK && field >= 0 &&
+            plan->layout.fields[field].kind == HLSL_PATCH_CUSTOM &&
+            plan->layout.fields[field].count == 1 && plan->layout.fields[field].width > 1 &&
+            selected[0] == selected[1] && left->index_values[0] != right->index_values[0];
+    }
+    if (left->type != OPERAND_TYPE_INPUT_PATCH_CONSTANT || phase->kind != DXBC_HULL_PHASE_JOIN ||
+        left->register_index != right->register_index || selected[0] == selected[1]) return false;
+    const int field = plan->layout.lane_field[left->register_index][selected[0]];
+    return field >= 0 && field == plan->layout.lane_field[right->register_index][selected[1]] &&
+        plan->layout.fields[field].kind == HLSL_PATCH_CUSTOM &&
+        plan->layout.fields[field].count == 1 && plan->layout.fields[field].width > 1;
 }
 static ASTExpr *owned_atom(HLSLEmitterContext *ctx, const char *text, int index, int operand,
                            uint8_t lanes, unsigned natural, unsigned selected, uint64_t id) {
@@ -338,25 +425,92 @@ static ASTExpr *owned_atom(HLSLEmitterContext *ctx, const char *text, int index,
     }
     return ast_create_emitter_operand_with_provenance(text, &origin);
 }
+static ASTExpr *patch_atom(HLSLEmitterContext *ctx, const PatchPlan *plan,
+                           int index, int operand, uint8_t lanes,
+                           int field, unsigned element, unsigned component, unsigned count) {
+    const HLSLPatchField *f = &plan->layout.fields[field];
+    char base[400], text[420], projection[5] = {0};
+    if (component + count > f->width || !count) return NULL;
+    if (f->count > 1) {
+        if (!hlsl_format_checked(ctx, base, sizeof(base), "%s.%s[%u]", plan->names[FACTOR_VARIABLE],
+            plan->field_names[field], element)) return NULL;
+    } else if (!hlsl_format_checked(ctx, base, sizeof(base), "%s.%s", plan->names[FACTOR_VARIABLE],
+                                   plan->field_names[field])) return NULL;
+    if (count == f->width && !component) {
+        if (!hlsl_copy_checked(ctx, text, sizeof(text), base)) return NULL;
+    } else {
+        for (unsigned c = 0; c < count; ++c) projection[c] = "xyzw"[component + c];
+        if (!hlsl_format_checked(ctx, text, sizeof(text), "%s.%s", base, projection)) return NULL;
+    }
+    ASTOperandProvenance origin;
+    ast_operand_provenance_init(&origin);
+    origin.complete = true; origin.value_role = AST_OPERAND_VALUE_LOGICAL;
+    origin.logical_value_id = UINT64_C(0x9000000000000000) | (uint64_t)(unsigned)field << 8 | element;
+    origin.natural_components = f->width; origin.result_components = (uint8_t)count;
+    for (unsigned c = 0; c < count; ++c) origin.selected_components[c] = (uint8_t)(component + c);
+    origin.selection_role = count == f->width && !component ? AST_COMPONENT_SELECTION_NONE : AST_COMPONENT_SELECTION_SEMANTIC;
+    origin.instruction_index = index; origin.source_instruction_index = ctx->program->instructions[index].source_instruction_index;
+    origin.operand_index = operand; origin.destination_lanes = lanes;
+    return ast_create_emitter_operand_with_provenance(text, &origin);
+}
+static ASTExpr *patch_source_expression(HLSLEmitterContext *ctx, const PatchPlan *plan,
+                                      int index, int operand, uint8_t lanes) {
+    const DXBCOperand *o = &ctx->program->instructions[index].operands[operand];
+    int fields[4], elements[4], components[4], count = 0;
+    bool same = true;
+    for (unsigned lane = 0; lane < 4; ++lane) if (lanes & (1u << lane)) {
+        const int physical = usil_operand_source_component(o, (int)lane);
+        if (physical < 0 || physical >= 4 || o->register_index < 0 || (unsigned)o->register_index >= plan->layout.row_count) return NULL;
+        fields[count] = plan->layout.lane_field[o->register_index][physical];
+        if (fields[count] < 0) return NULL;
+        elements[count] = plan->layout.lane_element[o->register_index][physical];
+        components[count] = plan->layout.lane_component[o->register_index][physical];
+        same &= !count || (fields[count] == fields[0] && elements[count] == elements[0] && components[count] == components[0]);
+        ++count;
+    }
+    if (!count) return NULL;
+    if (same) return patch_atom(ctx, plan, index, operand, lanes, fields[0], (unsigned)elements[0], (unsigned)components[0], 1);
+    ASTExpr *arguments[4] = {0};
+    int argument_count = 0;
+    for (int first = 0; first < count;) {
+        int length = 1;
+        while (first + length < count && fields[first + length] == fields[first] &&
+            elements[first + length] == elements[first] && components[first + length] == components[first] + length) ++length;
+        arguments[argument_count] = patch_atom(ctx, plan, index, operand, lanes, fields[first],
+            (unsigned)elements[first], (unsigned)components[first], (unsigned)length);
+        if (!arguments[argument_count++]) goto bad;
+        first += length;
+    }
+    if (argument_count == 1) return arguments[0];
+    char type[20];
+    if (!hlsl_format_checked(ctx, type, sizeof(type), "float%d", count)) goto bad;
+    ASTExpr *composition = ast_create_call(type, arguments, argument_count);
+    if (!composition) goto bad;
+    ASTLogicalValueOrigin origin;
+    ast_logical_value_origin_init(&origin);
+    origin.complete = true; origin.scalar_type = AST_SCALAR_FLOAT32; origin.components = (uint8_t)count;
+    origin.logical_value_id = (uint64_t)index; origin.instruction_index = index;
+    origin.source_instruction_index = ctx->program->instructions[index].source_instruction_index;
+    origin.destination_lanes = lanes;
+    if (!ast_set_logical_value_origin(composition, &origin)) { ast_free_expr(composition); return NULL; }
+    return composition;
+bad:
+    for (int argument = 0; argument < argument_count; ++argument) ast_free_expr(arguments[argument]);
+    return NULL;
+}
 static ASTExpr *source_expression(HLSLEmitterContext *ctx, int index, int operand, uint8_t lanes, void *opaque) {
     PatchPlan *plan = opaque;
     if (!source_supported(ctx, index, operand, opaque)) return NULL;
     const DXBCOperand *o = &ctx->program->instructions[index].operands[operand];
     char text[400];
-    if (o->type == OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
-        int field = plan->layout.register_field[o->register_index];
-        if (plan->layout.fields[field].count > 1) {
-            if (!hlsl_format_checked(ctx, text, sizeof(text), "%s.%s[%u]", plan->names[FACTOR_VARIABLE], plan->field_names[field],
-                                     (unsigned)plan->layout.register_element[o->register_index])) return NULL;
-        } else if (!hlsl_format_checked(ctx, text, sizeof(text), "%s.%s", plan->names[FACTOR_VARIABLE], plan->field_names[field])) return NULL;
-        return owned_atom(ctx, text, index, operand, lanes, 1, 0, UINT64_C(0x9000000000000000) | (unsigned)o->register_index);
-    }
+    if (o->type == OPERAND_TYPE_INPUT_PATCH_CONSTANT)
+        return patch_source_expression(ctx, plan, index, operand, lanes);
     const bool location = o->type == OPERAND_TYPE_DOMAIN_LOCATION;
     const unsigned natural = location ? plan->shape.coordinate_count : 4;
     char base[320];
     if (location) {
         if (!hlsl_copy_checked(ctx, base, sizeof(base), plan->names[LOCATION])) return NULL;
-    } else if (ctx->program->program_type == DXBC_PROGRAM_TYPE_HULL) {
+    } else if (ctx->program->program_type == DXBC_PROGRAM_TYPE_HULL && o->rel_op0) {
         if (!hlsl_format_checked(ctx, base, sizeof(base), "%s[%s].%s", plan->names[PATCH_VARIABLE], plan->names[INSTANCE_INDEX], plan->names[POINT_FIELD])) return NULL;
     } else if (!hlsl_format_checked(ctx, base, sizeof(base), "%s[%u].%s", plan->names[PATCH_VARIABLE],
                                   (unsigned)o->index_values[0], plan->names[POINT_FIELD])) return NULL;
@@ -368,7 +522,8 @@ static ASTExpr *source_expression(HLSLEmitterContext *ctx, int index, int operan
         ++width;
     }
     const uint64_t id = (location ? UINT64_C(0xb000000000000000) : UINT64_C(0xa000000000000000)) |
-        (ctx->program->program_type == DXBC_PROGRAM_TYPE_HULL ? (uint64_t)plan->phase << 32 : o->index_values[0]);
+        (ctx->program->program_type == DXBC_PROGRAM_TYPE_HULL ? (uint64_t)plan->phase << 32 |
+            (!o->rel_op0 ? UINT64_C(0x100000) | o->index_values[0] : 0) : o->index_values[0]);
     if (identity && width == (int)natural) {
         ASTOperandProvenance origin;
         ast_operand_provenance_init(&origin);
@@ -412,6 +567,7 @@ static bool append_destination(HLSLEmitterContext *ctx, int index, void *opaque)
         const int field = plan->phase_field[plan->phase];
         sb_appendf(ctx->sb, "%s.%s", plan->names[FACTOR_VARIABLE], plan->field_names[field]);
         if (plan->layout.fields[field].count > 1) sb_appendf(ctx->sb, "[%s]", plan->names[INSTANCE_INDEX]);
+        if (plan->layout.fields[field].width > 1) sb_appendf(ctx->sb, ".%c", "xyzw"[plan->phase_component[plan->phase]]);
     }
     return sb_ok(ctx->sb);
 }
@@ -514,7 +670,8 @@ static void emit_structures(HLSLEmitterContext *ctx, const PatchPlan *plan) {
     hlsl_source_quality_emission(ctx, 0, false, -1);
     for (unsigned field = 0; field < plan->layout.field_count; ++field) {
         const HLSLPatchField *f = &plan->layout.fields[field];
-        sb_appendf(ctx->sb, "    float %s", plan->field_names[field]);
+        if (f->width == 1) sb_appendf(ctx->sb, "    float %s", plan->field_names[field]);
+        else sb_appendf(ctx->sb, "    float%u %s", (unsigned)f->width, plan->field_names[field]);
         if (f->count > 1) sb_appendf(ctx->sb, "[%u]", (unsigned)f->count);
         sb_appendf(ctx->sb, " : %s", f->semantic);
         if (f->kind == HLSL_PATCH_CUSTOM) sb_appendf(ctx->sb, "%u", f->semantic_index);
@@ -582,7 +739,8 @@ bool hlsl_emit_high_level_hull_join(HLSLEmitterContext *ctx) {
         ctx->indent = 8;
         const HLSLPureExpressionScope scope = {.first_instruction = s->first_instruction_index, .end_instruction = s->end_instruction_index,
             .omitted_instructions = &plan.index_transports, .destination_supported = destination_supported, .append_destination = append_destination,
-            .source_supported = source_supported, .source_expression = source_expression, .context = &plan};
+            .source_supported = source_supported, .source_expression = source_expression,
+            .ordered_add_supported = ordered_add_supported, .context = &plan};
         if (!hlsl_emit_pure_expression_scope(ctx, &scope)) return finish(ctx, false, 3);
         const size_t end_begin = ctx->sb->len;
         sb_append(ctx->sb, "    }\n"); hlsl_source_quality_emission(ctx, 0, false, s->end_instruction_index - 1);

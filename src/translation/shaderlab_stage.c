@@ -11,6 +11,7 @@
 #include "translation/hlsl_unity_uv_lift.h"
 #include "translation/shaderlab_emitter_internal.h"
 #include "translation/shaderlab_source_quality_internal.h"
+#include "translation/hlsl_emitted_matrix_uses_internal.h"
 #include "translation/usil.h"
 
 #include <inttypes.h>
@@ -650,7 +651,8 @@ static bool translate_stage_to_hlsl(
     const char *const *reserved_preprocessor_identifiers,
     size_t reserved_preprocessor_identifier_count, bool high_level,
     bool unity_uv_helpers, bool *unity_uv_used,
-    ShaderLabExpressionSourceRecord *record, ShaderLabStageDiagnostic *diagnostic) {
+    ShaderLabExpressionSourceRecord *record, ShaderLabEmittedMatrixUses *matrix_uses,
+    ShaderLabStageDiagnostic *diagnostic) {
   if (!pass || !out_hlsl || !names || stage_index < 0 || stage_index >= 6 ||
       subprogram_index < 0 ||
       subprogram_index >= pass->subprogram_count[stage_index] ||
@@ -841,11 +843,23 @@ static bool translate_stage_to_hlsl(
       reserved_preprocessor_identifiers;
   emit_options.reserved_preprocessor_identifier_count =
       reserved_preprocessor_identifier_count;
+  HLSLMatrixUseCapture *matrix_capture = NULL;
+  if (matrix_uses && !shaderlab_matrix_uses_begin(matrix_uses, record, &usil,
+          raw_view.data, raw_view.size, payload, payload_length, selected_parameters,
+          &pass->common_parameters[stage_index], &matrix_capture)) {
+    set_diagnostic(diagnostic, SHADERLAB_STAGE_HLSL_EMISSION_FAILED,
+                   stage_index, subprogram_index, -1);
+    usil_free(&usil);
+    goto cleanup;
+  }
   HLSLEmitDiagnostic hlsl_diagnostic;
-  if (!hlsl_emit_with_options_diagnostic(
-          &usil, out_hlsl, selected_parameters,
-          &pass->common_parameters[stage_index], names, &emit_options,
-          &hlsl_diagnostic)) {
+  bool emitted = matrix_capture ? hlsl_emit_with_matrix_capture(
+          &usil, out_hlsl, selected_parameters, &pass->common_parameters[stage_index],
+          names, &emit_options, matrix_capture, &hlsl_diagnostic) :
+      hlsl_emit_with_options_diagnostic(&usil, out_hlsl, selected_parameters,
+          &pass->common_parameters[stage_index], names, &emit_options, &hlsl_diagnostic);
+  if (!emitted || (matrix_capture && !shaderlab_matrix_uses_finish(
+          matrix_capture, out_hlsl, &record->instructions))) {
     set_diagnostic(diagnostic, SHADERLAB_STAGE_HLSL_EMISSION_FAILED,
                    stage_index, subprogram_index, -1);
     if (diagnostic) diagnostic->hlsl = hlsl_diagnostic;
@@ -1023,7 +1037,7 @@ bool emit_stage_hlsl(const SerializedPass *pass, int stage_index,
             pass, stage_index, variant->subprogram_index, blob_entries,
             entry_count, segments, segment_lengths, segment_count,
             &variant_hlsl, &names,
-            (const char *const *)plan.keywords, plan.keyword_count, false, false, NULL, NULL,
+            (const char *const *)plan.keywords, plan.keyword_count, false, false, NULL, NULL, NULL,
             diagnostic)) {
       sb_free(&variant_hlsl);
       sb_free(&stage_output);
@@ -1735,7 +1749,7 @@ bool emit_stage_hlsl_with_variant_plan_mode(
                   variant_plan->shader->keyword_names.keywords,
               (size_t)variant_plan->shader->keyword_names.count, high_level,
               trace && trace->unity_uv_helpers, trace ? trace->unity_uv_used : NULL,
-              source_map ? &record : NULL, diagnostic)) {
+              source_map ? &record : NULL, quality_capture ? quality_capture->matrix_uses : NULL, diagnostic)) {
         sb_free(&variant_hlsl);
         sb_free(&stage_output);
         mem_free(generated_used,

@@ -196,6 +196,117 @@ void serialized_program_parameters_free(SerializedProgramParameters* params) {
     memset(params, 0, sizeof(*params));
 }
 
+enum { VARIANT_EQUAL_KEYWORD_LIMIT = 4096, VARIANT_EQUAL_TARGET_LIMIT = 64 * 1024 * 1024 };
+
+static bool variant_keyword_text_valid(const char *text) {
+    if (!text || !text[0]) return false;
+    for (size_t index = 0; index <= 4096; ++index)
+        if (!text[index]) return true;
+    return false;
+}
+
+static bool variant_keywords_valid(char *const *values, int count) {
+    if (count < 0 || count > VARIANT_EQUAL_KEYWORD_LIMIT || (count && !values)) return false;
+    for (int index = 0; index < count; ++index) {
+        if (!variant_keyword_text_valid(values[index])) return false;
+        for (int prior = 0; prior < index; ++prior)
+            if (!strcmp(values[index], values[prior])) return false;
+    }
+    return true;
+}
+
+static bool variant_has_valid_shape(const PlayerSubProgramMetadata *player) {
+    return player && variant_keywords_valid(player->local_keywords, player->local_keyword_count) &&
+        variant_keywords_valid(player->global_keywords, player->global_keyword_count) &&
+        player->bytecode && player->bytecode_length && player->bytecode_length <= VARIANT_EQUAL_TARGET_LIMIT &&
+        player->binding_count >= 0 && player->binding_count <= VARIANT_EQUAL_KEYWORD_LIMIT &&
+        (!player->binding_count || player->bindings);
+}
+
+static bool variant_keywords_equal(char *const *left, int left_count, char *const *right, int right_count) {
+    if (left_count != right_count) return false;
+    for (int index = 0; index < left_count; ++index)
+        if (strcmp(left[index], right[index])) return false;
+    return true;
+}
+
+bool subprogram_metadata_variant_equal(const PlayerSubProgramMetadata *left, const PlayerSubProgramMetadata *right) {
+    if (!variant_has_valid_shape(left) || !variant_has_valid_shape(right) || left->version != right->version || left->dialect != right->dialect ||
+        left->program_type != right->program_type || left->has_player_blob_header != right->has_player_blob_header ||
+        memcmp(left->player_header_words, right->player_header_words, sizeof(left->player_header_words)) ||
+        left->source_map != right->source_map || left->bytecode_length != right->bytecode_length ||
+        memcmp(left->bytecode, right->bytecode, left->bytecode_length) || left->binding_count != right->binding_count ||
+        !variant_keywords_equal(left->local_keywords, left->local_keyword_count, right->local_keywords, right->local_keyword_count) ||
+        !variant_keywords_equal(left->global_keywords, left->global_keyword_count, right->global_keywords, right->global_keyword_count)) return false;
+    for (int index = 0; index < left->binding_count; ++index)
+        if (left->bindings[index].channel != right->bindings[index].channel ||
+            left->bindings[index].component != right->bindings[index].component) return false;
+    return true;
+}
+
+/* Equality accepts valid typed models, including dormant fields. Pool addresses
+ * and allocation identity never supply equality. */
+static bool parameters_have_valid_shape(const SerializedProgramParameters *parameters) {
+    if (!parameters || parameters->cb_count < 0 || parameters->res_count < 0 ||
+        (parameters->cb_count && !parameters->constant_buffers) ||
+        (parameters->res_count && !parameters->resources)) return false;
+    for (int index = 0; index < parameters->cb_count; ++index) {
+        const SerializedConstantBuffer *buffer = &parameters->constant_buffers[index];
+        if (!buffer->name || buffer->var_count < 0 || buffer->struct_count < 0 ||
+            (buffer->var_count && !buffer->variables) ||
+            (buffer->struct_count && !buffer->struct_params)) return false;
+        for (int field = 0; field < buffer->var_count; ++field)
+            if (!buffer->variables[field].name) return false;
+        for (int structure = 0; structure < buffer->struct_count; ++structure) {
+            const SerializedStructParam *value = &buffer->struct_params[structure];
+            if (!value->name || value->member_count < 0 ||
+                (value->member_count && !value->members)) return false;
+            for (int member = 0; member < value->member_count; ++member)
+                if (!value->members[member].name) return false;
+        }
+    }
+    for (int index = 0; index < parameters->res_count; ++index)
+        if (!parameters->resources[index].name) return false;
+    return true;
+}
+
+/* Compare typed fields rather than allocation addresses, pools or C padding. */
+static bool parameter_variable_equal(const SerializedVariable *left, const SerializedVariable *right) {
+    return right->name && !strcmp(left->name, right->name) &&
+        !memcmp(left->layout, right->layout, sizeof(left->layout));
+}
+bool serialized_program_parameters_equal(const SerializedProgramParameters *left, const SerializedProgramParameters *right) {
+    if (!parameters_have_valid_shape(left) || !parameters_have_valid_shape(right)) return false;
+    if (!right || left->version != right->version || left->dialect != right->dialect ||
+        left->is_binary != right->is_binary || left->cb_count != right->cb_count || left->res_count != right->res_count ||
+        (right->cb_count && !right->constant_buffers) || (right->res_count && !right->resources)) return false;
+    for (int index = 0; index < left->cb_count; ++index) {
+        const SerializedConstantBuffer *a = &left->constant_buffers[index], *b = &right->constant_buffers[index];
+        if (!b->name || strcmp(a->name, b->name) || a->role != b->role || a->size != b->size ||
+            a->has_is_partial != b->has_is_partial || a->is_partial != b->is_partial ||
+            a->var_count != b->var_count || a->struct_count != b->struct_count ||
+            (b->var_count && !b->variables) || (b->struct_count && !b->struct_params)) return false;
+        for (int field = 0; field < a->var_count; ++field)
+            if (!parameter_variable_equal(&a->variables[field], &b->variables[field])) return false;
+        for (int structure = 0; structure < a->struct_count; ++structure) {
+            const SerializedStructParam *sa = &a->struct_params[structure], *sb = &b->struct_params[structure];
+            if (!sb->name || strcmp(sa->name, sb->name) || memcmp(sa->layout, sb->layout, sizeof(sa->layout)) ||
+                sa->member_count != sb->member_count || (sb->member_count && !sb->members)) return false;
+            for (int member = 0; member < sa->member_count; ++member)
+                if (!parameter_variable_equal(&sa->members[member], &sb->members[member])) return false;
+        }
+    }
+    for (int index = 0; index < left->res_count; ++index) {
+        const SerializedResourceParam *a = &left->resources[index], *b = &right->resources[index];
+        if (!b->name || strcmp(a->name, b->name) || a->bind_type != b->bind_type || a->bind_index != b->bind_index ||
+            a->array_size != b->array_size || a->dimension != b->dimension || a->sampler_index != b->sampler_index ||
+            a->multisampled != b->multisampled || a->original_index != b->original_index ||
+            a->sampler_state != b->sampler_state || memcmp(a->extra, b->extra, sizeof(a->extra))) return false;
+    }
+    return true;
+}
+
+
 bool serialized_program_parameters_copy(SerializedProgramParameters* dest,
                                         const SerializedProgramParameters* src) {
     if (!dest || !src || src->cb_count < 0 || src->res_count < 0 ||
