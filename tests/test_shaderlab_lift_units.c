@@ -403,14 +403,13 @@ static int test_verified_and_fallback(void) {
         CHECK(strstr(json, "\"source_quality\":{\"scope\":\"observed-source-units\""));
         CHECK(strstr(json, "\"whole_source_quality\":\"unavailable\""));
         CHECK(baseline->bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_UNSUPPORTED_MODE);
-        CHECK(candidate->bounded_source_inventory.status == (passes == 1 ?
-            UNITY_SHADERLAB_INVENTORY_OBSERVED : UNITY_SHADERLAB_INVENTORY_SCOPE_UNAVAILABLE));
-        if (passes == 1) {
-            CHECK(candidate->bounded_source_inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
-            CHECK(candidate->bounded_source_inventory.quality.gaps & SHADERLAB_SOURCE_GAP_SCHEMA_AUTHORITY);
-            CHECK(strstr(json, "\"bounded_source_inventory\":{\"scope\":\"emitted-shaderlab-with-explicit-gaps\""));
-            CHECK(strstr(json, "\"classification\":\"mixed\""));
-        }
+        CHECK(candidate->bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_OBSERVED);
+        CHECK(candidate->bounded_source_inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+        CHECK(candidate->bounded_source_inventory.quality.gaps & SHADERLAB_SOURCE_GAP_SCHEMA_AUTHORITY);
+        CHECK(candidate->bounded_source_inventory.quality.linked_entry_count == (size_t)passes * 2);
+        CHECK(candidate->bounded_source_inventory.quality.required_external_include_root_count == (size_t)passes);
+        CHECK(strstr(json, "\"bounded_source_inventory\":{\"scope\":\"emitted-shaderlab-with-explicit-gaps\""));
+        CHECK(strstr(json, "\"classification\":\"mixed\""));
         CHECK(strstr(json, "\"recorded\":true,\"response_received\":true"));
         char lift_identity[128];
         snprintf(lift_identity, sizeof(lift_identity), "\"lift\":{\"id\":\"%s\",\"version\":%u}",
@@ -567,14 +566,12 @@ static int test_independent_geometry_candidate(void) {
         CHECK(candidate->certified_pass_count == (size_t)passes &&
               shaderlab_expression_source_map_matches_source(&candidate->source_map,
                                                               &candidate->source));
-        CHECK(candidate->bounded_source_inventory.status == (passes == 1
-            ? UNITY_SHADERLAB_INVENTORY_OBSERVED : UNITY_SHADERLAB_INVENTORY_SCOPE_UNAVAILABLE));
-        if (passes == 1) {
-            CHECK(candidate->bounded_source_inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
-            CHECK(candidate->bounded_source_inventory.quality.linked_entry_count == 3);
-            CHECK(unity_shaderlab_lift_inventory_matches_source(candidate, candidate->source.len,
-                candidate->bounded_source_inventory.source_digest));
-        }
+        CHECK(candidate->bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_OBSERVED);
+        CHECK(candidate->bounded_source_inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+        CHECK(candidate->bounded_source_inventory.quality.linked_entry_count == (size_t)passes * 3);
+        CHECK(candidate->bounded_source_inventory.quality.required_external_include_root_count == (size_t)passes);
+        CHECK(unity_shaderlab_lift_inventory_matches_source(candidate, candidate->source.len,
+            candidate->bounded_source_inventory.source_digest));
         CHECK(strstr(candidate->source.buf, "TriangleStream<") &&
               strstr(candidate->source.buf, ".Append(") &&
               strstr(candidate->source.buf, ".RestartStrip()"));

@@ -151,10 +151,31 @@ static bool test_inventory(void) {
     unity_shaderlab_lift_record_inventory(&input, &artifact);
     CHECK(artifact.bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_SCOPE_UNAVAILABLE);
     fixture.shader.dependency_count = 0;
+    SerializedPass multiple_passes[2] = {fixture.pass, fixture.pass};
     fixture.subshader.pass_count = 2;
+    fixture.subshader.passes = multiple_passes;
     unity_shaderlab_lift_record_inventory(&input, &artifact);
-    CHECK(artifact.bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_SCOPE_UNAVAILABLE);
+    CHECK(artifact.bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_SOURCE_MISMATCH);
+    /* A changed complete model cannot certify the old selected bytes. A
+     * separately produced whole two-pass artifact retains its own coverage. */
+    UnityShaderLabLiftArtifact complete_multiple = {.attempted = true, .high_level = true,
+        .emission_attempted = true};
+    sb_init(&complete_multiple.source);
+    CHECK(shaderlab_emit_high_level_candidate_with_source_map(&fixture.shader,
+        fixture.archive.entries, fixture.archive.entry_count, fixture.archive.segments,
+        fixture.archive.segment_lengths, fixture.archive.segment_count, &complete_multiple.source,
+        &complete_multiple.source_map, NULL));
+    unity_shaderlab_lift_record_inventory(&input, &complete_multiple);
+    CHECK(complete_multiple.bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_OBSERVED);
+    CHECK(complete_multiple.bounded_source_inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+    CHECK(complete_multiple.bounded_source_inventory.quality.linked_entry_count == 4);
+    CHECK(complete_multiple.bounded_source_inventory.quality.required_external_include_root_count == 2);
+    CHECK(unity_shaderlab_lift_inventory_matches_source(&complete_multiple, complete_multiple.source.len,
+        complete_multiple.bounded_source_inventory.source_digest));
+    shaderlab_expression_source_map_free(&complete_multiple.source_map);
+    sb_free(&complete_multiple.source);
     fixture.subshader.pass_count = 1;
+    fixture.subshader.passes = &fixture.pass;
     CHECK(observed_inventory(&fixture, &artifact));
     artifact.high_level = false;
     unity_shaderlab_lift_record_inventory(&input, &artifact);

@@ -1057,6 +1057,7 @@ static bool validate_program_for_hlsl(const USILProgram *program,
   if (program->program_type == DXBC_PROGRAM_TYPE_HULL ||
       program->program_type == DXBC_PROGRAM_TYPE_DOMAIN) {
     if (hlsl_high_level_hull_source_supported(program, mode) ||
+        hlsl_high_level_patch_domain_supported(program, mode) ||
         hlsl_exact_tessellation_lift_matches(program)) return true;
     if (!hlsl_high_level_domain_interface_supported(program, mode)) {
       hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
@@ -1892,6 +1893,7 @@ static bool hlsl_emit_with_options_impl(
         program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
         !hlsl_high_level_geometry_interface_supported(program, emit_mode) &&
         !hlsl_high_level_domain_interface_supported(program, emit_mode) &&
+        !hlsl_high_level_patch_domain_supported(program, emit_mode) &&
         !hlsl_high_level_hull_source_supported(program, emit_mode)))) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                           HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
@@ -1985,6 +1987,13 @@ static bool hlsl_emit_with_options_impl(
 
   if (hlsl_high_level_hull_source_supported(program, emit_mode)) {
     const bool emitted = hlsl_emit_high_level_hull_stage(&ctx);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return emitted && sb_ok(sb);
+  }
+
+  if (hlsl_high_level_patch_domain_supported(program, emit_mode)) {
+    const bool emitted = hlsl_emit_high_level_patch_domain(&ctx);
     free_emitter_context(&ctx);
     free(ctx_ptr);
     return emitted && sb_ok(sb);

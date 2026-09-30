@@ -334,6 +334,12 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
             scope->destination_supported(ctx, index, scope->context);
         const bool stage_source = operand && scope && scope->source_supported &&
             scope->source_supported(ctx, index, operand, scope->context);
+        if (scope && scope->compose_disjoint_temp_lanes && value->type == OPERAND_TYPE_TEMP &&
+            (value->register_index_dim != 1 || value->register_index < 0 ||
+             !value->index_has_immediate[0] || value->index_representations[0] ||
+             value->index_value_exceeds_int[0] || value->index_values[0] != (uint32_t)value->register_index ||
+             value->rel_op0 || value->rel_op1 || value->rel_op2))
+            return reject(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
         if (!stage_destination && !stage_source && !hlsl_lift_operand_is_plain(&unmodified))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         const bool domain_input = ctx->high_level_domain &&
@@ -387,6 +393,7 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
             if (!usil_instruction_shape_valid(program, inst) ||
                 (inst->opcode != USIL_OP_MOV && inst->opcode != USIL_OP_ADD &&
                  inst->opcode != USIL_OP_MUL && inst->opcode != USIL_OP_MAD &&
+                 inst->opcode != USIL_OP_MIN && inst->opcode != USIL_OP_MAX &&
                  inst->opcode != USIL_OP_RET))
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             for (int operand = 1; operand < inst->operand_count; ++operand)
@@ -443,6 +450,27 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
             if (inst->operands[operand].type != OPERAND_TYPE_TEMP)
                 continue;
             const int definition = vector_definition(ctx, index, operand);
+            if (definition < 0 && scope && scope->compose_disjoint_temp_lanes) {
+                const uint8_t demanded = source_lanes(ctx, index, operand);
+                HLSLInstructionOwners definitions = {0};
+                if (!demanded) return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+                for (int lane = 0; lane < 4; ++lane) {
+                    if (!(demanded & (1u << lane))) continue;
+                    const int owner = hlsl_operand_definition(ctx, index, operand, lane);
+                    const int selected = usil_operand_source_component(&inst->operands[operand], lane);
+                    if (owner < first || owner >= index || selected < 0 || selected > 3 ||
+                        (scope->omitted_instructions && hlsl_instruction_owners_contains(scope->omitted_instructions, owner)) ||
+                        program->instructions[owner].operands[0].type != OPERAND_TYPE_TEMP ||
+                        program->instructions[owner].operands[0].register_index != inst->operands[operand].register_index ||
+                        !(usil_operand_destination_lane_mask(&program->instructions[owner].operands[0]) & (1u << selected)) ||
+                        !hlsl_instruction_owners_add(&definitions, owner))
+                        return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+                }
+                for (int owner = first; owner < index; ++owner)
+                    if (hlsl_instruction_owners_contains(&definitions, owner))
+                        uses[owner] = uses[owner] < 2 ? 2 : uses[owner] + 1;
+                continue;
+            }
             if (definition < 0)
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
             ++uses[definition];
@@ -625,14 +653,77 @@ static ASTExpr *vector_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *s
     return formatted_source_atom(ctx, source, mask, false, instruction, operand);
 }
 
+static ASTExpr *disjoint_temp_composition(HLSLEmitterContext *ctx, int instruction, int operand,
+                                        uint8_t mask, const DXBCOperand *source,
+                                        const uint8_t *logical_widths) {
+    const int width = lane_count(mask);
+    if (width < 2 || width > 4) return NULL;
+    int owners[4], selections[4], lanes[4], leaf_count = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!(mask & (1u << lane))) continue;
+        owners[leaf_count] = hlsl_operand_definition(ctx, instruction, operand, lane);
+        selections[leaf_count] = usil_operand_source_component(source, lane);
+        lanes[leaf_count++] = lane;
+    }
+    ASTExpr *arguments[4] = {0};
+    int count = 0;
+    for (int leaf = 0; leaf < leaf_count;) {
+        const int owner = owners[leaf];
+        if (owner < 0 || owner >= instruction || selections[leaf] < 0 || selections[leaf] > 3) goto failed;
+        const DXBCOperand *destination = &ctx->program->instructions[owner].operands[0];
+        const uint8_t producer_mask = usil_operand_destination_lane_mask(destination);
+        const unsigned natural = logical_widths[owner];
+        if (!natural || natural > 4 || !(producer_mask & (1u << selections[leaf]))) goto failed;
+        char name[48];
+        if (!value_name(ctx, owner, name)) goto failed;
+        ASTExpr *value = ast_create_var(owner, source->register_index, OPERAND_TYPE_TEMP, name);
+        value = logical_expression(ctx, value, owner, producer_mask, natural);
+        if (!value) goto failed;
+        /* Join a contiguous, ascending selection from one owned natural value.
+         * A complete float3 zero producer remains one float3 argument rather
+         * than three component reads spelling out physical register packing. */
+        int group = 1;
+        while (leaf + group < leaf_count && owners[leaf + group] == owner &&
+               selections[leaf + group] == selections[leaf] + group &&
+               (producer_mask & (1u << selections[leaf + group])) && natural > 1) ++group;
+        const int first_component = lane_count((uint8_t)(producer_mask & ((1u << selections[leaf]) - 1u)));
+        if (natural > 1 && (first_component || group != (int)natural)) {
+            int components[4];
+            for (int component = 0; component < group; ++component) {
+                components[component] = first_component + component;
+                if (components[component] >= (int)natural) { ast_free_expr(value); goto failed; }
+            }
+            ASTExpr *projection = ast_create_swizzle(value, components, group);
+            if (!projection) { ast_free_expr(value); goto failed; }
+            uint8_t projection_lanes = 0;
+            for (int component = 0; component < group; ++component)
+                projection_lanes |= (uint8_t)(1u << lanes[leaf + component]);
+            value = logical_expression(ctx, projection, instruction, projection_lanes, (unsigned)group);
+            if (!value) goto failed;
+            value->logical_origin.semantic_projection = true;
+        }
+        arguments[count++] = value;
+        leaf += group;
+    }
+    static const char *const constructors[] = {NULL, NULL, "float2", "float3", "float4"};
+    ASTExpr *composition = ast_create_call(constructors[width], arguments, count);
+    if (!composition) goto failed;
+    return logical_expression(ctx, composition, instruction, mask, (unsigned)width);
+failed:
+    for (int component = 0; component < count; ++component) ast_free_expr(arguments[component]);
+    return NULL;
+}
+
 static ASTExpr *source_expression_unmodified(HLSLEmitterContext *ctx, int instruction, int operand,
                                   const unsigned *uses, ASTExpr **pending, HLSLInstructionOwners *pending_owners,
                                   HLSLInstructionOwners *owners, const DXBCOperand *source,
-                                  const uint8_t *logical_widths) {
+                                  const uint8_t *logical_widths, bool compose_disjoint) {
     const uint8_t mask = source_lanes(ctx, instruction, operand);
     if (!mask) return NULL;
     if (source->type == OPERAND_TYPE_TEMP) {
         int definition = vector_definition(ctx, instruction, operand);
+        if (definition < 0 && compose_disjoint)
+            return disjoint_temp_composition(ctx, instruction, operand, mask, source, logical_widths);
         if (definition < 0)
             return NULL;
         ASTExpr *value = NULL;
@@ -716,7 +807,8 @@ static ASTExpr *source_expression(HLSLEmitterContext *ctx, int instruction, int 
         scope->source_supported(ctx, instruction, operand, scope->context)
         ? scope->source_expression(ctx, instruction, operand, lanes, scope->context)
         : source_expression_unmodified(ctx, instruction, operand, uses,
-            pending, pending_owners, owners, &unmodified, logical_widths);
+            pending, pending_owners, owners, &unmodified, logical_widths,
+            scope && scope->compose_disjoint_temp_lanes);
     if (expression && original->has_abs) {
         const unsigned width = expression_width(expression);
         ASTExpr *call = ast_create_call("abs", &expression, 1);

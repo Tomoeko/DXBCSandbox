@@ -468,11 +468,33 @@ static bool signature_declaration_matches_element(
           declaration->array_element_count == program->tessellation.input_control_point_count) ||
          (role == DXBC_SIGNATURE_ROLE_OUTPUT && declaration->kind == USIL_SIGNATURE_DECL_OUTPUT &&
           declaration->operand_type == OPERAND_TYPE_OUTPUT && !declaration->has_array_element_count));
+    bool hull_patch_phase_position = false;
+    if (program && program->program_type == DXBC_PROGRAM_TYPE_HULL && program->has_stage_contract &&
+        program->tessellation.valid && program->tessellation.phases &&
+        program->tessellation.phase_count <= 64 &&
+        program->tessellation.phase_capacity >= program->tessellation.phase_count &&
+        role == DXBC_SIGNATURE_ROLE_INPUT && declaration->kind == USIL_SIGNATURE_DECL_INPUT &&
+        declaration->operand_type == OPERAND_TYPE_INPUT_CONTROL_POINT &&
+        declaration->has_array_element_count &&
+        declaration->array_element_count == program->tessellation.input_control_point_count &&
+        element->system_value == 1u && element->component_type == 3u &&
+        element->semantic_index == 0u && element->mask == 15u &&
+        !element->min_precision && !element->stream_index && !element->interpolation_mode &&
+        signature_semantic_equals(dxbc_signature_semantic_name(element), "SV_Position")) {
+        unsigned owners = 0;
+        for (size_t phase = 0; phase < program->tessellation.phase_count; ++phase) {
+            const USILHullPhase *scope = &program->tessellation.phases[phase];
+            if ((scope->kind == DXBC_HULL_PHASE_FORK || scope->kind == DXBC_HULL_PHASE_JOIN) &&
+                declaration->source_instruction_index >= scope->first_source_instruction_index &&
+                declaration->source_instruction_index < scope->end_source_instruction_index) ++owners;
+        }
+        hull_patch_phase_position = owners == 1;
+    }
     const bool plain_special_output =
         role != DXBC_SIGNATURE_ROLE_INPUT && element->system_value >= 64u &&
         element->system_value <= 70u;
     return (element->system_value == 0u || plain_special_output || domain_position_input ||
-            hull_control_point_position) &&
+            hull_control_point_position || hull_patch_phase_position) &&
            (!declaration->has_interpolation ||
             declaration->interpolation_mode ==
                 element->interpolation_mode);

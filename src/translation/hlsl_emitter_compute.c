@@ -11,7 +11,7 @@
 /* A bounded source projection, not the Class72 declaration inverse. The
  * existing lossless decoder and USIL execution contract supply all metadata;
  * existing CFG/SSA supplies definition ownership. A private candidate route
- * admits one typed UINT4 texture load/store expression with original metadata.
+ * admits one UINT4 texture or structured bits load/store expression with original metadata.
  * Signed/float domains, other memory families and control flow remain unavailable. */
 /* This stage retains its own bound; generic V/F capacity grants no wider
  * compute admission or effect-planning authority. */
@@ -443,8 +443,9 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
         if (!usil_instruction_memory_access(ctx->program, instruction, &memory) ||
             memory.kind != USIL_MEMORY_STRUCTURED || memory.byte_stride != 16u ||
             memory.space != (load ? USIL_MEMORY_SHADER_RESOURCE : USIL_MEMORY_UNORDERED_ACCESS) ||
-            memory.address_lanes != 1u || memory.memory_component_lanes != 15u ||
-            (load ? memory.destination_lanes != 15u : memory.value_lanes != 15u) ||
+            memory.address_lanes != 1u || !memory.memory_component_lanes ||
+            (load ? !memory.destination_lanes :
+                (memory.memory_component_lanes != 15u || memory.value_lanes != 15u)) ||
             memory.atomic || memory.globally_coherent || memory.rasterizer_ordered ||
             memory.has_order_preserving_counter || memory.reads != load || memory.writes == load ||
             instruction->geometry_stream_id || instruction->geometry_stream_explicit ||
@@ -454,7 +455,9 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
         const DXBCOperand *binding = &instruction->operands[memory.binding_operand];
         if (load) for (int lane = 0; lane < 4; ++lane)
-            if (usil_operand_source_component(binding, lane) != lane)
+            if ((memory.destination_lanes & (1u << lane)) &&
+                (usil_operand_source_component(binding, lane) < 0 ||
+                 usil_operand_source_component(binding, lane) > 3))
                 return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
         for (int operand = 1; operand < instruction->operand_count; ++operand)
             if (operand != memory.binding_operand && !operand_plain(&instruction->operands[operand]))
@@ -538,8 +541,8 @@ static ASTExpr *memory_origin(ComputeMemoryPlan *plan, ASTExpr *expression, int 
 static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operand_index,
                                uint8_t lanes, unsigned depth);
 
-static bool memory_zero_lane(ComputeMemoryPlan *plan, int consumer, int operand_index,
-                              int lane, unsigned depth, int *literal_owner, uint8_t *literal_lanes) {
+static bool memory_literal_lane(ComputeMemoryPlan *plan, int consumer, int operand_index,
+    int lane, unsigned depth, uint32_t *bits, int *literal_owner, uint8_t *literal_lanes) {
     if (depth > COMPUTE_SOURCE_INSTRUCTION_LIMIT) return false;
     const DXBCOperand *operand = &plan->ctx->program->instructions[consumer].operands[operand_index];
     if (!operand_plain(operand)) return false;
@@ -547,7 +550,8 @@ static bool memory_zero_lane(ComputeMemoryPlan *plan, int consumer, int operand_
     if (operand->type == OPERAND_TYPE_IMMEDIATE32) {
         if (operand->imm_value_count == 1) selected = 0;
         if (selected < 0 || selected >= operand->imm_value_count ||
-            operand->imm_values[selected] != 0u || operand->immediate_words[selected] != 0u) return false;
+            operand->imm_values[selected] != operand->immediate_words[selected]) return false;
+        *bits = operand->imm_values[selected];
         *literal_owner = consumer; *literal_lanes = (uint8_t)(1u << lane);
         return true;
     }
@@ -556,7 +560,15 @@ static bool memory_zero_lane(ComputeMemoryPlan *plan, int consumer, int operand_
     if (definition < 0 || definition >= consumer ||
         plan->ctx->program->instructions[definition].opcode != USIL_OP_MOV) return false;
     plan->consumed[definition] |= (uint8_t)(1u << selected);
-    return memory_zero_lane(plan, definition, 1, selected, depth + 1, literal_owner, literal_lanes);
+    return memory_literal_lane(plan, definition, 1, selected, depth + 1,
+        bits, literal_owner, literal_lanes);
+}
+
+static bool memory_zero_lane(ComputeMemoryPlan *plan, int consumer, int operand_index,
+    int lane, unsigned depth, int *literal_owner, uint8_t *literal_lanes) {
+    uint32_t bits;
+    return memory_literal_lane(plan, consumer, operand_index, lane, depth,
+        &bits, literal_owner, literal_lanes) && !bits;
 }
 
 static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8_t lanes,
@@ -568,7 +580,7 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
     if (instruction->opcode == USIL_OP_MOV)
         return memory_operand(plan, definition, 1, lanes, depth + 1);
     if (uint_operation(instruction->opcode)) {
-        if (width != 1u && width != 2u && width != 4u) return NULL;
+        if (width < 1u || width > 4u) return NULL;
         ASTExpr *left = memory_operand(plan, definition, 1, lanes, depth + 1);
         const bool unary = instruction->opcode == USIL_OP_NOT;
         ASTExpr *right = unary ? NULL : memory_operand(plan, definition, 2, lanes, depth + 1);
@@ -580,22 +592,42 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
         return memory_origin(plan, expression, definition, lanes, AST_SCALAR_UINT32, width);
     }
     if ((instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_STRUCTURED) ||
-        lanes != 15u || definition != plan->load) return NULL;
+        lanes != usil_operand_destination_lane_mask(&instruction->operands[0]) ||
+        definition != plan->load) return NULL;
     /* Direct SSA use counts do not expose duplication through a shared pure
      * intermediate. Count the actual expanded effect node independently. */
     if (++plan->load_expansions != 1u) return NULL;
     for (unsigned component = 0; component < 4; ++component)
-        if (hlsl_definition_use_count(plan->ctx, definition, (int)component) != 1u) return NULL;
+        if ((lanes & (1u << component)) &&
+            hlsl_definition_use_count(plan->ctx, definition, (int)component) != 1u) return NULL;
     /* LOD is a proven zero source lane. The fourth transport lane is unused by
      * this 2D load; SSA liveness below accounts for its absence explicitly. */
     int literal_owner; uint8_t literal_lanes;
     ASTExpr *location = NULL;
     int binding_operand = 2;
+    int projection[4] = {0, 1, 2, 3};
+    bool project = false;
     if (instruction->opcode == USIL_OP_LD_STRUCTURED) {
         USILMemoryAccess memory;
+        uint32_t byte_offset;
         if (!usil_instruction_memory_access(plan->ctx->program, instruction, &memory) ||
-            !memory_zero_lane(plan, definition, memory.byte_offset_operand, 0, depth + 1,
-                              &literal_owner, &literal_lanes)) return NULL;
+            !memory_literal_lane(plan, definition, memory.byte_offset_operand, 0, depth + 1,
+                &byte_offset, &literal_owner, &literal_lanes) ||
+            byte_offset >= 16u || (byte_offset & 3u)) return NULL;
+        unsigned component = 0;
+        int previous = -1;
+        const DXBCOperand *resource = &instruction->operands[memory.binding_operand];
+        for (int lane = 0; lane < 4; ++lane) if (lanes & (1u << lane)) {
+            const int selected = usil_operand_source_component(resource, lane);
+            if (selected < 0 || selected > 3) return NULL;
+            const unsigned physical = byte_offset / 4u + (unsigned)selected;
+            if (physical >= 4u || (int)physical <= previous) return NULL;
+            projection[component] = (int)physical;
+            project |= physical != component;
+            previous = (int)physical;
+            ++component;
+        }
+        project |= width != 4u;
         location = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
         binding_operand = memory.binding_operand;
     } else {
@@ -619,7 +651,16 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
     ASTExpr *load_arguments[] = {location};
     ASTExpr *load = ast_create_call(method, load_arguments, 1);
     if (!load) { ast_free_expr(location); return NULL; }
-    return memory_origin(plan, load, definition, 15u, AST_SCALAR_UINT32, 4);
+    /* The declared bits view has four words. The following projection owns
+     * only the actual aligned byte window and retains its load instruction;
+     * it does not assert the unavailable original structured element type. */
+    load = memory_origin(plan, load, definition, lanes, AST_SCALAR_UINT32, 4);
+    if (!load || !project) return load;
+    ASTExpr *selection = ast_create_swizzle(load, projection, (int)width);
+    if (!selection) { ast_free_expr(load); return NULL; }
+    selection = memory_origin(plan, selection, definition, lanes, AST_SCALAR_UINT32, width);
+    if (selection) selection->logical_origin.semantic_projection = true;
+    return selection;
 }
 
 static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operand_index,
@@ -645,15 +686,53 @@ static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operan
     }
     if (operand->type == OPERAND_TYPE_TEMP) {
         if (!static_indices(operand, 1)) return NULL;
-        int definition = -1, previous = -1; uint8_t selected_lanes = 0;
+        int definition = -1;
+        int definitions[4], selections[4]; unsigned count = 0;
+        uint8_t selected_lanes = 0; bool mixed = false;
         for (int lane = 0; lane < 4; ++lane) if (lanes & (1u << lane)) {
             const int current = hlsl_operand_definition(plan->ctx, consumer, operand_index, lane);
             const int selected = usil_operand_source_component(operand, lane);
-            if (current < 0 || current >= consumer || (definition >= 0 && definition != current) ||
-                selected < 0 || selected <= previous) return NULL;
-            definition = current; previous = selected; selected_lanes |= (uint8_t)(1u << selected);
+            if (current < 0 || current >= consumer || selected < 0 || selected > 3 ||
+                plan->ctx->program->instructions[current].operands[0].type != OPERAND_TYPE_TEMP ||
+                plan->ctx->program->instructions[current].operands[0].register_index != operand->register_index ||
+                !(usil_operand_destination_lane_mask(&plan->ctx->program->instructions[current].operands[0]) &
+                  (1u << selected))) return NULL;
+            mixed |= definition >= 0 && definition != current;
+            definitions[count] = current; selections[count++] = selected;
+            definition = current; selected_lanes |= (uint8_t)(1u << selected);
         }
-        return memory_definition(plan, definition, selected_lanes, depth + 1);
+        if (!mixed) {
+            int previous = -1;
+            for (unsigned component = 0; component < count; ++component) {
+                if (selections[component] <= previous) return NULL;
+                previous = selections[component];
+            }
+            return memory_definition(plan, definition, selected_lanes, depth + 1);
+        }
+        ASTExpr *arguments[4] = {0}; unsigned argument_count = 0;
+        /* Compose distinct naturally ordered producers as vector arguments.
+         * A resource read cannot recur through a second group or expansion. */
+        for (unsigned component = 0; component < count;) {
+            const int owner = definitions[component];
+            for (unsigned prior = 0; prior < component; ++prior)
+                if (definitions[prior] == owner) goto composition_failed;
+            uint8_t producer_lanes = (uint8_t)(1u << selections[component]);
+            unsigned end = component + 1;
+            while (end < count && definitions[end] == owner) {
+                if (selections[end] != selections[end - 1] + 1) goto composition_failed;
+                producer_lanes |= (uint8_t)(1u << selections[end++]);
+            }
+            arguments[argument_count] = memory_definition(plan, owner, producer_lanes, depth + 1);
+            if (!arguments[argument_count]) goto composition_failed;
+            ++argument_count;
+            component = end;
+        }
+        ASTExpr *composition = ast_create_call(uint_type(width), arguments, (int)argument_count);
+        if (!composition) goto composition_failed;
+        return memory_origin(plan, composition, consumer, lanes, AST_SCALAR_UINT32, width);
+composition_failed:
+        for (unsigned component = 0; component < argument_count; ++component) ast_free_expr(arguments[component]);
+        return NULL;
     }
     const ComputeBuiltin *builtin = compute_builtin(operand->type);
     if (!builtin || builtin->flag != USIL_COMPUTE_DISPATCH_THREAD_ID || !static_indices(operand, 0) ||
@@ -778,7 +857,9 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
     }
     /* A retained resource read is an effect even when SSA liveness finds no
      * consumer. It cannot disappear behind a later pure redefinition. */
-    if (plan.load >= 0 && (plan.consumed[plan.load] != 15u || plan.load_expansions != 1u)) {
+    if (plan.load >= 0 &&
+        (plan.consumed[plan.load] != usil_operand_destination_lane_mask(&program->instructions[plan.load].operands[0]) ||
+         plan.load_expansions != 1u)) {
         ast_free_expr(resource); ast_free_expr(coordinates); ast_free_expr(value);
         return reject_instruction(ctx, plan.load, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     }

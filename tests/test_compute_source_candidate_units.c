@@ -721,6 +721,151 @@ static bool check_typed_uint_operations(void) {
     return true;
 }
 
+
+/* Build controlled partial structured reads from the declared sixteen-byte
+ * element. A scalar/vector constant owns the prefix, and a single retained
+ * read owns the suffix; these are distinct SSA producers, not lane locals. */
+static void partial_structured_words(uint32_t *words, unsigned width) {
+    memcpy(words, structured_words, 44u * sizeof(*words));
+    const unsigned prefix = 4u - width;
+    const uint8_t load_lanes = (uint8_t)(15u & ~((1u << prefix) - 1u));
+    words[26] = UINT32_C(0x00100002) | (uint32_t)load_lanes << 4u;
+    words[31] = prefix * 4u;
+    words[32] = UINT32_C(0x00107006);
+    for (unsigned component = 0; component < width; ++component)
+        words[32] |= component << (4u + 2u * (component + prefix));
+    words[34] = INSTRUCTION(60, 10); /* OR in the actual UINT32 domain. */
+    words[35] = words[26];
+    const uint32_t prefix_words[] = {INSTRUCTION(54, 8),
+        UINT32_C(0x00100002) | ((1u << prefix) - 1u) << 4u,
+        1u, UINT32_C(0x00004002), UINT32_MAX, UINT32_C(0x80000000), 23u, 41u};
+    memcpy(words + 44, prefix_words, sizeof(prefix_words));
+    memcpy(words + 52, structured_words + 44,
+        (COUNT(structured_words) - 44u) * sizeof(*words));
+}
+
+static bool check_partial_structured_candidate(void) {
+    Fixture fixture; CHECK(structured_fixture(&fixture));
+    ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+    uint32_t words[COUNT(structured_words) + 8];
+    const char *selections[] = {NULL, ".w", ".zw", ".yzw"};
+    for (unsigned width = 1; width <= 3; ++width) {
+        partial_structured_words(words, width);
+        CHECK(typed_code(&fixture, words, COUNT(words)));
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) ==
+            COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        CHECK(candidate.domain_complete && candidate.variant_count == 8 &&
+            candidate.source_quality.classification == HLSL_SOURCE_QUALITY_MIXED &&
+            candidate.source_quality.counts.incomplete_units == 1 &&
+            !candidate.source_quality.counts.residual_total &&
+            !candidate.source_quality.counts.unknown_provenance);
+        CHECK(strstr(candidate.source.buf, selections[width]) &&
+            strstr(candidate.source.buf, "uint4(") && strstr(candidate.source.buf, "4294967295u"));
+        CHECK(!strstr(candidate.source.buf, "asfloat") && !strstr(candidate.source.buf, "asuint"));
+        for (size_t row = 0; row < candidate.variant_count; ++row) {
+            const ComputeSourceVariant *entry = &candidate.variants[row];
+            CHECK(entry->entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                entry->expression_count == 3 && entry->memory_effect_count == 2);
+            CHECK(entry->memory_effects[0].opcode == USIL_OP_LD_STRUCTURED &&
+                entry->memory_effects[1].opcode == USIL_OP_STORE_STRUCTURED &&
+                entry->memory_effects[0].instruction_index < entry->memory_effects[1].instruction_index);
+            const ASTExpr *composition = entry->expressions[2];
+            CHECK(composition->kind == AST_EXPR_CALL && !strcmp(composition->u.call.name, "uint4") &&
+                composition->u.call.arg_count == 2 && composition->logical_origin.complete &&
+                composition->logical_origin.scalar_type == AST_SCALAR_UINT32 &&
+                composition->logical_origin.components == 4);
+            const ASTExpr *operation = composition->u.call.args[1];
+            CHECK(operation->kind == AST_EXPR_BINARY && operation->u.binary.op == USIL_OP_OR &&
+                operation->logical_origin.components == width);
+            const ASTExpr *projection = operation->u.binary.left;
+            CHECK(projection->kind == AST_EXPR_SWIZZLE && projection->logical_origin.complete &&
+                projection->logical_origin.semantic_projection &&
+                projection->logical_origin.components == width &&
+                projection->u.swizzle.swizzle_count == (int)width &&
+                projection->logical_origin.instruction_index == (int)entry->memory_effects[0].instruction_index);
+            for (unsigned component = 0; component < width; ++component)
+                CHECK(projection->u.swizzle.swizzle[component] == (int)(4u - width + component));
+            CHECK(projection->u.swizzle.sub->kind == AST_EXPR_CALL &&
+                !strcmp(projection->u.swizzle.sub->u.call.name, "SourceElements.Load") &&
+                projection->u.swizzle.sub->logical_origin.components == 4);
+        }
+    }
+    /* Exact byte windows cannot cross the element, repeat/reverse components,
+     * or consume an undefined or dead read lane. Partial stores remain out. */
+    const struct { size_t word; uint32_t value; } negatives[] = {
+        {31, 1}, {31, 16}, {31, UINT32_MAX}, {31, 8},
+        {32, UINT32_C(0x00107e46)}, /* Offset four plus identity crosses stride. */
+        {32, UINT32_C(0x00107006)}, /* Repeated memory words. */
+        {32, UINT32_C(0x00107306)}, /* Reverse the first two retained words. */
+        {26, UINT32_C(0x00100062)}, /* Missing w owner. */
+        {35, UINT32_C(0x00100062)}, /* Retained w read becomes dead. */
+        {38, 2}, {53, UINT32_C(0x0011e0e2)}, /* Missing SSA owner/partial store. */
+        {23, UINT32_C(0x8b0020a7)}, /* Saturated load. */
+        {34, INSTRUCTION(60, 10) | (UINT32_C(1) << 13)}
+    };
+    for (size_t n = 0; n < COUNT(negatives); ++n) {
+        partial_structured_words(words, 3); words[negatives[n].word] = negatives[n].value;
+        CHECK(typed_code(&fixture, words, COUNT(words)));
+        CHECK(expect_failure(&fixture, &candidate, n == 11 ?
+            COMPUTE_SOURCE_STAGE_CONTRACT_FAILED : COMPUTE_SOURCE_EMISSION_FAILED));
+    }
+    /* Duplicating the resource result through the binary operator retains
+     * only one read instruction and must fail instead of creating two loads. */
+    partial_structured_words(words, 3);
+    words[34] = INSTRUCTION(60, 7); words[39] = UINT32_C(0x00100e46); words[40] = 1;
+    memmove(words + 41, words + 44, (COUNT(words) - 44u) * sizeof(*words));
+    CHECK(typed_code(&fixture, words, COUNT(words) - 3u));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* A retained MOV chain can supply the byte offset without turning the
+     * byte coordinate into an element index or trusting a register spelling. */
+    partial_structured_words(words, 3);
+    uint32_t offset_words[COUNT(words) + 5];
+    memcpy(offset_words, words, 23u * sizeof(*words));
+    const uint32_t offset_definition[] = {INSTRUCTION(54, 5), UINT32_C(0x00100022),
+        0u, UINT32_C(0x00004001), 4u};
+    memcpy(offset_words + 23, offset_definition, sizeof(offset_definition));
+    memcpy(offset_words + 28, words + 23, (COUNT(words) - 23u) * sizeof(*words));
+    offset_words[35] = UINT32_C(0x0010001a); offset_words[36] = 0u;
+    CHECK(typed_code(&fixture, offset_words, COUNT(offset_words)));
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(strstr(candidate.source.buf, ".yzw") && candidate.variants[0].memory_effect_count == 2);
+    offset_words[27] = 8u;
+    CHECK(typed_code(&fixture, offset_words, COUNT(offset_words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    offset_words[27] = 4u; offset_words[36] = 1u; /* No preceding offset owner in r1. */
+    CHECK(typed_code(&fixture, offset_words, COUNT(offset_words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* Non-contiguous DXBC destinations may own naturally ordered distinct
+     * memory words. Real use/def selections compress those words once. */
+    partial_structured_words(words, 2);
+    words[26] = UINT32_C(0x00100052); /* Load x,z. */
+    words[31] = 4u; words[32] = UINT32_C(0x00107106); /* Physical y,z. */
+    words[35] = UINT32_C(0x00100032); /* Operation writes x,y. */
+    words[37] = UINT32_C(0x00100086); /* Its source reads x,z. */
+    words[45] = UINT32_C(0x001000c2); /* Constant owns z,w. */
+    CHECK(typed_code(&fixture, words, COUNT(words)));
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(strstr(candidate.source.buf, ".yz") && strstr(candidate.source.buf, "uint2(23u, 41u)"));
+    CHECK(candidate.variants[0].entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    /* A producer cannot recur in separate constructor groups A/B/A/B,
+     * including a pure literal producer; no per-lane expansion is permitted. */
+    partial_structured_words(words, 2);
+    words[26] = words[35] = UINT32_C(0x001000a2);
+    words[32] = UINT32_C(0x00107406); /* Physical z,w for y,w. */
+    words[45] = UINT32_C(0x00100052);
+    CHECK(typed_code(&fixture, words, COUNT(words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    partial_structured_words(words, 3);
+    CHECK(typed_code(&fixture, words, COUNT(words)));
+    const ComputeShaderStringView renamed = text(&fixture, "RenamedProjectedElements");
+    for (size_t k = 0; k < 2; ++k) for (size_t v = 0; v < 4; ++v) fixture.textures[k][v].name = renamed;
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(strstr(candidate.source.buf, "RenamedProjectedElements.Load") &&
+        candidate.source_quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+    compute_source_candidate_dispose(&candidate);
+    return true;
+}
+
 static bool check_owned_quality_resolver(void) {
     HLSLSourceQualityFacts facts;
     hlsl_source_quality_facts_init(&facts);
@@ -762,7 +907,7 @@ static bool check_owned_quality_resolver(void) {
 }
 
 int main(void) {
-    return check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }

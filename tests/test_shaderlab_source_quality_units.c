@@ -93,7 +93,7 @@ static bool check_current_inventory(Fixture *fixture, StringBuilder *source,
     return true;
 }
 
-static bool check_bad_inventory(Fixture *fixture, StringBuilder *source,
+static bool check_bad_inventory(Fixture *fixture, const StringBuilder *source,
                                 ShaderLabSourceQualityInventory *inventory) {
     ShaderLabSourceQualityRequest request = {.shader = &fixture->shader, .archive = &fixture->archive};
     ShaderLabSourceQualityResult result = {.classification = HLSL_SOURCE_QUALITY_UNSUPPORTED};
@@ -523,6 +523,7 @@ static bool check_linked_graphics_stages(void) {
             fixture.pass.subprogram_count[4] = 1;
         }
         SerializedPass two_passes[2] = {fixture.pass, fixture.pass};
+        two_passes[1].pass_type = 1; /* A later UsePass is still outside scope. */
         fixture.subshader.pass_count = 2; fixture.subshader.passes = two_passes;
         CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
         CHECK(!rejected.len && !memcmp(&saved, &inventory, sizeof(saved)));
@@ -641,6 +642,212 @@ static bool check_inventory_limits(void) {
     return true;
 }
 
+typedef struct {
+    int subshader;
+    int pass;
+    ShaderLabSourceSyntaxKind kind;
+} ReceiptRejection;
+
+static bool reject_selected_receipt(void *context, const ShaderLabSourceSyntaxReceipt *receipt) {
+    const ReceiptRejection *rejected = context;
+    return receipt->subshader_index != rejected->subshader ||
+        receipt->pass_index != rejected->pass || receipt->kind != rejected->kind;
+}
+
+static bool check_same_source_changed_model(Fixture *fixture, const StringBuilder *source,
+                                            ShaderLabSourceQualityInventory *inventory) {
+    CHECK(check_bad_inventory(fixture, source, inventory));
+    const ShaderLabSourceQualityRequest request = {.shader = &fixture->shader, .archive = &fixture->archive};
+    StringBuilder current; sb_init(&current);
+    ShaderLabSourceQualityInventory rebuilt = {0};
+    CHECK(shaderlab_source_quality_emit(&request, &current, &rebuilt, NULL) == SHADERLAB_SOURCE_QUALITY_OK);
+    CHECK(current.len == source->len && !memcmp(current.buf, source->buf, source->len));
+    CHECK(!memcmp(rebuilt.source_digest, inventory->source_digest, sizeof(rebuilt.source_digest)));
+    CHECK(memcmp(rebuilt.modeled_input_digest, inventory->modeled_input_digest,
+        sizeof(rebuilt.modeled_input_digest)));
+    CHECK(rebuilt.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+    shaderlab_source_quality_inventory_dispose(&rebuilt); sb_free(&current);
+    return true;
+}
+
+static bool check_multiple_passes_and_subshaders(void) {
+    for (unsigned stage_family = 0; stage_family < 3; ++stage_family) {
+        Fixture fixture; CHECK(fixture_init(&fixture));
+        if (stage_family == 1) CHECK(fixture_add_stage(&fixture, 2));
+        if (stage_family == 2) {
+            CHECK(fixture_add_stage(&fixture, 3));
+            CHECK(fixture_add_stage(&fixture, 4));
+        }
+        const size_t entries_per_pass = fixture.expected_entries;
+        SerializedPass passes[8];
+        SerializedSubShader subshaders[4];
+        SerializedSubProgram programs[8][5];
+        SerializedSubProgramIdentity identities[8][5];
+        for (int index = 0; index < 8; ++index) {
+            passes[index] = fixture.pass;
+            for (int stage = 0; stage < 5; ++stage) {
+                programs[index][stage] = fixture.programs[stage];
+                identities[index][stage] = fixture.identities[stage];
+                if (!passes[index].subprogram_count[stage]) continue;
+                passes[index].subprograms[stage] = &programs[index][stage];
+                passes[index].subprogram_identities[stage] = &identities[index][stage];
+            }
+            /* These distinct absent values deliberately generate identical
+             * pass text. Their order remains selected-model authority. */
+            passes[index].state.culling.val = (float)index;
+        }
+        for (int index = 0; index < 4; ++index)
+            subshaders[index] = (SerializedSubShader){.pass_count = 2, .passes = &passes[index * 2]};
+        fixture.shader.subshader_count = 4;
+        fixture.shader.subshaders = subshaders;
+        fixture.expected_entries *= 8;
+        const ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
+        StringBuilder source, baseline, rejected;
+        sb_init(&source); sb_init(&baseline); sb_init(&rejected);
+        ShaderLabSourceQualityInventory inventory = {0};
+        CHECK(shaderlab_source_quality_emit(&request, &source, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_OK);
+        CHECK(shaderlab_emit_high_level_candidate(&fixture.shader, fixture.archive.entries,
+            fixture.archive.entry_count, fixture.archive.segments, fixture.archive.segment_lengths,
+            fixture.archive.segment_count, &baseline, NULL));
+        CHECK(source.len == baseline.len && !memcmp(source.buf, baseline.buf, source.len));
+        CHECK(inventory.entries.count == entries_per_pass * 8 && inventory.entries.count <= 32);
+        CHECK(inventory.receipt_count <= 256 && inventory.quality.wrapper_complete);
+        CHECK(inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+        CHECK(inventory.quality.required_external_include_root_count == 8);
+        CHECK(inventory.quality.gaps & SHADERLAB_SOURCE_GAP_SCHEMA_AUTHORITY);
+        ShaderLabSourceQualityResult quality;
+        CHECK(shaderlab_source_quality_inventory_analyze(&request, &source, &inventory,
+            &quality, NULL) == SHADERLAB_SOURCE_QUALITY_OK);
+        inventory.quality.required_external_include_root_count = 1;
+        CHECK(check_bad_inventory(&fixture, &source, &inventory));
+        inventory.quality.required_external_include_root_count = 8;
+        unsigned pass_begins[4][2] = {{0}}, pass_ends[4][2] = {{0}}, includes[4][2] = {{0}};
+        size_t linked[4][2] = {{0}};
+        for (size_t index = 0; index < inventory.receipt_count; ++index) {
+            const ShaderLabSourceSyntaxReceipt *receipt = &inventory.receipts[index];
+            if (receipt->pass_index < 0) continue;
+            CHECK(receipt->subshader_index >= 0 && receipt->subshader_index < 4);
+            CHECK(receipt->pass_index < 2);
+            const int sub = receipt->subshader_index, pass = receipt->pass_index;
+            pass_begins[sub][pass] += receipt->kind == SHADERLAB_SOURCE_SYNTAX_PASS_BEGIN;
+            pass_ends[sub][pass] += receipt->kind == SHADERLAB_SOURCE_SYNTAX_PASS_END;
+            includes[sub][pass] += receipt->kind == SHADERLAB_SOURCE_SYNTAX_INCLUDE_POLICY;
+            linked[sub][pass] += receipt->kind == SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY;
+        }
+        for (int sub = 0; sub < 4; ++sub)
+            for (int pass = 0; pass < 2; ++pass)
+                CHECK(pass_begins[sub][pass] == 1 && pass_ends[sub][pass] == 1 &&
+                    includes[sub][pass] == 1 && linked[sub][pass] == entries_per_pass);
+        /* An absent later-pass command still changes the modeled identity. */
+        passes[7].state.culling.val += 10;
+        CHECK(check_same_source_changed_model(&fixture, &source, &inventory));
+        passes[7].state.culling.val -= 10;
+        /* The digest must inspect the actual later pass, not pass zero's
+         * matching target/program. Absent tier and inner-row values leave
+         * emitted text unchanged but still belong to their current owner. */
+        ++programs[7][1].hardware_tier;
+        CHECK(check_same_source_changed_model(&fixture, &source, &inventory));
+        --programs[7][1].hardware_tier;
+        ++identities[7][1].inner_subprogram_index;
+        CHECK(check_same_source_changed_model(&fixture, &source, &inventory));
+        --identities[7][1].inner_subprogram_index;
+        programs[7][1].shader_requirements ^= 1;
+        CHECK(check_bad_inventory(&fixture, &source, &inventory));
+        programs[7][1].shader_requirements ^= 1;
+        ++programs[7][1].blob_index;
+        CHECK(check_bad_inventory(&fixture, &source, &inventory));
+        --programs[7][1].blob_index;
+        ++identities[7][1].hardware_tier_group;
+        CHECK(check_bad_inventory(&fixture, &source, &inventory));
+        --identities[7][1].hardware_tier_group;
+        /* Complete pass/subshader moves cannot reuse receipts even when all
+         * generated syntax is identical and source hashes remain unchanged. */
+        SerializedPass moved_pass = passes[6]; passes[6] = passes[7]; passes[7] = moved_pass;
+        CHECK(check_same_source_changed_model(&fixture, &source, &inventory));
+        moved_pass = passes[6]; passes[6] = passes[7]; passes[7] = moved_pass;
+        SerializedSubShader moved_subshader = subshaders[2];
+        subshaders[2] = subshaders[3]; subshaders[3] = moved_subshader;
+        CHECK(check_same_source_changed_model(&fixture, &source, &inventory));
+        moved_subshader = subshaders[2]; subshaders[2] = subshaders[3]; subshaders[3] = moved_subshader;
+        for (size_t index = 0; index < inventory.receipt_count; ++index) {
+            ShaderLabSourceSyntaxReceipt *receipt = &inventory.receipts[index];
+            if (receipt->subshader_index != 3 || receipt->pass_index != 1) continue;
+            const ShaderLabSourceSyntaxReceipt saved = *receipt;
+            receipt->pass_index = 0;
+            CHECK(check_bad_inventory(&fixture, &source, &inventory)); *receipt = saved;
+            receipt->subshader_index = 2;
+            CHECK(check_bad_inventory(&fixture, &source, &inventory)); *receipt = saved;
+        }
+        ShaderLabExpressionSourceRecord *entry = &inventory.entries.records[inventory.entries.count - 1];
+        --entry->pass_index;
+        CHECK(check_bad_inventory(&fixture, &source, &inventory)); ++entry->pass_index;
+        --entry->subshader_index;
+        CHECK(check_bad_inventory(&fixture, &source, &inventory)); ++entry->subshader_index;
+        const ShaderLabSourceQualityInventory before = inventory;
+        const ShaderLabSourceSyntaxKind observed_kinds[] = {SHADERLAB_SOURCE_SYNTAX_PASS_BEGIN,
+            SHADERLAB_SOURCE_SYNTAX_RENDER_STATE, SHADERLAB_SOURCE_SYNTAX_INCLUDE_POLICY,
+            SHADERLAB_SOURCE_SYNTAX_STAGE_GUARD, SHADERLAB_SOURCE_SYNTAX_ROUTING,
+            SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY, SHADERLAB_SOURCE_SYNTAX_PASS_END};
+        for (size_t index = 0; index < sizeof(observed_kinds) / sizeof(observed_kinds[0]); ++index) {
+            ReceiptRejection rejection = {3, 1, observed_kinds[index]};
+            ShaderLabSourceQualityRequest observed = request;
+            observed.observer = reject_selected_receipt; observed.observer_context = &rejection;
+            passes[7].state.culling.present = observed_kinds[index] == SHADERLAB_SOURCE_SYNTAX_RENDER_STATE;
+            if (passes[7].state.culling.present) passes[7].state.culling.val = 1;
+            CHECK(shaderlab_source_quality_emit(&observed, &rejected, &inventory, NULL) ==
+                SHADERLAB_SOURCE_QUALITY_OBSERVER_REJECTED);
+            CHECK(!rejected.len && !memcmp(&before, &inventory, sizeof(before)));
+            passes[7].state.culling.present = false; passes[7].state.culling.val = 7;
+        }
+        const SerializedPass ordinary = passes[7];
+        passes[7].pass_type = 1;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary; passes[7].pass_type = 2;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary; passes[7].use_name = "External/Shader/PASS";
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary; passes[7].has_instancing_variant = true;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary; passes[7].has_procedural_instancing_variant = true;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary;
+        int other_platform = 5;
+        passes[7].platforms = &other_platform;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary;
+        uint16_t invalid_keyword = 0;
+        passes[7].serialized_keyword_state_mask_count = 1;
+        passes[7].serialized_keyword_state_mask = &invalid_keyword;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_EMISSION_FAILED);
+        passes[7] = ordinary;
+        for (int stage = 0; stage < 6; ++stage) passes[7].subprogram_count[stage] = 0;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary; passes[7].subprogram_count[5] = 1; passes[7].subprograms[5] = &fixture.programs[0];
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        passes[7] = ordinary;
+        if (stage_family == 2) {
+            passes[7].subprogram_count[4] = 0;
+            CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+            passes[7] = ordinary;
+        }
+        fixture.shader.subshader_count = 5;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        fixture.shader.subshader_count = 4;
+        subshaders[3].pass_count = 3;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        subshaders[3].pass_count = 2;
+        subshaders[3].pass_count = 0;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        subshaders[3].pass_count = 2;
+        CHECK(!rejected.len && !memcmp(&before, &inventory, sizeof(before)));
+        CHECK(shaderlab_source_quality_inventory_analyze(&request, &source, &inventory,
+            &quality, NULL) == SHADERLAB_SOURCE_QUALITY_OK);
+        shaderlab_source_quality_inventory_dispose(&inventory);
+        sb_free(&source); sb_free(&baseline); sb_free(&rejected); fixture_dispose(&fixture);
+    }
+    return true;
+}
+
 int main(void) {
     Fixture fixture;
     if (!fixture_init(&fixture)) return 1;
@@ -657,7 +864,7 @@ int main(void) {
         check_transaction_and_model(&fixture, &source, &inventory) &&
         check_named_wrapper_fields(&fixture) && check_keyword_routing() &&
         check_texture_properties_and_schema_guards() && check_linked_graphics_stages() &&
-        check_inventory_limits();
+        check_inventory_limits() && check_multiple_passes_and_subshaders();
     shaderlab_source_quality_inventory_dispose(&inventory);
     sb_free(&source); sb_free(&baseline); fixture_dispose(&fixture);
     passed = passed && g_allocated_bytes == 0 && g_allocations_count == 0;

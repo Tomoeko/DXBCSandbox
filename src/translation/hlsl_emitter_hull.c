@@ -278,7 +278,8 @@ static bool hull_contract(const USILProgram *program, HullSourcePlan *plan) {
 
 bool hlsl_high_level_hull_source_supported(const USILProgram *program, HLSLEmitMode mode) {
     HullSourcePlan plan = {0};
-    return mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE && hull_contract(program, &plan);
+    return mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+        (hull_contract(program, &plan) || hlsl_high_level_hull_join_supported(program, mode));
 }
 
 static bool instance_operand(const DXBCOperand *operand, bool control_point) {
@@ -499,6 +500,8 @@ static bool observe_owned_atom(HLSLEmitterContext *ctx, const char *text, int in
 }
 
 bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
+    if (hlsl_high_level_hull_join_supported(ctx->program, ctx->emit_mode))
+        return hlsl_emit_high_level_hull_join(ctx);
     HullSourcePlan plan = {0};
     bool emitted = false;
     if (!hull_contract(ctx->program, &plan) || !allocate_names(ctx, &plan) ||

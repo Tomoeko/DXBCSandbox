@@ -560,6 +560,9 @@ void emit_instructions(HLSLEmitterContext* ctx);
 typedef struct {
     int first_instruction;
     int end_instruction;
+    /* Scope opt-in: compose pure, independently owned SSA definitions into a
+     * natural vector. Each definition is materialized at its original site. */
+    bool compose_disjoint_temp_lanes;
     const HLSLInstructionOwners *omitted_instructions;
     bool (*destination_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
     bool (*append_destination)(HLSLEmitterContext *ctx, int instruction, void *context);
@@ -617,6 +620,10 @@ bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *c
 bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *name);
 bool hlsl_allocate_interface_name(HLSLEmitterContext *ctx, const char *base, char destination[96]);
 bool hlsl_high_level_hull_source_supported(const USILProgram *program, HLSLEmitMode mode);
+bool hlsl_high_level_hull_join_supported(const USILProgram *program, HLSLEmitMode mode);
+bool hlsl_emit_high_level_hull_join(HLSLEmitterContext *ctx);
+bool hlsl_high_level_patch_domain_supported(const USILProgram *program, HLSLEmitMode mode);
+bool hlsl_emit_high_level_patch_domain(HLSLEmitterContext *ctx);
 bool hlsl_hull_phase_return_owned(const USILProgram *program, int instruction);
 bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx);
 /* Always consumes all supplied expressions, including on failure. Parameters

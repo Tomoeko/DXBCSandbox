@@ -101,16 +101,19 @@ instancing and multiple streams remain unsupported in these paths.
 A bounded domain path emits typed control-point patches, triangle barycentric
 or quad/isoline coordinates, tessellation-factor declarations in their retained
 interface order, and SSA expressions. It admits static point indices in patches
-of up to 32 points and retains a separate 64-instruction limit. Patch-factor reads,
-resources and wider phase forms remain open. A bounded hull path reconstructs
+of up to 32 points and retains a separate 64-instruction limit. Patch resources
+and wider phase forms remain open. A bounded hull path reconstructs
 independent scalar-factor fork phases, signature-backed implicit control-point
 passthrough and pure float4 control-point transforms using separate CFG/SSA scopes
 for triangle, quad and isoline domains. Temporary bounds and control-point indices
 retain their own phase authority. Explicit phases also admit output counts no
 larger than their input patches; implicit copies preserve the count. Complete
 linked vertex/hull/domain/fragment passes admit independently validated empty
-Globals metadata, preserving each stage's declaration and read scope. Join phases
-and patch-resource reads remain unsupported.
+Globals metadata, preserving each stage's declaration and read scope. Custom
+scalar and scalar-array patch constants also admit bounded fork phases and a
+one-instance join phase that reads earlier fork-owned constants. Hull and domain
+stages share the retained patch layout. Packed vector patch constants, join-to-join
+reads and patch-resource reads remain unsupported.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,
@@ -122,9 +125,11 @@ ownership across the complete graph. Geometry and compute keep their narrower
 stage bounds. Larger or unsupported graphs report an explicit analysis limit.
 Extraction's JSON lift report carries independent quality counters and reasons
 for each emitted stage entry. The bounded `shaderlab_source_quality_emit` API records contiguous receipts for
-one ordinary vertex/fragment pass with optional supported geometry or paired
-hull/domain stages, including properties, render state and variant
-routing. It retains each linked entry's independent quality and replays receipt
+up to four subshaders and eight ordinary vertex/fragment passes total, with
+optional supported geometry or paired hull/domain stages. Every retained pass
+must participate in the selected D3D11 route. Whole-source limits remain 32 linked
+stage bodies, 256 receipts and 4 MiB. The inventory covers properties, render state
+and variant routing, retains each linked entry's independent quality and replays receipt
 authority against the current source/model. Whole ShaderLab remains `mixed` while
 external include or dependency coverage is incomplete; no stage aggregate grants
 whole-source cleanliness. The compiler-side `unity_hlsl_expansion_inspect_request`
@@ -132,6 +137,11 @@ API observes the unchanged graphics invocation with canonical request and contro
 identities. A bounded cbuffer inventory records expanded declarations, packing and
 extent. These receipts cover declarations only; callers still need actual target
 bindings, instruction reads and include semantics before granting source quality.
+The opaque `unity_hlsl_matrix_declaration_capture` API joins actual current/common
+column-major float4x4 reads with live expanded declarations, full-container equality
+and reflection. Replay checks owned models and the active compiler/include lease.
+Legacy half storage requires an explicit captured contract and a matching request
+profile. These observations grant no emitted AST or whole-source quality authority.
 Extraction reports historical bounded source inventories for ordinary high-level
 artifacts and binds the published view to the accepted file's size and hash.
 These snapshots preserve quality gaps and remain separate from compiler acceptance;
@@ -146,11 +156,12 @@ with their captured names, keywords and group dimensions. It supports resource-f
 RET/barrier bodies and a typed `Texture2D<uint4>` load / `RWTexture2D<uint4>` store
 path with dispatch coordinates, unsigned addition, bitwise operations and logical
 shifts. A 16-byte structured load/store path uses an explicit `uint4` bit
-representation, preserving the actual
-index and memory-effect order. Release metadata does not retain the original
+representation, preserving the actual index, byte window and memory-effect order. Release metadata does not retain the original
 structured element type; that declaration gap keeps whole source quality `mixed`
 even when the unsigned entry bodies are `clean`. These memory paths require one
-complete `uint4` read followed by one store; partial reads remain unsupported.
+read followed by one complete store. Structured reads admit aligned, ascending
+word projections within the element and compose distinct SSA producers as natural
+scalar/vector constructor arguments; typed texture reads still require `uint4`.
 Wider strides, float arithmetic, other resources, control flow, shared memory
 and atomics remain unsupported.
 Use `dxbc-sandbox extract INPUT --kind compute --all --compute-source-candidate

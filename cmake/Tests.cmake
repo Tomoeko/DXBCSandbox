@@ -255,6 +255,8 @@ if(BUILD_TESTING)
         tests/test_hlsl_ast_units.c hlsl_ast_units)
     dxbc_add_core_test(test_hlsl_vector_lift_units
         tests/test_hlsl_vector_lift_units.c hlsl_vector_lift_units)
+    dxbc_add_core_test(test_hlsl_current_matrix_reads_units
+        tests/test_hlsl_current_matrix_reads_units.c hlsl_current_matrix_reads_units)
     dxbc_add_core_test(test_hlsl_matrix_lift_units
         tests/test_hlsl_matrix_lift_units.c hlsl_matrix_lift_units)
     dxbc_add_core_test(test_hlsl_global_declarations_units
@@ -344,6 +346,8 @@ if(BUILD_TESTING)
         DXBC_LIMIT_TEST2_GS_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/limit_test2_extrusion_gs.dxbc.b64")
     dxbc_add_core_test(test_hlsl_hull_source_units
         tests/test_hlsl_hull_source_units.c hlsl_hull_source_units)
+    dxbc_add_core_test(test_hlsl_patch_phase_units
+        tests/test_hlsl_patch_phase_units.c hlsl_patch_phase_units)
     target_sources(test_hlsl_hull_source_units PRIVATE tests/test_tessellation_fixture.c)
     dxbc_add_core_test(test_tessellation_usil_units
         tests/test_tessellation_usil_units.c tessellation_usil_units)
@@ -516,6 +520,12 @@ if(BUILD_TESTING)
         target_link_libraries(test_unity_hlsl_expansion_units PRIVATE
             unity_compiler_support dxbc_build_options)
         add_test(NAME unity_hlsl_expansion_units COMMAND test_unity_hlsl_expansion_units)
+
+        add_executable(test_unity_hlsl_matrix_declaration_units tests/test_unity_hlsl_matrix_declaration_units.c)
+        target_include_directories(test_unity_hlsl_matrix_declaration_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_unity_hlsl_matrix_declaration_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME unity_hlsl_matrix_declaration_units COMMAND test_unity_hlsl_matrix_declaration_units)
 
         add_executable(test_unity_hlsl_cbuffer_inventory_units tests/test_unity_hlsl_cbuffer_inventory_units.c)
         target_link_libraries(test_unity_hlsl_cbuffer_inventory_units PRIVATE

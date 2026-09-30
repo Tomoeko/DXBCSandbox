@@ -6,7 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { MAX_RECEIPTS = 256, MAX_ENTRY_RECORDS = 32, MAX_SOURCE_BYTES = 4 * 1024 * 1024 };
+enum {
+    MAX_SUBSHADERS = 4,
+    MAX_PASSES = 8,
+    MAX_RECEIPTS = 256,
+    MAX_ENTRY_RECORDS = 32,
+    MAX_SOURCE_BYTES = 4 * 1024 * 1024
+};
 
 void shaderlab_source_quality_inventory_dispose(ShaderLabSourceQualityInventory *inventory) {
     if (!inventory) return;
@@ -108,6 +114,37 @@ static bool tags_bounded(const SerializedTagMap *tags) {
     return true;
 }
 
+static bool pass_scope_available(const SerializedPass *pass) {
+    if (pass->pass_type || (pass->use_name && pass->use_name[0]) ||
+        pass->has_instancing_variant || pass->has_procedural_instancing_variant ||
+        !tags_bounded(&pass->tags) || !bounded_text(pass->state.name, 1024) ||
+        !bounded_text(pass->name, 1024) || !bounded_text(pass->texture_name, 1024) ||
+        pass->platform_count < 0 || pass->platform_count > 32 ||
+        (pass->platform_count && !pass->platforms) ||
+        pass->serialized_keyword_state_mask_count < 0 ||
+        pass->serialized_keyword_state_mask_count > 8 ||
+        (pass->serialized_keyword_state_mask_count && !pass->serialized_keyword_state_mask))
+        return false;
+    bool stages_present[5] = {false};
+    for (int stage = 0; stage < 6; ++stage) {
+        if (pass->subprogram_count[stage] < 0 || pass->subprogram_count[stage] > 32 ||
+            (pass->subprogram_count[stage] && !pass->subprograms[stage]))
+            return false;
+        for (int index = 0; index < pass->subprogram_count[stage]; ++index) {
+            if (!serialized_pass_subprogram_is_platform(pass, stage, index, 4)) continue;
+            if (stage == 5) return false;
+            stages_present[stage] = true;
+        }
+    }
+    /* Every retained ordinary shell participates in the selected route. The
+     * emitter may omit proven stripped/other-platform shells in other modes;
+     * this bounded inventory does not claim their unobserved model coverage.
+     * Linking authority remains with each complete stage/variant producer. */
+    return stages_present[0] && stages_present[1] &&
+        stages_present[3] == stages_present[4] &&
+        !shaderlab_pass_is_proven_not_platform(pass, 4);
+}
+
 static ShaderLabSourceQualityStatus validate_scope(const ShaderLabSourceQualityRequest *request) {
     if (!request || !request->shader || !request->archive ||
         (request->object && request->shader != &request->object->shader))
@@ -116,7 +153,7 @@ static ShaderLabSourceQualityStatus validate_scope(const ShaderLabSourceQualityR
     if (!shader->name || !bounded_text(shader->name, 1024) ||
         shader->property_count < 0 || shader->property_count > 32 ||
         (shader->property_count && !shader->properties) ||
-        shader->subshader_count != 1 || !shader->subshaders ||
+        shader->subshader_count < 1 || shader->subshader_count > MAX_SUBSHADERS || !shader->subshaders ||
         shader->keyword_names.count < 0 || shader->keyword_names.count > 8 ||
         (shader->keyword_names.count && (!shader->keyword_names.keywords || !shader->keyword_flags)) ||
         shader->dependency_count || shader->custom_editor_for_render_pipeline_count ||
@@ -137,32 +174,18 @@ static ShaderLabSourceQualityStatus validate_scope(const ShaderLabSourceQualityR
         if (!shader->keyword_names.keywords[index] ||
             !bounded_text(shader->keyword_names.keywords[index], 255))
             return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
-    const SerializedSubShader *subshader = &shader->subshaders[0];
-    if (subshader->pass_count != 1 || !subshader->passes || !tags_bounded(&subshader->tags))
-        return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
-    const SerializedPass *pass = &subshader->passes[0];
-    if (pass->pass_type || (pass->use_name && pass->use_name[0]) ||
-        pass->has_instancing_variant || pass->has_procedural_instancing_variant ||
-        !tags_bounded(&pass->tags) || !bounded_text(pass->state.name, 1024))
-        return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
-    bool tessellation_stage_present[2] = {false, false};
-    for (int stage = 0; stage < 6; ++stage) {
-        if (pass->subprogram_count[stage] < 0 || pass->subprogram_count[stage] > 32 ||
-            (pass->subprogram_count[stage] && !pass->subprograms[stage]))
+    size_t total_passes = 0;
+    for (int subshader_index = 0; subshader_index < shader->subshader_count; ++subshader_index) {
+        const SerializedSubShader *subshader = &shader->subshaders[subshader_index];
+        if (subshader->pass_count < 1 ||
+            (size_t)subshader->pass_count > MAX_PASSES - total_passes ||
+            !subshader->passes || !tags_bounded(&subshader->tags))
             return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
-        for (int index = 0; index < pass->subprogram_count[stage]; ++index) {
-            if (!serialized_pass_subprogram_is_platform(pass, stage, index, 4)) continue;
-            if (stage == 5)
+        total_passes += (size_t)subshader->pass_count;
+        for (int pass_index = 0; pass_index < subshader->pass_count; ++pass_index)
+            if (!pass_scope_available(&subshader->passes[pass_index]))
                 return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
-            if (stage == 3 || stage == 4) tessellation_stage_present[stage - 3] = true;
-        }
     }
-    /* This is a one-pass inventory of the linked generated route. A lone hull
-     * or domain stage has no admitted linked tessellation route. Individual
-     * contracts and variants are still validated by the shared stage emitter;
-     * their quality is never supplied by these wrapper observations. */
-    if (tessellation_stage_present[0] != tessellation_stage_present[1])
-        return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
     return SHADERLAB_SOURCE_QUALITY_OK;
 }
 
@@ -177,6 +200,14 @@ static void hash_text(CommonSha256Context *hash, const char *text) {
     const size_t size = text ? strlen(text) : 0;
     hash_number(hash, size);
     if (size) common_sha256_update(hash, text, size);
+}
+
+static void hash_tags(CommonSha256Context *hash, const SerializedTagMap *tags) {
+    hash_number(hash, (uint64_t)tags->tag_count);
+    for (int index = 0; index < tags->tag_count; ++index) {
+        hash_text(hash, tags->tags[index].key);
+        hash_text(hash, tags->tags[index].value);
+    }
 }
 
 static void hash_float_value(CommonSha256Context *hash, const SerializedShaderFloatValue *value) {
@@ -216,7 +247,7 @@ static void hash_render_state(CommonSha256Context *hash, const SerializedShaderS
 
 static void model_digest(const ShaderLabSourceQualityRequest *request,
                          ShaderLabSourceQualityInventory *inventory) {
-    static const char domain[] = "DXBCSandbox.ShaderLabSourceQuality.SelectedModel.v1";
+    static const char domain[] = "DXBCSandbox.ShaderLabSourceQuality.SelectedModel.v2";
     CommonSha256Context hash;
     common_sha256_init(&hash);
     common_sha256_update(&hash, domain, sizeof(domain));
@@ -224,6 +255,8 @@ static void model_digest(const ShaderLabSourceQualityRequest *request,
     const SerializedShader *shader = request->shader;
     hash_number(&hash, inventory->has_structural_authority);
     if (request->object) hash_number(&hash, request->object->profile);
+    hash_text(&hash, shader->name);
+    hash_number(&hash, shader->disable_no_subshaders_message);
     hash_number(&hash, shader->property_count);
     for (int index = 0; index < shader->property_count; ++index) {
         const ParsedShaderProperty *property = &shader->properties[index];
@@ -244,12 +277,35 @@ static void model_digest(const ShaderLabSourceQualityRequest *request,
         hash_text(&hash, shader->keyword_names.keywords[index]);
         hash_number(&hash, shader->keyword_flags[index]);
     }
-    const SerializedPass *pass = &shader->subshaders[0].passes[0];
-    hash_render_state(&hash, &pass->state);
-    hash_number(&hash, pass->program_mask);
-    hash_number(&hash, pass->serialized_keyword_state_mask_count);
-    for (int index = 0; index < pass->serialized_keyword_state_mask_count; ++index)
-        hash_number(&hash, pass->serialized_keyword_state_mask[index]);
+    hash_number(&hash, (uint64_t)shader->subshader_count);
+    for (int subshader_index = 0; subshader_index < shader->subshader_count; ++subshader_index) {
+        const SerializedSubShader *subshader = &shader->subshaders[subshader_index];
+        hash_number(&hash, (uint64_t)subshader_index);
+        hash_number(&hash, (uint64_t)subshader->lod);
+        hash_tags(&hash, &subshader->tags);
+        hash_number(&hash, (uint64_t)subshader->pass_count);
+        for (int pass_index = 0; pass_index < subshader->pass_count; ++pass_index) {
+            const SerializedPass *pass = &subshader->passes[pass_index];
+            hash_number(&hash, (uint64_t)pass_index);
+            hash_number(&hash, (uint64_t)pass->version);
+            hash_number(&hash, (uint64_t)pass->pass_type);
+            hash_text(&hash, pass->name);
+            hash_text(&hash, pass->use_name);
+            hash_text(&hash, pass->texture_name);
+            hash_tags(&hash, &pass->tags);
+            hash_render_state(&hash, &pass->state);
+            hash_number(&hash, pass->has_serialized_platforms);
+            hash_number(&hash, (uint64_t)pass->platform_count);
+            for (int index = 0; index < pass->platform_count; ++index)
+                hash_number(&hash, (uint64_t)pass->platforms[index]);
+            hash_number(&hash, pass->program_mask);
+            hash_number(&hash, (uint64_t)pass->serialized_keyword_state_mask_count);
+            for (int index = 0; index < pass->serialized_keyword_state_mask_count; ++index)
+                hash_number(&hash, pass->serialized_keyword_state_mask[index]);
+            for (int stage = 0; stage < 6; ++stage)
+                hash_number(&hash, (uint64_t)pass->subprogram_count[stage]);
+        }
+    }
     hash_number(&hash, inventory->entries.count);
     for (size_t index = 0; index < inventory->entries.count; ++index) {
         const ShaderLabExpressionSourceRecord *entry = &inventory->entries.records[index];
@@ -261,9 +317,28 @@ static void model_digest(const ShaderLabSourceQualityRequest *request,
         hash_number(&hash, entry->hardware_tier_group);
         hash_number(&hash, entry->serialized_state);
         common_sha256_update(&hash, entry->target_digest, sizeof(entry->target_digest));
+        const SerializedPass *pass = &shader->subshaders[entry->subshader_index].passes[entry->pass_index];
         const SerializedSubProgram *program = &pass->subprograms[entry->stage_index][entry->subprogram_index];
         hash_number(&hash, program->program_type);
         hash_number(&hash, program->shader_requirements);
+        hash_number(&hash, program->has_hardware_tier);
+        hash_number(&hash, (uint64_t)program->hardware_tier);
+        hash_number(&hash, (uint64_t)program->global_keyword_count);
+        for (int index = 0; index < program->global_keyword_count; ++index)
+            hash_text(&hash, program->global_keywords[index]);
+        hash_number(&hash, (uint64_t)program->local_keyword_count);
+        for (int index = 0; index < program->local_keyword_count; ++index)
+            hash_text(&hash, program->local_keywords[index]);
+        const SerializedSubProgramIdentity *identity = &pass->subprogram_identities[entry->stage_index][entry->subprogram_index];
+        hash_number(&hash, (uint64_t)identity->hardware_tier_group);
+        hash_number(&hash, (uint64_t)identity->inner_subprogram_index);
+        hash_number(&hash, identity->keyword_scopes_are_explicit);
+        hash_number(&hash, (uint64_t)identity->global_keyword_index_count);
+        for (int index = 0; index < identity->global_keyword_index_count; ++index)
+            hash_number(&hash, (uint64_t)identity->global_keyword_indices[index]);
+        hash_number(&hash, (uint64_t)identity->local_keyword_index_count);
+        for (int index = 0; index < identity->local_keyword_index_count; ++index)
+            hash_number(&hash, (uint64_t)identity->local_keyword_indices[index]);
     }
     common_sha256_final(&hash, inventory->modeled_input_digest);
 }
@@ -273,10 +348,9 @@ static bool summarize_inventory(ShaderLabSourceQualityInventory *inventory) {
     result.classification = HLSL_SOURCE_QUALITY_MIXED;
     result.reasons = HLSL_SOURCE_QUALITY_REASON_INCOMPLETE_SOURCE;
     result.gaps = SHADERLAB_SOURCE_GAP_EXTERNAL_INCLUDE | SHADERLAB_SOURCE_GAP_DEPENDENCY_INVENTORY;
-    /* The pass emitted one literal UnityShaderVariables include. Native
-     * implicit roots and the transitive closure are not inventoried by this
-     * source-only request; SDK convention cannot supply their authority. */
-    result.required_external_include_root_count = 1;
+    /* Each actual program emits a literal include policy unit. Count source
+     * occurrences, not inferred SDK roots or unique filenames. Native implicit
+     * roots and the transitive closure remain outside this source inventory. */
     if (!inventory->has_structural_authority) result.gaps |= SHADERLAB_SOURCE_GAP_SCHEMA_AUTHORITY;
     bool seen[MAX_ENTRY_RECORDS] = {false};
     size_t cursor = 0;
@@ -285,6 +359,8 @@ static bool summarize_inventory(ShaderLabSourceQualityInventory *inventory) {
         if (receipt->source_begin != cursor || receipt->source_end <= cursor ||
             receipt->source_end > inventory->source_size) return false;
         cursor = receipt->source_end;
+        if (receipt->kind == SHADERLAB_SOURCE_SYNTAX_INCLUDE_POLICY)
+            ++result.required_external_include_root_count;
         if (receipt->kind != SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY) {
             ++result.wrapper_receipt_count;
             continue;
