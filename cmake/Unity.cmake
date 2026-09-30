@@ -117,6 +117,11 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
     target_link_libraries(unity_precision_collision_probe PRIVATE
         unity_compiler_support dxbc_build_options)
 
+    # Manual native compute preprocessing/compilation observation; no automatic live test.
+    add_executable(compute_preprocess_probe tests/probes/compute_preprocess_probe.c)
+    target_link_libraries(compute_preprocess_probe PRIVATE
+        unity_compiler_support dxbc_build_options)
+
     # Live severity witness for the shared `err:` callback: preprocessing
     # emits a retained type-zero timing note, while successful D3D compilation
     # emits warning 3206 as a retained actionable type-one diagnostic.

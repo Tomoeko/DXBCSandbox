@@ -252,4 +252,17 @@ bool usc_cache_store(
     const uint8_t* data,
     size_t size);
 
+struct UnityCompilerComputeKernelRequest;
+bool usc_cache_serialize_compute_request(
+    const struct UnityCompilerComputeKernelRequest* request,
+    const char* toolchain_configuration,
+    const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
+    const uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE],
+    uint8_t** out_data, size_t* out_size);
+
+struct UnityCompilerComputePreprocessRequest;
+bool usc_cache_serialize_compute_preprocess_request(
+    const struct UnityCompilerComputePreprocessRequest* request, const char* toolchain_configuration,
+    const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
+    const uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE], uint8_t** data, size_t* size);
 #endif

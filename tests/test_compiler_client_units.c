@@ -274,6 +274,125 @@ static int fake_shader_path_matches(
     return strcmp(directory, "Assets") == 0;
 }
 
+static int fake_consume_compute_request(int fd, char** out_source) {
+    *out_source = fake_read_string(fd);
+    char* filename = fake_read_string(fd);
+    char* kernel = fake_read_string(fd);
+    int ok = *out_source && filename && kernel &&
+        strstr(filename, "/Compute.compute") && strcmp(kernel, "ComputeMain") == 0;
+    free(filename); free(kernel);
+    uint32_t value = 0U;
+    ok = ok && fake_read_u32(fd, &value) && value == 1U &&
+        fake_read_u32(fd, &value) && value == 0U &&
+        fake_read_u32(fd, &value) && value == 1U &&
+        fake_read_u32(fd, &value) && value == 19U &&
+        fake_read_u32(fd, &value) && value == 2U;
+    const char* expected[] = {"FIRST", "1", "SECOND", "literal-value",
+        "PLATFORM_A", "PLATFORM_B", "USER_A"};
+    for (int index = 0; index < 4 && ok; ++index) {
+        char* text = fake_read_string(fd);
+        ok = text && strcmp(text, expected[index]) == 0;
+        free(text);
+    }
+    ok = ok && fake_read_u32(fd, &value) && value == 2U;
+    for (int index = 4; index < 6 && ok; ++index) {
+        char* text = fake_read_string(fd);
+        ok = text && strcmp(text, expected[index]) == 0;
+        free(text);
+    }
+    ok = ok && fake_read_u32(fd, &value) && value == 1U;
+    char* user = ok ? fake_read_string(fd) : NULL;
+    ok = ok && user && strcmp(user, expected[6]) == 0;
+    free(user);
+    uint64_t requirements = 0U;
+    return ok && fake_read_u32(fd, &value) && value == 4U &&
+        fake_read_u32(fd, &value) && value == UINT32_C(0xdeadbeef) &&
+        fake_read_u64(fd, &requirements) && requirements == UINT64_C(0x123456789abcdef0) &&
+        fake_read_u32(fd, &value) && value == 3U &&
+        fake_read_u32(fd, &value) && value == 4U;
+}
+
+
+static int fake_consume_compute_preprocess_request(int fd, char** out_source) {
+    *out_source = fake_read_string(fd);
+    char* filename = fake_read_string(fd); uint32_t value = 0U;
+    int ok = *out_source && filename && strstr(filename, "/Compute.compute") &&
+        fake_read_u32(fd, &value) && value == 1U &&
+        fake_read_u32(fd, &value) && value == 19U &&
+        fake_read_u32(fd, &value) && value == FAKE_SESSION_VALID_APIS &&
+        fake_read_u32(fd, &value) && value == 2U;
+    free(filename);
+    const char* expected[] = {"PLATFORM_A", "PLATFORM_B", "DISABLED_A"};
+    for (int i = 0; i < 2 && ok; ++i) {
+        char* keyword = fake_read_string(fd); ok = keyword && strcmp(keyword, expected[i]) == 0;
+        free(keyword);
+    }
+    ok = ok && fake_read_u32(fd, &value) && value == 1U;
+    char* disabled = ok ? fake_read_string(fd) : NULL;
+    ok = ok && disabled && strcmp(disabled, expected[2]) == 0; free(disabled); return ok;
+}
+static int fake_compute_preprocess_response(int fd, const char* source) {
+    if (strcmp(source, "pp-error") == 0 || strcmp(source, "pp-warning") == 0) {
+        (void)fake_write_string(fd, strcmp(source, "pp-error") == 0 ? "err: 0 4 3" : "err: 1 4 3");
+        (void)fake_write_string(fd, "Compute.compute");
+        (void)fake_write_string(fd, "retained preprocessing diagnostic");
+    }
+    if (strcmp(source, "pp-unknown") == 0) {
+        (void)fake_write_string(fd, "computeReflection: 1"); return 0;
+    }
+    if (strcmp(source, "pp-nul-header") == 0) {
+        static const char bytes[] = "computeKeywordsUserGlobal: 0\0tail";
+        (void)fake_write_buffer(fd, bytes, sizeof(bytes) - 1U); return 0;
+    }
+    if (strcmp(source, "pp-oversize-header") == 0) {
+        (void)fake_write_u64(fd, UINT64_C(1048577)); return 0;
+    }
+    if (strcmp(source, "pp-count") == 0) {
+        (void)fake_write_string(fd, "computeKeywordsUserGlobal: 1025"); return 0;
+    }
+    (void)fake_write_string(fd, "computeKeywordsUserGlobal: 2");
+    (void)fake_write_string(fd, ""); (void)fake_write_string(fd, " OPTION_A OPTION_B");
+    if (strcmp(source, "pp-duplicate-global") == 0) {
+        (void)fake_write_string(fd, "computeKeywordsUserGlobal: 0"); return 0;
+    }
+    (void)fake_write_string(fd, "computeKeywordsUserLocal: 1"); (void)fake_write_string(fd, "LOCAL");
+    if (strcmp(source, "pp-order") == 0) {
+        (void)fake_write_string(fd, "endKernels: 0 0 0 0 0 0"); return 0;
+    }
+    if (strcmp(source, "pp-error") != 0) {
+        (void)fake_write_string(fd, "kernel: First 2");
+        (void)fake_write_string(fd, "A"); (void)fake_write_string(fd, "1");
+        (void)fake_write_string(fd, strcmp(source, "pp-duplicate-macro") == 0 ? "A" : "B");
+        (void)fake_write_string(fd, "literal-value");
+        if (strcmp(source, "pp-duplicate-macro") == 0) return 0;
+        (void)fake_write_string(fd, strcmp(source, "pp-duplicate-kernel") == 0 ? "kernel: First 0" : "kernel: Second 0");
+        if (strcmp(source, "pp-duplicate-kernel") == 0) return 0;
+    }
+    (void)fake_write_string(fd, "requirements:"); (void)fake_write_u64(fd, UINT64_C(0x100004001));
+    (void)fake_write_u32(fd, 2U);
+    (void)fake_write_string(fd, "OPTION_A"); (void)fake_write_u64(fd, 16385U);
+    (void)fake_write_string(fd, strcmp(source, "pp-duplicate-requirement") == 0 ? "OPTION_A" : "OPTION_B");
+    (void)fake_write_u64(fd, UINT64_C(0x8000000000000001));
+    if (strcmp(source, "pp-duplicate-requirement") == 0) return 0;
+    if (strcmp(source, "pp-duplicate-requirements") == 0) {
+        (void)fake_write_string(fd, "requirements:"); return 0;
+    }
+    if (strcmp(source, "pp-uncaptured-include") == 0) {
+        (void)fake_write_string(fd, "endKernels: -1 -2147483648 2147483647 -2 3 1");
+        (void)fake_write_string(fd, "/UncapturedComputeDependency/Foreign.hlsl");
+    } else {
+        (void)fake_write_string(fd, "endKernels: -1 -2147483648 2147483647 -2 3 0");
+    }
+    if (strcmp(source, "pp-nul-source") == 0) {
+        static const char bytes[] = "source\0tail";
+        (void)fake_write_buffer(fd, bytes, sizeof(bytes) - 1U); return 0;
+    }
+    (void)fake_write_string(fd, "// native transformed source\n");
+    (void)fake_write_u32(fd, UINT32_MAX); (void)fake_write_u32(fd, 16U);
+    if (strcmp(source, "pp-truncated") == 0) return 0;
+    (void)fake_write_u32(fd, 32U); return 1;
+}
+
 static int run_fake_compiler(
     const char* unity_contents_path, const char* port_text) {
     char* end = NULL;
@@ -496,6 +615,81 @@ static int run_fake_compiler(
             free(name);
             free(file_path);
             continue;
+        }
+        if (strcmp(command, "preprocessCompute") == 0) {
+            free(command); char* source = NULL;
+            if (!fake_consume_compute_preprocess_request(fd, &source)) {free(source);break;}
+            int keep_running = fake_compute_preprocess_response(fd, source); free(source);
+            if (!keep_running) break;
+            continue;
+        }
+        if (strcmp(command, "compileComputeKernel") == 0) {
+            free(command);
+            char* source = NULL;
+            if (!fake_consume_compute_request(fd, &source)) {free(source);break;}
+            if (strcmp(source, "compute-oversize-header") == 0) {
+                (void)fake_write_u64(fd, UINT64_C(1048577));
+                free(source);
+                break;
+            }
+            if (strcmp(source, "compute-diagnostic-limit") == 0 ||
+                strcmp(source, "compute-diagnostic-overflow") == 0) {
+                const unsigned count = strcmp(source, "compute-diagnostic-limit") == 0
+                    ? 1024U : 1025U;
+                for (unsigned i = 0U; i < count; ++i) {
+                    (void)fake_write_string(fd, "err: 1 4 17");
+                    (void)fake_write_string(fd, "Compute.compute");
+                    (void)fake_write_string(fd, "retained compute diagnostic");
+                }
+            }
+            if (strcmp(source, "compute-oversize-diagnostic") == 0 ||
+                strcmp(source, "compute-nul-diagnostic") == 0) {
+                (void)fake_write_string(fd, "err: 1 4 17");
+                (void)fake_write_string(fd, "Compute.compute");
+                if (strcmp(source, "compute-oversize-diagnostic") == 0) {
+                    (void)fake_write_u64(fd, UINT64_C(1048577));
+                } else {
+                    static const char text[] = "diagnostic\0tail";
+                    (void)fake_write_buffer(fd, text, sizeof(text) - 1U);
+                }
+                free(source);
+                break;
+            }
+            if (strcmp(source, "compute-rejected") == 0 ||
+                strcmp(source, "compute-warning") == 0) {
+                (void)fake_write_string(fd, "err: 1 4 17");
+                (void)fake_write_string(fd, "Compute.compute");
+                (void)fake_write_string(fd, "retained compute diagnostic");
+            }
+            if (strcmp(source, "compute-unknown") == 0) {
+                (void)fake_write_string(fd, "computeReflection: 1");
+                free(source);break;
+            }
+            if (strcmp(source, "compute-nul-terminal") == 0) {
+                static const char nul_terminal[] = "computeData: 1\0trailing";
+                (void)fake_write_buffer(fd, nul_terminal, sizeof(nul_terminal) - 1U);
+                free(source);break;
+            }
+            const char* status = strcmp(source, "compute-rejected") == 0
+                ? "computeData: 0" : strcmp(source, "compute-malformed") == 0
+                ? "computeData: 1 trailing" : "computeData: 1";
+            (void)fake_write_string(fd, status);
+            if (strcmp(source, "compute-aggregate-payload") == 0) {
+                /* Individually legal payload length, illegal after its header.
+                 * The client must reject before allocating or reading bytes. */
+                (void)fake_write_u64(fd, UINT64_C(512) * 1024U * 1024U);
+                free(source);
+                break;
+            }
+            if (strcmp(source, "compute-truncated") == 0) {
+                (void)fake_write_u64(fd, 12U);
+                (void)fake_write_all(fd, "short", 5U);
+                free(source);break;
+            }
+            static const uint8_t payload[] = {0x31U, 0U, 0x7fU, 0xffU};
+            (void)fake_write_buffer(fd, payload,
+                strcmp(source, "compute-empty-success") == 0 ? 0U : sizeof(payload));
+            free(source);continue;
         }
         if (strcmp(command, "compileSnippet") == 0) {
             free(command);
@@ -956,6 +1150,249 @@ static int verify_external_include_cache(
     CHECK(!response.data && !response.has_request_identity && channel->process_id == 0);
     unity_compiler_binary_response_free(&response);
     remove_tree(temporary);
+    return 0;
+}
+
+static int verify_compute_transport(UnityCompilerChannel* channel, const char* root) {
+    char filename[PATH_MAX];
+    CHECK(snprintf(filename, sizeof(filename), "%s/Compute.compute", root) > 0);
+    UnityCompilerComputeMacro macros[] = {{"FIRST", "1"}, {"SECOND", "literal-value"}};
+    char* pkw[] = {"PLATFORM_A", "PLATFORM_B"};
+    char* ukw[] = {"USER_A"};
+    UnityCompilerComputeKernelRequest request = {.source = "compute-success",
+                                                 .source_filename = filename,
+                                                 .kernel_name = "ComputeMain",
+                                                 .caching_preprocessor = true,
+                                                 .strip_line_directives = true,
+                                                 .build_platform = 19U,
+                                                 .kernel_macros = macros,
+                                                 .kernel_macro_count = 2,
+                                                 .platform_keywords = pkw,
+                                                 .platform_keyword_count = 2,
+                                                 .user_keywords = ukw,
+                                                 .user_keyword_count = 1,
+                                                 .compiler_platform = 4,
+                                                 .compilation_flags = UINT32_C(0xdeadbeef),
+                                                 .requirements = UINT64_C(0x123456789abcdef0),
+                                                 .force_dxc = 3U,
+                                                 .force_fxc = 4U};
+    bool success = true;
+    CHECK(unity_compiler_parse_compute_status_record("computeData: 0", &success) && !success);
+    CHECK(unity_compiler_parse_compute_status_record("computeData: 1", &success) && success);
+    const char* malformed[] = {"computeData: 2",  "computeData: 1 0", "computeData:1",
+                               "computeData: 1 ", "computeData: 01",  "shader: 1",
+                               " computeData: 1"};
+    for (size_t index = 0; index < sizeof(malformed) / sizeof(malformed[0]); ++index)
+        CHECK(!unity_compiler_parse_compute_status_record(malformed[index], &success) && !success);
+    UnityCompilerBinaryResponse response;
+    CHECK(unity_compiler_compile_compute_response(channel, &request, &response));
+    CHECK(response.status.compiler_success && response.has_request_identity &&
+          response.size == 4U && response.data[0] == 0x31U && response.data[1] == 0U &&
+          response.status.diagnostic_count == 0U);
+    uint8_t digest[32];
+    memcpy(digest, response.request_digest, sizeof(digest));
+    unity_compiler_binary_response_free(&response);
+    uint8_t* transcript = NULL;
+    size_t size = 0U;
+    uint8_t encoded_digest[32];
+    CHECK(unity_compiler_serialize_compute_request(channel, &request, &transcript, &size,
+                                                   encoded_digest));
+    CHECK(size > 0U && memcmp(encoded_digest, digest, 32U) == 0);
+    free(transcript);
+    pid_t healthy = channel->process_id;
+    request.source = "compute-rejected";
+    CHECK(unity_compiler_compile_compute_response(channel, &request, &response));
+    CHECK(!response.status.compiler_success && response.status.diagnostic_count == 1U &&
+          strcmp(response.status.diagnostics[0].message, "retained compute diagnostic") == 0 &&
+          channel->process_id == healthy && response.size == 4U);
+    unity_compiler_binary_response_free(&response);
+    request.source = "compute-warning";
+    CHECK(unity_compiler_compile_compute_response(channel, &request, &response));
+    CHECK(response.status.compiler_success &&
+          !unity_compiler_response_status_is_clean_success(&response.status));
+    unity_compiler_binary_response_free(&response);
+    request.source = "compute-diagnostic-limit";
+    CHECK(unity_compiler_compile_compute_response(channel, &request, &response));
+    CHECK(response.status.compiler_success && response.status.diagnostic_count == 1024U &&
+          !unity_compiler_response_status_is_clean_success(&response.status) &&
+          strcmp(response.status.diagnostics[1023].message, "retained compute diagnostic") == 0 &&
+          channel->process_id == healthy);
+    unity_compiler_binary_response_free(&response);
+    const char* poisoned[] = {
+        "compute-malformed",           "compute-truncated",           "compute-unknown",
+        "compute-empty-success",       "compute-nul-terminal",        "compute-oversize-header",
+        "compute-diagnostic-overflow", "compute-oversize-diagnostic", "compute-nul-diagnostic",
+        "compute-aggregate-payload"};
+    for (size_t index = 0; index < sizeof(poisoned) / sizeof(poisoned[0]); ++index) {
+        request.source = poisoned[index];
+        CHECK(!unity_compiler_compile_compute_response(channel, &request, &response));
+        CHECK(!response.data && !response.size && !response.has_request_identity &&
+              !response.status.diagnostic_count && channel->socket_fd == -1 &&
+              !channel->process_id);
+        request.source = "compute-success";
+        CHECK(unity_compiler_compile_compute_response(channel, &request, &response));
+        CHECK(response.status.compiler_success && response.size == 4U);
+        unity_compiler_binary_response_free(&response);
+    }
+    healthy = channel->process_id;
+    request.kernel_macro_count = -1;
+    CHECK(!unity_compiler_compile_compute_response(channel, &request, &response));
+    CHECK(channel->process_id == healthy && !response.data);
+    request.kernel_macro_count = 2;
+    request.compiler_platform = 25;
+    CHECK(!unity_compiler_compile_compute_response(channel, &request, &response));
+    CHECK(channel->process_id == healthy);
+    request.compiler_platform = 4;
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    CHECK(unity_compiler_compile_compute_response(channel, &request, &response));
+    CHECK(response.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS &&
+          !response.data && response.has_request_identity && channel->process_id == healthy);
+    unity_compiler_binary_response_free(&response);
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
+    return 0;
+}
+
+static int verify_compute_preprocess_transport(UnityCompilerChannel* channel, const char* root) {
+    char filename[PATH_MAX];
+    CHECK(snprintf(filename, sizeof(filename), "%s/Compute.compute", root) > 0);
+    char* platform[] = {"PLATFORM_A", "PLATFORM_B"};
+    char* disabled[] = {"DISABLED_A"};
+    UnityCompilerComputePreprocessRequest request = {.source = "pp-success",
+                                                     .source_filename = filename,
+                                                     .caching_preprocessor = true,
+                                                     .build_platform = 19U,
+                                                     .valid_apis = FAKE_SESSION_VALID_APIS,
+                                                     .platform_keywords = platform,
+                                                     .platform_keyword_count = 2,
+                                                     .disabled_keywords = disabled,
+                                                     .disabled_keyword_count = 1};
+    UnityCompilerComputePreprocessResponse* response = NULL;
+    UnityCompilerComputePreprocessInfo info;
+    CHECK(unity_compiler_preprocess_compute_response(channel, &request, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info));
+    CHECK(info.transport_complete && !info.native_success_present && info.has_request_identity &&
+          info.availability == UNITY_COMPILER_RESPONSE_AVAILABLE && info.diagnostic_count == 0U);
+    const UnityCompilerComputePreprocessResult* result =
+        unity_compiler_compute_preprocess_response_result(response);
+    CHECK(result && result->user_global.line_count == 2U && result->user_local.line_count == 1U &&
+          strcmp(result->user_global.lines[0], "") == 0 &&
+          strcmp(result->user_global.lines[1], " OPTION_A OPTION_B") == 0 &&
+          strcmp(result->user_local.lines[0], "LOCAL") == 0 && result->kernel_count == 2U &&
+          strcmp(result->kernels[0].name, "First") == 0 && result->kernels[0].macro_count == 2U &&
+          strcmp(result->kernels[0].macros[0].name, "A") == 0 &&
+          strcmp(result->kernels[0].macros[0].value, "1") == 0 &&
+          strcmp(result->kernels[0].macros[1].value, "literal-value") == 0 &&
+          strcmp(result->kernels[1].name, "Second") == 0 && result->kernels[1].macro_count == 0U);
+    CHECK(result->requirements == UINT64_C(0x100004001) &&
+          result->conditional_requirement_count == 2U &&
+          result->conditional_requirements[1].requirements == UINT64_C(0x8000000000000001) &&
+          result->compilation_flags == UINT32_MAX &&
+          result->include_hash_words[0] == UINT32_C(0x80000000) &&
+          result->include_hash_words[1] == INT32_MAX &&
+          result->include_hash_words[2] == UINT32_C(0xfffffffe) &&
+          result->include_hash_words[3] == 3U && result->dependency_count == 0U &&
+          strcmp(result->source, "// native transformed source\n") == 0 &&
+          result->source_size == strlen(result->source) && result->supported_apis == -1 &&
+          result->use_dxc_mask == 16U && result->never_use_dxc_mask == 32U);
+    uint8_t digest[32];
+    memcpy(digest, info.request_digest, sizeof(digest));
+    uint8_t* bytes = NULL;
+    size_t size = 0U;
+    uint8_t serialized_digest[32];
+    CHECK(unity_compiler_serialize_compute_preprocess_request(channel, &request, &bytes, &size,
+                                                              serialized_digest));
+    CHECK(size > 0U && memcmp(digest, serialized_digest, 32U) == 0);
+    free(bytes);
+    CHECK(!unity_compiler_preprocess_compute_response(channel, &request, &response));
+    CHECK(unity_compiler_compute_preprocess_response_result(response) == result);
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    pid_t healthy = channel->process_id;
+    const char* diagnostics[] = {"pp-error", "pp-warning"};
+    for (size_t i = 0; i < 2U; ++i) {
+        request.source = diagnostics[i];
+        CHECK(unity_compiler_preprocess_compute_response(channel, &request, &response));
+        CHECK(unity_compiler_compute_preprocess_response_info(response, &info) &&
+              info.transport_complete && !info.native_success_present &&
+              info.diagnostic_count == 1U && channel->process_id == healthy);
+        size_t count = 0U;
+        const UnityCompilerDiagnostic* entries =
+            unity_compiler_compute_preprocess_response_diagnostics(response, &count);
+        CHECK(count == 1U && entries &&
+              strcmp(entries[0].record, i == 0U ? "err: 0 4 3" : "err: 1 4 3") == 0 &&
+              strcmp(entries[0].message, "retained preprocessing diagnostic") == 0);
+        result = unity_compiler_compute_preprocess_response_result(response);
+        CHECK(result && result->kernel_count == (i == 0U ? 0U : 2U));
+        char* formatted =
+            unity_compiler_compute_preprocess_response_format_diagnostics(response, "fallback");
+        CHECK(formatted && strstr(formatted, "retained preprocessing diagnostic"));
+        free(formatted);
+        unity_compiler_compute_preprocess_response_free(response);
+        response = NULL;
+    }
+    const char* malformed[] = {"pp-unknown",
+                               "pp-nul-header",
+                               "pp-oversize-header",
+                               "pp-count",
+                               "pp-duplicate-global",
+                               "pp-order",
+                               "pp-duplicate-macro",
+                               "pp-duplicate-kernel",
+                               "pp-duplicate-requirement",
+                               "pp-duplicate-requirements",
+                               "pp-nul-source",
+                               "pp-truncated"};
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); ++i) {
+        request.source = malformed[i];
+        CHECK(!unity_compiler_preprocess_compute_response(channel, &request, &response));
+        CHECK(!response && channel->socket_fd == -1 && !channel->process_id);
+        request.source = "pp-success";
+        CHECK(unity_compiler_preprocess_compute_response(channel, &request, &response));
+        CHECK(unity_compiler_compute_preprocess_response_info(response, &info) &&
+              info.transport_complete);
+        unity_compiler_compute_preprocess_response_free(response);
+        response = NULL;
+    }
+    request.source = "pp-uncaptured-include";
+    CHECK(unity_compiler_preprocess_compute_response(channel, &request, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info));
+    uint8_t zero_digest[32] = {0};
+    CHECK(info.transport_complete &&
+          info.availability == UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE &&
+          !info.has_request_identity &&
+          memcmp(info.request_digest, zero_digest, sizeof(zero_digest)) == 0 &&
+          memcmp(info.controls_digest, zero_digest, sizeof(zero_digest)) == 0 &&
+          !unity_compiler_compute_preprocess_response_result(response) &&
+          channel->socket_fd == -1 && !channel->process_id && !channel->cache_toolchain_lease &&
+          !channel->cache_include_lease && !channel->cache_source_lease &&
+          !channel->session_capabilities_ready);
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    request.source = "pp-success";
+    CHECK(unity_compiler_preprocess_compute_response(channel, &request, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info) &&
+          info.transport_complete && info.has_request_identity &&
+          info.availability == UNITY_COMPILER_RESPONSE_AVAILABLE && channel->process_id > 0);
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    healthy = channel->process_id;
+    request.disabled_keyword_count = -1;
+    CHECK(!unity_compiler_preprocess_compute_response(channel, &request, &response) && !response &&
+          channel->process_id == healthy);
+    request.disabled_keyword_count = 1;
+    request.valid_apis ^= UINT32_C(1) << 4U;
+    CHECK(!unity_compiler_preprocess_compute_response(channel, &request, &response) && !response);
+    request.valid_apis = FAKE_SESSION_VALID_APIS;
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    CHECK(unity_compiler_preprocess_compute_response(channel, &request, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info) &&
+          !info.transport_complete && !info.native_success_present &&
+          info.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS &&
+          info.has_request_identity &&
+          !unity_compiler_compute_preprocess_response_result(response));
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
     return 0;
 }
 
@@ -3308,6 +3745,8 @@ int main(int argc, char** argv) {
     CHECK(verify_source_root_cache(&fixture_channel, &informational_compile_request,
                                    &fixture_preprocess) == 0);
     CHECK(verify_external_include_cache(&fixture_channel, &informational_compile_request) == 0);
+    CHECK(verify_compute_transport(&fixture_channel, temporary_dir) == 0);
+    CHECK(verify_compute_preprocess_transport(&fixture_channel, temporary_dir) == 0);
     fixture_text = unity_compiler_disassemble(
         &fixture_channel, "ignore-shutdown", 4, 0, NULL, 0U);
     CHECK(fixture_text && strcmp(fixture_text, "fake disassembly") == 0);

@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Authored native protocol evaluation input, never a reconstruction reference.
+// This fixture does not establish reconstruction support or runtime acceptance.
+#pragma kernel SampleAndWrite PROBE_BINDINGS
+#pragma only_renderers d3d11
+
+cbuffer BindingParameters : register(b0)
+{
+    float4 _Tint;
+    float2 _UvScale;
+    float2 _UvOffset;
+};
+
+Texture2D<float4> _Source : register(t0);
+SamplerState sampler_LinearClamp : register(s0);
+RWTexture2D<float4> _Destination : register(u0);
+
+[numthreads(8, 8, 1)]
+void SampleAndWrite(uint3 dispatchId : SV_DispatchThreadID)
+{
+    float2 coordinates = (float2(dispatchId.xy) + 0.5) * _UvScale + _UvOffset;
+    float4 sampled = _Source.SampleLevel(sampler_LinearClamp, coordinates, 0.0);
+    _Destination[dispatchId.xy] = sampled * _Tint;
+}

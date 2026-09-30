@@ -1,10 +1,14 @@
 #include "compiler/unity_compiler_broker.h"
 #include "compiler/unity_compiler_singleflight.h"
 
+#include <arpa/inet.h>
+#include <errno.h>
 #include <pthread.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +24,8 @@
 } while (0)
 
 #define CONCURRENT_CALLS 8
+#define BROKER_FAKE_MAGIC UINT32_C(0x0C0BD1E4)
+#define BROKER_FAKE_VALID_APIS UINT32_C(0x00048230)
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -62,6 +68,205 @@ static bool write_test_file(const char* path, const char* text) {
     if (fflush(output) != 0) ok = false;
     if (fclose(output) != 0) ok = false;
     return ok;
+}
+
+/* This small peer exercises the broker's complete protocol boundary.  Its
+ * payload is controlled transport data, not a decoded ComputeShaderBinary. */
+static bool broker_fake_transfer(int fd, void* data, size_t size, bool writing) {
+    uint8_t* cursor = (uint8_t*)data;
+    while (size > 0U) {
+        const ssize_t count = writing ? write(fd, cursor, size)
+                                      : read(fd, cursor, size);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        cursor += (size_t)count;
+        size -= (size_t)count;
+    }
+    return true;
+}
+
+static bool broker_fake_scalar(int fd, void* value, size_t size, bool writing) {
+    uint32_t magic = BROKER_FAKE_MAGIC;
+    return broker_fake_transfer(fd, &magic, sizeof(magic), writing) &&
+           magic == BROKER_FAKE_MAGIC &&
+           broker_fake_transfer(fd, value, size, writing);
+}
+
+static bool broker_fake_write_u32(int fd, uint32_t value) {
+    return broker_fake_scalar(fd, &value, sizeof(value), true);
+}
+
+static bool broker_fake_write_u64(int fd, uint64_t value) {
+    return broker_fake_scalar(fd, &value, sizeof(value), true);
+}
+
+static bool broker_fake_expect_u32(int fd, uint32_t expected) {
+    uint32_t value = 0U;
+    return broker_fake_scalar(fd, &value, sizeof(value), false) &&
+           value == expected;
+}
+
+static bool broker_fake_write_text(int fd, const char* text) {
+    uint64_t size = (uint64_t)strlen(text);
+    return broker_fake_scalar(fd, &size, sizeof(size), true) &&
+           broker_fake_transfer(fd, (void*)text, (size_t)size, true);
+}
+
+static char* broker_fake_read_text(int fd) {
+    uint64_t size = 0U;
+    if (!broker_fake_scalar(fd, &size, sizeof(size), false) || size > 4096U) {
+        return NULL;
+    }
+    char* text = (char*)malloc((size_t)size + 1U);
+    if (!text) return NULL;
+    if (!broker_fake_transfer(fd, text, (size_t)size, false)) {
+        free(text);
+        return NULL;
+    }
+    text[size] = '\0';
+    return text;
+}
+
+static bool broker_fake_expect_text(int fd, const char* expected) {
+    char* text = broker_fake_read_text(fd);
+    const bool matches = text && strcmp(text, expected) == 0;
+    free(text);
+    return matches;
+}
+
+static bool broker_fake_initialize(int fd) {
+    if (!broker_fake_expect_text(fd, "initializeCompiler")) return false;
+    uint32_t count = 0U;
+    if (!broker_fake_scalar(fd, &count, sizeof(count), false) ||
+        count < 1U || count > 16U) return false;
+    for (uint32_t index = 0U; index < count; ++index) {
+        char* directory = broker_fake_read_text(fd);
+        if (!directory) return false;
+        free(directory);
+    }
+    if (!broker_fake_expect_u32(fd, 0U)) return false;
+    char* configuration = broker_fake_read_text(fd);
+    if (!configuration) return false;
+    free(configuration);
+    if (!broker_fake_write_u32(fd, BROKER_FAKE_VALID_APIS |
+                                    ~UNITY_COMPILER_PLATFORM_MASK)) return false;
+    for (size_t platform = 0U; platform < UNITY_COMPILER_PLATFORM_COUNT;
+         ++platform) {
+        if (!broker_fake_write_u64(fd, UINT64_C(0x1020304050607080) +
+                                      (uint64_t)platform) ||
+            !broker_fake_write_u32(fd, 7300U + (uint32_t)platform)) return false;
+    }
+    return true;
+}
+
+static bool broker_fake_compute_request(int fd, const char* root,
+                                        bool preprocessing, char** source) {
+    *source = broker_fake_read_text(fd);
+    char filename[PATH_MAX];
+    const int written = snprintf(filename, sizeof(filename),
+                                 "%s/Compute.compute", root);
+    if (!*source || written <= 0 || (size_t)written >= sizeof(filename) ||
+        !broker_fake_expect_text(fd, filename)) return false;
+    if (!preprocessing && !broker_fake_expect_text(fd, "ComputeMain")) {
+        return false;
+    }
+    if (!broker_fake_expect_u32(fd, 1U)) return false;
+    if (!preprocessing && (!broker_fake_expect_u32(fd, 0U) ||
+                           !broker_fake_expect_u32(fd, 1U))) return false;
+    if (!broker_fake_expect_u32(fd, 19U)) return false;
+    if (preprocessing) {
+        if (!broker_fake_expect_u32(fd, BROKER_FAKE_VALID_APIS)) return false;
+    } else if (!broker_fake_expect_u32(fd, 1U) ||
+               !broker_fake_expect_text(fd, "VALUE") ||
+               !broker_fake_expect_text(fd, "2")) return false;
+    if (!broker_fake_expect_u32(fd, 1U) ||
+        !broker_fake_expect_text(fd, "PLATFORM_A") ||
+        !broker_fake_expect_u32(fd, 1U) ||
+        !broker_fake_expect_text(fd, preprocessing ? "DISABLED_A" : "USER_A")) {
+        return false;
+    }
+    if (preprocessing) return true;
+    uint64_t requirements = 0U;
+    return broker_fake_expect_u32(fd, 4U) &&
+           broker_fake_expect_u32(fd, 7U) &&
+           broker_fake_scalar(fd, &requirements, sizeof(requirements), false) &&
+           requirements == UINT64_C(0x100004001) &&
+           broker_fake_expect_u32(fd, 16U) &&
+           broker_fake_expect_u32(fd, 32U);
+}
+
+static bool broker_fake_preprocess_response(int fd, const char* source) {
+    const bool uncaptured = strcmp(source, "broker-uncaptured") == 0;
+    if (!broker_fake_write_text(fd, "computeKeywordsUserGlobal: 0") ||
+        !broker_fake_write_text(fd, "computeKeywordsUserLocal: 0") ||
+        !broker_fake_write_text(fd, "kernel: ComputeMain 0") ||
+        !broker_fake_write_text(fd, "requirements:") ||
+        !broker_fake_write_u64(fd, UINT64_C(0x100004001)) ||
+        !broker_fake_write_u32(fd, 0U) ||
+        !broker_fake_write_text(fd, uncaptured
+            ? "endKernels: 7 0 0 0 0 1" : "endKernels: 7 0 0 0 0 0")) {
+        return false;
+    }
+    if (uncaptured && !broker_fake_write_text(
+            fd, "/UncapturedBrokerDependency/Foreign.hlsl")) return false;
+    return broker_fake_write_text(fd, "// controlled preprocessing output\n") &&
+           broker_fake_write_u32(fd, BROKER_FAKE_VALID_APIS) &&
+           broker_fake_write_u32(fd, 16U) &&
+           broker_fake_write_u32(fd, 32U);
+}
+
+static int run_broker_fake_compute(const char* root, const char* port_text) {
+    char* end = NULL;
+    const long port = strtol(port_text, &end, 10);
+    if (end == port_text || *end || port <= 0 || port > 65535) return 2;
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 3;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    int connected;
+    do {
+        connected = connect(fd, (struct sockaddr*)&address, sizeof(address));
+    } while (connected < 0 && errno == EINTR);
+    if (connected < 0 || !broker_fake_write_text(fd, "") ||
+        !broker_fake_initialize(fd)) {
+        close(fd);
+        return 4;
+    }
+    for (;;) {
+        char* command = broker_fake_read_text(fd);
+        if (!command) break;
+        if (strcmp(command, "shutdown") == 0) {
+            free(command);
+            break;
+        }
+        const bool preprocessing = strcmp(command, "preprocessCompute") == 0;
+        const bool known = preprocessing ||
+                           strcmp(command, "compileComputeKernel") == 0;
+        free(command);
+        char* source = NULL;
+        bool ok = known && broker_fake_compute_request(fd, root, preprocessing,
+                                                       &source);
+        /* These calls must be rejected before any native request is sent. */
+        if (ok && strcmp(source, "broker-authority-rejected") == 0) ok = false;
+        if (ok && preprocessing) {
+            ok = broker_fake_preprocess_response(fd, source);
+        } else if (ok) {
+            static uint8_t payload[] = {0x31U, 0U, 0x7fU, 0xffU};
+            const bool rejected = strcmp(source, "broker-native-rejected") == 0;
+            uint64_t size = rejected ? 0U : sizeof(payload);
+            ok = broker_fake_write_text(fd, rejected
+                                           ? "computeData: 0" : "computeData: 1") &&
+                 broker_fake_scalar(fd, &size, sizeof(size), true) &&
+                 broker_fake_transfer(fd, payload, (size_t)size, true);
+        }
+        free(source);
+        if (!ok) break;
+    }
+    close(fd);
+    return 0;
 }
 
 static uint8_t* controlled_operation(void* opaque, size_t* out_size,
@@ -688,6 +893,276 @@ static bool verify_oversized_source_live_process_lifecycle(
     return true;
 }
 
+static bool verify_compute_broker_identity_and_residency(
+    const char* executable_path) {
+    char executable[PATH_MAX];
+    CHECK(realpath(executable_path, executable) != NULL);
+    char temporary_template[] = "/tmp/dxbc_broker_compute.XXXXXX";
+    char* root = mkdtemp(temporary_template);
+    CHECK(root != NULL);
+    char includes[PATH_MAX];
+    char glslang[PATH_MAX];
+    char dxcompiler[PATH_MAX];
+    char filename[PATH_MAX];
+    CHECK(snprintf(includes, sizeof(includes), "%s/builtin", root) > 0);
+    CHECK(snprintf(glslang, sizeof(glslang), "%s/glslang.dylib", root) > 0);
+    CHECK(snprintf(dxcompiler, sizeof(dxcompiler), "%s/libdxcompiler.dylib",
+                   root) > 0);
+    CHECK(snprintf(filename, sizeof(filename), "%s/Compute.compute", root) > 0);
+    CHECK(mkdir(includes, 0700) == 0);
+    CHECK(write_test_file(glslang, "controlled-glslang"));
+    CHECK(write_test_file(dxcompiler, "controlled-dxcompiler"));
+
+    struct {
+        const char* name;
+        const char* value;
+        char* previous;
+    } environment[] = {
+        {"DXBC_USC_CACHE_DIR", NULL, NULL},
+        {"DXBC_USC_CACHE_ONLY", NULL, NULL},
+        {"DXBC_USC_BROKER_FAKE_COMPUTE", "1", NULL},
+        {"DXBC_USC_IO_TIMEOUT_MS", "3000", NULL},
+        {"DXBC_UNITY_CONTENTS_PATH", root, NULL},
+        {"DXBC_UNITY_COMPILER_PATH", executable, NULL},
+        {"DXBC_UNITY_BUILTIN_INCLUDES_PATH", includes, NULL},
+        {"DXBC_UNITY_PLAYBACK_ENGINES_PATH", root, NULL},
+        {"DXBC_UNITY_GLSLANG_PATH", glslang, NULL},
+        {"DXBC_UNITY_DXCOMPILER_PATH", dxcompiler, NULL},
+    };
+    for (size_t index = 0U; index < sizeof(environment) / sizeof(environment[0]);
+         ++index) {
+        const char* previous = getenv(environment[index].name);
+        environment[index].previous = previous ? duplicate_text(previous) : NULL;
+        CHECK(!previous || environment[index].previous != NULL);
+        CHECK(environment[index].value
+            ? setenv(environment[index].name, environment[index].value, 1) == 0
+            : unsetenv(environment[index].name) == 0);
+    }
+
+    UnityCompilerBroker* broker = unity_compiler_broker_create_lazy(root, includes);
+    CHECK(broker != NULL);
+    CHECK(unity_compiler_broker_set_source_residency_budget(broker, 4096U));
+    CHECK(unity_compiler_broker_set_expected_valid_apis(
+        broker, BROKER_FAKE_VALID_APIS));
+    char source[] = "broker-compute-source";
+    char* platform_keywords[] = {"PLATFORM_A"};
+    char* user_keywords[] = {"USER_A"};
+    char* disabled_keywords[] = {"DISABLED_A"};
+    const UnityCompilerComputeMacro macros[] = {{"VALUE", "2"}};
+    UnityCompilerComputeKernelRequest compile = {
+        .source = source,
+        .source_filename = filename,
+        .kernel_name = "ComputeMain",
+        .caching_preprocessor = true,
+        .strip_line_directives = true,
+        .build_platform = 19U,
+        .kernel_macros = macros,
+        .kernel_macro_count = 1,
+        .platform_keywords = platform_keywords,
+        .platform_keyword_count = 1,
+        .user_keywords = user_keywords,
+        .user_keyword_count = 1,
+        .compiler_platform = 4,
+        .compilation_flags = 7U,
+        .requirements = UINT64_C(0x100004001),
+        .force_dxc = 16U,
+        .force_fxc = 32U,
+    };
+    UnityCompilerComputePreprocessRequest preprocess = {
+        .source = source,
+        .source_filename = filename,
+        .caching_preprocessor = true,
+        .build_platform = 19U,
+        .valid_apis = BROKER_FAKE_VALID_APIS,
+        .platform_keywords = platform_keywords,
+        .platform_keyword_count = 1,
+        .disabled_keywords = disabled_keywords,
+        .disabled_keyword_count = 1,
+    };
+    uint8_t compile_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t preprocess_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t changed_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t* transcript = NULL;
+    size_t transcript_size = 0U;
+    CHECK(unity_compiler_broker_serialize_compute_request(
+        broker, &compile, &transcript, &transcript_size, compile_digest));
+    CHECK(transcript != NULL && transcript_size > 0U);
+    free(transcript);
+    CHECK(unity_compiler_broker_serialize_compute_preprocess_request(
+        broker, &preprocess, &transcript, &transcript_size, preprocess_digest));
+    CHECK(transcript != NULL && transcript_size > 0U &&
+          memcmp(compile_digest, preprocess_digest, sizeof(compile_digest)) != 0);
+    free(transcript);
+    compile.kernel_name = "DifferentKernel";
+    CHECK(unity_compiler_broker_serialize_compute_request(
+        broker, &compile, &transcript, &transcript_size, changed_digest));
+    CHECK(memcmp(compile_digest, changed_digest, sizeof(compile_digest)) != 0);
+    free(transcript);
+    compile.kernel_name = "ComputeMain";
+    disabled_keywords[0] = "DISABLED_B";
+    CHECK(unity_compiler_broker_serialize_compute_preprocess_request(
+        broker, &preprocess, &transcript, &transcript_size, changed_digest));
+    CHECK(memcmp(preprocess_digest, changed_digest, sizeof(preprocess_digest)) != 0);
+    free(transcript);
+    disabled_keywords[0] = "DISABLED_A";
+    UnityCompilerBrokerStats stats;
+    unity_compiler_broker_get_stats(broker, &stats);
+    CHECK(stats.submitted_requests == 0U && stats.executed_requests == 0U &&
+          stats.compiler_process_starts == 0U && !stats.compiler_process_running &&
+          stats.source_digest_scans == 0U && stats.tracked_source_window_bytes == 0U);
+
+    UnityCompilerBinaryResponse binary;
+    CHECK(unity_compiler_broker_compile_compute_response(broker, &compile, &binary));
+    const uint8_t payload[] = {0x31U, 0U, 0x7fU, 0xffU};
+    CHECK(binary.status.availability == UNITY_COMPILER_RESPONSE_AVAILABLE &&
+          unity_compiler_response_status_is_clean_success(&binary.status) &&
+          binary.size == sizeof(payload) && binary.data != NULL &&
+          memcmp(binary.data, payload, sizeof(payload)) == 0 &&
+          binary.has_request_identity &&
+          memcmp(binary.request_digest, compile_digest, sizeof(compile_digest)) == 0);
+    unity_compiler_binary_response_free(&binary);
+    UnityCompilerComputePreprocessResponse* response = NULL;
+    UnityCompilerComputePreprocessInfo info;
+    CHECK(unity_compiler_broker_preprocess_compute_response(
+        broker, &preprocess, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info));
+    CHECK(info.transport_complete && !info.native_success_present &&
+          info.availability == UNITY_COMPILER_RESPONSE_AVAILABLE &&
+          info.has_request_identity &&
+          info.valid_apis_authority.status == UNITY_COMPILER_VALID_APIS_AUTHORITY_MATCHED &&
+          memcmp(info.request_digest, preprocess_digest, sizeof(preprocess_digest)) == 0);
+    const UnityCompilerComputePreprocessResult* result =
+        unity_compiler_compute_preprocess_response_result(response);
+    CHECK(result && result->kernel_count == 1U &&
+          strcmp(result->kernels[0].name, "ComputeMain") == 0 &&
+          result->dependency_count == 0U &&
+          strcmp(result->source, "// controlled preprocessing output\n") == 0);
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    unity_compiler_broker_get_stats(broker, &stats);
+    const uint64_t source_size = (uint64_t)strlen(source);
+    CHECK(stats.submitted_requests == 2U && stats.executed_requests == 2U &&
+          stats.compile_requests == 1U && stats.preprocess_requests == 1U &&
+          stats.compiler_process_starts == 1U && stats.compiler_process_running &&
+          stats.source_digest_scans == 2U && stats.unique_source_submissions == 1U &&
+          stats.tracked_unique_source_count == 1U &&
+          stats.tracked_source_window_bytes == source_size);
+
+    /* The native terminal rejection is still a completed source submission,
+     * even when it has no payload.  Local authority rejection below is not. */
+    compile.source = "broker-native-rejected";
+    CHECK(unity_compiler_broker_compile_compute_response(broker, &compile, &binary));
+    CHECK(binary.status.availability == UNITY_COMPILER_RESPONSE_AVAILABLE &&
+          !binary.status.compiler_success && binary.data == NULL && binary.size == 0U &&
+          binary.status.valid_apis_authority.status == UNITY_COMPILER_VALID_APIS_AUTHORITY_MATCHED);
+    unity_compiler_binary_response_free(&binary);
+    const uint64_t submitted_bytes = source_size + (uint64_t)strlen(compile.source);
+    unity_compiler_broker_get_stats(broker, &stats);
+    CHECK(stats.compiler_process_starts == 1U && stats.compiler_process_running &&
+          stats.source_digest_scans == 3U && stats.unique_source_submissions == 2U &&
+          stats.tracked_unique_source_count == 2U &&
+          stats.tracked_source_window_bytes == submitted_bytes);
+
+    /* A typed local miss never submits source to an already live process. */
+    CHECK(setenv("DXBC_USC_CACHE_ONLY", "1", 1) == 0);
+    compile.source = "broker-cache-only";
+    preprocess.source = compile.source;
+    CHECK(unity_compiler_broker_compile_compute_response(broker, &compile, &binary));
+    CHECK(binary.status.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS &&
+          !binary.status.compiler_success && !binary.data && binary.size == 0U &&
+          binary.has_request_identity);
+    unity_compiler_binary_response_free(&binary);
+    CHECK(unity_compiler_broker_preprocess_compute_response(
+        broker, &preprocess, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info) &&
+          info.availability == UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS &&
+          !info.transport_complete && !info.native_success_present &&
+          info.has_request_identity &&
+          !unity_compiler_compute_preprocess_response_result(response));
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    CHECK(unsetenv("DXBC_USC_CACHE_ONLY") == 0);
+
+    /* Mismatch has its own typed authority disposition.  The fake peer will
+     * retire if either tripwire source reaches it despite the local guard. */
+    CHECK(unity_compiler_broker_set_expected_valid_apis(
+        broker, BROKER_FAKE_VALID_APIS ^ (UINT32_C(1) << 4U)));
+    compile.source = "broker-authority-rejected";
+    preprocess.source = compile.source;
+    CHECK(unity_compiler_broker_compile_compute_response(broker, &compile, &binary));
+    CHECK(binary.status.valid_apis_authority.status ==
+              UNITY_COMPILER_VALID_APIS_AUTHORITY_MISMATCH &&
+          !unity_compiler_response_status_is_clean_success(&binary.status) &&
+          !binary.data && binary.size == 0U);
+    unity_compiler_binary_response_free(&binary);
+    CHECK(unity_compiler_broker_preprocess_compute_response(
+        broker, &preprocess, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info) &&
+          info.valid_apis_authority.status == UNITY_COMPILER_VALID_APIS_AUTHORITY_MISMATCH &&
+          !info.transport_complete && !unity_compiler_compute_preprocess_response_result(response));
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    unity_compiler_broker_get_stats(broker, &stats);
+    CHECK(stats.compiler_process_starts == 1U && stats.compiler_process_running &&
+          stats.source_digest_scans == 3U && stats.unique_source_submissions == 2U &&
+          stats.tracked_unique_source_count == 2U &&
+          stats.tracked_source_window_bytes == submitted_bytes);
+    CHECK(unity_compiler_broker_set_expected_valid_apis(broker, BROKER_FAKE_VALID_APIS));
+
+    /* A late returned dependency cannot be authorized by an earlier source
+     * lease.  Its native process and complete residency window must retire. */
+    preprocess.source = "broker-uncaptured";
+    CHECK(unity_compiler_broker_preprocess_compute_response(
+        broker, &preprocess, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info));
+    const uint8_t zero_digest[UNITY_COMPILER_FINGERPRINT_SIZE] = {0};
+    CHECK(info.transport_complete &&
+          info.availability == UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE &&
+          !info.has_request_identity &&
+          memcmp(info.request_digest, zero_digest, sizeof(zero_digest)) == 0 &&
+          memcmp(info.controls_digest, zero_digest, sizeof(zero_digest)) == 0 &&
+          !unity_compiler_compute_preprocess_response_result(response));
+    unity_compiler_compute_preprocess_response_free(response);
+    response = NULL;
+    unity_compiler_broker_get_stats(broker, &stats);
+    CHECK(!stats.compiler_process_running && stats.compiler_process_starts == 1U &&
+          stats.tracked_source_window_bytes == 0U && stats.tracked_unique_source_count == 0U &&
+          stats.source_digest_scans == 3U && stats.unique_source_submissions == 2U &&
+          stats.source_budget_recycles == 0U);
+    UnityCompilerSessionCapabilities capabilities;
+    CHECK(!unity_compiler_broker_session_capabilities_snapshot(broker, &capabilities));
+
+    preprocess.source = source;
+    CHECK(unity_compiler_broker_preprocess_compute_response(
+        broker, &preprocess, &response));
+    CHECK(unity_compiler_compute_preprocess_response_info(response, &info) &&
+          info.transport_complete && info.has_request_identity &&
+          info.availability == UNITY_COMPILER_RESPONSE_AVAILABLE &&
+          info.valid_apis_authority.status == UNITY_COMPILER_VALID_APIS_AUTHORITY_MATCHED);
+    unity_compiler_compute_preprocess_response_free(response);
+    unity_compiler_broker_get_stats(broker, &stats);
+    CHECK(stats.submitted_requests == 9U && stats.executed_requests == 9U &&
+          stats.compile_requests == 4U && stats.preprocess_requests == 5U &&
+          stats.compiler_process_starts == 2U && stats.compiler_process_running &&
+          stats.source_digest_scans == 4U && stats.unique_source_submissions == 3U &&
+          stats.tracked_unique_source_count == 1U &&
+          stats.tracked_source_window_bytes == source_size);
+    unity_compiler_broker_destroy(broker);
+
+    for (size_t index = 0U; index < sizeof(environment) / sizeof(environment[0]);
+         ++index) {
+        CHECK(environment[index].previous
+            ? setenv(environment[index].name, environment[index].previous, 1) == 0
+            : unsetenv(environment[index].name) == 0);
+        free(environment[index].previous);
+    }
+    CHECK(unlink(glslang) == 0);
+    CHECK(unlink(dxcompiler) == 0);
+    CHECK(rmdir(includes) == 0);
+    CHECK(rmdir(root) == 0);
+    return true;
+}
+
 static bool run_all_tests(const char* executable_path) {
     CHECK(verify_single_flight());
     CHECK(verify_broker_stays_lazy());
@@ -695,9 +1170,13 @@ static bool run_all_tests(const char* executable_path) {
     CHECK(verify_source_budget_exact_mutation_and_lifecycle());
     CHECK(verify_source_budget_recycle_policy());
     CHECK(verify_oversized_source_live_process_lifecycle(executable_path));
+    CHECK(verify_compute_broker_identity_and_residency(executable_path));
     return true;
 }
 
 int main(int argc, char** argv) {
+    if (argc == 5 && getenv("DXBC_USC_BROKER_FAKE_COMPUTE")) {
+        return run_broker_fake_compute(argv[1], argv[3]);
+    }
     return argc > 0 && run_all_tests(argv[0]) ? 0 : 1;
 }

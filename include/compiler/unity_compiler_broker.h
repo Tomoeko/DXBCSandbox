@@ -204,4 +204,23 @@ bool unity_compiler_broker_disassemble_response(
 void unity_compiler_broker_get_stats(
     UnityCompilerBroker* broker, UnityCompilerBrokerStats* out_stats);
 
+/* Serialized through the same broker lifecycle/source-residency budget as
+ * snippet compilation. The complete ComputeShaderBinary response is owned. */
+bool unity_compiler_broker_compile_compute_response(
+    UnityCompilerBroker* broker,
+    const UnityCompilerComputeKernelRequest* request,
+    UnityCompilerBinaryResponse* out_response);
+
+bool unity_compiler_broker_serialize_compute_request(
+    UnityCompilerBroker* broker,
+    const UnityCompilerComputeKernelRequest* request,
+    uint8_t** out_transcript, size_t* out_transcript_size,
+    uint8_t out_request_digest[UNITY_COMPILER_FINGERPRINT_SIZE]);
+
+bool unity_compiler_broker_preprocess_compute_response(UnityCompilerBroker* broker,
+    const UnityCompilerComputePreprocessRequest* request,
+    UnityCompilerComputePreprocessResponse** response);
+bool unity_compiler_broker_serialize_compute_preprocess_request(UnityCompilerBroker* broker,
+    const UnityCompilerComputePreprocessRequest* request, uint8_t** data, size_t* size,
+    uint8_t digest[UNITY_COMPILER_FINGERPRINT_SIZE]);
 #endif /* UNITY_COMPILER_BROKER_H */

@@ -4,6 +4,7 @@
 #include "compiler/unity_compiler_cache.h"
 #include "compiler/unity_include_closure.h"
 #include "common/string_builder.h"
+#include "common/sha256.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1803,13 +1804,13 @@ static bool read_uint64(int fd, uint64_t* out_val) {
     return read_all(fd, out_val, sizeof(uint64_t));
 }
 
-static bool read_buffer(int fd, void** out_data, size_t* out_len) {
+static bool read_buffer_bounded(int fd, void** out_data, size_t* out_len, size_t limit) {
     uint32_t magic = 0;
     if (!read_all(fd, &magic, sizeof(magic))) return false;
     if (magic != MAGIC_NUMBER) return false;
     uint64_t len64 = 0;
     if (!read_all(fd, &len64, sizeof(len64))) return false;
-    if (len64 > SIZE_MAX - 1 || len64 > UNITY_COMPILER_MAX_BUFFER_SIZE) {
+    if (len64 > SIZE_MAX - 1 || len64 > UNITY_COMPILER_MAX_BUFFER_SIZE || len64 > limit) {
         return false;
     }
     
@@ -1829,6 +1830,10 @@ static bool read_buffer(int fd, void** out_data, size_t* out_len) {
     buf[len64] = '\0';
     *out_data = buf;
     return true;
+}
+
+static bool read_buffer(int fd, void** out_data, size_t* out_len) {
+    return read_buffer_bounded(fd, out_data, out_len, UNITY_COMPILER_MAX_BUFFER_SIZE);
 }
 
 static char* read_string_with_size(int fd, size_t* out_size) {
@@ -2598,13 +2603,24 @@ static bool preprocess_dependencies_are_captured(
     return true;
 }
 
+static void reject_preprocess_request_authority(
+    UnityCompilerChannel* channel, UnityCompilerResponseStatus* status,
+    bool* has_request_identity, uint8_t request_digest[USC_CACHE_DIGEST_SIZE],
+    uint8_t controls_digest[USC_CACHE_DIGEST_SIZE]) {
+    status->availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+    *has_request_identity = false;
+    memset(request_digest, 0, USC_CACHE_DIGEST_SIZE);
+    memset(controls_digest, 0, USC_CACHE_DIGEST_SIZE);
+    /* An uncaptured include may already be resident in Unity's native cache.
+     * A new lease cannot authorize that process's earlier file contents. */
+    discard_toolchain_authority(channel, true);
+}
+
 static void reject_preprocess_include_authority(
     UnityCompilerChannel* channel, UnityCompilerPreprocessResponse* response) {
-    response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
-    response->has_request_identity = false;
-    memset(response->request_digest, 0, sizeof(response->request_digest));
-    memset(response->controls_digest, 0, sizeof(response->controls_digest));
-    discard_toolchain_authority(channel, true);
+    reject_preprocess_request_authority(channel, &response->status,
+        &response->has_request_identity, response->request_digest,
+        response->controls_digest);
 }
 
 static void preprocess_response_request_identity(
@@ -4100,4 +4116,630 @@ void unity_compiler_shutdown(UnityCompilerChannel* channel) {
     free(channel->dynamic_library_path);
     memset(channel, 0, sizeof(*channel));
     channel->socket_fd = -1;
+}
+
+bool unity_compiler_parse_compute_status_record(const char* record, bool* out_success) {
+    if (!out_success)
+        return false;
+    *out_success = false;
+    bool flags[3];
+    if (!parse_exact_status_record(record, "computeData: ", 1U, flags))
+        return false;
+    *out_success = flags[0];
+    return true;
+}
+
+static bool compute_request_valid(const UnityCompilerComputeKernelRequest* request) {
+    if (!request || !request->source || !request->source_filename || !request->source_filename[0] ||
+        !request->kernel_name || !request->kernel_name[0] || request->compiler_platform < 0 ||
+        request->compiler_platform >= (int32_t)UNITY_COMPILER_PLATFORM_COUNT ||
+        request->kernel_macro_count < 0 || request->kernel_macro_count > 1024 ||
+        (request->kernel_macro_count && !request->kernel_macros) ||
+        request->platform_keyword_count > 1024 || request->user_keyword_count > 1024 ||
+        !valid_owned_string_array(request->platform_keywords, request->platform_keyword_count) ||
+        !valid_owned_string_array(request->user_keywords, request->user_keyword_count) ||
+        strnlen(request->source, (size_t)UNITY_COMPILER_MAX_BUFFER_SIZE + 1U) >
+            (size_t)UNITY_COMPILER_MAX_BUFFER_SIZE ||
+        strnlen(request->source_filename, 1048577U) > 1048576U ||
+        strnlen(request->kernel_name, 1048577U) > 1048576U)
+        return false;
+    for (int index = 0; index < request->kernel_macro_count; ++index) {
+        const UnityCompilerComputeMacro* macro = &request->kernel_macros[index];
+        if (!macro->name || !macro->name[0] || !macro->value ||
+            strnlen(macro->name, 1048577U) > 1048576U || strnlen(macro->value, 1048577U) > 1048576U)
+            return false;
+    }
+    for (int index = 0; index < request->platform_keyword_count; ++index)
+        if (strnlen(request->platform_keywords[index], 1048577U) > 1048576U)
+            return false;
+    for (int index = 0; index < request->user_keyword_count; ++index)
+        if (strnlen(request->user_keywords[index], 1048577U) > 1048576U)
+            return false;
+    return true;
+}
+
+/* The native dispatcher passes the full filename to the plugin, and derives
+ * its priority include directory by removing its last path component. Do not
+ * reuse the legacy graphics helper, which invents an Assets/ prefix. */
+static char* compute_source_directory(const char* filename) {
+    const char* slash = strrchr(filename, '/');
+    const char* backslash = strrchr(filename, '\\');
+    if (backslash && (!slash || backslash > slash))
+        slash = backslash;
+    if (!slash)
+        return strdup(".");
+    size_t size = (size_t)(slash - filename);
+    if (size == 0U)
+        size = 1U;
+    char* directory = malloc(size + 1U);
+    if (directory) {
+        memcpy(directory, filename, size);
+        directory[size] = '\0';
+    }
+    return directory;
+}
+
+static bool compute_request_transcript(UnityCompilerChannel* channel,
+                                       const UnityCompilerComputeKernelRequest* request,
+                                       uint8_t** out_data, size_t* out_size,
+                                       uint8_t compiler_fingerprint[32],
+                                       uint8_t environment_fingerprint[32]) {
+    char* directory = compute_source_directory(request->source_filename);
+    if (!directory)
+        return false;
+    bool result = get_request_fingerprints(channel, directory, request->source,
+                                           compiler_fingerprint, environment_fingerprint);
+    free(directory);
+    return result && usc_cache_serialize_compute_request(
+                         request, UNITY_TOOLCHAIN_CONFIGURATION, compiler_fingerprint,
+                         environment_fingerprint, out_data, out_size);
+}
+
+bool unity_compiler_serialize_compute_request(
+    UnityCompilerChannel* channel, const UnityCompilerComputeKernelRequest* request,
+    uint8_t** out_transcript, size_t* out_transcript_size,
+    uint8_t out_request_digest[UNITY_COMPILER_FINGERPRINT_SIZE]) {
+    if (!out_transcript || !out_transcript_size || !out_request_digest)
+        return false;
+    *out_transcript = NULL;
+    *out_transcript_size = 0U;
+    memset(out_request_digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
+    if (!channel || !compute_request_valid(request))
+        return false;
+    uint8_t compiler_fingerprint[32], environment_fingerprint[32];
+    if (!compute_request_transcript(channel, request, out_transcript, out_transcript_size,
+                                    compiler_fingerprint, environment_fingerprint))
+        return false;
+    common_sha256(*out_transcript, *out_transcript_size, out_request_digest);
+    return true;
+}
+
+#define COMPUTE_RESPONSE_MAX_ITEMS 1024U
+#define COMPUTE_RESPONSE_MAX_TEXT (1024U * 1024U)
+#define COMPUTE_RESPONSE_MAX_AGGREGATE ((size_t)UNITY_COMPILER_MAX_BUFFER_SIZE)
+
+/* Bounds account for owned strings and collection storage before allocation.
+ * The same native magic/length/read/deadline framing remains in use. */
+static bool compute_response_reserve(size_t* used, size_t bytes) {
+    if (bytes > COMPUTE_RESPONSE_MAX_AGGREGATE - *used)
+        return false;
+    *used += bytes;
+    return true;
+}
+static char* compute_response_string(int fd, size_t limit, size_t* used, size_t* size) {
+    if (size)
+        *size = 0U;
+    if (*used >= COMPUTE_RESPONSE_MAX_AGGREGATE)
+        return NULL;
+    size_t remaining = COMPUTE_RESPONSE_MAX_AGGREGATE - *used - 1U;
+    if (limit > remaining)
+        limit = remaining;
+    void* data = NULL;
+    size_t length = 0U;
+    if (!read_buffer_bounded(fd, &data, &length, limit))
+        return NULL;
+    if (data && memchr(data, 0, length)) {
+        free(data);
+        return NULL;
+    }
+    if (!data)
+        data = strdup("");
+    if (!data || !compute_response_reserve(used, length + 1U)) {
+        free(data);
+        return NULL;
+    }
+    if (size)
+        *size = length;
+    return data;
+}
+static bool compute_response_append_diagnostic(int fd, UnityCompilerResponseStatus* status,
+                                               const char* message, size_t* used) {
+    int32_t fields[3];
+    if (!parse_error_record(message, fields) ||
+        status->diagnostic_count >= COMPUTE_RESPONSE_MAX_ITEMS)
+        return false;
+    char* file = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, used, NULL);
+    char* text = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, used, NULL);
+    /* append_diagnostic retains copies; count both temporary and owned bytes. */
+    const bool ready =
+        file && text &&
+        compute_response_reserve(used, sizeof(UnityCompilerDiagnostic) + strlen(message) +
+                                           strlen(file) + strlen(text) + 3U) &&
+        response_status_append_diagnostic(status, fields, message, file, text);
+    free(file);
+    free(text);
+    return ready;
+}
+
+bool unity_compiler_compile_compute_response(UnityCompilerChannel* channel,
+                                             const UnityCompilerComputeKernelRequest* request,
+                                             UnityCompilerBinaryResponse* out_response) {
+    if (!out_response)
+        return false;
+    unity_compiler_binary_response_init(out_response);
+    if (!channel || !compute_request_valid(request))
+        return false;
+    uint8_t compiler_fingerprint[32], environment_fingerprint[32];
+    uint8_t* transcript = NULL;
+    size_t transcript_size = 0U;
+    if (!compute_request_transcript(channel, request, &transcript, &transcript_size,
+                                    compiler_fingerprint, environment_fingerprint)) {
+        if (!channel->include_authority_unavailable)
+            return false;
+        out_response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+        return true;
+    }
+    uint8_t request_digest[32], controls_digest[32];
+    common_sha256(transcript, transcript_size, request_digest);
+    free(transcript);
+    UnityCompilerComputeKernelRequest controls = *request;
+    controls.source = "";
+    if (!usc_cache_serialize_compute_request(&controls, UNITY_TOOLCHAIN_CONFIGURATION,
+                                             compiler_fingerprint, environment_fingerprint,
+                                             &transcript, &transcript_size))
+        return false;
+    common_sha256(transcript, transcript_size, controls_digest);
+    free(transcript);
+    binary_response_request_identity(out_response, request_digest, controls_digest);
+    response_status_capture_valid_apis_authority(&out_response->status, channel);
+    if (compiler_cache_only_enabled()) {
+        out_response->status.availability = UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS;
+        return true;
+    }
+    if (!begin_compiler_transaction(channel)) {
+        response_status_capture_valid_apis_authority(&out_response->status, channel);
+        return expected_valid_apis_authority_is_rejection(
+            &out_response->status.valid_apis_authority);
+    }
+    response_status_capture_valid_apis_authority(&out_response->status, channel);
+    int fd = channel->socket_fd;
+    char* message = NULL;
+    void* payload = NULL;
+    size_t payload_size = 0U;
+    size_t response_bytes = 0U;
+    bool success = false;
+    if (!write_string(fd, "compileComputeKernel") || !write_string(fd, request->source) ||
+        !write_string(fd, request->source_filename) || !write_string(fd, request->kernel_name) ||
+        !write_bool(fd, request->caching_preprocessor) ||
+        !write_bool(fd, request->preprocess_only) ||
+        !write_bool(fd, request->strip_line_directives) ||
+        !write_uint32(fd, request->build_platform) || !write_int32(fd, request->kernel_macro_count))
+        goto compute_protocol_failure;
+    for (int index = 0; index < request->kernel_macro_count; ++index)
+        if (!write_string(fd, request->kernel_macros[index].name) ||
+            !write_string(fd, request->kernel_macros[index].value))
+            goto compute_protocol_failure;
+    if (!write_keyword_array(fd, request->platform_keywords, request->platform_keyword_count) ||
+        !write_keyword_array(fd, request->user_keywords, request->user_keyword_count) ||
+        !write_int32(fd, request->compiler_platform) ||
+        !write_uint32(fd, request->compilation_flags) || !write_uint64(fd, request->requirements) ||
+        !write_uint32(fd, request->force_dxc) || !write_uint32(fd, request->force_fxc))
+        goto compute_protocol_failure;
+    for (;;) {
+        message = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, &response_bytes, NULL);
+        if (!message)
+            goto compute_protocol_failure;
+        if (strncmp(message, "computeData:", 12U) == 0) {
+            if (!unity_compiler_parse_compute_status_record(message, &success) ||
+                response_bytes >= COMPUTE_RESPONSE_MAX_AGGREGATE ||
+                !read_buffer_bounded(fd, &payload, &payload_size,
+                                     COMPUTE_RESPONSE_MAX_AGGREGATE - response_bytes - 1U) ||
+                (success && payload_size == 0U))
+                goto compute_protocol_failure;
+            free(message);
+            message = NULL;
+            break;
+        }
+        if (strncmp(message, "err:", 4U) != 0)
+            goto compute_protocol_failure;
+        if (!compute_response_append_diagnostic(fd, &out_response->status, message,
+                                                &response_bytes))
+            goto compute_protocol_failure;
+        free(message);
+        message = NULL;
+    }
+    finish_compiler_transaction();
+    if (!validate_existing_toolchain_authority(channel)) {
+        free(payload);
+        unity_compiler_binary_response_free(out_response);
+        return false;
+    }
+    out_response->status.compiler_success = success;
+    out_response->data = payload;
+    out_response->size = payload_size;
+    return true;
+compute_protocol_failure:
+    free(message);
+    free(payload);
+    unity_compiler_binary_response_free(out_response);
+    fail_compiler_transaction(channel);
+    return false;
+}
+
+/* Native compute preprocessing shares the existing framing/lifecycle helpers. */
+struct UnityCompilerComputePreprocessResponse {
+    UnityCompilerComputePreprocessResult result;
+    UnityCompilerResponseStatus status;
+    bool transport_complete;
+    bool has_request_identity;
+    uint8_t request_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t controls_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+};
+void unity_compiler_compute_preprocess_response_free(
+    UnityCompilerComputePreprocessResponse* response) {
+    if (!response)
+        return;
+    const UnityCompilerComputePreprocessResult* result = &response->result;
+    const UnityCompilerComputeKeywordLines* sets[2] = {&result->user_global, &result->user_local};
+    for (size_t set = 0; set < 2; ++set) {
+        if (sets[set]->lines)
+            for (size_t i = 0; i < sets[set]->line_count; ++i)
+                free((void*)sets[set]->lines[i]);
+        free((void*)sets[set]->lines);
+    }
+    if (result->kernels)
+        for (size_t i = 0; i < result->kernel_count; ++i) {
+            const UnityCompilerComputePreprocessedKernel* kernel = &result->kernels[i];
+            free((void*)kernel->name);
+            if (kernel->macros)
+                for (size_t j = 0; j < kernel->macro_count; ++j) {
+                    free((void*)kernel->macros[j].name);
+                    free((void*)kernel->macros[j].value);
+                }
+            free((void*)kernel->macros);
+        }
+    free((void*)result->kernels);
+    if (result->conditional_requirements)
+        for (size_t i = 0; i < result->conditional_requirement_count; ++i)
+            free((void*)result->conditional_requirements[i].keyword);
+    free((void*)result->conditional_requirements);
+    if (result->dependencies)
+        for (size_t i = 0; i < result->dependency_count; ++i)
+            free((void*)result->dependencies[i]);
+    free((void*)result->dependencies);
+    free((void*)result->source);
+    unity_compiler_response_status_free(&response->status);
+    free(response);
+}
+bool unity_compiler_compute_preprocess_response_info(
+    const UnityCompilerComputePreprocessResponse* response,
+    UnityCompilerComputePreprocessInfo* info) {
+    if (!info)
+        return false;
+    memset(info, 0, sizeof(*info));
+    if (!response)
+        return false;
+    info->transport_complete = response->transport_complete;
+    info->native_success_present = false;
+    info->availability = response->status.availability;
+    info->valid_apis_authority = response->status.valid_apis_authority;
+    info->diagnostic_count = response->status.diagnostic_count;
+    info->has_request_identity = response->has_request_identity;
+    memcpy(info->request_digest, response->request_digest, sizeof(info->request_digest));
+    memcpy(info->controls_digest, response->controls_digest, sizeof(info->controls_digest));
+    return true;
+}
+const UnityCompilerComputePreprocessResult* unity_compiler_compute_preprocess_response_result(
+    const UnityCompilerComputePreprocessResponse* response) {
+    return response && response->transport_complete &&
+                   response->status.availability == UNITY_COMPILER_RESPONSE_AVAILABLE
+               ? &response->result
+               : NULL;
+}
+const UnityCompilerDiagnostic* unity_compiler_compute_preprocess_response_diagnostics(
+    const UnityCompilerComputePreprocessResponse* response, size_t* count) {
+    if (count)
+        *count = response ? response->status.diagnostic_count : 0U;
+    return response ? response->status.diagnostics : NULL;
+}
+char* unity_compiler_compute_preprocess_response_format_diagnostics(
+    const UnityCompilerComputePreprocessResponse* response, const char* fallback) {
+    return response ? unity_compiler_response_status_format(&response->status, fallback) : NULL;
+}
+static bool compute_pp_request_valid(const UnityCompilerComputePreprocessRequest* request) {
+    if (!request || !request->source || !request->source_filename || !request->source_filename[0] ||
+        (request->valid_apis & ~UNITY_COMPILER_PLATFORM_MASK) != 0U ||
+        request->platform_keyword_count > (int)COMPUTE_RESPONSE_MAX_ITEMS ||
+        request->disabled_keyword_count > (int)COMPUTE_RESPONSE_MAX_ITEMS ||
+        !valid_owned_string_array(request->platform_keywords, request->platform_keyword_count) ||
+        !valid_owned_string_array(request->disabled_keywords, request->disabled_keyword_count) ||
+        strnlen(request->source, COMPUTE_RESPONSE_MAX_AGGREGATE + 1U) >
+            COMPUTE_RESPONSE_MAX_AGGREGATE ||
+        strnlen(request->source_filename, COMPUTE_RESPONSE_MAX_TEXT + 1U) >
+            COMPUTE_RESPONSE_MAX_TEXT)
+        return false;
+    for (int i = 0; i < request->platform_keyword_count; ++i)
+        if (strnlen(request->platform_keywords[i], COMPUTE_RESPONSE_MAX_TEXT + 1U) >
+            COMPUTE_RESPONSE_MAX_TEXT)
+            return false;
+    for (int i = 0; i < request->disabled_keyword_count; ++i)
+        if (strnlen(request->disabled_keywords[i], COMPUTE_RESPONSE_MAX_TEXT + 1U) >
+            COMPUTE_RESPONSE_MAX_TEXT)
+            return false;
+    return true;
+}
+static bool compute_pp_transcript(UnityCompilerChannel* channel,
+                                  const UnityCompilerComputePreprocessRequest* request,
+                                  uint8_t** data, size_t* size, uint8_t compiler[32],
+                                  uint8_t environment[32]) {
+    char* directory = compute_source_directory(request->source_filename);
+    if (!directory)
+        return false;
+    bool ready =
+        get_request_fingerprints(channel, directory, request->source, compiler, environment);
+    free(directory);
+    return ready && usc_cache_serialize_compute_preprocess_request(
+                        request, UNITY_TOOLCHAIN_CONFIGURATION, compiler, environment, data, size);
+}
+bool unity_compiler_serialize_compute_preprocess_request(
+    UnityCompilerChannel* channel, const UnityCompilerComputePreprocessRequest* request,
+    uint8_t** data, size_t* size, uint8_t digest[UNITY_COMPILER_FINGERPRINT_SIZE]) {
+    if (!data || !size || !digest)
+        return false;
+    *data = NULL;
+    *size = 0U;
+    memset(digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
+    if (!channel || !compute_pp_request_valid(request))
+        return false;
+    uint8_t compiler[32], environment[32];
+    if (!compute_pp_transcript(channel, request, data, size, compiler, environment))
+        return false;
+    common_sha256(*data, *size, digest);
+    return true;
+}
+static bool compute_pp_lines(int fd, int32_t count, UnityCompilerComputeKeywordLines* set,
+                             size_t* used) {
+    if (count < 0 || count > (int32_t)COMPUTE_RESPONSE_MAX_ITEMS)
+        return false;
+    char** lines = NULL;
+    if (count) {
+        if (!compute_response_reserve(used, (size_t)count * sizeof(*lines)))
+            return false;
+        lines = calloc((size_t)count, sizeof(*lines));
+        if (!lines)
+            return false;
+    }
+    set->lines = (const char* const*)lines;
+    set->line_count = (size_t)count;
+    for (int32_t i = 0; i < count; ++i) {
+        lines[i] = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, used, NULL);
+        if (!lines[i])
+            return false;
+    }
+    return true;
+}
+static bool compute_pp_kernel(int fd, const char* message,
+                              UnityCompilerComputePreprocessResult* result, size_t* used) {
+    if (strncmp(message, "kernel: ", 8U) != 0 || result->kernel_count >= COMPUTE_RESPONSE_MAX_ITEMS)
+        return false;
+    const char* begin = message + 8U;
+    const char* end = strchr(begin, ' ');
+    if (!end || end == begin || (size_t)(end - begin) > COMPUTE_RESPONSE_MAX_TEXT)
+        return false;
+    for (const char* p = begin; p != end; ++p)
+        if (isspace((unsigned char)*p))
+            return false;
+    int32_t macro_count = -1;
+    if (!parse_exact_i32_record(end, "", 1U, &macro_count) || macro_count < 0 ||
+        macro_count > (int32_t)COMPUTE_RESPONSE_MAX_ITEMS)
+        return false;
+    size_t name_size = (size_t)(end - begin);
+    for (size_t i = 0; i < result->kernel_count; ++i)
+        if (strlen(result->kernels[i].name) == name_size &&
+            memcmp(result->kernels[i].name, begin, name_size) == 0)
+            return false;
+    if (!compute_response_reserve(
+            used, sizeof(UnityCompilerComputePreprocessedKernel) + name_size + 1U +
+                      (size_t)macro_count * sizeof(UnityCompilerComputePreprocessMacro)))
+        return false;
+    UnityCompilerComputePreprocessedKernel* kernels =
+        realloc((void*)result->kernels, (result->kernel_count + 1U) * sizeof(*kernels));
+    if (!kernels)
+        return false;
+    result->kernels = kernels;
+    UnityCompilerComputePreprocessedKernel* kernel = &kernels[result->kernel_count++];
+    memset(kernel, 0, sizeof(*kernel));
+    char* name = malloc(name_size + 1U);
+    if (!name)
+        return false;
+    memcpy(name, begin, name_size);
+    name[name_size] = 0;
+    kernel->name = name;
+    UnityCompilerComputePreprocessMacro* macros =
+        macro_count ? calloc((size_t)macro_count, sizeof(*macros)) : NULL;
+    if (macro_count && !macros)
+        return false;
+    kernel->macros = macros;
+    kernel->macro_count = (size_t)macro_count;
+    for (int32_t i = 0; i < macro_count; ++i) {
+        macros[i].name = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, used, NULL);
+        macros[i].value = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, used, NULL);
+        if (!macros[i].name || !macros[i].name[0] || !macros[i].value)
+            return false;
+        for (int32_t j = 0; j < i; ++j)
+            if (strcmp(macros[i].name, macros[j].name) == 0)
+                return false;
+    }
+    return true;
+}
+bool unity_compiler_preprocess_compute_response(
+    UnityCompilerChannel* channel, const UnityCompilerComputePreprocessRequest* request,
+    UnityCompilerComputePreprocessResponse** output) {
+    if (!output || *output || !channel || !compute_pp_request_valid(request))
+        return false;
+    UnityCompilerComputePreprocessResponse* response = calloc(1U, sizeof(*response));
+    if (!response)
+        return false;
+    uint8_t compiler[32], environment[32];
+    uint8_t* transcript = NULL;
+    size_t size = 0U;
+    if (!compute_pp_transcript(channel, request, &transcript, &size, compiler, environment)) {
+        if (!channel->include_authority_unavailable)
+            goto rejected;
+        response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
+        *output = response;
+        return true;
+    }
+    common_sha256(transcript, size, response->request_digest);
+    free(transcript);
+    transcript = NULL;
+    UnityCompilerComputePreprocessRequest controls = *request;
+    controls.source = "";
+    if (!usc_cache_serialize_compute_preprocess_request(&controls, UNITY_TOOLCHAIN_CONFIGURATION,
+                                                        compiler, environment, &transcript, &size))
+        goto rejected;
+    common_sha256(transcript, size, response->controls_digest);
+    free(transcript);
+    transcript = NULL;
+    response->has_request_identity = true;
+    response_status_capture_valid_apis_authority(&response->status, channel);
+    if (compiler_cache_only_enabled()) {
+        response->status.availability = UNITY_COMPILER_RESPONSE_CACHE_ONLY_MISS;
+        *output = response;
+        return true;
+    }
+    if (!begin_compiler_transaction(channel)) {
+        response_status_capture_valid_apis_authority(&response->status, channel);
+        if (expected_valid_apis_authority_is_rejection(&response->status.valid_apis_authority)) {
+            *output = response;
+            return true;
+        }
+        goto rejected;
+    }
+    response_status_capture_valid_apis_authority(&response->status, channel);
+    if (!validate_captured_session_valid_apis(channel, request->valid_apis, true)) {
+        finish_compiler_transaction();
+        goto rejected;
+    }
+    int fd = channel->socket_fd;
+    char* message = NULL;
+    size_t used = 0U;
+    unsigned phase = 0U;
+    UnityCompilerComputePreprocessResult* result = &response->result;
+    if (!write_string(fd, "preprocessCompute") || !write_string(fd, request->source) ||
+        !write_string(fd, request->source_filename) ||
+        !write_bool(fd, request->caching_preprocessor) ||
+        !write_uint32(fd, request->build_platform) || !write_uint32(fd, request->valid_apis) ||
+        !write_keyword_array(fd, request->platform_keywords, request->platform_keyword_count) ||
+        !write_keyword_array(fd, request->disabled_keywords, request->disabled_keyword_count))
+        goto protocol_failure;
+    for (;;) {
+        message = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, &used, NULL);
+        if (!message)
+            goto protocol_failure;
+        if (strncmp(message, "err:", 4U) == 0) {
+            if (!compute_response_append_diagnostic(fd, &response->status, message, &used))
+                goto protocol_failure;
+        } else if (phase < 2U) {
+            int32_t count = -1;
+            if (!parse_exact_i32_record(
+                    message,
+                    phase == 0U ? "computeKeywordsUserGlobal:" : "computeKeywordsUserLocal:", 1U,
+                    &count) ||
+                !compute_pp_lines(fd, count,
+                                  phase == 0U ? &result->user_global : &result->user_local, &used))
+                goto protocol_failure;
+            ++phase;
+        } else if (phase == 2U && strncmp(message, "kernel: ", 8U) == 0) {
+            if (!compute_pp_kernel(fd, message, result, &used))
+                goto protocol_failure;
+        } else if (phase == 2U && strcmp(message, "requirements:") == 0) {
+            int32_t count = -1;
+            if (!read_uint64(fd, &result->requirements) || !read_int32(fd, &count) || count < 0 ||
+                count > (int32_t)COMPUTE_RESPONSE_MAX_ITEMS ||
+                !compute_response_reserve(
+                    &used, (size_t)count * sizeof(UnityCompilerComputeConditionalRequirement)))
+                goto protocol_failure;
+            UnityCompilerComputeConditionalRequirement* requirements =
+                count ? calloc((size_t)count, sizeof(*requirements)) : NULL;
+            if (count && !requirements)
+                goto protocol_failure;
+            result->conditional_requirements = requirements;
+            result->conditional_requirement_count = (size_t)count;
+            for (int32_t i = 0; i < count; ++i) {
+                requirements[i].keyword =
+                    compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, &used, NULL);
+                if (!requirements[i].keyword || !requirements[i].keyword[0] ||
+                    !read_uint64(fd, &requirements[i].requirements))
+                    goto protocol_failure;
+                for (int32_t j = 0; j < i; ++j)
+                    if (strcmp(requirements[i].keyword, requirements[j].keyword) == 0)
+                        goto protocol_failure;
+            }
+            phase = 3U;
+        } else if (phase == 3U) {
+            int32_t fields[6];
+            if (!parse_exact_i32_record(message, "endKernels:", 6U, fields) || fields[5] < 0 ||
+                fields[5] > (int32_t)COMPUTE_RESPONSE_MAX_ITEMS ||
+                !compute_response_reserve(&used, (size_t)fields[5] * sizeof(char*)))
+                goto protocol_failure;
+            result->compilation_flags = (uint32_t)fields[0];
+            for (size_t i = 0; i < 4U; ++i)
+                result->include_hash_words[i] = (uint32_t)fields[i + 1U];
+            char** paths = fields[5] ? calloc((size_t)fields[5], sizeof(*paths)) : NULL;
+            if (fields[5] && !paths)
+                goto protocol_failure;
+            result->dependencies = (const char* const*)paths;
+            result->dependency_count = (size_t)fields[5];
+            for (int32_t i = 0; i < fields[5]; ++i) {
+                paths[i] = compute_response_string(fd, COMPUTE_RESPONSE_MAX_TEXT, &used, NULL);
+                if (!paths[i] || !paths[i][0])
+                    goto protocol_failure;
+            }
+            result->source = compute_response_string(fd, COMPUTE_RESPONSE_MAX_AGGREGATE, &used,
+                                                     &result->source_size);
+            if (!result->source || !read_int32(fd, &result->supported_apis) ||
+                !read_uint32_check_magic(fd, &result->use_dxc_mask) ||
+                !read_uint32_check_magic(fd, &result->never_use_dxc_mask))
+                goto protocol_failure;
+            free(message);
+            message = NULL;
+            break;
+        } else
+            goto protocol_failure;
+        free(message);
+        message = NULL;
+    }
+    finish_compiler_transaction();
+    if (!validate_existing_toolchain_authority(channel))
+        goto rejected;
+    response->transport_complete = true;
+    PreprocessResult dependency_view = {0};
+    dependency_view.includes.present = true;
+    dependency_view.includes.paths = (char**)result->dependencies;
+    dependency_view.includes.count = (int)result->dependency_count;
+    if (!preprocess_dependencies_are_captured(channel, &dependency_view)) {
+        reject_preprocess_request_authority(channel, &response->status,
+                                            &response->has_request_identity,
+                                            response->request_digest, response->controls_digest);
+    }
+    *output = response;
+    return true;
+protocol_failure:
+    free(message);
+    fail_compiler_transaction(channel);
+rejected:
+    free(transcript);
+    unity_compiler_compute_preprocess_response_free(response);
+    return false;
 }

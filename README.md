@@ -199,6 +199,25 @@ certificate, compiler equality, import or native result. Version2 candidate evid
 records resource representations, original-type availability, declaration witnesses
 and original ordered memory-effect owners alongside source-quality results.
 
+The optional macOS compiler backend also exposes explicit native compute
+preprocessing and kernel compilation requests. Preprocessing owns Unity's returned
+kernel macros, keyword-family lines, requirements, flags, include dependencies,
+source and API masks. Its wire protocol has no success flag; complete transport
+and retained diagnostics are separate observations. Kernel compilation retains
+its actual terminal status and complete native payload, decoded by
+`unity_compute_binary_decode`. That payload has a separate layout from player
+ClassID 72 and cannot supply its absent keyword keys, requirements or buffer
+variant indices.
+
+For a manual selected-kernel compiler check, build `compute_preprocess_probe` and
+run `compute_preprocess_probe SOURCE.compute PROJECT_ROOT INCLUDES_DIR KERNEL
+[--target DXBC_FILE] [USER_KEYWORD ...]`, using `-` for no extra include directory.
+The probe compiles Unity's actual returned source and controls, preserving the
+preprocessing mode. It fails on actionable diagnostics or an unequal requested
+complete DXBC target. Without a target it validates the returned container only.
+This is a selected-request observation, not exhaustive keyword coverage, import,
+ClassID 72 production, a logical compute certificate or physical execution.
+
 The import, bundle, and finite-visual gate commands accept an explicit Editor
 path and use isolated projects. Their installed C# bridges live in
 `share/dxbc-sandbox/unity/Editor`. `quick_test.sh --help` describes bundle-wide

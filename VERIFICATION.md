@@ -119,6 +119,18 @@ API likewise returns unverified source and owned per-kernel evidence. Controlled
 compiler equality does not supply the missing generic compute, import or native
 producers or enlarge the closed whole-shader scope above.
 
+Native compute preprocessing and kernel responses remain compiler observations.
+Their canonical identities retain every ordered request field and current
+compiler/include authority. Malformed or over-budget responses discard partial
+results and recycle the process; an uncaptured returned include clears identity
+and invalidates the compiler's cached content. The preprocessing protocol has no
+native success Boolean, and a cache-only miss provides no compiler result.
+Decoded native `ComputeShaderBinary` resource/group records and a selected
+complete DXBC comparison do not authenticate missing player ClassID 72 fields,
+enumerate the whole keyword domain, prove memory semantics or validate dispatch
+and readback. These producers do not change any required logical plane or the
+closed certificate scope.
+
 The optional `--compute-source-candidate` extraction publishes candidate source and
 evidence as distinct members of the existing compute package transaction. It never
 changes the original binary manifest or its source authority. Generation,

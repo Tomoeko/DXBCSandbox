@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "io/compute_shader_object.h"
+#include "io/unity_compute_binary.h"
 
 #include "common/stream.h"
 #include "dxbc/dxbc_parser.h"
@@ -23,6 +24,7 @@ static const uint8_t k_compute_shader_type_hash[16] = {
 typedef struct {
     ByteStream stream;
     ComputeShaderObjectStatus status;
+    bool native_binary;
 } ComputeReader;
 
 static bool source_file_is_structurally_valid(const SerializedFile* file) {
@@ -142,6 +144,7 @@ static bool reader_i64(ComputeReader* reader, int64_t* value) {
 
 static bool reader_align4(ComputeReader* reader) {
     if (reader->status != COMPUTE_SHADER_OBJECT_OK) return false;
+    if (reader->native_binary) return true;
     if (!stream_align(&reader->stream, 4U)) {
         reader_fail(reader, COMPUTE_SHADER_OBJECT_PAYLOAD_TRUNCATED);
         return false;
@@ -185,6 +188,22 @@ static bool reader_string(ComputeReader* reader,
 
 static bool reader_count(ComputeReader* reader, size_t minimum_wire_size,
                          size_t* count) {
+    if (reader->native_binary) {
+        uint64_t value = 0U;
+        *count = 0U;
+        if (!stream_read_uint64(&reader->stream, &value)) {
+            reader_fail(reader, COMPUTE_SHADER_OBJECT_PAYLOAD_TRUNCATED);
+            return false;
+        }
+        if (value > SIZE_MAX || value > UINT64_C(1048576) ||
+            (minimum_wire_size && value >
+                stream_remaining(&reader->stream) / minimum_wire_size)) {
+            reader_fail(reader, COMPUTE_SHADER_OBJECT_COUNT_INVALID);
+            return false;
+        }
+        *count = (size_t)value;
+        return true;
+    }
     int32_t value = 0;
     *count = 0U;
     if (!reader_i32(reader, &value)) return false;
@@ -489,7 +508,7 @@ ComputeShaderObjectStatus compute_shader_object_decode_borrowed(
 
     const uint64_t absolute_offset = file->data_offset + object->byte_offset;
     const uint8_t* object_data = file->raw_data + (size_t)absolute_offset;
-    ComputeReader reader;
+    ComputeReader reader = {0};
     stream_init(&reader.stream, object_data, object->byte_size);
     stream_set_endian(&reader.stream, file->big_endian);
     reader.status = COMPUTE_SHADER_OBJECT_OK;
@@ -788,4 +807,131 @@ const char* compute_shader_source_authority_status_name(
             return "declaration-inverse-unavailable";
         default: return "unknown";
     }
+}
+
+void unity_compute_binary_init(UnityComputeBinary* binary) {
+    if (binary)
+        memset(binary, 0, sizeof(*binary));
+}
+
+void unity_compute_binary_dispose(UnityComputeBinary* binary) {
+    if (!binary)
+        return;
+    if (binary->directives)
+        for (size_t index = 0U; index < binary->directive_count; ++index)
+            free(binary->directives[index].macros);
+    if (binary->buffer_variants)
+        for (size_t index = 0U; index < binary->buffer_variant_count; ++index) {
+            UnityComputeBufferVariant* variant = &binary->buffer_variants[index];
+            if (variant->buffers)
+                for (size_t buffer = 0U; buffer < variant->buffer_count; ++buffer)
+                    free(variant->buffers[buffer].parameters);
+            free(variant->buffers);
+        }
+    if (binary->kernels)
+        for (size_t index = 0U; index < binary->kernel_count; ++index)
+            dispose_kernel_variant(&binary->kernels[index].data);
+    free(binary->directives);
+    free(binary->buffer_variants);
+    free(binary->kernels);
+    unity_compute_binary_init(binary);
+}
+
+static bool parse_native_kernel(ComputeReader* reader, UnityComputeKernelBinary* kernel) {
+    ComputeShaderKernelVariant* data = &kernel->data;
+    if (!reader_string(reader, &kernel->name) ||
+        !parse_resources(reader, &data->constant_buffers, &data->constant_buffer_count) ||
+        !parse_resources(reader, &data->textures, &data->texture_count) ||
+        !parse_resources(reader, &data->input_buffers, &data->input_buffer_count) ||
+        !parse_resources(reader, &data->output_buffers, &data->output_buffer_count) ||
+        !parse_builtin_samplers(reader, &data->builtin_samplers, &data->builtin_sampler_count))
+        return false;
+    if (!reader_count(reader, 1U, &data->code_size))
+        return false;
+    data->code = reader->stream.data + reader->stream.position;
+    if (!stream_skip(&reader->stream, data->code_size)) {
+        reader_fail(reader, COMPUTE_SHADER_OBJECT_PAYLOAD_TRUNCATED);
+        return false;
+    }
+    data->thread_group_size_count = 3U;
+    if (!reader_array_alloc(reader, 3U, sizeof(*data->thread_group_size),
+                            (void**)&data->thread_group_size))
+        return false;
+    for (size_t axis = 0U; axis < 3U; ++axis)
+        if (!reader_u32(reader, &data->thread_group_size[axis]))
+            return false;
+    return true;
+}
+
+ComputeShaderObjectStatus unity_compute_binary_decode(UnityComputeBinary* destination,
+                                                      const uint8_t* payload, size_t size) {
+    if (!destination || !payload || !size)
+        return COMPUTE_SHADER_OBJECT_INVALID_ARGUMENT;
+    UnityComputeBinary candidate;
+    unity_compute_binary_init(&candidate);
+    ComputeReader reader = {.status = COMPUTE_SHADER_OBJECT_OK, .native_binary = true};
+    stream_init(&reader.stream, payload, size);
+    stream_set_endian(&reader.stream, false);
+    if (!reader_count(&reader, 12U, &candidate.directive_count) ||
+        !reader_array_alloc(&reader, candidate.directive_count, sizeof(*candidate.directives),
+                            (void**)&candidate.directives))
+        goto fail;
+    for (size_t index = 0U; index < candidate.directive_count; ++index) {
+        UnityComputeKernelDirective* directive = &candidate.directives[index];
+        if (!reader_string(&reader, &directive->name) ||
+            !reader_count(&reader, 8U, &directive->macro_count) ||
+            !reader_array_alloc(&reader, directive->macro_count, sizeof(*directive->macros),
+                                (void**)&directive->macros))
+            goto fail;
+        for (size_t macro = 0U; macro < directive->macro_count; ++macro)
+            if (!reader_string(&reader, &directive->macros[macro].name) ||
+                !reader_string(&reader, &directive->macros[macro].value))
+                goto fail;
+    }
+    if (!reader_i32(&reader, &candidate.target_level) ||
+        !reader_count(&reader, 8U, &candidate.buffer_variant_count) ||
+        !reader_array_alloc(&reader, candidate.buffer_variant_count,
+                            sizeof(*candidate.buffer_variants), (void**)&candidate.buffer_variants))
+        goto fail;
+    for (size_t index = 0U; index < candidate.buffer_variant_count; ++index) {
+        UnityComputeBufferVariant* variant = &candidate.buffer_variants[index];
+        if (!reader_count(&reader, 16U, &variant->buffer_count) ||
+            !reader_array_alloc(&reader, variant->buffer_count, sizeof(*variant->buffers),
+                                (void**)&variant->buffers))
+            goto fail;
+        for (size_t buffer = 0U; buffer < variant->buffer_count; ++buffer)
+            if (!parse_constant_buffer(&reader, &variant->buffers[buffer]))
+                goto fail;
+    }
+    if (!reader_count(&reader, 64U, &candidate.kernel_count) ||
+        !reader_array_alloc(&reader, candidate.kernel_count, sizeof(*candidate.kernels),
+                            (void**)&candidate.kernels))
+        goto fail;
+    for (size_t index = 0U; index < candidate.kernel_count; ++index)
+        if (!parse_native_kernel(&reader, &candidate.kernels[index]))
+            goto fail;
+    uint8_t resolved = 0U;
+    if (!stream_read_uint8(&reader.stream, &resolved)) {
+        reader_fail(&reader, COMPUTE_SHADER_OBJECT_PAYLOAD_TRUNCATED);
+        goto fail;
+    }
+    if (resolved > 1U) {
+        reader_fail(&reader, COMPUTE_SHADER_OBJECT_MODEL_INVALID);
+        goto fail;
+    }
+    if (reader.stream.position != size) {
+        reader_fail(&reader, COMPUTE_SHADER_OBJECT_OBJECT_BYTES_NOT_EXHAUSTED);
+        goto fail;
+    }
+    candidate.resources_resolved = resolved != 0U;
+    candidate.payload = payload;
+    candidate.payload_size = size;
+    candidate.decoded = true;
+    unity_compute_binary_dispose(destination);
+    *destination = candidate;
+    return COMPUTE_SHADER_OBJECT_OK;
+fail:
+    unity_compute_binary_dispose(&candidate);
+    return reader.status == COMPUTE_SHADER_OBJECT_OK ? COMPUTE_SHADER_OBJECT_MODEL_INVALID
+                                                     : reader.status;
 }

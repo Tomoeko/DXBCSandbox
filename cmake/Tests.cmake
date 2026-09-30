@@ -88,6 +88,8 @@ if(BUILD_TESTING)
         unity_player_shader_caps_units)
     dxbc_add_core_test(test_compute_shader_object_units
         tests/test_compute_shader_object_units.c compute_shader_object_units)
+    dxbc_add_core_test(test_unity_compute_binary_units
+        tests/test_unity_compute_binary_units.c unity_compute_binary_units)
     dxbc_add_core_test(test_compute_usil_units
         tests/test_compute_usil_units.c compute_usil_units)
     dxbc_add_core_test(test_compute_source_candidate_units
@@ -487,6 +489,22 @@ if(BUILD_TESTING)
         target_link_libraries(test_compiler_client_units PRIVATE
             unity_compiler_support dxbc_build_options)
         add_test(NAME compiler_client_units COMMAND test_compiler_client_units)
+        add_executable(test_compiler_compute_request_units
+            tests/test_compiler_compute_request_units.c)
+        target_include_directories(test_compiler_compute_request_units PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_compiler_compute_request_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME compiler_compute_request_units COMMAND test_compiler_compute_request_units)
+        add_executable(test_compiler_compute_preprocess_request_units
+            tests/test_compiler_compute_preprocess_request_units.c)
+        target_include_directories(test_compiler_compute_preprocess_request_units PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_compiler_compute_preprocess_request_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME compiler_compute_preprocess_request_units
+            COMMAND test_compiler_compute_preprocess_request_units)
+
 
         add_executable(test_compiler_session_report_units
             tests/test_compiler_session_report_units.c)

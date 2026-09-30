@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include "compiler/unity_compute_preprocess.h"
 
 struct UscCacheToolchainLease;
 
@@ -763,4 +764,88 @@ void unity_compiler_free_preprocess(PreprocessResult* result);
 // Shuts down compiler process and closes connection.
 void unity_compiler_shutdown(UnityCompilerChannel* channel);
 
+/* Literal Unity 2021.3 compileComputeKernel request. All pointer storage is
+ * borrowed and must remain immutable for the call. source_filename is transmitted unchanged; its
+ * parent directory supplies the request-specific include/source lease. force_dxc and force_fxc
+ * retain the native API bitmasks, not inferred Boolean policy. This command has no snippet
+ * contract, disabled-keyword array or render-state field. Its framed response is
+ * ComputeShaderBinary, not a ClassID 72 object. */
+typedef struct {
+    const char* name;
+    const char* value;
+} UnityCompilerComputeMacro;
+
+typedef struct UnityCompilerComputeKernelRequest {
+    const char* source;
+    const char* source_filename;
+    const char* kernel_name;
+    bool caching_preprocessor;
+    bool preprocess_only;
+    bool strip_line_directives;
+    uint32_t build_platform;
+    const UnityCompilerComputeMacro* kernel_macros;
+    int kernel_macro_count;
+    char** platform_keywords;
+    int platform_keyword_count;
+    char** user_keywords;
+    int user_keyword_count;
+    int32_t compiler_platform;
+    uint32_t compilation_flags;
+    uint64_t requirements;
+    uint32_t force_dxc;
+    uint32_t force_fxc;
+} UnityCompilerComputeKernelRequest;
+
+bool unity_compiler_parse_compute_status_record(const char* record, bool* out_success);
+
+/* Complete terminal rejection is a true transport result, with owned lossless
+ * diagnostics and raw payload. Payload-model validation is independently
+ * available through unity_compute_binary_decode; transport success alone is
+ * not a decoded-model or byte-equivalence claim.
+ * Malformed records/truncated framing fail, discard
+ * the partial response and invalidate the channel. No persistent compute
+ * cache is implemented; cache-only mode returns a typed local miss. */
+bool unity_compiler_compile_compute_response(UnityCompilerChannel* channel,
+                                             const UnityCompilerComputeKernelRequest* request,
+                                             UnityCompilerBinaryResponse* out_response);
+
+/* Allocated canonical encoding of every ordered compute request field plus
+ * exact current compiler/environment leases. No compile command is executed. */
+bool unity_compiler_serialize_compute_request(
+    UnityCompilerChannel* channel, const UnityCompilerComputeKernelRequest* request,
+    uint8_t** out_transcript, size_t* out_transcript_size,
+    uint8_t out_request_digest[UNITY_COMPILER_FINGERPRINT_SIZE]);
+
+/* No native preprocessing-success field exists. Availability, complete
+ * framing, diagnostics and canonical identity are independent observations. */
+typedef struct {
+    bool transport_complete;
+    bool native_success_present;
+    UnityCompilerResponseAvailability availability;
+    UnityCompilerValidApisAuthority valid_apis_authority;
+    size_t diagnostic_count;
+    bool has_request_identity;
+    uint8_t request_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+    uint8_t controls_digest[UNITY_COMPILER_FINGERPRINT_SIZE];
+} UnityCompilerComputePreprocessInfo;
+/* Output must initially be NULL. Failure exposes no partial response.
+ * A typed unavailable response can be returned without executing the command.
+ * No persistent compute preprocessing cache is implemented. */
+bool unity_compiler_preprocess_compute_response(
+    UnityCompilerChannel* channel, const UnityCompilerComputePreprocessRequest* request,
+    UnityCompilerComputePreprocessResponse** out_response);
+void unity_compiler_compute_preprocess_response_free(
+    UnityCompilerComputePreprocessResponse* response);
+bool unity_compiler_compute_preprocess_response_info(
+    const UnityCompilerComputePreprocessResponse* response,
+    UnityCompilerComputePreprocessInfo* info);
+const UnityCompilerComputePreprocessResult* unity_compiler_compute_preprocess_response_result(
+    const UnityCompilerComputePreprocessResponse* response);
+const UnityCompilerDiagnostic* unity_compiler_compute_preprocess_response_diagnostics(
+    const UnityCompilerComputePreprocessResponse* response, size_t* count);
+char* unity_compiler_compute_preprocess_response_format_diagnostics(
+    const UnityCompilerComputePreprocessResponse* response, const char* fallback);
+bool unity_compiler_serialize_compute_preprocess_request(
+    UnityCompilerChannel* channel, const UnityCompilerComputePreprocessRequest* request,
+    uint8_t** data, size_t* size, uint8_t digest[UNITY_COMPILER_FINGERPRINT_SIZE]);
 #endif // UNITY_COMPILER_CLIENT_H

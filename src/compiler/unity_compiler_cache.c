@@ -2933,3 +2933,99 @@ void unity_compiler_cache_reset_stats(void) {
     atomic_store_explicit(&g_cache_corrupt_entries, 0U, memory_order_relaxed);
     atomic_store_explicit(&g_cache_write_errors, 0U, memory_order_relaxed);
 }
+
+bool usc_cache_serialize_compute_request(
+    const UnityCompilerComputeKernelRequest* request, const char* toolchain_configuration,
+    const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
+    const uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE], uint8_t** out_data,
+    size_t* out_size) {
+    if (!out_data || !out_size)
+        return false;
+    *out_data = NULL;
+    *out_size = 0U;
+    if (!request || !toolchain_configuration || !compiler_fingerprint || !environment_fingerprint ||
+        request->kernel_macro_count < 0 || (request->kernel_macro_count && !request->kernel_macros))
+        return false;
+    static const char schema[] = "DXBCSandbox.UnityCompiler.compileComputeKernel.request.v1";
+    CompileRequestSink sink = {.capture = true, .ok = true};
+    compile_request_sink_buffer(&sink, schema, sizeof(schema) - 1U);
+    compile_request_sink_buffer(&sink, compiler_fingerprint, USC_CACHE_DIGEST_SIZE);
+    compile_request_sink_buffer(&sink, environment_fingerprint, USC_CACHE_DIGEST_SIZE);
+    compile_request_sink_u32(&sink, UINT32_C(0x0C0BD1E4));
+    compile_request_sink_string(&sink, "compileComputeKernel");
+    compile_request_sink_string(&sink, toolchain_configuration);
+    compile_request_sink_string(&sink, request->source);
+    compile_request_sink_string(&sink, request->source_filename);
+    compile_request_sink_string(&sink, request->kernel_name);
+    compile_request_sink_u32(&sink, request->caching_preprocessor ? 1U : 0U);
+    compile_request_sink_u32(&sink, request->preprocess_only ? 1U : 0U);
+    compile_request_sink_u32(&sink, request->strip_line_directives ? 1U : 0U);
+    compile_request_sink_u32(&sink, request->build_platform);
+    compile_request_sink_u32(&sink, (uint32_t)request->kernel_macro_count);
+    for (int index = 0; index < request->kernel_macro_count; ++index) {
+        compile_request_sink_string(&sink, request->kernel_macros[index].name);
+        compile_request_sink_string(&sink, request->kernel_macros[index].value);
+    }
+    compile_request_sink_string_array(&sink, request->platform_keywords,
+                                      request->platform_keyword_count);
+    compile_request_sink_string_array(&sink, request->user_keywords, request->user_keyword_count);
+    compile_request_sink_u32(&sink, (uint32_t)request->compiler_platform);
+    compile_request_sink_u32(&sink, request->compilation_flags);
+    compile_request_sink_u64(&sink, request->requirements);
+    compile_request_sink_u32(&sink, request->force_dxc);
+    compile_request_sink_u32(&sink, request->force_fxc);
+    if (!sink.ok) {
+        free(sink.data);
+        return false;
+    }
+    *out_data = sink.data;
+    *out_size = sink.size;
+    return true;
+}
+
+bool usc_cache_serialize_compute_preprocess_request(
+    const UnityCompilerComputePreprocessRequest* request, const char* toolchain_configuration,
+    const uint8_t compiler_fingerprint[USC_CACHE_DIGEST_SIZE],
+    const uint8_t environment_fingerprint[USC_CACHE_DIGEST_SIZE], uint8_t** data, size_t* size) {
+    if (!data || !size)
+        return false;
+    *data = NULL;
+    *size = 0U;
+    if (!request || !request->source || !request->source_filename || !request->source_filename[0] ||
+        !toolchain_configuration || !compiler_fingerprint || !environment_fingerprint ||
+        request->platform_keyword_count < 0 || request->platform_keyword_count > 1024 ||
+        request->disabled_keyword_count < 0 || request->disabled_keyword_count > 1024 ||
+        (request->platform_keyword_count > 0 && !request->platform_keywords) ||
+        (request->disabled_keyword_count > 0 && !request->disabled_keywords))
+        return false;
+    for (int i = 0; i < request->platform_keyword_count; ++i)
+        if (!request->platform_keywords[i])
+            return false;
+    for (int i = 0; i < request->disabled_keyword_count; ++i)
+        if (!request->disabled_keywords[i])
+            return false;
+    static const char schema[] = "DXBCSandbox.UnityCompiler.preprocessCompute.request.v1";
+    CompileRequestSink sink = {.capture = true, .ok = true};
+    compile_request_sink_buffer(&sink, schema, sizeof(schema) - 1U);
+    compile_request_sink_buffer(&sink, compiler_fingerprint, USC_CACHE_DIGEST_SIZE);
+    compile_request_sink_buffer(&sink, environment_fingerprint, USC_CACHE_DIGEST_SIZE);
+    compile_request_sink_u32(&sink, UINT32_C(0x0C0BD1E4));
+    compile_request_sink_string(&sink, "preprocessCompute");
+    compile_request_sink_string(&sink, toolchain_configuration);
+    compile_request_sink_string(&sink, request->source);
+    compile_request_sink_string(&sink, request->source_filename);
+    compile_request_sink_u32(&sink, request->caching_preprocessor ? 1U : 0U);
+    compile_request_sink_u32(&sink, request->build_platform);
+    compile_request_sink_u32(&sink, request->valid_apis);
+    compile_request_sink_string_array(&sink, request->platform_keywords,
+                                      request->platform_keyword_count);
+    compile_request_sink_string_array(&sink, request->disabled_keywords,
+                                      request->disabled_keyword_count);
+    if (!sink.ok) {
+        free(sink.data);
+        return false;
+    }
+    *data = sink.data;
+    *size = sink.size;
+    return true;
+}

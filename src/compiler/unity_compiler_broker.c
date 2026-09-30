@@ -819,3 +819,91 @@ void unity_compiler_broker_get_stats(
     out_stats->compiler_process_running = broker->channel.process_id > 0;
     pthread_mutex_unlock(&broker->protocol_mutex);
 }
+
+bool unity_compiler_broker_compile_compute_response(
+    UnityCompilerBroker* broker, const UnityCompilerComputeKernelRequest* request,
+    UnityCompilerBinaryResponse* out_response) {
+    if (!out_response)
+        return false;
+    unity_compiler_binary_response_init(out_response);
+    if (!broker || !request)
+        return false;
+    atomic_fetch_add_explicit(&broker->submitted_requests, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&broker->compile_requests, 1, memory_order_relaxed);
+    pthread_mutex_lock(&broker->protocol_mutex);
+    atomic_fetch_add_explicit(&broker->executed_requests, 1, memory_order_relaxed);
+    const pid_t process_before = broker->channel.process_id;
+    const bool result =
+        unity_compiler_compile_compute_response(&broker->channel, request, out_response);
+    const UnityCompilerValidApisAuthorityStatus authority =
+        out_response->status.valid_apis_authority.status;
+    /* An authority rejection is a typed local result without a wire command.
+     * Genuine terminal failures, including empty payloads, did submit source. */
+    const bool source_submitted =
+        result && out_response->status.availability == UNITY_COMPILER_RESPONSE_AVAILABLE &&
+        (authority == UNITY_COMPILER_VALID_APIS_AUTHORITY_NOT_CONFIGURED ||
+         authority == UNITY_COMPILER_VALID_APIS_AUTHORITY_MATCHED);
+    finish_protocol_transaction_locked(
+        broker, process_before,
+        source_submitted && broker->channel.process_id > 0 ? request->source : NULL);
+    pthread_mutex_unlock(&broker->protocol_mutex);
+    return result;
+}
+
+bool unity_compiler_broker_serialize_compute_request(
+    UnityCompilerBroker* broker, const UnityCompilerComputeKernelRequest* request,
+    uint8_t** out_transcript, size_t* out_transcript_size,
+    uint8_t out_request_digest[UNITY_COMPILER_FINGERPRINT_SIZE]) {
+    if (out_transcript)
+        *out_transcript = NULL;
+    if (out_transcript_size)
+        *out_transcript_size = 0U;
+    if (out_request_digest)
+        memset(out_request_digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
+    if (!broker)
+        return false;
+    pthread_mutex_lock(&broker->protocol_mutex);
+    const bool result = unity_compiler_serialize_compute_request(
+        &broker->channel, request, out_transcript, out_transcript_size, out_request_digest);
+    pthread_mutex_unlock(&broker->protocol_mutex);
+    return result;
+}
+
+bool unity_compiler_broker_preprocess_compute_response(
+    UnityCompilerBroker* broker, const UnityCompilerComputePreprocessRequest* request,
+    UnityCompilerComputePreprocessResponse** response) {
+    if (!broker || !request || !response || *response)
+        return false;
+    atomic_fetch_add_explicit(&broker->submitted_requests, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&broker->preprocess_requests, 1, memory_order_relaxed);
+    pthread_mutex_lock(&broker->protocol_mutex);
+    atomic_fetch_add_explicit(&broker->executed_requests, 1, memory_order_relaxed);
+    const pid_t process_before = broker->channel.process_id;
+    bool result = unity_compiler_preprocess_compute_response(&broker->channel, request, response);
+    UnityCompilerComputePreprocessInfo info;
+    bool completed = result && unity_compiler_compute_preprocess_response_info(*response, &info) &&
+                     info.transport_complete &&
+                     info.availability == UNITY_COMPILER_RESPONSE_AVAILABLE;
+    finish_protocol_transaction_locked(broker, process_before,
+                                       completed && broker->channel.process_id > 0 ? request->source
+                                                                                   : NULL);
+    pthread_mutex_unlock(&broker->protocol_mutex);
+    return result;
+}
+bool unity_compiler_broker_serialize_compute_preprocess_request(
+    UnityCompilerBroker* broker, const UnityCompilerComputePreprocessRequest* request,
+    uint8_t** data, size_t* size, uint8_t digest[UNITY_COMPILER_FINGERPRINT_SIZE]) {
+    if (data)
+        *data = NULL;
+    if (size)
+        *size = 0U;
+    if (digest)
+        memset(digest, 0, UNITY_COMPILER_FINGERPRINT_SIZE);
+    if (!broker)
+        return false;
+    pthread_mutex_lock(&broker->protocol_mutex);
+    bool result = unity_compiler_serialize_compute_preprocess_request(&broker->channel, request,
+                                                                      data, size, digest);
+    pthread_mutex_unlock(&broker->protocol_mutex);
+    return result;
+}
