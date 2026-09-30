@@ -1052,11 +1052,12 @@ static bool validate_program_for_hlsl(const USILProgram *program,
     return false;
   }
   /* Ordinary hull/domain emission retains its complete source-backed inverse.
-   * The separate candidate path admits a typed triangle domain interface and
-   * generic SSA expressions; it supplies no linked hull/compiler authority. */
+   * Separate candidates admit typed domain interfaces and independent pure
+   * hull fork phases; admission supplies no linked compiler authority. */
   if (program->program_type == DXBC_PROGRAM_TYPE_HULL ||
       program->program_type == DXBC_PROGRAM_TYPE_DOMAIN) {
-    if (hlsl_exact_tessellation_lift_matches(program)) return true;
+    if (hlsl_high_level_hull_source_supported(program, mode) ||
+        hlsl_exact_tessellation_lift_matches(program)) return true;
     if (!hlsl_high_level_domain_interface_supported(program, mode)) {
       hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                             HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
@@ -1541,18 +1542,18 @@ bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
   return accepted;
 }
 
-/* This inventory describes only the natural direct-entry straightline emitter,
- * including signature-backed named result structures with one full write per
- * field. Actual interface spans are checked independently before finalization.
- * Every declaration/interface/statement in this bounded scope has an actual
- * emission event and every expression is visited before its AST is freed.
- * Other stages, includes, storage layouts and helpers retain explicit coverage
- * gaps until their syntax and dependencies have their own audited units. */
-static bool source_quality_inventory_complete(const HLSLEmitterContext *ctx) {
+/* Eligibility for independently inventoried natural stage-entry units. The
+ * bounded geometry flow route additionally proves its CFG/SSA/type/range
+ * contract and later replays receipts for every actual body/control byte.
+ * Interface and declaration syntax have separate coverage checks. Includes,
+ * uncovered storage layouts and helpers retain explicit coverage gaps. */
+bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx) {
   const USILProgram *program = ctx->program;
-  /* Actual control/body spans are retained, but the independently audited
-   * complete declaration/control syntax inventory is not yet available. */
-  if (hlsl_geometry_control_flow_admission(program, ctx->emit_mode)) return false;
+  /* The bounded flow route must independently prove CFG/SSA, types, loop
+   * bounds and persistent output initialization before promising coverage. */
+  const bool bounded_flow = hlsl_geometry_control_flow_admission(program, ctx->emit_mode);
+  if (bounded_flow &&
+      !hlsl_geometry_control_flow_inventory_supported(ctx)) return false;
   if (ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
       !hlsl_source_quality_interface_inventory_supported(ctx) ||
       !ctx->high_level_functions_prepared ||
@@ -1560,7 +1561,10 @@ static bool source_quality_inventory_complete(const HLSLEmitterContext *ctx) {
        program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
        !ctx->high_level_geometry && !ctx->high_level_domain) ||
       ctx->unity_uv_helper ||
-      ctx->readable_screen_pos_helper || ctx->compiler_model.replacement_count ||
+      ctx->readable_screen_pos_helper ||
+      /* This body consumes only the proved flow plan, never legacy compiler
+       * replacement plans discovered by the common analysis passes. */
+      (ctx->compiler_model.replacement_count && !bounded_flow) ||
       ctx->use_uint_temps ||
       ctx->indexed_face_basis.valid || ctx->surface_tangent_frame.valid ||
       !hlsl_source_quality_resource_inventory_complete(ctx) || program->uav_count ||
@@ -1579,6 +1583,10 @@ bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete) {
   if (!ctx->source_quality_analysis) return true;
   ctx->source_quality_interface_required = complete && ctx->high_level_interface;
   ctx->source_quality_cbuffer_required = complete && ctx->program->cbuffer_count > 0;
+  /* Replay actual flow receipts even when another unit dependency is already
+   * incomplete. This check can only retain/downgrade coverage, never grant it. */
+  ctx->source_quality_geometry_flow_required =
+      hlsl_geometry_control_flow_admission(ctx->program, ctx->emit_mode);
   if (hlsl_source_quality_analysis_begin_unit(ctx->source_quality_analysis, 0,
                                              HLSL_SOURCE_UNIT_ENTRY_POINT, complete))
     return true;
@@ -1640,7 +1648,9 @@ void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
         ((ctx->source_quality_interface_required &&
           !hlsl_source_quality_interface_inventory_complete(ctx)) ||
          (ctx->source_quality_cbuffer_required &&
-          !hlsl_source_quality_cbuffer_inventory_complete(ctx))) &&
+          !hlsl_source_quality_cbuffer_inventory_complete(ctx)) ||
+         (ctx->source_quality_geometry_flow_required &&
+          !hlsl_geometry_control_flow_inventory_complete(ctx))) &&
         !hlsl_source_quality_analysis_mark_incomplete_unit(ctx->source_quality_analysis)) {
       hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                      HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
@@ -1657,6 +1667,7 @@ void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
 
 static void free_emitter_context(HLSLEmitterContext *ctx) {
   hlsl_source_quality_finish_emission(ctx);
+  hlsl_geometry_control_flow_inventory_free(ctx);
   free(ctx->cb_reg_map);
   free_sampler_name_map(ctx);
   free_cbuffer_emission_layouts(ctx);
@@ -1880,7 +1891,8 @@ static bool hlsl_emit_with_options_impl(
        (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
         program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
         !hlsl_high_level_geometry_interface_supported(program, emit_mode) &&
-        !hlsl_high_level_domain_interface_supported(program, emit_mode)))) {
+        !hlsl_high_level_domain_interface_supported(program, emit_mode) &&
+        !hlsl_high_level_hull_source_supported(program, emit_mode)))) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                           HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
                           HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
@@ -1969,6 +1981,13 @@ static bool hlsl_emit_with_options_impl(
     free_emitter_context(&ctx);
     free(ctx_ptr);
     return false;
+  }
+
+  if (hlsl_high_level_hull_source_supported(program, emit_mode)) {
+    const bool emitted = hlsl_emit_high_level_hull_stage(&ctx);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return emitted && sb_ok(sb);
   }
 
   if (!ctx.high_level_domain && (program->program_type == DXBC_PROGRAM_TYPE_HULL ||
@@ -2075,7 +2094,7 @@ static bool hlsl_emit_with_options_impl(
     free(ctx_ptr);
     return false;
   }
-  if (!hlsl_source_quality_begin_entry(&ctx, source_quality_inventory_complete(&ctx))) {
+  if (!hlsl_source_quality_begin_entry(&ctx, hlsl_source_quality_inventory_supported(&ctx))) {
     free_emitter_context(&ctx);
     free(ctx_ptr);
     return false;
@@ -2101,7 +2120,7 @@ static bool hlsl_emit_with_options_impl(
           sb_append(sb, HLSL_UNITY_UV_INCLUDE_SOURCE);
   }
   emit_comments_and_icb(&ctx);
-  if (sb_ok(sb) && source_quality_inventory_complete(&ctx))
+  if (sb_ok(sb) && hlsl_source_quality_inventory_supported(&ctx))
     hlsl_source_quality_emission(&ctx, 0, false, -1);
   if (!sb_ok(sb)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_PROGRAM,

@@ -21,6 +21,9 @@ typedef struct {
 typedef struct {
     HLSLBlockPhis *block_phis; // Array of Phi lists per basic block (size = block_count)
     int *operand_ssa_vars;     // Flat array mapping (inst, operand, comp) -> ssa_var ID
+    /* Simple scalar TEMP roots used in relative index dimensions. Nested or
+     * non-TEMP roots remain unknown; consumers retain their own grammar. */
+    int *relative_operand_ssa_vars;
     /* Instruction definition per SSA variable; phi variables use
      * HLSL_DEFINITION_AMBIGUOUS instead of impersonating an instruction. */
     int *ssa_var_defs;
@@ -32,5 +35,7 @@ struct HLSLEmitterContext;
 
 bool build_hlsl_ssa_graph(struct HLSLEmitterContext *ctx);
 void free_hlsl_ssa_graph(struct HLSLEmitterContext *ctx);
+int hlsl_relative_operand_definition(const struct HLSLEmitterContext *ctx,
+                                     int instruction, int operand, int dimension);
 
 #endif // HLSL_SSA_H

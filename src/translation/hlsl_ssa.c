@@ -131,6 +131,27 @@ static bool rename_ssa_block(HLSLEmitterContext *ctx, int block, int (*active_ve
     for (int inst_idx = start; inst_idx <= end; inst_idx++) {
         const USILInstruction *inst = &ctx->program->instructions[inst_idx];
 
+        /* Relative index roots are reads even when their enclosing operand is
+         * a destination. Capture them before any destination is renamed. */
+        for (int operand = 0; operand < inst->operand_count; ++operand) {
+            const DXBCOperand *owner = &inst->operands[operand];
+            const DXBCOperand *roots[3] = {owner->rel_op0, owner->rel_op1, owner->rel_op2};
+            for (int dimension = 0; dimension < 3; ++dimension) {
+                const DXBCOperand *root = roots[dimension];
+                if (!root || root->type != OPERAND_TYPE_TEMP ||
+                    root->register_index_dim != 1 || !hlsl_lift_operand_is_plain(root) ||
+                    !root->index_has_immediate[0] || root->index_representations[0] ||
+                    root->index_value_exceeds_int[0] || root->register_index < 0 ||
+                    root->register_index >= ctx->program->temp_count ||
+                    root->index_values[0] != (uint32_t)root->register_index ||
+                    root->swizzle_mode != 2) continue;
+                const int component = usil_operand_source_component(root, 0);
+                if (component >= 0)
+                    ssa->relative_operand_ssa_vars[operand_offset(inst_idx, operand, dimension)] =
+                        active_version[root->register_index][component];
+            }
+        }
+
         // 2a. Rename uses (sources)
         for (int op_idx = 0; op_idx < inst->operand_count; ++op_idx) {
             USILOperandUseInfo use;
@@ -290,9 +311,11 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
     size_t max_ssa_vars = operand_count + phi_slots;
     if (max_ssa_vars > INT_MAX) return false;
     ctx->ssa.operand_ssa_vars = malloc(operand_count * sizeof(int));
+    ctx->ssa.relative_operand_ssa_vars = malloc(operand_count * sizeof(int));
     ctx->ssa.ssa_var_defs = malloc(max_ssa_vars * sizeof(int));
     ctx->ssa.block_phis = calloc(block_count_size, sizeof(HLSLBlockPhis));
-    if (!ctx->ssa.operand_ssa_vars || !ctx->ssa.ssa_var_defs || !ctx->ssa.block_phis) {
+    if (!ctx->ssa.operand_ssa_vars || !ctx->ssa.relative_operand_ssa_vars ||
+        !ctx->ssa.ssa_var_defs || !ctx->ssa.block_phis) {
         free_hlsl_ssa_graph(ctx);
         return false;
     }
@@ -301,6 +324,7 @@ bool build_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
 
     for (size_t i = 0; i < operand_count; i++) {
         ctx->ssa.operand_ssa_vars[i] = -1;
+        ctx->ssa.relative_operand_ssa_vars[i] = -1;
     }
 
     // Phis placement (Iterated Dominance Frontier)
@@ -459,6 +483,19 @@ void free_hlsl_ssa_graph(HLSLEmitterContext *ctx) {
         free(ssa->block_phis);
     }
     free(ssa->operand_ssa_vars);
+    free(ssa->relative_operand_ssa_vars);
     free(ssa->ssa_var_defs);
     memset(ssa, 0, sizeof(*ssa));
+}
+
+int hlsl_relative_operand_definition(const HLSLEmitterContext *ctx,
+                                     int instruction, int operand, int dimension) {
+    if (!ctx || instruction < 0 || instruction >= ctx->ssa.instruction_count ||
+        operand < 0 || operand >= DXBC_MAX_OPERANDS || dimension < 0 || dimension >= 3 ||
+        !ctx->ssa.relative_operand_ssa_vars || !ctx->ssa.ssa_var_defs)
+        return HLSL_DEFINITION_UNKNOWN;
+    const int variable = ctx->ssa.relative_operand_ssa_vars[
+        operand_offset(instruction, operand, dimension)];
+    return variable >= 0 && variable < ctx->ssa.ssa_var_count
+        ? ctx->ssa.ssa_var_defs[variable] : HLSL_DEFINITION_UNKNOWN;
 }

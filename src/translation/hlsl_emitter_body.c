@@ -2410,6 +2410,9 @@ void emit_return_block(HLSLEmitterContext* ctx) {
     sb_append(ctx->sb, "}\n");
     hlsl_source_quality_emission(ctx, 0, false, ctx->program->instruction_count - 1);
     ctx->high_level_return_block_emitted = sb_ok(ctx->sb) && ctx->sb->len > return_begin;
+    if (!hlsl_geometry_control_flow_record_return(ctx, return_begin))
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
     return;
   }
   if (ctx->high_level_interface && !ctx->high_level_direct_return) {

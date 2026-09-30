@@ -11,6 +11,7 @@
 #include "translation/hlsl_storage_plan.h"
 #include "translation/hlsl_use_def.h"
 #include "translation/hlsl_ssa.h"
+#include "hlsl_instruction_owners.h"
 #include "translation/hlsl_ast.h"
 #include "translation/hlsl_source_quality.h"
 #include "translation/hlsl_literal.h"
@@ -380,6 +381,8 @@ typedef struct HLSLEmitterContext {
     HLSLSemanticProgram semantic_program;
     HLSLCompilerModelProgram compiler_model;
     const char* readable_screen_pos_helper;
+    bool source_quality_geometry_flow_required;
+    struct HLSLGeometryFlowSourceInventory *geometry_flow_source_inventory;
 } HLSLEmitterContext;
 
 /* Complete by-value origins only; no program/root inference. */
@@ -394,6 +397,7 @@ void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
  * before observing syntax. New stage routes must keep incomplete coverage
  * until their complete emitted dependency inventory is represented. */
 bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptions *options);
+bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx);
 bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete);
 void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx);
 /* Bounded compute projection. Class72 source-artifact authority and complete
@@ -417,6 +421,8 @@ typedef struct {
     const char *attribute;
     uint8_t coordinate_count, outer_count, inner_count;
     uint32_t outer_system_values[4], inner_system_values[2];
+    /* Raw per-edge/inside D3D10_SB_NAME tokens remain distinct from PCSG enums. */
+    uint32_t raw_outer_siv_names[4], raw_inner_siv_names[2];
 } HLSLDomainShape;
 bool hlsl_domain_shape(DXBCTessellatorDomain domain, HLSLDomainShape *shape);
 bool hlsl_domain_factor_order(const USILProgram *program, bool *inner_first);
@@ -548,6 +554,19 @@ bool hlsl_ray_box_intersection_lift_matches(const USILProgram* program);
 bool hlsl_volume_slice_sampling_lift_matches(const USILProgram* program);
 void emit_exact_structural_helpers(HLSLEmitterContext* ctx);
 void emit_instructions(HLSLEmitterContext* ctx);
+/* Private pure phase scope over the original validated stage program. The
+ * destination callbacks validate and format actual stage-owned writes; omitted
+ * instructions must be independently accounted for by the stage producer. */
+typedef struct {
+    int first_instruction;
+    int end_instruction;
+    const HLSLInstructionOwners *omitted_instructions;
+    bool (*destination_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
+    bool (*append_destination)(HLSLEmitterContext *ctx, int instruction, void *context);
+    void *context;
+} HLSLPureExpressionScope;
+bool hlsl_emit_pure_expression_scope(HLSLEmitterContext *ctx,
+                                      const HLSLPureExpressionScope *scope);
 bool emit_high_level_expressions(HLSLEmitterContext* ctx);
 bool emit_high_level_functions(HLSLEmitterContext *ctx);
 bool hlsl_prepare_high_level_functions(HLSLEmitterContext *ctx);
@@ -591,6 +610,10 @@ bool hlsl_texture_sample_opcode(USILOpcode opcode);
 bool hlsl_texture_sample_supported(HLSLEmitterContext *ctx, int instruction);
 bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *ctx);
 bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *name);
+bool hlsl_allocate_interface_name(HLSLEmitterContext *ctx, const char *base, char destination[96]);
+bool hlsl_high_level_hull_source_supported(const USILProgram *program, HLSLEmitMode mode);
+bool hlsl_hull_phase_return_owned(const USILProgram *program, int instruction);
+bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx);
 /* Always consumes all supplied expressions, including on failure. Parameters
  * are absent for Sample, one for level/bias, and two for gradients. */
 ASTExpr *hlsl_texture_sample_expression(HLSLEmitterContext *ctx, int instruction,
@@ -765,6 +788,10 @@ HLSLExpressionKind hlsl_instruction_expression_kind(
 bool hlsl_retarget_expression_for_storage(
     HLSLEmitterContext* ctx, HLSLExpressionKind expression_kind,
     HLSLBackingStorage destination_storage, char* expression);
+/* Independent instruction scope, with original global semantic/raw owners.
+ * Out-of-scope instructions have no block or reaching temporary definition. */
+bool build_control_flow_graph_range(HLSLEmitterContext *ctx, int first_instruction,
+                                     int end_instruction);
 bool build_control_flow_graph(HLSLEmitterContext* ctx);
 bool instructions_have_unambiguous_path(const HLSLEmitterContext* ctx,
                                         int first, int second);

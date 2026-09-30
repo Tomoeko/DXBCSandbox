@@ -95,13 +95,17 @@ line, triangle and adjacency arrays, named output fields and ordered stream0
 `Append`/`RestartStrip` operations. A separate bounded geometry planner recovers
 one signed unit-step loop, proven emission limits, scalar control predicates,
 named values and stream0 operations from CFG/SSA ownership. Its source quality
-retains incomplete declaration/control coverage. Dynamic input indexing, geometry
+independently audits emitted interface/control syntax; anonymous packed constant-buffer
+padding still keeps those declarations incomplete. Dynamic input indexing, geometry
 instancing and multiple streams remain unsupported in these paths.
 A bounded domain path emits typed control-point patches, triangle barycentric
 or quad/isoline coordinates, tessellation-factor declarations in their retained
 interface order, and SSA expressions. It admits static point indices in patches
 of up to 32 points and retains a separate 64-instruction limit. Patch-factor reads,
-resources and generic hull phase reconstruction remain open.
+resources and wider phase forms remain open. A bounded hull path reconstructs
+independent scalar-factor fork phases and signature-backed implicit control-point
+passthrough using separate CFG/SSA scopes for triangle, quad and isoline domains.
+Explicit control-point transforms, join phases and patch-resource reads remain unsupported.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,
@@ -154,7 +158,7 @@ fixtures. Those finite observations remain separate from runtime-selection proof
 
 - Parsing targets explicitly supported Unity 2021.3 schemas, not every version.
 - HLSL/ShaderLab emission is experimental. Unsupported variants fail closed;
-  generic hull emission and wider domain/geometry support remain unavailable.
+  wider hull phases and domain/geometry forms remain unavailable.
 - Readable output is a presentation mode. Recompilation checks require exact
   mode and matching compiler, platform, keyword, and include authority.
 - Matching DXBC or a finite visual test does not prove universal visual equality

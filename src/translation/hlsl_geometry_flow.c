@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 /* Bounded typed geometry control-flow reconstruction from decoded ownership. */
 #include "hlsl_source_identifier.h"
+#include "hlsl_geometry_flow.h"
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
 #include <limits.h>
@@ -537,6 +538,248 @@ static bool build_plan(HLSLEmitterContext *ctx, Plan *plan) {
   return true;
 }
 
+/* The same bounded semantic proof is required both before an entry can
+ * promise coverage and after its actual syntax ledger has been emitted. */
+bool hlsl_geometry_control_flow_inventory_supported(HLSLEmitterContext *ctx) {
+  if (!ctx || !ctx->program || !ctx->high_level_geometry ||
+      !ctx->high_level_interface_prepared)
+    return false;
+  Plan plan = {0};
+  const bool valid = build_plan(ctx, &plan);
+  free(plan.variable_value);
+  free(plan.variable_component);
+  return valid;
+}
+
+static uint64_t syntax_digest(const char *source, size_t begin, size_t end) {
+  uint64_t digest = UINT64_C(14695981039346656037);
+  for (size_t index = begin; index < end; ++index) {
+    digest ^= (unsigned char)source[index];
+    digest *= UINT64_C(1099511628211);
+  }
+  return digest;
+}
+
+/* These receipts cover actual signature-backed field/frame syntax and the
+ * actual geometry attribute, parameters, function opening and result local.
+ * The first field receipt includes its struct opening; empty input/output
+ * structs are excluded by the retained stage/interface authority. */
+bool hlsl_geometry_control_flow_record_interface(HLSLEmitterContext *ctx,
+    HLSLGeometryFlowInterfaceKind kind, int field_index, size_t begin) {
+  if (!ctx || !ctx->source_quality_analysis ||
+      !hlsl_geometry_control_flow_admission(ctx->program, ctx->emit_mode)) return true;
+  if (!sb_ok(ctx->sb) || begin >= ctx->sb->len) return false;
+  HLSLGeometryFlowSourceInventory *inventory = ctx->geometry_flow_source_inventory;
+  if (!inventory) {
+    inventory = calloc(1, sizeof(*inventory));
+    if (!inventory) return false;
+    inventory->instruction_count = ctx->program->instruction_count;
+    inventory->source_begin = SIZE_MAX;
+    inventory->interface_begin = begin;
+    ctx->geometry_flow_source_inventory = inventory;
+  }
+  if (inventory->interface_record_count >= 72 || inventory->source_begin != SIZE_MAX)
+    return false;
+  HLSLGeometryFlowInterfaceRecord *record =
+      &inventory->interface_records[inventory->interface_record_count++];
+  record->kind = kind;
+  record->field_index = field_index;
+  record->source_begin = begin;
+  record->source_end = ctx->sb->len;
+  record->source_digest = syntax_digest(ctx->sb->buf, begin, ctx->sb->len);
+  return true;
+}
+
+static bool interface_receipt_matches(const HLSLEmitterContext *ctx,
+    const HLSLGeometryFlowSourceInventory *inventory, size_t *index, size_t *cursor,
+    HLSLGeometryFlowInterfaceKind kind, int field_index) {
+  if (*index >= inventory->interface_record_count) return false;
+  const HLSLGeometryFlowInterfaceRecord *record = &inventory->interface_records[(*index)++];
+  if (record->kind != kind || record->field_index != field_index ||
+      record->source_begin != *cursor || record->source_end <= *cursor ||
+      record->source_end > ctx->sb->len || record->source_digest !=
+          syntax_digest(ctx->sb->buf, record->source_begin, record->source_end))
+    return false;
+  *cursor = record->source_end;
+  return true;
+}
+
+static bool interface_receipts_complete(const HLSLEmitterContext *ctx,
+                                        const HLSLGeometryFlowSourceInventory *inventory) {
+  if (inventory->interface_record_count > 72 || inventory->interface_begin > ctx->sb->len)
+    return false;
+  size_t index = 0, cursor = inventory->interface_begin;
+  for (int field = 0; field < ctx->program->input_count; ++field)
+    if (!interface_receipt_matches(ctx, inventory, &index, &cursor,
+        HLSL_GEOMETRY_FLOW_INTERFACE_INPUT_FIELD, field)) return false;
+  if (!interface_receipt_matches(ctx, inventory, &index, &cursor,
+      HLSL_GEOMETRY_FLOW_INTERFACE_INPUT_END, -1)) return false;
+  for (int field = 0; field < ctx->program->output_count; ++field)
+    if (!interface_receipt_matches(ctx, inventory, &index, &cursor,
+        HLSL_GEOMETRY_FLOW_INTERFACE_OUTPUT_FIELD, field)) return false;
+  const HLSLGeometryFlowInterfaceKind remaining[] = {
+      HLSL_GEOMETRY_FLOW_INTERFACE_OUTPUT_END,
+      HLSL_GEOMETRY_FLOW_INTERFACE_ATTRIBUTE,
+      HLSL_GEOMETRY_FLOW_INTERFACE_INPUT_PARAMETER,
+      HLSL_GEOMETRY_FLOW_INTERFACE_STREAM_PARAMETER,
+      HLSL_GEOMETRY_FLOW_INTERFACE_FUNCTION_OPEN,
+      HLSL_GEOMETRY_FLOW_INTERFACE_RESULT_LOCAL};
+  for (size_t kind = 0; kind < sizeof(remaining) / sizeof(remaining[0]); ++kind)
+    if (!interface_receipt_matches(ctx, inventory, &index, &cursor, remaining[kind], -1))
+      return false;
+  return index == inventory->interface_record_count && cursor == inventory->source_begin;
+}
+
+static uint8_t syntax_destination_lanes(const USILProgram *program,
+                                       const USILInstruction *owner) {
+  USILOperandUseInfo use;
+  if (owner->operand_count &&
+      usil_instruction_operand_use(program, owner, 0, &use) &&
+      use.use == USIL_OPERAND_USE_DESTINATION)
+    return usil_operand_destination_lane_mask(&owner->operands[0]);
+  return 0;
+}
+
+static HLSLGeometryFlowSyntaxKind syntax_kind(const Plan *plan,
+                                             const USILInstruction *owner,
+                                             int instruction) {
+  if (instruction == plan->initial || instruction == plan->loop ||
+      instruction == plan->compare || instruction == plan->test ||
+      instruction == plan->increment)
+    return HLSL_GEOMETRY_FLOW_SYNTAX_LOOP_HEADER;
+  switch (owner->opcode) {
+  case USIL_OP_IF: return HLSL_GEOMETRY_FLOW_SYNTAX_IF;
+  case USIL_OP_ELSE: return HLSL_GEOMETRY_FLOW_SYNTAX_ELSE;
+  case USIL_OP_ENDIF: return HLSL_GEOMETRY_FLOW_SYNTAX_ENDIF;
+  case USIL_OP_ENDLOOP: return HLSL_GEOMETRY_FLOW_SYNTAX_ENDLOOP;
+  case USIL_OP_GEOMETRY_APPEND:
+  case USIL_OP_GEOMETRY_RESTART_STRIP:
+    return HLSL_GEOMETRY_FLOW_SYNTAX_EFFECT;
+  case USIL_OP_RET: return HLSL_GEOMETRY_FLOW_SYNTAX_RETURN;
+  case USIL_OP_NOP: return HLSL_GEOMETRY_FLOW_SYNTAX_NOP;
+  default: return HLSL_GEOMETRY_FLOW_SYNTAX_EXPRESSION;
+  }
+}
+
+static bool inventory_begin(HLSLEmitterContext *ctx, const Plan *plan) {
+  if (!ctx->source_quality_analysis) return true;
+  if (!sb_ok(ctx->sb)) return false;
+  HLSLGeometryFlowSourceInventory *inventory = ctx->geometry_flow_source_inventory;
+  if (!inventory || inventory->source_begin != SIZE_MAX ||
+      inventory->instruction_count != ctx->program->instruction_count) return false;
+  inventory->instruction_count = ctx->program->instruction_count;
+  inventory->loop = plan->loop;
+  inventory->end = plan->end;
+  inventory->compare = plan->compare;
+  inventory->test = plan->test;
+  inventory->increment = plan->increment;
+  inventory->initial = plan->initial;
+  inventory->source_begin = ctx->sb->len;
+  ctx->geometry_flow_source_inventory = inventory;
+  return true;
+}
+
+static bool record_syntax(HLSLEmitterContext *ctx, int instruction,
+                          HLSLGeometryFlowSyntaxKind kind, size_t begin) {
+  if (!ctx->source_quality_analysis) return true;
+  HLSLGeometryFlowSourceInventory *inventory = ctx->geometry_flow_source_inventory;
+  if (!inventory || instruction < 0 || instruction >= inventory->instruction_count ||
+      kind == HLSL_GEOMETRY_FLOW_SYNTAX_NONE || !sb_ok(ctx->sb) ||
+      begin > ctx->sb->len ||
+      (kind != HLSL_GEOMETRY_FLOW_SYNTAX_NOP && begin == ctx->sb->len) ||
+      (inventory->recorded_instructions & (UINT64_C(1) << instruction)))
+    return false;
+  const USILInstruction *owner = &ctx->program->instructions[instruction];
+  HLSLGeometryFlowSyntaxRecord *record = &inventory->records[instruction];
+  record->kind = kind;
+  record->source_instruction_index = owner->source_instruction_index;
+  record->destination_lanes = syntax_destination_lanes(ctx->program, owner);
+  record->source_begin = begin;
+  record->source_end = ctx->sb->len;
+  record->source_digest = syntax_digest(ctx->sb->buf, begin, ctx->sb->len);
+  inventory->recorded_instructions |= UINT64_C(1) << instruction;
+  return true;
+}
+
+/* A root is counted only after the observer accepted the AST and its formatter
+ * appended actual source. Folded induction owners share the proved loop header;
+ * only its bound expression has an AST observation. */
+static bool record_expression(HLSLEmitterContext *ctx, int instruction,
+                              size_t begin) {
+  if (!ctx->source_quality_analysis) return true;
+  HLSLGeometryFlowSourceInventory *inventory = ctx->geometry_flow_source_inventory;
+  if (!inventory || instruction < 0 || instruction >= inventory->instruction_count ||
+      !sb_ok(ctx->sb) || ctx->sb->len <= begin ||
+      (inventory->emitted_expressions & (UINT64_C(1) << instruction)))
+    return false;
+  inventory->emitted_expressions |= UINT64_C(1) << instruction;
+  return true;
+}
+
+bool hlsl_geometry_control_flow_record_return(HLSLEmitterContext *ctx,
+                                              size_t source_begin) {
+  if (!ctx || !ctx->geometry_flow_source_inventory) return true;
+  return record_syntax(ctx, ctx->program->instruction_count - 1,
+                       HLSL_GEOMETRY_FLOW_SYNTAX_RETURN, source_begin);
+}
+
+void hlsl_geometry_control_flow_inventory_free(HLSLEmitterContext *ctx) {
+  if (!ctx) return;
+  free(ctx->geometry_flow_source_inventory);
+  ctx->geometry_flow_source_inventory = NULL;
+}
+
+bool hlsl_geometry_control_flow_inventory_complete(HLSLEmitterContext *ctx) {
+  if (!ctx || !ctx->program || !ctx->geometry_flow_source_inventory || !sb_ok(ctx->sb))
+    return false;
+  const HLSLGeometryFlowSourceInventory *inventory = ctx->geometry_flow_source_inventory;
+  Plan plan = {0};
+  bool valid = false;
+  if (!build_plan(ctx, &plan) || inventory->instruction_count != ctx->program->instruction_count ||
+      inventory->loop != plan.loop || inventory->end != plan.end ||
+      inventory->compare != plan.compare || inventory->test != plan.test ||
+      inventory->increment != plan.increment || inventory->initial != plan.initial)
+    goto cleanup;
+  const uint64_t all = inventory->instruction_count == 64 ? UINT64_MAX :
+      (UINT64_C(1) << inventory->instruction_count) - 1u;
+  if (inventory->recorded_instructions != all || inventory->source_begin > ctx->sb->len ||
+      !interface_receipts_complete(ctx, inventory)) goto cleanup;
+  const HLSLGeometryFlowSyntaxRecord *header = &inventory->records[plan.loop];
+  uint64_t expected_expressions = UINT64_C(1) << plan.compare;
+  size_t cursor = inventory->source_begin;
+  for (int instruction = 0; instruction < inventory->instruction_count; ++instruction) {
+    const USILInstruction *owner = &ctx->program->instructions[instruction];
+    const HLSLGeometryFlowSyntaxRecord *record = &inventory->records[instruction];
+    const HLSLGeometryFlowSyntaxKind expected = syntax_kind(&plan, owner, instruction);
+    if (record->kind != expected ||
+        record->source_instruction_index != owner->source_instruction_index ||
+        record->destination_lanes != syntax_destination_lanes(ctx->program, owner) ||
+        record->source_begin > record->source_end || record->source_end > ctx->sb->len ||
+        record->source_digest != syntax_digest(ctx->sb->buf, record->source_begin, record->source_end))
+      goto cleanup;
+    if (expected == HLSL_GEOMETRY_FLOW_SYNTAX_LOOP_HEADER && instruction != plan.loop) {
+      if (record->source_begin != header->source_begin || record->source_end != header->source_end)
+        goto cleanup;
+      continue;
+    }
+    /* Every emitted body byte, including indentation and braces, belongs to a
+     * consecutive syntax receipt. A NOP contributes an explicit empty receipt. */
+    if (record->source_begin != cursor ||
+        (expected == HLSL_GEOMETRY_FLOW_SYNTAX_NOP
+             ? record->source_end != cursor : record->source_end == cursor))
+      goto cleanup;
+    cursor = record->source_end;
+    if (expected == HLSL_GEOMETRY_FLOW_SYNTAX_EXPRESSION ||
+        expected == HLSL_GEOMETRY_FLOW_SYNTAX_IF)
+      expected_expressions |= UINT64_C(1) << instruction;
+  }
+  valid = cursor == ctx->sb->len && inventory->emitted_expressions == expected_expressions;
+cleanup:
+  free(plan.variable_value);
+  free(plan.variable_component);
+  return valid;
+}
+
 static ASTExpr *owned(ASTExpr *expression, const HLSLEmitterContext *ctx,
                       int instruction, ASTScalarType type, int components,
                       uint64_t identity, bool projection) {
@@ -831,6 +1074,7 @@ bool hlsl_geometry_control_flow_emit(HLSLEmitterContext *ctx) {
   bool success = false;
   if (!build_plan(ctx, &plan))
     goto cleanup;
+  if (!inventory_begin(ctx, &plan)) goto cleanup;
   hlsl_expression_source_map_begin(ctx);
   HLSLExpressionSourceMap *map = ctx->expression_source_map;
   for (int i = 0; i < ctx->program->instruction_count; ++i) {
@@ -839,8 +1083,12 @@ bool hlsl_geometry_control_flow_emit(HLSLEmitterContext *ctx) {
     if (i == plan.initial || i == plan.compare || i == plan.test ||
         i == plan.increment)
       continue;
-    if (owner->opcode == USIL_OP_NOP || owner->opcode == USIL_OP_RET)
+    if (owner->opcode == USIL_OP_NOP) {
+      if (!record_syntax(ctx, i, HLSL_GEOMETRY_FLOW_SYNTAX_NOP, ctx->sb->len))
+        goto cleanup;
       continue;
+    }
+    if (owner->opcode == USIL_OP_RET) continue;
     const size_t statement_begin = ctx->sb->len;
     if (owner->opcode == USIL_OP_ENDLOOP || owner->opcode == USIL_OP_ENDIF ||
         owner->opcode == USIL_OP_ELSE)
@@ -862,8 +1110,10 @@ bool hlsl_geometry_control_flow_emit(HLSLEmitterContext *ctx) {
         ast_free_expr(bound);
         goto cleanup;
       }
+      const size_t bound_begin = ctx->sb->len;
       ast_format_expr(bound, ctx->sb);
       ast_free_expr(bound);
+      if (!record_expression(ctx, plan.compare, bound_begin)) goto cleanup;
       sb_appendf(ctx->sb, "; ++%s) {\n", plan.counter_name);
       ctx->indent += 4;
       const int owners[] = {plan.initial, plan.loop, plan.compare, plan.test,
@@ -872,6 +1122,8 @@ bool hlsl_geometry_control_flow_emit(HLSLEmitterContext *ctx) {
            owner_index < sizeof(owners) / sizeof(owners[0]); ++owner_index) {
         const int header_owner = owners[owner_index];
         hlsl_source_quality_emission(ctx, 0, true, header_owner);
+        if (!record_syntax(ctx, header_owner, HLSL_GEOMETRY_FLOW_SYNTAX_LOOP_HEADER,
+                           statement_begin)) goto cleanup;
         if (map) {
           map->origins[header_owner].kind = HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL;
           map->origins[header_owner].source_begin = statement_begin;
@@ -888,8 +1140,10 @@ bool hlsl_geometry_control_flow_emit(HLSLEmitterContext *ctx) {
         goto cleanup;
       }
       sb_append(ctx->sb, "[branch] if (");
+      const size_t condition_begin = ctx->sb->len;
       ast_format_expr(condition, ctx->sb);
       ast_free_expr(condition);
+      if (!record_expression(ctx, i, condition_begin)) goto cleanup;
       sb_append(ctx->sb, ") {\n");
       ctx->indent += 4;
       hlsl_source_quality_emission(ctx, 0, true, i);
@@ -972,11 +1226,14 @@ bool hlsl_geometry_control_flow_emit(HLSLEmitterContext *ctx) {
         map->origins[i].source_end = ctx->sb->len;
       }
       ast_free_expr(expression);
+      if (!record_expression(ctx, i, expression_begin)) goto cleanup;
       sb_append(ctx->sb, ";\n");
       hlsl_source_quality_emission(ctx, 0, true, i);
     }
-    if (!sb_ok(ctx->sb))
+    if (owner->opcode != USIL_OP_LOOP &&
+        !record_syntax(ctx, i, syntax_kind(&plan, owner, i), statement_begin))
       goto cleanup;
+    if (!sb_ok(ctx->sb)) goto cleanup;
   }
   /* The complete stage-entry syntax/declaration inventory remains separate
    * from these instruction-owned source spans. Neither certifies execution. */

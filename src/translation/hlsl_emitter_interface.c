@@ -115,16 +115,19 @@ bool hlsl_domain_shape(DXBCTessellatorDomain domain, HLSLDomainShape *shape) {
   case DXBC_TESSELLATOR_DOMAIN_TRIANGLE:
     *shape = (HLSLDomainShape){.attribute = "tri", .coordinate_count = 3,
         .outer_count = 3, .inner_count = 1,
-        .outer_system_values = {13, 13, 13}, .inner_system_values = {14}};
+        .outer_system_values = {13, 13, 13}, .inner_system_values = {14},
+        .raw_outer_siv_names = {17, 18, 19}, .raw_inner_siv_names = {20}};
     return true;
   case DXBC_TESSELLATOR_DOMAIN_QUAD:
     *shape = (HLSLDomainShape){.attribute = "quad", .coordinate_count = 2,
         .outer_count = 4, .inner_count = 2,
-        .outer_system_values = {11, 11, 11, 11}, .inner_system_values = {12, 12}};
+        .outer_system_values = {11, 11, 11, 11}, .inner_system_values = {12, 12},
+        .raw_outer_siv_names = {11, 12, 13, 14}, .raw_inner_siv_names = {15, 16}};
     return true;
   case DXBC_TESSELLATOR_DOMAIN_ISOLINE:
     *shape = (HLSLDomainShape){.attribute = "isoline", .coordinate_count = 2,
-        .outer_count = 2, .outer_system_values = {16, 15}};
+        .outer_count = 2, .outer_system_values = {16, 15},
+        .raw_outer_siv_names = {22, 21}};
     return true;
   default:
     return false;
@@ -136,7 +139,9 @@ bool hlsl_domain_shape(DXBCTessellatorDomain domain, HLSLDomainShape *shape) {
  * field order. Split, repeated or incomplete groups have no source authority. */
 bool hlsl_domain_factor_order(const USILProgram *program, bool *inner_first) {
   HLSLDomainShape shape;
-  if (!program || !inner_first || !hlsl_domain_shape(program->tessellation.domain, &shape)) return false;
+  if (!program || !inner_first ||
+      (program->program_type != DXBC_PROGRAM_TYPE_HULL && program->program_type != DXBC_PROGRAM_TYPE_DOMAIN) ||
+      !hlsl_domain_shape(program->tessellation.domain, &shape)) return false;
   const int count = shape.outer_count + shape.inner_count;
   if (program->patch_constant_count != count || program->patch_constant_alloc < count ||
       !program->patch_constants) return false;
@@ -153,7 +158,8 @@ bool hlsl_domain_factor_order(const USILProgram *program, bool *inner_first) {
     const unsigned semantic = (unsigned)reg - first;
     const uint32_t system = inner ? shape.inner_system_values[semantic] : shape.outer_system_values[semantic];
     const DXBCSignatureElement *field = ordered[reg];
-    if (!field || field->component_type != 3 || field->mask != 1 || field->rw_mask ||
+    if (!field || field->component_type != 3 || field->mask != 1 ||
+        field->rw_mask != (program->program_type == DXBC_PROGRAM_TYPE_HULL ? 14 : 0) ||
         field->min_precision || field->stream_index || field->system_value != system ||
         field->semantic_index != semantic) return false;
   }
@@ -508,7 +514,12 @@ void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, in
     const DXBCSignatureElement *element = &ctx->program->outputs[output];
     if (element->register_id != (uint32_t)owner->operands[0].register_index ||
         element->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
-        usil_operand_destination_lane_mask(&owner->operands[0]) != element->mask) continue;
+        !usil_operand_destination_lane_mask(&owner->operands[0]) ||
+        (usil_operand_destination_lane_mask(&owner->operands[0]) & ~element->mask)) continue;
+    /* Only the independently planned flow route admits partial field updates.
+     * Its CFG proof requires the complete persistent tuple at every Append. */
+    if (usil_operand_destination_lane_mask(&owner->operands[0]) != element->mask &&
+        !hlsl_geometry_control_flow_admission(ctx->program, ctx->emit_mode)) continue;
     ctx->high_level_output_statements_emitted |= UINT32_C(1) << element->register_id;
     if (ctx->high_level_geometry)
       ctx->high_level_geometry_statements_emitted |= UINT64_C(1) << instruction;
@@ -627,7 +638,7 @@ bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *n
   return true;
 }
 
-static bool allocate_interface_name(HLSLEmitterContext *ctx, const char *base, char destination[96]) {
+bool hlsl_allocate_interface_name(HLSLEmitterContext *ctx, const char *base, char destination[96]) {
   if (!base || !base[0] || strlen(base) > 80) return false;
   for (size_t index = 0; base[index]; ++index) {
     unsigned char value = (unsigned char)base[index];
@@ -668,25 +679,25 @@ bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
     } else if (!hlsl_copy_checked(ctx, base, sizeof(base), role)) {
       return false;
     }
-    if (!allocate_interface_name(ctx, base, ctx->high_level_input_names[element->register_id])) goto unsupported;
+    if (!hlsl_allocate_interface_name(ctx, base, ctx->high_level_input_names[element->register_id])) goto unsupported;
   }
   if (ctx->high_level_geometry &&
-      (!allocate_interface_name(ctx, ctx->preferred_input_struct_name,
+      (!hlsl_allocate_interface_name(ctx, ctx->preferred_input_struct_name,
                                 ctx->high_level_geometry_input_type) ||
-       !allocate_interface_name(ctx, "input", ctx->high_level_geometry_input_variable) ||
-       !allocate_interface_name(ctx, "stream", ctx->high_level_geometry_stream_variable)))
+       !hlsl_allocate_interface_name(ctx, "input", ctx->high_level_geometry_input_variable) ||
+       !hlsl_allocate_interface_name(ctx, "stream", ctx->high_level_geometry_stream_variable)))
     goto unsupported;
   if (ctx->high_level_domain &&
-      (!allocate_interface_name(ctx, ctx->preferred_input_struct_name, ctx->high_level_domain_point_type) ||
-       !allocate_interface_name(ctx, "patch", ctx->high_level_domain_patch_variable) ||
-       !allocate_interface_name(ctx, ctx->program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE ?
+      (!hlsl_allocate_interface_name(ctx, ctx->preferred_input_struct_name, ctx->high_level_domain_point_type) ||
+       !hlsl_allocate_interface_name(ctx, "patch", ctx->high_level_domain_patch_variable) ||
+       !hlsl_allocate_interface_name(ctx, ctx->program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE ?
            "barycentric" : "coordinates", ctx->high_level_domain_location_variable) ||
-       !allocate_interface_name(ctx, "DomainFactors", ctx->high_level_domain_factors_type) ||
-       !allocate_interface_name(ctx, "factors", ctx->high_level_domain_factors_variable))) goto unsupported;
+       !hlsl_allocate_interface_name(ctx, "DomainFactors", ctx->high_level_domain_factors_type) ||
+       !hlsl_allocate_interface_name(ctx, "factors", ctx->high_level_domain_factors_variable))) goto unsupported;
   if (!ctx->high_level_direct_return) {
-    if (!allocate_interface_name(ctx, ctx->preferred_output_struct_name,
+    if (!hlsl_allocate_interface_name(ctx, ctx->preferred_output_struct_name,
                                 ctx->high_level_output_type) ||
-        !allocate_interface_name(ctx, "output", ctx->high_level_output_variable)) goto unsupported;
+        !hlsl_allocate_interface_name(ctx, "output", ctx->high_level_output_variable)) goto unsupported;
     for (int output = 0; output < ctx->program->output_count; ++output) {
       const DXBCSignatureElement *element = &ctx->program->outputs[output];
       const char *semantic = dxbc_signature_semantic_name(element);
@@ -699,7 +710,7 @@ bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
       } else if (strcmp(semantic, "TEXCOORD") == 0 || element->semantic_index) {
         if (!hlsl_format_checked(ctx, base, sizeof(base), "%s%u", role, element->semantic_index)) return false;
       } else if (!hlsl_copy_checked(ctx, base, sizeof(base), role)) return false;
-      if (!allocate_interface_name(ctx, base, ctx->high_level_output_names[element->register_id])) goto unsupported;
+      if (!hlsl_allocate_interface_name(ctx, base, ctx->high_level_output_names[element->register_id])) goto unsupported;
     }
   }
   ctx->high_level_interface_prepared = true;
@@ -837,6 +848,13 @@ static const char *geometry_stream_type_name(DXBCOutputTopology value) {
   }
 }
 
+static void geometry_flow_interface_receipt(HLSLEmitterContext *ctx,
+    HLSLGeometryFlowInterfaceKind kind, int field_index, size_t begin) {
+  if (!hlsl_geometry_control_flow_record_interface(ctx, kind, field_index, begin))
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_INTERFACE_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+}
+
 void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const char* output_struct) {
   if (ctx->high_level_direct_return && !ctx->high_level_domain) return;
   const USILProgram* program = ctx->program;
@@ -846,6 +864,7 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
       const size_t input_begin = sb->len;
       sb_appendf(sb, "struct %s {\n", ctx->high_level_domain ? ctx->high_level_domain_point_type : ctx->high_level_geometry_input_type);
       for (int input = 0; input < program->input_count; ++input) {
+        const size_t field_begin = input ? sb->len : input_begin;
         const DXBCSignatureElement *element = &program->inputs[input];
         const char *name = hlsl_high_level_input_name(ctx, (int)element->register_id);
         const char *semantic = dxbc_signature_semantic_name(element);
@@ -856,13 +875,18 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
           sb_appendf(sb, "%u", element->semantic_index);
         sb_append(sb, ";\n");
         hlsl_source_quality_emission(ctx, 0, false, -1);
+        geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_INPUT_FIELD,
+                                         input, field_begin);
         if (sb_ok(sb)) {
           if (ctx->high_level_domain) ctx->high_level_domain_point_fields_emitted |= UINT32_C(1) << element->register_id;
           else ctx->high_level_geometry_input_fields_emitted |= UINT32_C(1) << element->register_id;
         }
       }
+      const size_t input_end_begin = sb->len;
       sb_append(sb, "};\n\n");
       hlsl_source_quality_emission(ctx, 0, false, -1);
+      geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_INPUT_END,
+                                       -1, input_end_begin);
       if (ctx->high_level_domain) ctx->high_level_domain_point_struct_emitted = sb_ok(sb) && sb->len > input_begin;
       else ctx->high_level_geometry_input_struct_emitted = sb_ok(sb) && sb->len > input_begin;
     }
@@ -893,6 +917,7 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
     size_t struct_begin = sb->len;
     sb_appendf(sb, "struct %s {\n", ctx->high_level_output_type);
     for (int output = 0; output < program->output_count; ++output) {
+      const size_t field_begin = output ? sb->len : struct_begin;
       const DXBCSignatureElement *element = &program->outputs[output];
       const char *name = hlsl_high_level_output_name(ctx, (int)element->register_id);
       const char *semantic = dxbc_signature_semantic_name(element);
@@ -903,11 +928,16 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
         sb_appendf(sb, "%u", element->semantic_index);
       sb_append(sb, ";\n");
       hlsl_source_quality_emission(ctx, 0, false, -1);
+      geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_OUTPUT_FIELD,
+                                       output, field_begin);
       if (sb_ok(sb))
         ctx->high_level_output_fields_emitted |= UINT32_C(1) << element->register_id;
     }
+    const size_t output_end_begin = sb->len;
     sb_append(sb, "};\n\n");
     hlsl_source_quality_emission(ctx, 0, false, -1);
+    geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_OUTPUT_END,
+                                     -1, output_end_begin);
     ctx->high_level_output_struct_emitted = sb_ok(sb) && sb->len > struct_begin;
     return;
   }
@@ -1052,28 +1082,43 @@ void emit_entry_point_declarations(HLSLEmitterContext* ctx,
     if (ctx->high_level_geometry) {
       const char *stream = geometry_stream_type_name(program->geometry.output_topology);
       if (!stream) { sb->failed = true; return; }
+      const size_t attribute_begin = sb->len;
       sb_appendf(sb, "[maxvertexcount(%u)]\n", program->geometry.max_output_vertex_count);
       hlsl_source_quality_emission(ctx, 0, false, -1);
+      geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_ATTRIBUTE,
+                                       -1, attribute_begin);
       ctx->high_level_geometry_attribute_emitted = sb_ok(sb);
       const char *primitive = geometry_input_primitive_name(program->geometry.input_primitive);
       if (!primitive) { sb->failed = true; return; }
+      const size_t input_parameter_begin = sb->len;
       sb_appendf(sb, "void %s(%s %s %s[%u]", entry_point, primitive,
           ctx->high_level_geometry_input_type, ctx->high_level_geometry_input_variable,
           program->geometry.input_vertex_count);
       hlsl_source_quality_emission(ctx, 0, false, -1);
+      geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_INPUT_PARAMETER,
+                                       -1, input_parameter_begin);
       if (sb_ok(sb)) {
         for (int input = 0; input < program->input_count; ++input)
           ctx->high_level_input_parameters_emitted |= UINT32_C(1) << program->inputs[input].register_id;
       }
+      const size_t stream_parameter_begin = sb->len;
       sb_appendf(sb, ", inout %s<%s> %s)", stream, ctx->high_level_output_type,
           ctx->high_level_geometry_stream_variable);
       hlsl_source_quality_emission(ctx, 0, false, -1);
+      geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_STREAM_PARAMETER,
+                                       -1, stream_parameter_begin);
       ctx->high_level_geometry_stream_parameter_emitted = sb_ok(sb);
+      const size_t function_open_begin = sb->len;
       sb_append(sb, " {\n");
       hlsl_source_quality_emission(ctx, 0, false, -1);
+      geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_FUNCTION_OPEN,
+                                       -1, function_open_begin);
       ctx->high_level_entry_signature_emitted = sb_ok(sb) && sb->len > entry_begin;
+      const size_t result_local_begin = sb->len;
       sb_appendf(sb, "    %s %s;\n", ctx->high_level_output_type, ctx->high_level_output_variable);
       hlsl_source_quality_emission(ctx, 0, false, -1);
+      geometry_flow_interface_receipt(ctx, HLSL_GEOMETRY_FLOW_INTERFACE_RESULT_LOCAL,
+                                       -1, result_local_begin);
       ctx->high_level_result_local_emitted = sb_ok(sb);
       return;
     }

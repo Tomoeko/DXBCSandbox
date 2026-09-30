@@ -34,14 +34,14 @@ static bool is_boundary(USILOpcode opcode) {
  * label. A single owned array keeps arbitrary switch fan-out bounded by the
  * instruction count without allocating a separate list for every block. */
 static bool add_successor(HLSLControlFlowGraph *cfg, int from, int instruction,
-                          int instruction_count, size_t *edge_count) {
+                          int first_instruction, int end_instruction, size_t *edge_count) {
     if (from < 0 || from >= cfg->block_count)
         return false;
-    if (instruction == instruction_count) {
+    if (instruction == end_instruction) {
         cfg->blocks[from].may_exit = true;
         return true;
     }
-    if (instruction < 0 || instruction >= instruction_count)
+    if (instruction < first_instruction || instruction >= end_instruction)
         return false;
     int to = cfg->instruction_block[instruction];
     if (to < 0 || to >= cfg->block_count)
@@ -50,7 +50,7 @@ static bool add_successor(HLSLControlFlowGraph *cfg, int from, int instruction,
     for (int item = 0; item < block->successor_count; ++item)
         if (block->successors[item] == to)
             return true;
-    if (*edge_count >= (size_t)instruction_count * 3u || block->successor_count == INT_MAX ||
+    if (*edge_count >= (size_t)cfg->instruction_count * 3u || block->successor_count == INT_MAX ||
         cfg->blocks[to].predecessor_count == INT_MAX)
         return false;
     block->successors[block->successor_count++] = to;
@@ -62,7 +62,8 @@ static bool add_successor(HLSLControlFlowGraph *cfg, int from, int instruction,
 /* Match once, preserving the nearest breakable scope independently from the
  * nearest loop. SWITCH inside LOOP must not turn its BREAK into a loop exit.
  * Shader Model 4/5 defines at most 64 nested flow-control constructs. */
-static bool match_flow_structure(const USILProgram *program, HLSLInstructionFlow *flow) {
+static bool match_flow_structure(const USILProgram *program, HLSLInstructionFlow *flow,
+                                 int first_instruction, int end_instruction) {
     enum { MAX_FLOW_DEPTH = 64 };
     int stack[MAX_FLOW_DEPTH];
     int last_case[MAX_FLOW_DEPTH];
@@ -71,7 +72,7 @@ static bool match_flow_structure(const USILProgram *program, HLSLInstructionFlow
         flow[index].end = flow[index].alternate = flow[index].parent = -1;
         flow[index].jump_scope = flow[index].first_case = flow[index].next_case = -1;
     }
-    for (int index = 0; index < program->instruction_count; ++index) {
+    for (int index = first_instruction; index < end_instruction; ++index) {
         const USILOpcode opcode = program->instructions[index].opcode;
         const int scope = depth ? stack[depth - 1] : -1;
         const USILOpcode enclosing = scope >= 0 ? program->instructions[scope].opcode : USIL_OP_NOP;
@@ -128,11 +129,15 @@ static bool match_flow_structure(const USILProgram *program, HLSLInstructionFlow
     return depth == 0;
 }
 
-bool build_control_flow_graph(HLSLEmitterContext *ctx) {
+bool build_control_flow_graph_range(HLSLEmitterContext *ctx, int first_instruction,
+                                     int end_instruction) {
     if (!ctx || !ctx->program || ctx->program->instruction_count < 0)
         return false;
     const USILProgram *program = ctx->program;
     const int count = program->instruction_count;
+    if (first_instruction < 0 || end_instruction < first_instruction ||
+        end_instruction > count || (first_instruction == end_instruction && count != 0))
+        return false;
     HLSLControlFlowGraph *cfg = &ctx->cfg;
     if (count == 0)
         return true;
@@ -150,17 +155,18 @@ bool build_control_flow_graph(HLSLEmitterContext *ctx) {
     cfg->successor_storage = malloc((size_t)count * 3u * sizeof(*cfg->successor_storage));
     cfg->blocks = calloc((size_t)count, sizeof(*cfg->blocks));
     if (!leader || !flow || !cfg->instruction_block || !cfg->successor_storage || !cfg->blocks ||
-        !match_flow_structure(program, flow))
+        !match_flow_structure(program, flow, first_instruction, end_instruction))
         goto fail;
-    leader[0] = true;
-    for (int index = 0; index < count; ++index) {
+    for (int index = 0; index < count; ++index) cfg->instruction_block[index] = -1;
+    leader[first_instruction] = true;
+    for (int index = first_instruction; index < end_instruction; ++index) {
         if (!is_boundary(program->instructions[index].opcode))
             continue;
         leader[index] = true;
-        if (index + 1 < count)
+        if (index + 1 < end_instruction)
             leader[index + 1] = true;
     }
-    for (int index = 0; index < count; ++index) {
+    for (int index = first_instruction; index < end_instruction; ++index) {
         if (!leader[index])
             continue;
         int block = cfg->block_count++;
@@ -168,7 +174,7 @@ bool build_control_flow_graph(HLSLEmitterContext *ctx) {
         if (block > 0)
             cfg->blocks[block - 1].last_instruction = index - 1;
     }
-    cfg->blocks[cfg->block_count - 1].last_instruction = count - 1;
+    cfg->blocks[cfg->block_count - 1].last_instruction = end_instruction - 1;
     for (int block = 0; block < cfg->block_count; ++block)
         for (int index = cfg->blocks[block].first_instruction;
              index <= cfg->blocks[block].last_instruction; ++index)
@@ -193,7 +199,7 @@ bool build_control_flow_graph(HLSLEmitterContext *ctx) {
         const USILOpcode opcode = program->instructions[last].opcode;
 #define EDGE(target)                                                                               \
     do {                                                                                           \
-        if (!add_successor(cfg, block, (target), count, &edge_count))                              \
+        if (!add_successor(cfg, block, (target), first_instruction, end_instruction, &edge_count))                              \
             goto fail;                                                                             \
     } while (0)
         if (opcode == USIL_OP_RET) {
@@ -258,12 +264,18 @@ fail:
     return false;
 }
 
+bool build_control_flow_graph(HLSLEmitterContext *ctx) {
+    return ctx && ctx->program &&
+        build_control_flow_graph_range(ctx, 0, ctx->program->instruction_count);
+}
+
 bool instructions_have_unambiguous_path(const HLSLEmitterContext *ctx, int first, int second) {
     if (!ctx->cfg.instruction_block || first < 0 || second < first ||
         second >= ctx->program->instruction_count)
         return false;
     int first_block = ctx->cfg.instruction_block[first];
     int second_block = ctx->cfg.instruction_block[second];
+    if (first_block < 0 || second_block < 0) return false;
     if (first_block == second_block)
         return true;
     for (int block = first_block; block < second_block; block++) {

@@ -60,6 +60,7 @@ set(DXBC_SOURCES
     src/translation/hlsl_source_identifier.c
     src/translation/compute_source_candidate.c
     src/translation/hlsl_emitter_interface.c
+    src/translation/hlsl_emitter_hull.c
     src/translation/hlsl_emitter_tessellation.c
     src/translation/hlsl_emitter_resources.c
     src/translation/hlsl_analysis_liveness.c

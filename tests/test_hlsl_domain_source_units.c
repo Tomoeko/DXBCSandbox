@@ -409,9 +409,92 @@ static bool separated_point_and_location_identity(void) {
     return true;
 }
 
+static bool logical_coordinate_source(DomainFixture *fixture, const char *spelling) {
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLSourceQualityResult quality; HLSLExpressionSourceMap map;
+    options.source_quality = &quality; options.expression_source_map = &map;
+    DomainLedger ledger = {.program = &fixture->program};
+    options.source_quality_pass_index = 6; options.source_quality_entry_point_index = 2;
+    options.source_quality_observer = observe_domain;
+    options.source_quality_observer_context = &ledger;
+    StringBuilder source; sb_init(&source);
+    HLSLEmitDiagnostic diagnostic;
+    if (!hlsl_emit_with_options_diagnostic(&fixture->program, &source, NULL, NULL, NULL, &options, &diagnostic)) {
+        fprintf(stderr, "Composition diagnostic: status=%s phase=%s reason=%s instruction=%d domain=%u\n", hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase), hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index, fixture->program.tessellation.domain);
+        sb_free(&source);
+        return false;
+    }
+    CHECK(strstr(source.buf, spelling));
+    CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    CHECK(!quality.counts.unknown_provenance && !quality.counts.residual_total &&
+          !quality.counts.incomplete_units && !ledger.bad_owner && ledger.location);
+    CHECK(hlsl_expression_source_map_matches(&map, &fixture->program, source.buf));
+    sb_free(&source);
+    return true;
+}
+
+static bool logical_coordinate_composition(void) {
+    for (unsigned domain = 1; domain <= 3; ++domain) {
+        DomainFixture fixture;
+        CHECK(domain_fixture_init_shape(&fixture, domain, domain == 1 ? 2u : domain == 2 ? 3u : 4u,
+                                       (uint8_t)(domain == 2 ? 7u : 3u)));
+        USILInstruction *producer = &fixture.program.instructions[0];
+        DXBCOperand *location = &producer->operands[1];
+        producer->opcode = USIL_OP_MUL;
+        producer->operands[0].destination_mask = 0x70;
+        const DXBCOperand saved_factor = producer->operands[2];
+        producer->operands[2] = (DXBCOperand){.type = OPERAND_TYPE_IMMEDIATE32,
+            .swizzle_mode = 1, .swizzle = {0,1,2,3}, .imm_values = {0x3f800000, 0x40000000, 0x40400000, 0x40800000}, .imm_value_count = 4};
+        fixture.program.instructions[1].operands[3].swizzle_mode = 1;
+        memset(fixture.program.instructions[1].operands[3].swizzle, 0,
+               sizeof(fixture.program.instructions[1].operands[3].swizzle));
+        location->swizzle_mode = 1;
+        location->swizzle[0] = location->swizzle[1] = 0;
+        location->swizzle[2] = location->swizzle[3] = 1;
+        CHECK(logical_coordinate_source(&fixture, domain == 2
+            ? "float3((barycentric.x), (barycentric.x), (barycentric.y))"
+            : "float3((coordinates.x), (coordinates.x), (coordinates.y))"));
+        producer->operands[0].destination_mask = 0xf0;
+        CHECK(logical_coordinate_source(&fixture, "float4("));
+        producer->operands[0].destination_mask = 0x30;
+        location->swizzle[0] = 1; location->swizzle[1] = 0;
+        CHECK(logical_coordinate_source(&fixture, "float2("));
+        producer->operands[0].destination_mask = 0x70;
+        location->swizzle[0] = location->swizzle[1] = 0;
+        location->swizzle[2] = 1;
+        location->has_abs = location->has_neg = true;
+        uint32_t modifier = 0xc1;
+        location->extended_tokens = &modifier; location->extended_token_count = 1;
+        CHECK(logical_coordinate_source(&fixture, "abs(float3("));
+        modifier = 0x800000c1;
+        CHECK(source_rejected(&fixture.program));
+        location->extended_tokens = NULL; location->extended_token_count = 0;
+        location->has_abs = location->has_neg = false;
+        location->min_precision = 1;
+        CHECK(source_rejected(&fixture.program));
+        location->min_precision = 0;
+        producer->precise_mask = 15;
+        CHECK(source_rejected(&fixture.program));
+        producer->precise_mask = 0;
+        producer->saturate = true;
+        CHECK(source_rejected(&fixture.program));
+        producer->saturate = false;
+        fixture.program.signature_declarations[0].mask = 1;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.signature_declarations[0].mask = (uint8_t)(domain == 2 ? 7u : 3u);
+        if (domain != 2) {
+            location->swizzle[2] = 2;
+            CHECK(source_rejected(&fixture.program));
+        }
+        producer->operands[2] = saved_factor;
+        domain_fixture_dispose(&fixture);
+    }
+    return true;
+}
+
 int main(void) {
     if (!natural_domain_source() || !domain_authority_negatives() ||
-        !other_domain_shapes() || !factor_group_order() || !separated_point_and_location_identity()) return 1;
+        !other_domain_shapes() || !factor_group_order() || !separated_point_and_location_identity() || !logical_coordinate_composition()) return 1;
     puts("Domain source units passed");
     return 0;
 }

@@ -3,6 +3,7 @@
 #include "dxbc/dxbc_hash.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/hlsl_geometry_flow.h"
 #include "translation/hlsl_source_quality.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,7 @@ static size_t write_signature(uint8_t *bytes, bool output) {
 /* A generic controlled token program, independent of captured fixture bytes:
  * signed clamped bound, scalar predicate, partial semantic field writes and
  * one anchored Append/Cut per iteration. Parsed authority is never forged. */
-static uint8_t *controlled_dxbc(size_t *out_size) {
+static uint8_t *controlled_dxbc(int variant, size_t *out_size) {
   uint32_t words[192];
   size_t count = 0;
 #define WORD(value) words[count++] = (value)
@@ -174,6 +175,10 @@ static uint8_t *controlled_dxbc(size_t *out_size) {
   WORD(0x00004001);
   WORD(1);
   WORD(INSTRUCTION(22, 1));
+  if (variant == 1) {
+    WORD(INSTRUCTION(18, 1));
+    WORD(INSTRUCTION(58, 1));
+  }
   WORD(INSTRUCTION(21, 1));
   WORD(INSTRUCTION(62, 1));
 #undef WORD
@@ -214,14 +219,16 @@ typedef struct {
   HLSLExpressionSourceMap map;
   HLSLSourceQualityResult quality;
   bool reject_expression;
+  bool reject_emission;
+  int rejected_instruction;
 } Fixture;
 
-static bool fixture_init(Fixture *fixture) {
+static bool fixture_init_variant(Fixture *fixture, int variant) {
   memset(fixture, 0, sizeof(*fixture));
   dxbc_document_init(&fixture->document);
   dxbc_stage_contract_init(&fixture->contract);
   size_t size = 0;
-  uint8_t *bytes = controlled_dxbc(&size);
+  uint8_t *bytes = controlled_dxbc(variant, &size);
   CHECK(bytes);
   DXBCDocumentDiagnostic document_diagnostic;
   DXBCStageContractDiagnostic contract_diagnostic;
@@ -233,8 +240,11 @@ static bool fixture_init(Fixture *fixture) {
                                    &fixture->contract, &contract_diagnostic));
   CHECK(usil_translate_with_stage_contract(
       &fixture->program, &fixture->semantic, &fixture->contract));
-  CHECK(fixture->program.instruction_count == 20);
+  CHECK(fixture->program.instruction_count == (variant == 1 ? 22 : 20));
   return true;
+}
+static bool fixture_init(Fixture *fixture) {
+  return fixture_init_variant(fixture, 0);
 }
 static void fixture_free(Fixture *fixture) {
   usil_free(&fixture->program);
@@ -252,6 +262,8 @@ static bool observe(void *context,
            fixture->program.instructions[facts->instruction_index]
                .source_instruction_index))
     return false;
+  if (fixture->reject_emission && observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION &&
+      facts->instruction_index == fixture->rejected_instruction) return false;
   return !fixture->reject_expression ||
          observation->kind != HLSL_SOURCE_OBSERVATION_EXPRESSION;
 }
@@ -280,13 +292,20 @@ static bool typed_flow_and_owners(void) {
         strstr(source.buf, "output.texcoord0") &&
         strstr(source.buf, "stream.Append(output);") &&
         !strstr(source.buf, " r0") && !strstr(source.buf, " o0"));
-  CHECK(fixture.quality.classification == HLSL_SOURCE_QUALITY_MIXED &&
-        fixture.quality.counts.incomplete_units == 1 &&
+  CHECK(fixture.quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        fixture.quality.counts.incomplete_units == 0 &&
         !fixture.quality.counts.unknown_provenance &&
         !fixture.quality.counts.residual_total);
   CHECK(fixture.map.complete &&
         hlsl_expression_source_map_matches(&fixture.map, &fixture.program,
                                            source.buf));
+  StringBuilder unobserved;
+  sb_init(&unobserved);
+  HLSLEmitOptions unobserved_options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+  CHECK(hlsl_emit_with_options(&fixture.program, &unobserved, NULL, NULL, NULL,
+                              &unobserved_options));
+  CHECK(strcmp(source.buf, unobserved.buf) == 0);
+  sb_free(&unobserved);
   const int header[] = {4, 5, 6, 7, 16};
   for (size_t i = 0; i < sizeof(header) / sizeof(header[0]); ++i)
     CHECK(fixture.map.origins[header[i]].kind ==
@@ -319,7 +338,7 @@ static bool typed_flow_and_owners(void) {
   return true;
 }
 static bool flow_rejections(void) {
-  for (int mutation = 0; mutation < 10; ++mutation) {
+  for (int mutation = 0; mutation < 16; ++mutation) {
     Fixture fixture;
     CHECK(fixture_init(&fixture));
     USILInstruction *instructions = fixture.program.instructions;
@@ -345,6 +364,12 @@ static bool flow_rejections(void) {
       instructions[16].operand_count = 1;
     if (mutation == 9)
       instructions[14].source_instruction_index++;
+    if (mutation == 10) instructions[7].opcode = USIL_OP_BREAK, instructions[7].operand_count = 0;
+    if (mutation == 11) instructions[2].opcode = USIL_OP_SWITCH, instructions[2].operand_count = 1;
+    if (mutation == 12) instructions[2].opcode = USIL_OP_LOOP, instructions[2].operand_count = 0;
+    if (mutation == 13) instructions[2].opcode = USIL_OP_CONTINUEC, instructions[2].operand_count = 1;
+    if (mutation == 14) instructions[1].condition_test = DXBC_INSTRUCTION_TEST_ZERO;
+    if (mutation == 15) instructions[2].opcode = USIL_OP_RET, instructions[2].operand_count = 0;
     StringBuilder source;
     const bool emitted = emit(&fixture, &source);
     if (emitted)
@@ -357,6 +382,252 @@ static bool flow_rejections(void) {
   }
   return true;
 }
+/* Exercise the private receipts before finalization without adding a
+ * production mutation hook. All semantic authority comes from the parsed
+ * controlled DXBC above and the same CFG/SSA/value/interface modules. */
+static HLSLEmitterContext *inventory_context(Fixture *fixture, StringBuilder *source,
+                                            HLSLEmitDiagnostic *diagnostic) {
+  HLSLEmitterContext *ctx = calloc(1, sizeof(*ctx));
+  if (!ctx) return NULL;
+  sb_init(source);
+  hlsl_emit_diagnostic_init(diagnostic);
+  ctx->program = &fixture->program;
+  ctx->diagnostic = diagnostic;
+  ctx->emit_mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+  ctx->is_geometry = true;
+  ctx->high_level_geometry = true;
+  ctx->high_level_interface = true;
+  ctx->preferred_input_struct_name = "appdata";
+  ctx->preferred_output_struct_name = "v2f";
+  ctx->entry_point_name = "main";
+  ctx->indent = 4;
+  ctx->sb = source;
+  if (!build_control_flow_graph(ctx) || !compute_dominance(&ctx->cfg) ||
+      !build_cbuffer_emission_layouts(ctx) || !analyze_block_nesting(ctx) ||
+      !build_hlsl_ssa_graph(ctx) || !build_component_provenance(ctx) ||
+      !build_hlsl_use_def_graph(ctx) || !analyze_lane_value_types(ctx) ||
+      !hlsl_prepare_high_level_interface(ctx) ||
+      !hlsl_prepare_high_level_functions(ctx)) {
+    fputs("Could not prepare inventory context.\n", stderr);
+    abort();
+  }
+  HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+  options.source_quality = &fixture->quality;
+  options.source_quality_observer = observe;
+  options.source_quality_observer_context = fixture;
+  if (!hlsl_source_quality_initialize(ctx, &options)) abort();
+  return ctx;
+}
+
+static void inventory_context_free(HLSLEmitterContext *ctx) {
+  hlsl_source_quality_finish_emission(ctx);
+  hlsl_geometry_control_flow_inventory_free(ctx);
+  free_d3dcompiler_model(ctx);
+  free_cbuffer_emission_layouts(ctx);
+  free_lane_value_types(ctx);
+  free_hlsl_use_def_graph(ctx);
+  free_component_provenance(ctx);
+  free_hlsl_ssa_graph(ctx);
+  free_control_flow_graph(ctx);
+  free(ctx);
+}
+
+static bool inventory_emit(HLSLEmitterContext *ctx) {
+  CHECK(hlsl_source_quality_inventory_supported(ctx));
+  CHECK(hlsl_source_quality_begin_entry(ctx, true));
+  /* Include every active prelude/function/declaration path in the comparison;
+   * no resource/CB/helper dependency is supplied by this controlled program. */
+  emit_comments_and_icb(ctx);
+  hlsl_source_quality_emission(ctx, 0, false, -1);
+  emit_cbuffers(ctx);
+  emit_resources(ctx);
+  emit_exact_structural_helpers(ctx);
+  CHECK(emit_high_level_functions(ctx));
+  emit_io_structs(ctx, "appdata", "v2f");
+  bool inputs_used[HLSL_SM5_IO_REGISTER_COUNT] = {false};
+  bool outputs_used[HLSL_SM5_IO_REGISTER_COUNT] = {false};
+  emit_entry_point_declarations(ctx, "main", "appdata", "v2f", inputs_used, outputs_used);
+  CHECK(hlsl_geometry_control_flow_emit(ctx));
+  emit_return_block(ctx);
+  CHECK(sb_ok(ctx->sb));
+  CHECK(hlsl_source_quality_interface_inventory_complete(ctx));
+  CHECK(hlsl_geometry_control_flow_inventory_complete(ctx));
+  return true;
+}
+
+static bool empty_else_and_nop_inventory(void) {
+  Fixture fixture;
+  CHECK(fixture_init_variant(&fixture, 1));
+  StringBuilder source;
+  HLSLEmitDiagnostic diagnostic;
+  HLSLEmitterContext *ctx = inventory_context(&fixture, &source, &diagnostic);
+  CHECK(ctx && inventory_emit(ctx));
+  HLSLGeometryFlowSourceInventory *inventory = ctx->geometry_flow_source_inventory;
+  CHECK(inventory->records[18].kind == HLSL_GEOMETRY_FLOW_SYNTAX_ELSE);
+  CHECK(inventory->records[19].kind == HLSL_GEOMETRY_FLOW_SYNTAX_NOP &&
+        inventory->records[19].source_begin == inventory->records[19].source_end);
+  CHECK(strstr(source.buf, "} else {\n"));
+  hlsl_source_quality_finish_emission(ctx);
+  CHECK(fixture.quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        !fixture.quality.counts.incomplete_units && !fixture.quality.counts.unknown_provenance &&
+        !fixture.quality.counts.residual_total);
+  inventory_context_free(ctx);
+  sb_free(&source);
+  fixture_free(&fixture);
+  return true;
+}
+
+static bool syntax_ledger_mutations(void) {
+  /* Missing owners, altered kinds/raw ownership/lanes/ranges, folded header
+   * overlap, absent AST observations and mutated source cannot close a unit. */
+  for (int mutation = -1; mutation < 35; ++mutation) {
+    Fixture fixture;
+    CHECK(fixture_init(&fixture));
+    StringBuilder source;
+    HLSLEmitDiagnostic diagnostic;
+    HLSLEmitterContext *ctx = inventory_context(&fixture, &source, &diagnostic);
+    CHECK(ctx && inventory_emit(ctx));
+    HLSLGeometryFlowSourceInventory *inventory = ctx->geometry_flow_source_inventory;
+    CHECK(inventory && inventory->recorded_instructions == ((UINT64_C(1) << 20) - 1u));
+    if (mutation == 0) inventory->recorded_instructions &= ~(UINT64_C(1) << 1);
+    if (mutation == 1) inventory->records[1].kind = HLSL_GEOMETRY_FLOW_SYNTAX_EXPRESSION;
+    if (mutation == 2) ++inventory->records[14].source_instruction_index;
+    if (mutation == 3) inventory->records[12].destination_lanes = 3;
+    if (mutation == 4) ++inventory->records[1].source_begin;
+    if (mutation == 5) inventory->records[18].source_end = source.len + 1;
+    if (mutation == 6) ++inventory->records[16].source_begin;
+    if (mutation == 7) inventory->emitted_expressions &= ~(UINT64_C(1) << 1);
+    if (mutation == 8) inventory->emitted_expressions |= UINT64_C(1) << 14;
+    if (mutation == 9) ++inventory->instruction_count;
+    if (mutation == 10) ++inventory->increment;
+    if (mutation == 11) source.buf[inventory->records[1].source_begin] = '!';
+    if (mutation == 12) ++inventory->source_begin;
+    if (mutation == 13) inventory->records[14].source_begin = inventory->records[13].source_begin;
+    if (mutation == 14) inventory->records[19].source_end = inventory->records[19].source_begin;
+    if (mutation == 15) inventory->recorded_instructions |= UINT64_C(1) << 20;
+    if (mutation == 16) ctx->high_level_geometry_attribute_emitted = false;
+    if (mutation == 17) ctx->high_level_geometry_input_struct_emitted = false;
+    if (mutation == 18) ctx->high_level_output_struct_emitted = false;
+    if (mutation == 19) ctx->high_level_result_local_emitted = false;
+    if (mutation == 20) ctx->high_level_geometry_statements_emitted &= ~(UINT64_C(1) << 12);
+    if (mutation == 21) ctx->high_level_return_block_emitted = false;
+    if (mutation == 22) --inventory->interface_record_count;
+    if (mutation == 23) inventory->interface_records[0].kind = HLSL_GEOMETRY_FLOW_INTERFACE_OUTPUT_FIELD;
+    if (mutation == 24) ++inventory->interface_records[2].field_index;
+    if (mutation == 25) ++inventory->interface_records[8].source_begin;
+    if (mutation == 26) inventory->interface_records[7].source_end = source.len + 1;
+    if (mutation == 27) source.buf[inventory->interface_records[5].source_begin] = '!';
+    if (mutation == 28) inventory->interface_record_count = 73;
+    if (mutation == 29) ++inventory->interface_begin;
+    if (mutation == 30) inventory->interface_records[8].source_end = inventory->interface_records[8].source_begin;
+    if (mutation == 31) inventory->interface_records[2].field_index = 1;
+    if (mutation == 32) ++inventory->interface_records[7].source_digest;
+    if (mutation == 33) {
+      HLSLGeometryFlowInterfaceRecord saved = inventory->interface_records[5];
+      inventory->interface_records[5] = inventory->interface_records[6];
+      inventory->interface_records[6] = saved;
+    }
+    if (mutation == 34) {
+      memmove(inventory->interface_records, inventory->interface_records + 1,
+              (--inventory->interface_record_count) * sizeof(*inventory->interface_records));
+    }
+    CHECK((hlsl_geometry_control_flow_inventory_complete(ctx) &&
+           hlsl_source_quality_interface_inventory_complete(ctx)) == (mutation < 0));
+    hlsl_source_quality_finish_emission(ctx);
+    CHECK(fixture.quality.classification ==
+          (mutation < 0 ? HLSL_SOURCE_QUALITY_CLEAN : HLSL_SOURCE_QUALITY_MIXED));
+    CHECK(fixture.quality.counts.incomplete_units == (size_t)(mutation >= 0));
+    CHECK(!fixture.quality.counts.unknown_provenance && !fixture.quality.counts.residual_total);
+    inventory_context_free(ctx);
+    sb_free(&source);
+    fixture_free(&fixture);
+  }
+  return true;
+}
+
+static bool inactive_compiler_plans(void) {
+  Fixture fixture;
+  CHECK(fixture_init(&fixture));
+  StringBuilder original;
+  CHECK(emit(&fixture, &original));
+  CHECK(fixture.quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+  for (int mutation = 0; mutation < 3; ++mutation) {
+    StringBuilder source;
+    HLSLEmitDiagnostic diagnostic;
+    HLSLEmitterContext *ctx = inventory_context(&fixture, &source, &diagnostic);
+    CHECK(ctx);
+    const size_t count = (size_t)fixture.program.instruction_count;
+    ctx->compiler_model.swap_binary_operands = calloc(count, sizeof(signed char));
+    ctx->compiler_model.preserve_vector_output = calloc(count, sizeof(unsigned char));
+    ctx->compiler_model.claim_owner = calloc(count, sizeof(int));
+    ctx->compiler_model.tangent_frames = calloc(count, sizeof(HLSLCompilerTangentFrame));
+    ctx->compiler_model.screen_positions = calloc(count, sizeof(HLSLCompilerScreenPosition));
+    ctx->compiler_model.interleaved_projection_packs =
+        calloc(count, sizeof(HLSLCompilerInterleavedProjectionPack));
+    ctx->compiler_model.split_matrix_transforms =
+        calloc(count, sizeof(HLSLCompilerSplitMatrixTransform));
+    CHECK(ctx->compiler_model.swap_binary_operands && ctx->compiler_model.preserve_vector_output &&
+          ctx->compiler_model.claim_owner && ctx->compiler_model.tangent_frames &&
+          ctx->compiler_model.screen_positions && ctx->compiler_model.interleaved_projection_packs &&
+          ctx->compiler_model.split_matrix_transforms);
+    for (size_t instruction = 0; instruction < count; ++instruction) {
+      ctx->compiler_model.swap_binary_operands[instruction] = (signed char)(mutation & 1);
+      ctx->compiler_model.preserve_vector_output[instruction] = (unsigned char)mutation;
+      ctx->compiler_model.claim_owner[instruction] = mutation ? (int)instruction : -1;
+      ctx->compiler_model.tangent_frames[instruction].valid = mutation != 0;
+      ctx->compiler_model.screen_positions[instruction].valid = mutation != 0;
+      ctx->compiler_model.interleaved_projection_packs[instruction].valid = mutation != 0;
+      ctx->compiler_model.split_matrix_transforms[instruction].valid = mutation != 0;
+    }
+    ctx->compiler_model.replacement_count = mutation ? 37 : 0;
+    CHECK(inventory_emit(ctx));
+    CHECK(strcmp(original.buf, source.buf) == 0);
+    hlsl_source_quality_finish_emission(ctx);
+    CHECK(fixture.quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    inventory_context_free(ctx);
+    sb_free(&source);
+  }
+  sb_free(&original);
+  fixture_free(&fixture);
+  return true;
+}
+
+static bool dependencies_and_callback_rejection(void) {
+  for (int mutation = 0; mutation < 7; ++mutation) {
+    Fixture fixture;
+    CHECK(fixture_init(&fixture));
+    StringBuilder source;
+    HLSLEmitDiagnostic diagnostic;
+    HLSLEmitterContext *ctx = inventory_context(&fixture, &source, &diagnostic);
+    CHECK(ctx && hlsl_source_quality_inventory_supported(ctx));
+    if (mutation == 0) ctx->unity_uv_helper = true;
+    if (mutation == 1) ctx->readable_screen_pos_helper = "ExternalScreenPosition";
+    if (mutation == 2) ctx->float4_functions.use_count[0] = 2;
+    if (mutation == 3) ctx->cbuffer_layouts_built = false;
+    if (mutation == 4) ctx->high_level_geometry_stream_parameter_emitted = true,
+                       ctx->high_level_interface_prepared = false;
+    if (mutation == 5) ctx->indexed_face_basis.valid = true;
+    if (mutation == 6) ctx->use_uint_temps = true;
+    CHECK(!hlsl_source_quality_inventory_supported(ctx));
+    inventory_context_free(ctx);
+    sb_free(&source);
+    fixture_free(&fixture);
+  }
+  const int rejected_owners[] = {1, 5, 14, 19};
+  for (size_t index = 0; index < sizeof(rejected_owners) / sizeof(rejected_owners[0]); ++index) {
+    Fixture fixture;
+    CHECK(fixture_init(&fixture));
+    fixture.reject_emission = true;
+    fixture.rejected_instruction = rejected_owners[index];
+    StringBuilder source;
+    CHECK(!emit(&fixture, &source));
+    CHECK(fixture.quality.classification == HLSL_SOURCE_QUALITY_FAILED && !fixture.map.complete);
+    sb_free(&source);
+    fixture_free(&fixture);
+  }
+  return true;
+}
+
 static bool scalar_comparison_ownership(void) {
   const uint32_t zero = 0, one = 1;
   ASTExpr *left = ast_create_literal_bits(&zero, 1, AST_SCALAR_SINT32);
@@ -390,7 +661,8 @@ static bool scalar_comparison_ownership(void) {
 int main(void) {
   const size_t allocations = g_allocations_count, bytes = g_allocated_bytes;
   if (!scalar_comparison_ownership() || !typed_flow_and_owners() ||
-      !flow_rejections())
+      !flow_rejections() || !empty_else_and_nop_inventory() || !syntax_ledger_mutations() ||
+      !inactive_compiler_plans() || !dependencies_and_callback_rejection())
     return 1;
   if (g_allocations_count != allocations || g_allocated_bytes != bytes) {
     fputs("Flow unit leaked tracked allocations.\n", stderr);

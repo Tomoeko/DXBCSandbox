@@ -334,6 +334,8 @@ if(BUILD_TESTING)
     target_compile_definitions(test_geometry_usil_units PRIVATE
         DXBC_WIREFRAME_GS_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/spatial_mapping_wireframe_gs.dxbc.b64"
         DXBC_LIMIT_TEST2_GS_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/limit_test2_extrusion_gs.dxbc.b64")
+    dxbc_add_core_test(test_hlsl_hull_source_units
+        tests/test_hlsl_hull_source_units.c hlsl_hull_source_units)
     dxbc_add_core_test(test_tessellation_usil_units
         tests/test_tessellation_usil_units.c tessellation_usil_units)
     target_compile_definitions(test_tessellation_usil_units PRIVATE

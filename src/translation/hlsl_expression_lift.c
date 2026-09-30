@@ -295,7 +295,8 @@ static bool material_source_supported(HLSLEmitterContext *ctx, const DXBCOperand
     return value_name != NULL;
 }
 
-static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool full_width) {
+static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool full_width,
+                                        const HLSLPureExpressionScope *scope) {
     const USILProgram *program = ctx->program;
     const USILInstruction *inst = &program->instructions[index];
     if (inst->precise_mask || inst->saturate)
@@ -328,7 +329,10 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
             unmodified.extended_tokens = NULL;
             unmodified.extended_token_count = 0;
         }
-        if (!hlsl_lift_operand_is_plain(&unmodified))
+        const bool stage_destination = !operand && scope &&
+            value->type == OPERAND_TYPE_OUTPUT && scope->destination_supported &&
+            scope->destination_supported(ctx, index, scope->context);
+        if (!stage_destination && !hlsl_lift_operand_is_plain(&unmodified))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         const bool domain_input = ctx->high_level_domain &&
             (value->type == OPERAND_TYPE_INPUT_CONTROL_POINT || value->type == OPERAND_TYPE_DOMAIN_LOCATION);
@@ -350,7 +354,7 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
 }
 
 bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int index) {
-    return float_instruction_supported(ctx, index, true);
+    return float_instruction_supported(ctx, index, true, NULL);
 }
 
 /* The straight-line planner can represent a partial register definition as a
@@ -363,21 +367,37 @@ static bool vector_program_supported(HLSLEmitterContext *ctx) {
 }
 
 static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, bool full_width,
-                                       HLSLMatrixLiftPlan *matrix_plans) {
-    if (!(full_width ? hlsl_float4_program_supported(ctx) : vector_program_supported(ctx)))
+                                       HLSLMatrixLiftPlan *matrix_plans,
+                                       const HLSLPureExpressionScope *scope) {
+    if (!scope && !(full_width ? hlsl_float4_program_supported(ctx) : vector_program_supported(ctx)))
         return false;
     if (ctx->compiler_model.replacement_count)
         return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
     uint8_t written_outputs[HLSL_SM5_IO_REGISTER_COUNT] = {0};
     const USILProgram *program = ctx->program;
-    for (int index = 0; index < program->instruction_count; ++index) {
+    const int first = scope ? scope->first_instruction : 0;
+    const int end = scope ? scope->end_instruction : program->instruction_count;
+    for (int index = first; index < end; ++index) {
         const USILInstruction *inst = &program->instructions[index];
+        if (scope && scope->omitted_instructions &&
+            hlsl_instruction_owners_contains(scope->omitted_instructions, index)) continue;
+        if (scope) {
+            if (!usil_instruction_shape_valid(program, inst) ||
+                (inst->opcode != USIL_OP_MOV && inst->opcode != USIL_OP_ADD &&
+                 inst->opcode != USIL_OP_MUL && inst->opcode != USIL_OP_MAD &&
+                 inst->opcode != USIL_OP_RET))
+                return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+            for (int operand = 1; operand < inst->operand_count; ++operand)
+                if (inst->operands[operand].type != OPERAND_TYPE_TEMP &&
+                    inst->operands[operand].type != OPERAND_TYPE_IMMEDIATE32)
+                    return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+        }
         if (inst->precise_mask || inst->saturate)
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         if (inst->opcode == USIL_OP_NOP)
             continue;
         if (inst->opcode == USIL_OP_RET) {
-            if (index + 1 != program->instruction_count)
+            if (index + 1 != end)
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             continue;
         }
@@ -401,12 +421,15 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
             index = final;
             continue;
         }
-        if (!float_instruction_supported(ctx, index, full_width))
+        if (!float_instruction_supported(ctx, index, full_width, scope))
             return false;
         if (hlsl_texture_sample_opcode(inst->opcode) || float_derivative(inst->opcode))
             uses[index] = 2; /* Keep quad/resource operations at their original site. */
         const DXBCOperand *destination = &inst->operands[0];
         if (destination->type == OPERAND_TYPE_OUTPUT) {
+            if (scope && (!scope->destination_supported ||
+                !scope->destination_supported(ctx, index, scope->context)))
+                return reject(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
             if (destination->register_index < 0 ||
                 destination->register_index >= HLSL_SM5_IO_REGISTER_COUNT)
                 return reject(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
@@ -422,8 +445,9 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
             ++uses[definition];
         }
     }
-    if (program->instructions[program->instruction_count - 1].opcode != USIL_OP_RET)
+    if (program->instructions[end - 1].opcode != USIL_OP_RET)
         return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+    if (scope) return true; /* The stage producer owns full per-phase field coverage. */
     for (int index = 0; index < program->output_count; ++index) {
         const DXBCSignatureElement *output = &program->outputs[index];
         if (output->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
@@ -435,7 +459,7 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
 
 bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
                                       unsigned uses[EXPRESSION_INSTRUCTION_LIMIT]) {
-    return validate_float_expressions(ctx, uses, true, NULL);
+    return validate_float_expressions(ctx, uses, true, NULL, NULL);
 }
 
 static ASTExpr *formatted_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *source,
@@ -517,6 +541,57 @@ static ASTExpr *formatted_source_atom(HLSLEmitterContext *ctx, const DXBCOperand
     return value;
 }
 
+/* An actual domain coordinate is a pure logical parameter. Compose a vector
+ * from individually owned scalar component reads instead of treating a mixed
+ * repeated selection as one semantic swizzle. No register/temp/effectful source
+ * is admitted here, and existing scalar broadcast/ascending selections remain. */
+static ASTExpr *domain_coordinate_composition(HLSLEmitterContext *ctx,
+                                              const DXBCOperand *source,
+                                              uint8_t mask, int instruction,
+                                              int operand,
+                                              const ASTOperandProvenance *selection) {
+    const int width = lane_count(mask);
+    if (!selection || width < 2 || width > 4 || instruction < 0 ||
+        instruction >= ctx->program->instruction_count || operand < 1 ||
+        operand >= ctx->program->instructions[instruction].operand_count)
+        return NULL;
+    ASTExpr *arguments[4] = {0};
+    int count = 0;
+    for (unsigned lane = 0; lane < 4; ++lane) {
+        if (!(mask & (1u << lane))) continue;
+        ASTExpr *component = formatted_source_atom(ctx, source,
+            (uint8_t)(1u << lane), false, instruction, operand);
+        if (!component || component->kind != AST_EXPR_EMITTER_OPERAND ||
+            !component->operand_provenance.complete ||
+            component->operand_provenance.value_role != AST_OPERAND_VALUE_LOGICAL ||
+            component->operand_provenance.result_components != 1 ||
+            component->operand_provenance.natural_components != selection->natural_components ||
+            component->operand_provenance.logical_value_id != selection->logical_value_id ||
+            component->operand_provenance.selected_components[0] != selection->selected_components[count] ||
+            component->operand_provenance.selection_role != AST_COMPONENT_SELECTION_SEMANTIC ||
+            component->operand_provenance.bitcast_role != AST_OPERAND_BITCAST_NONE ||
+            component->operand_provenance.raw_buffer_reconstruction ||
+            component->operand_provenance.synthetic_interface ||
+            component->operand_provenance.instruction_index != instruction ||
+            component->operand_provenance.source_instruction_index !=
+                ctx->program->instructions[instruction].source_instruction_index ||
+            component->operand_provenance.operand_index != operand ||
+            component->operand_provenance.destination_lanes != (uint8_t)(1u << lane)) {
+            ast_free_expr(component);
+            for (int previous = 0; previous < count; ++previous)
+                ast_free_expr(arguments[previous]);
+            return NULL;
+        }
+        arguments[count++] = component;
+    }
+    static const char *const constructors[] = {NULL, NULL, "float2", "float3", "float4"};
+    ASTExpr *composition = ast_create_call(constructors[width], arguments, count);
+    if (!composition)
+        for (int previous = 0; previous < count; ++previous)
+            ast_free_expr(arguments[previous]);
+    return logical_expression(ctx, composition, instruction, mask, (unsigned)width);
+}
+
 static ASTExpr *vector_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *source,
                                     uint8_t mask, int instruction, int operand) {
     const int width = lane_count(mask);
@@ -533,6 +608,16 @@ static ASTExpr *vector_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *s
             bits[component++] = source->imm_values[selected];
         }
         return ast_create_literal_bits(bits, width, AST_SCALAR_FLOAT32);
+    }
+    if (ctx->high_level_domain && source->type == OPERAND_TYPE_DOMAIN_LOCATION) {
+        ASTOperandProvenance origin;
+        if (!hlsl_high_level_input_provenance(ctx, source, mask, &origin)) return NULL;
+        if (origin.complete && origin.value_role == AST_OPERAND_VALUE_LOGICAL &&
+            origin.selection_role == AST_COMPONENT_SELECTION_TRANSPORT &&
+            origin.natural_components >= 2 && origin.natural_components <= 3 &&
+            origin.result_components == width && origin.bitcast_role == AST_OPERAND_BITCAST_NONE &&
+            !origin.raw_buffer_reconstruction && !origin.synthetic_interface)
+            return domain_coordinate_composition(ctx, source, mask, instruction, operand, &origin);
     }
     return formatted_source_atom(ctx, source, mask, false, instruction, operand);
 }
@@ -872,13 +957,10 @@ void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx) {
     }
 }
 
-bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
-    if (ctx->unity_uv_helper)
-        return emit_unity_uv_lift(ctx);
-    for (int index = 0; index < ctx->program->instruction_count; ++index)
-        if (ctx->program->instructions[index].opcode == USIL_OP_IF ||
-            ctx->program->instructions[index].opcode == USIL_OP_LOOP)
-            return emit_high_level_structured(ctx);
+static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
+                                          const HLSLPureExpressionScope *scope) {
+    const int first = scope ? scope->first_instruction : 0;
+    const int end = scope ? scope->end_instruction : ctx->program->instruction_count;
     unsigned uses[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     ASTExpr *pending[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     ASTExpr *roots[EXPRESSION_INSTRUCTION_LIMIT] = {0};
@@ -889,21 +971,21 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
     for (int index = 0; index < EXPRESSION_INSTRUCTION_LIMIT; ++index)
         matrix_starts[index] = -1;
     bool success = false;
-    if (!validate_float_expressions(ctx, uses, false, matrix_plans))
+    if (!validate_float_expressions(ctx, uses, false, scope ? NULL : matrix_plans, scope))
         goto cleanup;
-    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+    for (int index = first; index < end; ++index) {
         if (!matrix_plans[index].expression) continue;
         for (int claimed = index; claimed <= matrix_plans[index].end_instruction; ++claimed)
             matrix_starts[claimed] = index;
     }
-    for (int index = 0; index < ctx->program->instruction_count; ++index)
+    for (int index = first; index < end; ++index)
         if (ctx->float4_functions.group[index] >= 0)
             uses[index] = 2; /* Keep each call result at its original instruction site. */
     /* Method arguments are emitted in coordinate/LOD/gradient order. Distinct
      * pure SSA values can have been computed in another order in DXBC. Preserve
      * those evaluation sites with natural typed locals instead of moving their
      * operation graphs into a differently ordered argument list. */
-    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+    for (int index = first; index < end; ++index) {
         const USILInstruction *sample = &ctx->program->instructions[index];
         if (!hlsl_texture_sample_opcode(sample->opcode)) continue;
         const int source_operands[] = {1, 4, 5};
@@ -923,11 +1005,13 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
             for (int argument = 0; argument < count; ++argument)
                 if (uses[definitions[argument]] < 2) uses[definitions[argument]] = 2;
     }
-    hlsl_expression_source_map_begin(ctx);
+    if (!scope) hlsl_expression_source_map_begin(ctx);
     HLSLExpressionSourceMap *map = ctx->expression_source_map;
-    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+    for (int index = first; index < end; ++index) {
         const USILInstruction *inst = &ctx->program->instructions[index];
         ctx->current_instruction_index = index;
+        if (scope && scope->omitted_instructions &&
+            hlsl_instruction_owners_contains(scope->omitted_instructions, index)) continue;
         if (inst->opcode == USIL_OP_NOP || inst->opcode == USIL_OP_RET)
             continue;
         if (ctx->high_level_geometry &&
@@ -946,7 +1030,7 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
         HLSLMatrixLiftPlan *matrix = matrix_starts[index] >= 0
                                         ? &matrix_plans[matrix_starts[index]] : NULL;
         if (matrix && index != matrix->end_instruction) continue;
-        if (index + 1 < ctx->program->instruction_count &&
+        if (index + 1 < end &&
             ctx->float4_functions.group[index + 1] >= 0)
             continue; /* The following call owns this single-use producer. */
         HLSLInstructionOwners owners = {0};
@@ -1030,9 +1114,10 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
         } else if (ctx->high_level_direct_return) {
             sb_append(ctx->sb, "return ");
         } else {
-            if (!(ctx->high_level_interface
-                    ? hlsl_append_high_level_output(ctx, destination)
-                    : hlsl_float4_append_output(ctx, destination))) {
+            if (!(scope ? scope->append_destination(ctx, index, scope->context)
+                    : ctx->high_level_interface
+                        ? hlsl_append_high_level_output(ctx, destination)
+                        : hlsl_float4_append_output(ctx, destination))) {
                 ast_free_expr(expression);
                 goto cleanup;
             }
@@ -1045,7 +1130,7 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
             ctx->sb->failed = true;
         sb_append(ctx->sb, ";\n");
         hlsl_source_quality_emission(ctx,
-            destination->type == OPERAND_TYPE_OUTPUT && !ctx->high_level_interface
+            destination->type == OPERAND_TYPE_OUTPUT && !scope && !ctx->high_level_interface
                 ? HLSL_SOURCE_ARTIFACT_REGISTER_STORAGE : 0, false, index);
         ast_free_expr(expression);
         if (!sb_ok(ctx->sb))
@@ -1058,6 +1143,30 @@ cleanup:
         hlsl_matrix_lift_plan_free(&matrix_plans[index]);
     }
     return success;
+}
+
+bool hlsl_emit_pure_expression_scope(HLSLEmitterContext *ctx,
+                                      const HLSLPureExpressionScope *scope) {
+    if (!ctx || !ctx->program || !scope || !scope->destination_supported ||
+        !scope->append_destination || scope->first_instruction < 0 ||
+        scope->end_instruction <= scope->first_instruction ||
+        scope->end_instruction > ctx->program->instruction_count ||
+        ctx->program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+        !ctx->cfg.blocks || ctx->cfg.block_count < 1 ||
+        !ctx->cfg.instruction_block || !ctx->ssa.operand_ssa_vars ||
+        ctx->cfg.blocks[0].first_instruction != scope->first_instruction ||
+        ctx->cfg.blocks[ctx->cfg.block_count - 1].last_instruction != scope->end_instruction - 1)
+        return false;
+    return emit_straightline_expressions(ctx, scope);
+}
+
+bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
+    if (ctx->unity_uv_helper) return emit_unity_uv_lift(ctx);
+    for (int index = 0; index < ctx->program->instruction_count; ++index)
+        if (ctx->program->instructions[index].opcode == USIL_OP_IF ||
+            ctx->program->instructions[index].opcode == USIL_OP_LOOP)
+            return emit_high_level_structured(ctx);
+    return emit_straightline_expressions(ctx, NULL);
 }
 
 bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
@@ -1121,7 +1230,8 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
             }
             break;
         case HLSL_EXPRESSION_ORIGIN_RETURN:
-            if (inst->opcode != USIL_OP_RET || index + 1 != map->count)
+            if (inst->opcode != USIL_OP_RET ||
+                (index + 1 != map->count && !hlsl_hull_phase_return_owned(program, (int)index)))
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_DEAD:

@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 17U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 18U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -126,11 +126,14 @@ typedef enum HLSLEmitMode {
      * A separate parsed geometry route admits static point/line/triangle and
      * adjacency input arrays, one typed stream0, persistent named output fields
      * and anchored Append/RestartStrip effects. Dynamic input indexing, emission
-     * loops, multiple streams and instances remain outside it.
-     * Parsed triangle DOMAIN stages admit one float4 control-point field,
-     * static OutputPatch indexing, float3 domain coordinates, actual tessellation
-     * factors and generic SSA expressions, within their own 64-instruction cap.
-     * Patch-factor reads, resources and other domain forms remain unsupported.
+     * multiple streams and instances remain outside it. A separate CFG/SSA
+     * route recovers one bounded signed induction loop and audits emitted syntax.
+     * Parsed triangle/quad/isoline DOMAIN stages admit one float4 control-point
+     * field, static OutputPatch indexing, typed domain coordinates, actual factor
+     * interfaces and generic SSA expressions, within their own 64-instruction cap.
+     * HULL candidates admit independent scalar-factor fork phases and retained
+     * implicit control-point passthrough. Explicit control-point transforms, join
+     * phases, patch-factor reads and resources remain unsupported.
      * Straight-line single-use expressions are nested once; shared values have
      * typed deterministic names. Unsupported input fails instead of silently using
      * presentation recognizers. Reuses compiler inverse operand/MAD spelling;
