@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include <limits.h>
 #include <stdbool.h>
@@ -1549,6 +1550,9 @@ bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
  * gaps until their syntax and dependencies have their own audited units. */
 static bool source_quality_inventory_complete(const HLSLEmitterContext *ctx) {
   const USILProgram *program = ctx->program;
+  /* Actual control/body spans are retained, but the independently audited
+   * complete declaration/control syntax inventory is not yet available. */
+  if (hlsl_geometry_control_flow_admission(program, ctx->emit_mode)) return false;
   if (ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
       !hlsl_source_quality_interface_inventory_supported(ctx) ||
       !ctx->high_level_functions_prepared ||

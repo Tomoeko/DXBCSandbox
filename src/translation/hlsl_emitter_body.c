@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "hlsl_geometry_flow.h"
 #include <limits.h>
 #include <string.h>
 
@@ -2200,6 +2201,15 @@ static int emit_row_struct_index_capture(HLSLEmitterContext *ctx,
 void emit_instructions(HLSLEmitterContext* ctx) {
   const USILProgram* program = ctx->program;
   StringBuilder* sb = ctx->sb;
+
+  if (ctx->high_level_geometry &&
+      hlsl_geometry_control_flow_admission(program, ctx->emit_mode)) {
+    if (!hlsl_geometry_control_flow_emit(ctx))
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_UNSUPPORTED,
+                     HLSL_EMIT_PHASE_INSTRUCTION_EMISSION,
+                     HLSL_EMIT_REASON_LOWERING_FAILED);
+    return;
+  }
 
   if (ctx->emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) {
     if (!emit_high_level_expressions(ctx)) {

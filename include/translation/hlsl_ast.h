@@ -17,10 +17,11 @@ typedef enum {
     AST_EXPR_CALL,
     AST_EXPR_CAST,
     AST_EXPR_BITCAST,
-    AST_EXPR_EMITTER_OPERAND
+    AST_EXPR_EMITTER_OPERAND,
+    AST_EXPR_COMPARISON
 } ASTExprKind;
 
-typedef enum { AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32 } ASTScalarType;
+typedef enum { AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32, AST_SCALAR_BOOL } ASTScalarType;
 
 typedef enum {
     AST_OPERAND_VALUE_UNKNOWN = 0,
@@ -217,6 +218,8 @@ ASTExpr *ast_create_literal_int(int i);
  * inputs; this syntax layer is not a DXBC type/provenance analysis. */
 ASTExpr *ast_create_unary(int op, ASTExpr *sub);
 ASTExpr *ast_create_binary(int op, ASTExpr *left, ASTExpr *right);
+/* Scalar logical predicate only. DXBC mask values need separate lowering. */
+ASTExpr *ast_create_comparison(int op, ASTExpr *left, ASTExpr *right);
 ASTExpr *ast_create_ternary(ASTExpr *cond, ASTExpr *true_expr, ASTExpr *false_expr);
 ASTExpr *ast_create_swizzle(ASTExpr *sub, const int *swizzle, int count);
 ASTExpr *ast_create_call(const char *name, ASTExpr **args, int count);

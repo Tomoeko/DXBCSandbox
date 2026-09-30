@@ -82,6 +82,7 @@ set(DXBC_SOURCES
     src/translation/hlsl_function_lift.c
     src/translation/hlsl_unity_uv_lift.c
     src/translation/hlsl_expression_lift.c
+    src/translation/hlsl_geometry_flow.c
     src/translation/hlsl_structured_lift.c
     src/translation/hlsl_value_analysis.c
     src/translation/hlsl_storage_plan.c

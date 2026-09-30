@@ -53,7 +53,11 @@ bool hlsl_global_declarations_same_family(const SerializedPass *pass, int serial
 
 /* Every provided witness must be a complete same-platform/type/tier/requirements
  * sibling. Missing/duplicate/current-less witnesses and mismatched player
- * keyword authority reject. No source fixture or name-based layout inference. */
+ * keyword authority reject. Fields are metadata-proven float or integer scalar/
+ * vector values within one 16-byte row; packed four-byte offsets are admitted.
+ * Integer metadata does not retain signedness. Declarations use the existing
+ * integer spelling; no unsigned execution or reflection authority is inferred.
+ * Boolean, arrays/matrices/structs and type/name-based inference are unsupported. */
 HLSLGlobalDeclarationStatus hlsl_global_declarations_build(
     const SerializedPass *pass, int serialized_stage, int current_subprogram_index,
     const HLSLGlobalDeclarationWitness *witnesses, size_t witness_count,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include "hlsl_matrix_lift.h"
 
@@ -1061,6 +1062,8 @@ cleanup:
 
 bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                                         const USILProgram *program, const char *source) {
+    if (hlsl_geometry_control_flow_admission(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE))
+        return hlsl_geometry_control_flow_source_map_matches(map, program, source);
     if (!map || !map->complete || !program || !source || !program->instructions ||
         program->instruction_count < 1 ||
         program->instruction_count > EXPRESSION_INSTRUCTION_LIMIT ||

@@ -1503,7 +1503,12 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
         memset(layout->uses, 0,
                (size_t)layout->use_alloc * sizeof(*layout->uses));
       }
-    } else if (layout->projection.saw_access && !layout->compact_global_layout) {
+    } else if (layout->projection.saw_access && !layout->compact_global_layout &&
+               !(ctx->global_declarations && compact_globals)) {
+      /* A reviewed keyword-sibling union describes source/reflection fields,
+       * including inactive packed fields. Preserve those declarations here;
+       * validate_target already checked every executable read against only the
+       * target's original metadata. Imported fields grant no read authority. */
       int output = 0;
       for (int variable = 0; variable < layout->variable_count; ++variable) {
         if (!layout->uses[variable].referenced) continue;
@@ -1819,7 +1824,8 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
                                                 var->authority)) return;
           ++layout->source_quality_fields_emitted;
         }
-        if (layout->compact_global_layout) {
+        if (layout->compact_global_layout ||
+            (ctx->global_declarations && var->authority == 4)) {
           if (var->authority != 4 || !ctx->source_quality_analysis) {
             hlsl_source_quality_emission(ctx, 0, false, -1);
           } else {

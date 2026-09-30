@@ -92,8 +92,11 @@ player/runtime selection, or visual equivalence.
 
 The candidate emitter also reconstructs straight-line geometry with typed point,
 line, triangle and adjacency arrays, named output fields and ordered stream0
-`Append`/`RestartStrip` operations. Dynamic input indexing, emission loops,
-geometry instancing and multiple streams remain unsupported in this path.
+`Append`/`RestartStrip` operations. A separate bounded geometry planner recovers
+one signed unit-step loop, proven emission limits, scalar control predicates,
+named values and stream0 operations from CFG/SSA ownership. Its source quality
+retains incomplete declaration/control coverage. Dynamic input indexing, geometry
+instancing and multiple streams remain unsupported in these paths.
 A bounded domain path emits typed control-point patches, triangle barycentric
 or quad/isoline coordinates, tessellation-factor declarations in their retained
 interface order, and SSA expressions. It admits static point indices in patches

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include <stdio.h>
 #include <string.h>
@@ -304,6 +305,7 @@ static bool geometry_effect_supported(const USILProgram *program,
 }
 
 bool hlsl_high_level_geometry_interface_supported(const USILProgram *program, HLSLEmitMode mode) {
+  if (hlsl_geometry_control_flow_admission(program, mode)) return true;
   if (!program || mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
       !program->has_stage_contract || !program->has_parsed_signature_authority ||
       program->program_type != DXBC_PROGRAM_TYPE_GEOMETRY ||

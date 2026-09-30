@@ -34,6 +34,7 @@ typedef struct {
 typedef struct {
     size_t witness_records;
     HLSLSourceQualityFacts copied;
+    bool reject_witness;
 } Ledger;
 
 static bool observe_witness(void *context, const HLSLSourceQualityObservation *observation) {
@@ -41,6 +42,7 @@ static bool observe_witness(void *context, const HLSLSourceQualityObservation *o
     if (observation->facts.declaration_witness_record) {
         ++ledger->witness_records;
         ledger->copied = observation->facts;
+        return !ledger->reject_witness;
     }
     return true;
 }
@@ -249,8 +251,8 @@ static bool check_conflicting_witnesses(void) {
             f.variables[1][1].layout[1] = 2;
             break; // Arrays cannot close this natural scalar/vector shell.
         case 17:
-            f.variables[1][1].layout[0] = 52;
-            break; // Non-row-aligned field.
+            f.variables[1][1].layout[0] = 50;
+            break; // Misaligned component offset.
         case 18:
             f.sub[1].global_keyword_count = 1;
             f.sub[1].global_keywords = &f.keyword;
@@ -400,10 +402,227 @@ static bool check_emission_and_witness_quality(void) {
     return true;
 }
 
+static void packed_fixture_init(Fixture *f, uint32_t scalar_type, uint32_t component,
+                                uint32_t columns) {
+    fixture_init(f);
+    for (int sibling = 0; sibling < 2; ++sibling) {
+        f->buffers[sibling].size = 16;
+        f->variables[sibling][0] = (SerializedVariable){"_Threshold", {0, 0, 0, 1, 0, 0}};
+        f->variables[sibling][1] = (SerializedVariable){
+            "_Typed", {component * 4, 0, scalar_type, columns, 0, 0}};
+    }
+    f->cbuffer.size = 1;
+    f->instructions[0].operands[1] = operand(OPERAND_TYPE_CONSTANT_BUFFER, 0, 0);
+    memset(f->instructions[0].operands[1].swizzle, 0,
+           sizeof(f->instructions[0].operands[1].swizzle));
+}
+
+static bool check_packed_typed_declarations(void) {
+    const char *types[] = {"float", "int"};
+    for (uint32_t type = 0; type < 2; ++type) {
+        for (uint32_t component = 1; component < 4; ++component) {
+            for (uint32_t columns = 1; columns <= 4 - component; ++columns) {
+                Fixture f;
+                packed_fixture_init(&f, type, component, columns);
+                HLSLGlobalDeclarationUnion *u = NULL;
+                CHECK(hlsl_global_declarations_build(&f.pass, 1, 0, f.witnesses, 2, &u, NULL) ==
+                      HLSL_GLOBAL_DECLARATIONS_OK);
+                size_t count;
+                const HLSLGlobalDeclarationField *fields =
+                    hlsl_global_declarations_fields(u, &count);
+                CHECK(count == 2 && fields[0].current_authority && !fields[1].current_authority &&
+                      fields[1].layout.scalar_type == type && fields[1].layout.columns == columns &&
+                      fields[1].layout.byte_offset == component * 4 &&
+                      fields[1].byte_size == columns * 4 && fields[1].witness_count == 1);
+                CHECK(hlsl_global_declarations_validate_target(u, &f.program, &f.parameters[0], NULL) ==
+                      HLSL_GLOBAL_DECLARATIONS_OK);
+                HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+                HLSLSourceQualityResult quality;
+                options.source_quality = &quality;
+                options.global_declarations = u;
+                Ledger ledger = {0};
+                options.source_quality_observer = observe_witness;
+                options.source_quality_observer_context = &ledger;
+                StringBuilder source;
+                sb_init(&source);
+                CHECK(hlsl_emit_with_options(&f.program, &source, &f.parameters[0], NULL,
+                                              NULL, &options));
+                char declaration[64];
+                if (columns == 1)
+                    snprintf(declaration, sizeof(declaration), "%s _Typed", types[type]);
+                else
+                    snprintf(declaration, sizeof(declaration), "%s%u _Typed", types[type], columns);
+                CHECK(strstr(source.buf, "float _Threshold") && strstr(source.buf, declaration));
+                CHECK(quality.classification == HLSL_SOURCE_QUALITY_UNSUPPORTED &&
+                      quality.counts.incomplete_units == 1 && !quality.counts.unknown_provenance &&
+                      quality.counts.sibling_declarations == 1 &&
+                      quality.counts.sibling_declaration_witnesses == 1);
+                CHECK(ledger.witness_records == 1 && ledger.copied.declaration_variant_index == 0 &&
+                      ledger.copied.declaration_field_index == 1 &&
+                      ledger.copied.declaration_witness_subprogram_index == 1 &&
+                      ledger.copied.declaration_witness_count == 1);
+                CHECK(f.buffers[0].var_count == 1 && f.pass.common_parameters[1].cb_count == 0);
+                sb_free(&source);
+                ledger.reject_witness = true;
+                sb_init(&source);
+                HLSLEmitDiagnostic diagnostic;
+                CHECK(!hlsl_emit_with_options_diagnostic(&f.program, &source, &f.parameters[0],
+                                                         NULL, NULL, &options, &diagnostic));
+                CHECK(diagnostic.status == HLSL_EMIT_STATUS_ANALYSIS_FAILED &&
+                      quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+                sb_free(&source);
+                ledger.reject_witness = false;
+                /* The declaration import never authorizes the corresponding executable bytes. */
+                memset(f.instructions[0].operands[1].swizzle, (int)component,
+                       sizeof(f.instructions[0].operands[1].swizzle));
+                CHECK(hlsl_global_declarations_validate_target(u, &f.program, &f.parameters[0], NULL) ==
+                      HLSL_GLOBAL_DECLARATIONS_CURRENT_READ_UNAUTHORIZED);
+                sb_init(&source);
+                CHECK(!hlsl_emit_with_options(&f.program, &source, &f.parameters[0], NULL,
+                                               NULL, &options));
+                CHECK(quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+                sb_free(&source);
+                hlsl_global_declarations_free(u);
+            }
+        }
+    }
+    return true;
+}
+
+static bool check_packed_conflicts_and_invalid_layouts(void) {
+    for (int mutation = 0; mutation < 13; ++mutation) {
+        Fixture f;
+        packed_fixture_init(&f, 1, 1, 1);
+        /* Both siblings provide the typed field, so layout disagreements cannot
+         * be mistaken for a merely unsupported declaration domain. */
+        f.buffers[0].var_count = 2;
+        HLSLGlobalDeclarationStatus expected = HLSL_GLOBAL_DECLARATIONS_FIELD_CONFLICT;
+        switch (mutation) {
+        case 0:
+            f.variables[1][1].layout[2] = 2;
+            break; /* Integer versus boolean metadata. */
+        case 1:
+            f.variables[1][1].layout[0] = 8;
+            break; /* Same name, different offset. */
+        case 2:
+            f.variables[1][1].name = "_Alias";
+            break; /* Same bytes, different name. */
+        case 3:
+            f.variables[1][1].layout[3] = 2;
+            break; /* Same name, different width. */
+        case 4:
+            f.variables[1][1].layout[2] = 3;
+            break; /* Unknown scalar type. */
+        case 5:
+            f.variables[1][1].layout[0] = 6;
+            break; /* Misaligned bytes. */
+        case 6:
+            f.variables[1][1].layout[0] = 12;
+            f.variables[1][1].layout[3] = 2;
+            break; /* Vector straddles a row. */
+        case 7:
+            f.variables[1][1].layout[1] = 2;
+            break; /* Array. */
+        case 8:
+            f.variables[1][1].layout[4] = 1;
+            break; /* Matrix. */
+        case 9:
+            f.variables[1][1].layout[0] = 16;
+            break; /* Outside the shell. */
+        case 10:
+            f.variables[1][1].name = "bad name";
+            expected = HLSL_GLOBAL_DECLARATIONS_INVALID;
+            break;
+        case 11:
+            f.buffers[1].size = 32;
+            expected = HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT;
+            break;
+        case 12:
+            f.identities[1].hardware_tier_group = 2;
+            expected = HLSL_GLOBAL_DECLARATIONS_SCOPE_CONFLICT;
+            break;
+        }
+        HLSLGlobalDeclarationUnion *u = NULL;
+        CHECK(hlsl_global_declarations_build(&f.pass, 1, 0, f.witnesses, 2, &u, NULL) == expected && !u);
+    }
+    Fixture f;
+    packed_fixture_init(&f, 1, 1, 1);
+    f.buffers[0].var_count = 2;
+    HLSLGlobalDeclarationUnion *u = NULL;
+    CHECK(hlsl_global_declarations_build(&f.pass, 1, 0, f.witnesses, 2, &u, NULL) ==
+          HLSL_GLOBAL_DECLARATIONS_OK);
+    f.variables[0][1].layout[2] = 0;
+    CHECK(hlsl_global_declarations_validate_target(u, &f.program, &f.parameters[0], NULL) ==
+          HLSL_GLOBAL_DECLARATIONS_FIELD_CONFLICT);
+    hlsl_global_declarations_free(u);
+    return true;
+}
+
+static bool check_packed_common_metadata(void) {
+    Fixture f;
+    packed_fixture_init(&f, 0, 1, 1);
+    for (unsigned sibling = 0; sibling < 2; ++sibling) {
+        f.buffers[sibling].var_count = 0;
+    }
+    SerializedVariable variables[] = {
+        {"_RepeatCount", {0, 0, 1, 1, 0, 0}},
+        {"_ClipThreshold", {4, 0, 0, 1, 0, 0}}
+    };
+    SerializedConstantBuffer common = {
+        .name = "$Globals",
+        .has_is_partial = true,
+        .is_partial = true,
+        .var_count = 2,
+        .variables = variables
+    };
+    f.pass.common_parameters[1].cb_count = 1;
+    f.pass.common_parameters[1].constant_buffers = &common;
+    memset(f.instructions[0].operands[1].swizzle, 1,
+           sizeof(f.instructions[0].operands[1].swizzle));
+    HLSLGlobalDeclarationUnion *u = NULL;
+    CHECK(hlsl_global_declarations_build(&f.pass, 1, 0, f.witnesses, 2, &u, NULL) ==
+          HLSL_GLOBAL_DECLARATIONS_OK);
+    size_t count;
+    const HLSLGlobalDeclarationField *fields = hlsl_global_declarations_fields(u, &count);
+    CHECK(count == 2 && fields[0].current_authority && fields[1].current_authority &&
+          fields[0].layout.scalar_type == 1 && fields[1].layout.byte_offset == 4);
+    CHECK(hlsl_global_declarations_validate_target(u, &f.program, &f.parameters[0],
+                                                   &f.pass.common_parameters[1]) ==
+          HLSL_GLOBAL_DECLARATIONS_OK);
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLSourceQualityResult quality;
+    options.global_declarations = u;
+    options.source_quality = &quality;
+    StringBuilder source;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&f.program, &source, &f.parameters[0],
+                                  &f.pass.common_parameters[1], NULL, &options));
+    CHECK(strstr(source.buf, "int _RepeatCount;") &&
+          strstr(source.buf, "float _ClipThreshold;") &&
+          strstr(source.buf, "return (_ClipThreshold);"));
+    CHECK(quality.classification == HLSL_SOURCE_QUALITY_UNSUPPORTED &&
+          quality.counts.incomplete_units == 1 && !quality.counts.sibling_declarations);
+    CHECK(f.buffers[0].var_count == 0 && common.var_count == 2);
+    sb_free(&source);
+    variables[0].layout[2] = 0;
+    CHECK(hlsl_global_declarations_validate_target(u, &f.program, &f.parameters[0],
+                                                   &f.pass.common_parameters[1]) ==
+          HLSL_GLOBAL_DECLARATIONS_FIELD_CONFLICT);
+    hlsl_global_declarations_free(u);
+    return true;
+}
+
 int main(void) {
+    const size_t allocations = g_allocations_count, bytes = g_allocated_bytes;
     if (!check_owned_union_and_target_authority() || !check_conflicting_witnesses() ||
-        !check_family_filter() || !check_emission_and_witness_quality())
+        !check_family_filter() || !check_emission_and_witness_quality() ||
+        !check_packed_typed_declarations() || !check_packed_conflicts_and_invalid_layouts() ||
+        !check_packed_common_metadata())
         return 1;
+    if (g_allocations_count != allocations || g_allocated_bytes != bytes) {
+        fputs("Packed global union tests leaked tracked allocations.\n", stderr);
+        return 1;
+    }
     puts("Strict declaration-only global sibling union passed");
     return 0;
 }

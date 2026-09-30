@@ -265,6 +265,8 @@ if(BUILD_TESTING)
         tests/test_hlsl_texture_lift_units.c hlsl_texture_lift_units)
     dxbc_add_core_test(test_hlsl_domain_source_units
         tests/test_hlsl_domain_source_units.c hlsl_domain_source_units)
+    dxbc_add_core_test(test_hlsl_geometry_flow_units
+        tests/test_hlsl_geometry_flow_units.c hlsl_geometry_flow_units)
     dxbc_add_core_test(test_hlsl_geometry_source_units
         tests/test_hlsl_geometry_source_units.c hlsl_geometry_source_units)
     target_sources(test_hlsl_geometry_source_units PRIVATE tests/test_geometry_fixture.c)

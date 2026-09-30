@@ -299,6 +299,22 @@ static bool visit_expression(QualityAnalysis *analysis, const ASTExpr *expressio
             return false;
         children_logical = children[0].logical && children[1].logical;
         break;
+    case AST_EXPR_COMPARISON:
+        if ((expression->u.binary.op != USIL_OP_GE && expression->u.binary.op != USIL_OP_IGE &&
+             expression->u.binary.op != USIL_OP_UGE && expression->u.binary.op != USIL_OP_LT &&
+             expression->u.binary.op != USIL_OP_ILT && expression->u.binary.op != USIL_OP_ULT &&
+             expression->u.binary.op != USIL_OP_EQ && expression->u.binary.op != USIL_OP_IEQ &&
+             expression->u.binary.op != USIL_OP_NE && expression->u.binary.op != USIL_OP_INE) ||
+            expression->u.binary.left == expression->u.binary.right)
+            return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
+        if (!visit_expression(analysis, expression->u.binary.left, depth + 1, &children[0]) ||
+            !visit_expression(analysis, expression->u.binary.right, depth + 1, &children[1]))
+            return false;
+        children_logical = children[0].logical && children[1].logical;
+        if (facts.known && (facts.components != 1 || children[0].components != 1 ||
+                            children[1].components != 1))
+            return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
+        break;
     case AST_EXPR_TERNARY:
         if (expression->u.ternary.cond == expression->u.ternary.true_expr ||
             expression->u.ternary.cond == expression->u.ternary.false_expr ||

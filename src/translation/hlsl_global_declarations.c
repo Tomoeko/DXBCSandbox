@@ -178,6 +178,20 @@ static HLSLGlobalDeclarationStatus shell(const SerializedProgramParameters *resi
     return bound && *size ? HLSL_GLOBAL_DECLARATIONS_OK : HLSL_GLOBAL_DECLARATIONS_NOT_APPLICABLE;
 }
 
+/* Metadata supplies scalar type, shape and byte offset. A natural HLSL
+ * scalar/vector can start at any four-byte component, but cannot straddle a
+ * sixteen-byte packing row. Serialized type 1 is integer metadata; Unity
+ * erases INT/UINT signedness, so it cannot prove unsigned source spelling.
+ * Boolean, array/matrix/struct and inferred types remain outside this domain. */
+static bool scalar_vector_layout(const HLSLGlobalDeclarationField *field, uint32_t shell_size) {
+    const DecodedVariableLayout *layout = &field->layout;
+    return layout->scalar_type <= 1 && !layout->is_matrix && !layout->array_size &&
+           layout->rows == 1 && layout->columns >= 1 && layout->columns <= 4 &&
+           !(layout->byte_offset & 3u) && field->byte_size == layout->columns * 4u &&
+           (layout->byte_offset & 15u) + field->byte_size <= 16u &&
+           (uint64_t)layout->byte_offset + field->byte_size <= shell_size;
+}
+
 static HLSLGlobalDeclarationStatus append_parameters(HLSLGlobalDeclarationUnion *value,
                                                      const SerializedProgramParameters *parameters,
                                                      uint32_t witness, bool current) {
@@ -207,11 +221,7 @@ static HLSLGlobalDeclarationStatus append_parameters(HLSLGlobalDeclarationUnion 
             if (project && field.layout.byte_offset >= value->shell_size)
                 continue;
             field.byte_size = parameter_layout_byte_size(&field.layout);
-            if (field.layout.scalar_type != 0 || field.layout.is_matrix ||
-                field.layout.array_size || field.layout.rows != 1 || !field.layout.columns ||
-                field.layout.columns > 4 || (field.layout.byte_offset & 15u) ||
-                field.byte_size != field.layout.columns * 4u ||
-                (uint64_t)field.layout.byte_offset + field.byte_size > value->shell_size)
+            if (!scalar_vector_layout(&field, value->shell_size))
                 return HLSL_GLOBAL_DECLARATIONS_FIELD_CONFLICT;
             HLSLGlobalDeclarationStatus status = add_field(value, &field, witness, current);
             if (status != HLSL_GLOBAL_DECLARATIONS_OK)
