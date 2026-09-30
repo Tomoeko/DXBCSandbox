@@ -50,6 +50,12 @@ typedef struct {
     int stage_index, subprogram_index, hardware_tier_group;
     UnityHlslMatrixDeclarationStatus declaration_status;
     UnityHlslMatrixDeclarationSummary declaration;
+    /* Additive historical observation of the emitted entry and its complete
+     * required declaration fragments. It does not replace base stage/whole
+     * results or close any include/runtime/asset dependency scope. */
+    bool has_scoped_source_quality;
+    uint32_t unresolved_coverage_obligations;
+    HLSLSourceQualityResult scoped_source_quality;
 } UnityEmittedMatrixAttachmentRequest;
 
 /* Observation-only owned factory. It internally emits the complete ordinary
@@ -61,8 +67,10 @@ typedef struct {
  * Output must initially be NULL and remains NULL on every failure. All input
  * storage is borrowed, immutable for this call; the result owns copied emitted
  * source/metadata/ASTs, preprocessing, compiler receipts and coordinate facts.
- * Receipt/layout/read attachment supplies no include-unit or source-quality
- * authority: stage and whole classifications remain their base observations. */
+ * A separate fresh analyzer may observe the bounded emitted entry plus its
+ * required complete declaration fragments. That result does not supply full
+ * include-unit, wrapper or dependency closure; base stage and whole
+ * classifications remain their original observations. */
 UnityEmittedMatrixAttachmentStatus unity_emitted_matrix_attachment_capture(
     const UnityEmittedMatrixAttachmentInput *input, UnityEmittedMatrixAttachment **output,
     UnityEmittedMatrixAttachmentDiagnostic *diagnostic);

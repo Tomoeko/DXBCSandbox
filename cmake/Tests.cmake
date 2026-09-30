@@ -528,6 +528,13 @@ if(BUILD_TESTING)
             unity_compiler_support dxbc_build_options)
         add_test(NAME unity_hlsl_expansion_units COMMAND test_unity_hlsl_expansion_units)
 
+        add_executable(test_unity_required_declaration_quality_units
+            tests/test_unity_required_declaration_quality_units.c tests/test_shaderlab_fixture.c)
+        target_include_directories(test_unity_required_declaration_quality_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_unity_required_declaration_quality_units PRIVATE unity_compiler_support)
+        target_compile_definitions(test_unity_required_declaration_quality_units PRIVATE
+            REQUIRED_DECLARATION_PIXEL_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
+        add_test(NAME unity_required_declaration_quality_units COMMAND test_unity_required_declaration_quality_units)
         add_executable(test_unity_emitted_matrix_attachment_units
             tests/test_unity_emitted_matrix_attachment_units.c tests/test_shaderlab_fixture.c)
         target_include_directories(test_unity_emitted_matrix_attachment_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

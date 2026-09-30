@@ -1533,6 +1533,7 @@ static bool high_level_direct_return_supported(const USILProgram *program,
 bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
                                             const ASTExpr *expression, int instruction) {
   if (!ctx->source_quality_analysis) return true;
+  if (!hlsl_stage_coverage_root(ctx, expression, instruction)) return false;
   hlsl_source_quality_interface_expression_begin(ctx, instruction);
   ctx->source_quality_root = expression;
   ctx->source_quality_instruction = instruction;
@@ -1549,7 +1550,7 @@ bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
  * contract and later replays receipts for every actual body/control byte.
  * Interface and declaration syntax have separate coverage checks. Includes,
  * uncovered storage layouts and helpers retain explicit coverage gaps. */
-bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx) {
+bool hlsl_source_quality_body_inventory_supported(HLSLEmitterContext *ctx) {
   const USILProgram *program = ctx->program;
   /* The bounded flow route must independently prove CFG/SSA, types, loop
    * bounds and persistent output initialization before promising coverage. */
@@ -1572,8 +1573,7 @@ bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx) {
       !hlsl_source_quality_resource_inventory_complete(ctx) || program->uav_count ||
       program->icb_value_count || program->indexable_temp_count ||
       program->index_range_count ||
-      (program->patch_constant_count && !ctx->high_level_domain) ||
-      !hlsl_source_quality_cbuffer_inventory_supported(ctx))
+      (program->patch_constant_count && !ctx->high_level_domain))
     return false;
   for (int group = 0; group < 2; ++group)
     if (ctx->float4_functions.use_count[group] >= 2)
@@ -1581,7 +1581,13 @@ bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx) {
   return true;
 }
 
+bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx) {
+  return hlsl_source_quality_body_inventory_supported(ctx) &&
+      hlsl_source_quality_cbuffer_inventory_supported(ctx);
+}
+
 bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete) {
+  if (!hlsl_stage_coverage_begin(ctx)) return false;
   if (!ctx->source_quality_analysis) return true;
   ctx->source_quality_interface_required = complete && ctx->high_level_interface;
   ctx->source_quality_cbuffer_required = complete && ctx->program->cbuffer_count > 0;
@@ -1623,8 +1629,17 @@ void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
     hlsl_source_quality_interface_statement_emitted(ctx, instruction);
 }
 
+static bool owned_stage_quality_observer(void *context, const HLSLSourceQualityObservation *observation) {
+  HLSLEmitterContext *ctx = context;
+  return hlsl_stage_coverage_observation(ctx, observation) &&
+      (!ctx->source_quality_forward_observer ||
+       ctx->source_quality_forward_observer(ctx->source_quality_forward_observer_context, observation));
+}
+
 bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptions *options) {
   if (!options || !options->source_quality) return true;
+  ctx->source_quality_forward_observer = options->source_quality_observer;
+  ctx->source_quality_forward_observer_context = options->source_quality_observer_context;
   const HLSLSourceQualityRequest quality_request = {
       .stage = ctx->program->program_type,
       .pass_index = options->source_quality_pass_index,
@@ -1632,8 +1647,8 @@ bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptio
       .emission_status = HLSL_EMIT_STATUS_OK,
       .expression_facts = emitter_source_quality_expression_facts,
       .facts_context = ctx,
-      .observer = options->source_quality_observer,
-      .observer_context = options->source_quality_observer_context};
+      .observer = ctx->matrix_use_capture ? owned_stage_quality_observer : options->source_quality_observer,
+      .observer_context = ctx->matrix_use_capture ? ctx : options->source_quality_observer_context};
   ctx->source_quality_analysis =
       hlsl_source_quality_analysis_create(&quality_request, options->source_quality);
   if (ctx->source_quality_analysis) return true;
@@ -1643,6 +1658,7 @@ bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptio
 }
 
 void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
+  hlsl_stage_coverage_finish(ctx);
   if (ctx->source_quality_analysis) {
     HLSLEmitStatus status = ctx->diagnostic ? ctx->diagnostic->status : HLSL_EMIT_STATUS_OK;
     if (status == HLSL_EMIT_STATUS_OK && !sb_ok(ctx->sb)) status = HLSL_EMIT_STATUS_OUTPUT_FAILED;

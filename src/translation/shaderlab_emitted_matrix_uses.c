@@ -11,12 +11,49 @@
 enum { MATRIX_ENTRY_LIMIT = 32, MATRIX_TREE_LIMIT = 512, MATRIX_TREE_DEPTH = 64,
        MATRIX_INPUT_BYTE_LIMIT = 4 * 1024 * 1024 };
 
-/* Mechanical bounded tree copy. These are exactly the existing matrix AST
- * forms; unsupported nodes fail rather than acquire invented provenance. */
+/* Mechanical bounded tree copy shared by matrix and stage observations.
+ * It copies syntax and owned origins, never recovers or invents provenance. */
 static ASTExpr *copy_tree(const ASTExpr *source, unsigned depth, size_t *nodes) {
     if (!source || depth > MATRIX_TREE_DEPTH || ++*nodes > MATRIX_TREE_LIMIT) return NULL;
     ASTExpr *copy = NULL;
     switch (source->kind) {
+    case AST_EXPR_VAR:
+        copy = ast_create_var(source->u.var.ssa_var, source->u.var.register_index, source->u.var.operand_type, source->u.var.name);
+        break;
+    case AST_EXPR_UNARY: {
+        ASTExpr *child = copy_tree(source->u.unary.sub, depth + 1, nodes);
+        if (child) copy = ast_create_unary(source->u.unary.op, child);
+        if (!copy) ast_free_expr(child);
+        break;
+    }
+    case AST_EXPR_BINARY:
+    case AST_EXPR_COMPARISON: {
+        ASTExpr *left = copy_tree(source->u.binary.left, depth + 1, nodes);
+        ASTExpr *right = left ? copy_tree(source->u.binary.right, depth + 1, nodes) : NULL;
+        if (left && right) copy = source->kind == AST_EXPR_BINARY
+            ? ast_create_binary(source->u.binary.op, left, right)
+            : ast_create_comparison(source->u.binary.op, left, right);
+        if (!copy) { ast_free_expr(left); ast_free_expr(right); }
+        break;
+    }
+    case AST_EXPR_CAST:
+    case AST_EXPR_BITCAST: {
+        const ASTExpr *original = source->kind == AST_EXPR_CAST ? source->u.cast.sub : source->u.bitcast.sub;
+        ASTExpr *child = copy_tree(original, depth + 1, nodes);
+        if (child) copy = source->kind == AST_EXPR_CAST
+            ? ast_create_cast(source->u.cast.type_name, child)
+            : ast_create_bitcast(source->u.bitcast.scalar_type, child);
+        if (!copy) ast_free_expr(child);
+        break;
+    }
+    case AST_EXPR_TERNARY: {
+        ASTExpr *condition = copy_tree(source->u.ternary.cond, depth + 1, nodes);
+        ASTExpr *yes = condition ? copy_tree(source->u.ternary.true_expr, depth + 1, nodes) : NULL;
+        ASTExpr *no = yes ? copy_tree(source->u.ternary.false_expr, depth + 1, nodes) : NULL;
+        if (condition && yes && no) copy = ast_create_ternary(condition, yes, no);
+        if (!copy) { ast_free_expr(condition); ast_free_expr(yes); ast_free_expr(no); }
+        break;
+    }
     case AST_EXPR_LITERAL:
         copy = ast_create_literal_bits(source->u.literal.val, source->u.literal.components,
                                        source->u.literal.scalar_type);
@@ -50,6 +87,12 @@ static ASTExpr *copy_tree(const ASTExpr *source, unsigned depth, size_t *nodes) 
     }
     if (copy) copy->logical_origin = source->logical_origin;
     return copy;
+}
+
+ASTExpr *hlsl_owned_expression_copy(const ASTExpr *source, size_t *node_count) {
+    if (!node_count) return NULL;
+    *node_count = 0;
+    return copy_tree(source, 0, node_count);
 }
 
 static void hash_number(CommonSha256Context *hash, uint64_t number) {
@@ -139,6 +182,25 @@ static bool operand_origins_equal(const ASTOperandProvenance *a, const ASTOperan
 static bool trees_equal(const ASTExpr *a, const ASTExpr *b, unsigned depth, size_t *nodes) {
     if (!a || !b || depth > MATRIX_TREE_DEPTH || ++*nodes > MATRIX_TREE_LIMIT ||
         a->kind != b->kind || !logical_origins_equal(&a->logical_origin, &b->logical_origin)) return false;
+    if (a->kind == AST_EXPR_VAR)
+        return a->u.var.ssa_var == b->u.var.ssa_var && a->u.var.register_index == b->u.var.register_index &&
+            a->u.var.operand_type == b->u.var.operand_type && a->u.var.name && b->u.var.name && !strcmp(a->u.var.name, b->u.var.name);
+    if (a->kind == AST_EXPR_UNARY)
+        return a->u.unary.op == b->u.unary.op && trees_equal(a->u.unary.sub, b->u.unary.sub, depth + 1, nodes);
+    if (a->kind == AST_EXPR_BINARY || a->kind == AST_EXPR_COMPARISON)
+        return a->u.binary.op == b->u.binary.op &&
+            trees_equal(a->u.binary.left, b->u.binary.left, depth + 1, nodes) &&
+            trees_equal(a->u.binary.right, b->u.binary.right, depth + 1, nodes);
+    if (a->kind == AST_EXPR_CAST)
+        return a->u.cast.type_name && b->u.cast.type_name && !strcmp(a->u.cast.type_name, b->u.cast.type_name) &&
+            trees_equal(a->u.cast.sub, b->u.cast.sub, depth + 1, nodes);
+    if (a->kind == AST_EXPR_BITCAST)
+        return a->u.bitcast.scalar_type == b->u.bitcast.scalar_type &&
+            trees_equal(a->u.bitcast.sub, b->u.bitcast.sub, depth + 1, nodes);
+    if (a->kind == AST_EXPR_TERNARY)
+        return trees_equal(a->u.ternary.cond, b->u.ternary.cond, depth + 1, nodes) &&
+            trees_equal(a->u.ternary.true_expr, b->u.ternary.true_expr, depth + 1, nodes) &&
+            trees_equal(a->u.ternary.false_expr, b->u.ternary.false_expr, depth + 1, nodes);
     if (a->kind == AST_EXPR_EMITTER_OPERAND)
         return a->u.emitter_operand && b->u.emitter_operand &&
             !strcmp(a->u.emitter_operand, b->u.emitter_operand) &&
@@ -196,6 +258,7 @@ static bool tree_has_field(const ASTExpr *tree, const HLSLCurrentMatrixField *fi
 }
 
 static void entry_dispose(HLSLMatrixUseCapture *entry) {
+    hlsl_stage_coverage_dispose(&entry->coverage);
     for (size_t index = 0; index < entry->use_count; ++index) ast_free_expr(entry->uses[index].tree);
     free(entry->uses); free(entry->target);
     subprogram_metadata_free_variant(&entry->player); free(entry->player_payload);
@@ -242,6 +305,8 @@ bool shaderlab_matrix_uses_begin(ShaderLabEmittedMatrixUses *owned,
         (common && !serialized_program_parameters_copy(&entry->common, common))) return false;
     HLSLCurrentMatrixStatus status = hlsl_current_matrix_reads_build(program, current, common, &entry->reads);
     if (status != HLSL_CURRENT_MATRIX_OK && status != HLSL_CURRENT_MATRIX_NOT_APPLICABLE) return false;
+    entry->coverage.global_node_count = &owned->owned_stage_node_count;
+    entry->coverage.global_event_count = &owned->owned_stage_event_count;
     entry->observation.field_count = entry->reads.field_count;
     entry->observation.read_count = entry->reads.read_count;
     *capture = entry;
@@ -277,6 +342,7 @@ bool hlsl_matrix_uses_plan(HLSLEmitterContext *ctx, const HLSLMatrixLiftPlan *pl
 bool hlsl_matrix_uses_span(HLSLMatrixUseCapture *entry,
     const ASTExpr *expression, size_t begin, size_t end) {
     if (!entry) return true;
+    if (!hlsl_stage_coverage_span(&entry->coverage, expression, begin, end)) return false;
     for (size_t index = 0; index < entry->use_count; ++index) {
         HLSLEmittedMatrixUse *use = &entry->uses[index];
         if (use->live_tree != expression) continue;
@@ -291,7 +357,8 @@ bool hlsl_matrix_uses_span(HLSLMatrixUseCapture *entry,
 
 bool shaderlab_matrix_uses_finish(HLSLMatrixUseCapture *entry,
     const StringBuilder *source, const HLSLExpressionSourceMap *map) {
-    if (!entry || entry->finished || !source || !sb_ok(source) || !map || !map->complete ||
+    if (!entry || entry->finished || !source || !sb_ok(source) ||
+        !hlsl_stage_coverage_validate(&entry->coverage, source) || !map || !map->complete ||
         map->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT) return false;
     entry->raw_map = *map;
     for (size_t index = 0; index < entry->use_count; ++index) {
@@ -366,6 +433,20 @@ bool shaderlab_matrix_uses_seal(ShaderLabEmittedMatrixUses *owned) {
         entry->observation.source_end = body->source_end;
         memcpy(entry->observation.body_digest, body->source_digest, 32);
         entry->observation.base_quality = record->source_quality;
+        for (size_t root_index = 0; root_index < entry->coverage.root_count; ++root_index) {
+            HLSLStageOwnedRoot *root = &entry->coverage.roots[root_index];
+            if (root->instruction < 0 || (size_t)root->instruction >= record->instructions.count) return false;
+            const HLSLExpressionOrigin *raw = &entry->raw_map.origins[root->instruction];
+            const HLSLExpressionOrigin *whole = &record->instructions.origins[root->instruction];
+            if (raw->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION || raw->source_begin != root->begin ||
+                raw->source_end != root->end || whole->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION ||
+                whole->source_begin < body->source_begin || whole->source_end > body->source_end ||
+                whole->source_end - whole->source_begin != root->end - root->begin ||
+                memcmp(owned->source.buf + whole->source_begin,
+                    entry->coverage.source + root->begin, root->end - root->begin)) return false;
+            root->whole_begin = whole->source_begin;
+            root->whole_end = whole->source_end;
+        }
         for (size_t use_index = 0; use_index < entry->use_count; ++use_index) {
             HLSLEmittedMatrixUse *use = &entry->uses[use_index];
             const HLSLExpressionOrigin *origin = &record->instructions.origins[use->observation.final_instruction];
@@ -463,7 +544,9 @@ bool hlsl_matrix_uses_read_matches(const HLSLMatrixUseCapture *entry, size_t ind
 
 static bool observations_equal(const ShaderLabEmittedMatrixUses *a, const ShaderLabEmittedMatrixUses *b) {
     if (!a->sealed || !b->sealed || a->source.len != b->source.len || a->entry_count != b->entry_count ||
-        a->owned_input_bytes != b->owned_input_bytes || memcmp(a->source.buf, b->source.buf, a->source.len)) return false;
+        a->owned_input_bytes != b->owned_input_bytes || a->owned_stage_node_count != b->owned_stage_node_count ||
+        a->owned_stage_event_count != b->owned_stage_event_count ||
+        memcmp(a->source.buf, b->source.buf, a->source.len)) return false;
     for (size_t index = 0; index < a->entry_count; ++index) {
         const HLSLMatrixUseCapture *left = &a->entries[index], *right = &b->entries[index];
         if (!left->finished || !entry_coordinates_match(&left->observation, &b->inventory.entries.records[index]) ||
@@ -480,6 +563,7 @@ static bool observations_equal(const ShaderLabEmittedMatrixUses *a, const Shader
             left->observation.field_count != right->observation.field_count ||
             left->observation.read_count != right->observation.read_count ||
             left->observation.use_count != right->observation.use_count ||
+            !hlsl_stage_coverage_equal(&left->coverage, &right->coverage) ||
             left->use_count != right->use_count || left->raw_map.count != right->raw_map.count ||
             !left->raw_map.complete || !right->raw_map.complete) return false;
         for (size_t instruction = 0; instruction < left->raw_map.count; ++instruction) {

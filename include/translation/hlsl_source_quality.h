@@ -23,7 +23,9 @@ typedef enum {
     HLSL_SOURCE_UNIT_GENERATED_INCLUDE,
     HLSL_SOURCE_UNIT_EXTERNAL_INCLUDE,
     /* Kernel/keyword pragmas and conditional source selection syntax. */
-    HLSL_SOURCE_UNIT_CONFIGURATION
+    HLSL_SOURCE_UNIT_CONFIGURATION,
+    /* Complete required declaration fragments, never a whole include. */
+    HLSL_SOURCE_UNIT_REQUIRED_EXTERNAL_DECLARATION
 } HLSLSourceQualityUnitKind;
 
 typedef enum {

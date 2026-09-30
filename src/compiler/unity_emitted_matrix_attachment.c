@@ -2,6 +2,8 @@
 
 #include "compiler/unity_emitted_matrix_attachment.h"
 #include "compiler/unity_generated_owned_request_internal.h"
+#include "compiler/unity_required_declaration_quality_internal.h"
+#include "translation/hlsl_source_quality_internal.h"
 #include "compiler/unity_shaderlab_mapping.h"
 #include "translation/hlsl_emitted_matrix_uses_internal.h"
 
@@ -168,6 +170,26 @@ static bool observe_request(void *context, const UnityGeneratedOwnedRequest *act
                 !hlsl_matrix_uses_read_matches(entry, read_index, &read)) return false;
         }
         request->observation.declaration = summary;
+    }
+    UnityRequiredDeclarationQuality declarations;
+    unity_required_declaration_quality_init(&declarations);
+    bool quality_valid = (!request->receipt || unity_hlsl_matrix_declaration_visit_required_blocks(
+        capture->input->broker, request->receipt, &declaration_input,
+        unity_required_declaration_quality_block, &declarations)) &&
+        unity_required_declaration_quality_seal(&declarations) &&
+        unity_required_declaration_quality_analyze(entry, &declarations,
+            &request->observation.scoped_source_quality,
+            &request->observation.unresolved_coverage_obligations, NULL, NULL);
+    unity_required_declaration_quality_dispose(&declarations);
+    if (!quality_valid) return false;
+    request->observation.has_scoped_source_quality = true;
+    if (capture->replaying) {
+        const UnityEmittedMatrixAttachmentRequest *prior =
+            &capture->replaying->requests[request_index].observation;
+        if (!prior->has_scoped_source_quality ||
+            prior->unresolved_coverage_obligations != request->observation.unresolved_coverage_obligations ||
+            !hlsl_source_quality_results_equal(&prior->scoped_source_quality,
+                &request->observation.scoped_source_quality)) return false;
     }
     ++capture->body_request_counts[entry_index];
     return true;

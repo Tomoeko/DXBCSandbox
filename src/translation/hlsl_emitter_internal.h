@@ -262,6 +262,8 @@ typedef struct HLSLEmitterContext {
     HLSLExpressionSourceMap *expression_source_map;
     struct HLSLMatrixUseCapture *matrix_use_capture; /* Private owned factory only. */
     HLSLSourceQualityAnalysis *source_quality_analysis;
+    HLSLSourceQualityObserver source_quality_forward_observer;
+    void *source_quality_forward_observer_context;
     const ASTExpr *source_quality_root;
     int source_quality_instruction;
     bool high_level_direct_return;
@@ -398,6 +400,7 @@ void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
  * before observing syntax. New stage routes must keep incomplete coverage
  * until their complete emitted dependency inventory is represented. */
 bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptions *options);
+bool hlsl_source_quality_body_inventory_supported(HLSLEmitterContext *ctx);
 bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx);
 bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete);
 void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx);
@@ -506,6 +509,8 @@ extern const size_t g_builtins_count;
 // Top-level emission phases. Each phase owns one coherent HLSL section.
 void emit_comments_and_icb(HLSLEmitterContext* ctx);
 void emit_cbuffers(HLSLEmitterContext* ctx);
+bool hlsl_source_quality_local_cbuffer_supported(const HLSLEmitterContext *ctx, int index);
+bool hlsl_source_quality_local_cbuffer_complete(const HLSLEmitterContext *ctx, int index);
 bool hlsl_source_quality_cbuffer_inventory_supported(const HLSLEmitterContext *ctx);
 bool hlsl_source_quality_cbuffer_inventory_complete(const HLSLEmitterContext *ctx);
 bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,

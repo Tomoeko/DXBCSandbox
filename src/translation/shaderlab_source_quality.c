@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/shaderlab_source_quality_internal.h"
+#include "translation/hlsl_source_quality_internal.h"
 #include "translation/shaderlab_emitter_internal.h"
 
 #include <stdlib.h>
@@ -465,84 +466,6 @@ static bool receipts_equal(const ShaderLabSourceSyntaxReceipt *a, const ShaderLa
         a->entry_record_index == b->entry_record_index && !memcmp(a->source_digest, b->source_digest, 32);
 }
 
-static bool stage_counters_equal(const HLSLSourceQualityCounters *a, const HLSLSourceQualityCounters *b) {
-    return a->ast_expressions == b->ast_expressions &&
-        a->ast_statements == b->ast_statements &&
-        a->emission_events == b->emission_events &&
-        a->inspected_units == b->inspected_units &&
-        a->incomplete_units == b->incomplete_units &&
-        a->unknown_provenance == b->unknown_provenance &&
-        a->logical_operations == b->logical_operations &&
-        a->logical_value_references == b->logical_value_references &&
-        a->semantic_projections == b->semantic_projections &&
-        a->real_bitcasts == b->real_bitcasts &&
-        a->register_storage == b->register_storage &&
-        a->lane_transport == b->lane_transport &&
-        a->scalarized_intrinsics == b->scalarized_intrinsics &&
-        a->raw_buffer_reconstruction == b->raw_buffer_reconstruction &&
-        a->synthetic_interface == b->synthetic_interface &&
-        a->instruction_assignments == b->instruction_assignments &&
-        a->unstructured_control == b->unstructured_control &&
-        a->storage_bitcasts == b->storage_bitcasts &&
-        a->sibling_declarations == b->sibling_declarations &&
-        a->sibling_declaration_witnesses == b->sibling_declaration_witnesses &&
-        a->resource_declarations == b->resource_declarations &&
-        a->residual_total == b->residual_total &&
-        a->cbuffer_declarations == b->cbuffer_declarations &&
-        a->cbuffer_fields == b->cbuffer_fields;
-}
-
-static bool stage_facts_equal(const HLSLSourceQualityFacts *a, const HLSLSourceQualityFacts *b) {
-    return a->known == b->known &&
-        a->value_kind == b->value_kind &&
-        a->logical_value_id == b->logical_value_id &&
-        a->components == b->components &&
-        a->artifacts == b->artifacts &&
-        a->semantic_projection == b->semantic_projection &&
-        a->real_bitcast == b->real_bitcast &&
-        a->logical_operation == b->logical_operation &&
-        a->instruction_index == b->instruction_index &&
-        a->source_instruction_index == b->source_instruction_index &&
-        a->lanes == b->lanes &&
-        a->declaration_witness_count == b->declaration_witness_count &&
-        a->declaration_variant_index == b->declaration_variant_index &&
-        a->declaration_witness_record == b->declaration_witness_record &&
-        a->declaration_field_index == b->declaration_field_index &&
-        a->declaration_witness_subprogram_index == b->declaration_witness_subprogram_index &&
-        a->resource_declaration_kind == b->resource_declaration_kind &&
-        a->resource_binding_register == b->resource_binding_register &&
-        a->cbuffer_declaration_kind == b->cbuffer_declaration_kind &&
-        a->cbuffer_binding_register == b->cbuffer_binding_register &&
-        a->cbuffer_field_index == b->cbuffer_field_index &&
-        a->cbuffer_byte_offset == b->cbuffer_byte_offset &&
-        a->cbuffer_byte_size == b->cbuffer_byte_size &&
-        a->cbuffer_declaration_authority == b->cbuffer_declaration_authority;
-}
-
-static bool stage_observations_equal(const HLSLSourceQualityObservation *a, const HLSLSourceQualityObservation *b) {
-    return a->stage == b->stage &&
-        a->pass_index == b->pass_index &&
-        a->entry_point_index == b->entry_point_index &&
-        a->source_unit_id == b->source_unit_id &&
-        a->unit_kind == b->unit_kind &&
-        a->kind == b->kind &&
-        a->ast_kind == b->ast_kind &&
-        a->reasons == b->reasons &&
-        stage_facts_equal(&a->facts, &b->facts);
-}
-
-static bool stage_quality_equal(const HLSLSourceQualityResult *a, const HLSLSourceQualityResult *b) {
-    return a->stage == b->stage &&
-        a->pass_index == b->pass_index &&
-        a->entry_point_index == b->entry_point_index &&
-        a->emission_status == b->emission_status &&
-        a->classification == b->classification &&
-        a->reasons == b->reasons &&
-        a->has_first_issue == b->has_first_issue &&
-        stage_counters_equal(&a->counts, &b->counts) &&
-        (!a->has_first_issue || stage_observations_equal(&a->first_issue, &b->first_issue));
-}
-
 static bool instruction_origins_equal(const HLSLExpressionOrigin *a, const HLSLExpressionOrigin *b) {
     return a->kind == b->kind &&
         a->instruction_index == b->instruction_index &&
@@ -569,7 +492,7 @@ static bool entries_equal(const ShaderLabExpressionSourceRecord *a, const Shader
         a->blob_index == b->blob_index && a->hardware_tier_group == b->hardware_tier_group &&
         a->serialized_state == b->serialized_state && !memcmp(a->target_digest, b->target_digest, 32) &&
         a->has_source_quality == b->has_source_quality &&
-        stage_quality_equal(&a->source_quality, &b->source_quality) &&
+        hlsl_source_quality_results_equal(&a->source_quality, &b->source_quality) &&
         instruction_maps_equal(&a->instructions, &b->instructions);
 }
 

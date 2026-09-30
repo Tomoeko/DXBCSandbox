@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_source_quality.h"
+#include "translation/hlsl_source_quality_internal.h"
 #include "translation/usil.h"
 
 #include <stdlib.h>
@@ -508,7 +509,7 @@ static bool inspect_unit_header(QualityAnalysis *analysis, const HLSLSourceQuali
                                  bool allow_empty) {
     analysis->unit = unit;
     ++analysis->result->counts.inspected_units;
-    if (unit->kind < HLSL_SOURCE_UNIT_ENTRY_POINT || unit->kind > HLSL_SOURCE_UNIT_CONFIGURATION ||
+    if (unit->kind < HLSL_SOURCE_UNIT_ENTRY_POINT || unit->kind > HLSL_SOURCE_UNIT_REQUIRED_EXTERNAL_DECLARATION ||
         (unit->expression_count && !unit->expressions) ||
         (unit->statement_count && !unit->statements) ||
         (unit->emission_fact_count && !unit->emission_facts))
@@ -764,4 +765,82 @@ bool hlsl_source_quality_analysis_finish(HLSLSourceQualityAnalysis *analysis,
 
 void hlsl_source_quality_analysis_destroy(HLSLSourceQualityAnalysis *analysis) {
     free(analysis);
+}
+
+static bool quality_counters_equal(const HLSLSourceQualityCounters *a, const HLSLSourceQualityCounters *b) {
+    return a->ast_expressions == b->ast_expressions &&
+        a->ast_statements == b->ast_statements &&
+        a->emission_events == b->emission_events &&
+        a->inspected_units == b->inspected_units &&
+        a->incomplete_units == b->incomplete_units &&
+        a->unknown_provenance == b->unknown_provenance &&
+        a->logical_operations == b->logical_operations &&
+        a->logical_value_references == b->logical_value_references &&
+        a->semantic_projections == b->semantic_projections &&
+        a->real_bitcasts == b->real_bitcasts &&
+        a->register_storage == b->register_storage &&
+        a->lane_transport == b->lane_transport &&
+        a->scalarized_intrinsics == b->scalarized_intrinsics &&
+        a->raw_buffer_reconstruction == b->raw_buffer_reconstruction &&
+        a->synthetic_interface == b->synthetic_interface &&
+        a->instruction_assignments == b->instruction_assignments &&
+        a->unstructured_control == b->unstructured_control &&
+        a->storage_bitcasts == b->storage_bitcasts &&
+        a->sibling_declarations == b->sibling_declarations &&
+        a->sibling_declaration_witnesses == b->sibling_declaration_witnesses &&
+        a->resource_declarations == b->resource_declarations &&
+        a->residual_total == b->residual_total &&
+        a->cbuffer_declarations == b->cbuffer_declarations &&
+        a->cbuffer_fields == b->cbuffer_fields;
+}
+
+bool hlsl_source_quality_facts_equal(const HLSLSourceQualityFacts *a, const HLSLSourceQualityFacts *b) {
+    return a->known == b->known &&
+        a->value_kind == b->value_kind &&
+        a->logical_value_id == b->logical_value_id &&
+        a->components == b->components &&
+        a->artifacts == b->artifacts &&
+        a->semantic_projection == b->semantic_projection &&
+        a->real_bitcast == b->real_bitcast &&
+        a->logical_operation == b->logical_operation &&
+        a->instruction_index == b->instruction_index &&
+        a->source_instruction_index == b->source_instruction_index &&
+        a->lanes == b->lanes &&
+        a->declaration_witness_count == b->declaration_witness_count &&
+        a->declaration_variant_index == b->declaration_variant_index &&
+        a->declaration_witness_record == b->declaration_witness_record &&
+        a->declaration_field_index == b->declaration_field_index &&
+        a->declaration_witness_subprogram_index == b->declaration_witness_subprogram_index &&
+        a->resource_declaration_kind == b->resource_declaration_kind &&
+        a->resource_binding_register == b->resource_binding_register &&
+        a->cbuffer_declaration_kind == b->cbuffer_declaration_kind &&
+        a->cbuffer_binding_register == b->cbuffer_binding_register &&
+        a->cbuffer_field_index == b->cbuffer_field_index &&
+        a->cbuffer_byte_offset == b->cbuffer_byte_offset &&
+        a->cbuffer_byte_size == b->cbuffer_byte_size &&
+        a->cbuffer_declaration_authority == b->cbuffer_declaration_authority;
+}
+
+static bool quality_observations_equal(const HLSLSourceQualityObservation *a, const HLSLSourceQualityObservation *b) {
+    return a->stage == b->stage &&
+        a->pass_index == b->pass_index &&
+        a->entry_point_index == b->entry_point_index &&
+        a->source_unit_id == b->source_unit_id &&
+        a->unit_kind == b->unit_kind &&
+        a->kind == b->kind &&
+        a->ast_kind == b->ast_kind &&
+        a->reasons == b->reasons &&
+        hlsl_source_quality_facts_equal(&a->facts, &b->facts);
+}
+
+bool hlsl_source_quality_results_equal(const HLSLSourceQualityResult *a, const HLSLSourceQualityResult *b) {
+    return a->stage == b->stage &&
+        a->pass_index == b->pass_index &&
+        a->entry_point_index == b->entry_point_index &&
+        a->emission_status == b->emission_status &&
+        a->classification == b->classification &&
+        a->reasons == b->reasons &&
+        a->has_first_issue == b->has_first_issue &&
+        quality_counters_equal(&a->counts, &b->counts) &&
+        (!a->has_first_issue || quality_observations_equal(&a->first_issue, &b->first_issue));
 }

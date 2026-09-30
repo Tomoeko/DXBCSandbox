@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "compiler/unity_hlsl_matrix_declaration.h"
+#include "compiler/unity_required_declaration_quality_internal.h"
 #include "compiler/unity_compile_authority.h"
 #include "common/sha256.h"
 #include "common/shader_stage.h"
@@ -452,4 +453,20 @@ bool unity_hlsl_matrix_declaration_read(const UnityHlslMatrixDeclarationReceipt 
                                        size_t index, HLSLCurrentMatrixRead *read) {
     if (!receipt || !read || index >= receipt->reads.read_count) return false;
     *read = receipt->reads.reads[index]; return true;
+}
+
+/* The visitor can inspect only copied typed facts from this owned receipt.
+ * The expanded response never crosses this private boundary. */
+bool unity_hlsl_matrix_declaration_visit_required_blocks(UnityCompilerBroker *broker,
+    const UnityHlslMatrixDeclarationReceipt *receipt, const UnityHlslMatrixDeclarationInput *current,
+    UnityRequiredBlockVisitor visitor, void *context) {
+    if (!visitor || !unity_hlsl_matrix_declaration_replay(broker, receipt, current)) return false;
+    for (size_t index = 0; index < receipt->declarations.block_count; ++index) {
+        const UnityHlslCBufferBlock *block = &receipt->declarations.blocks[index];
+        if (block->first_field > receipt->declarations.field_count ||
+            block->field_count > receipt->declarations.field_count - block->first_field ||
+            !visitor(context, index, block, receipt->declarations.fields + block->first_field,
+                block->field_count)) return false;
+    }
+    return unity_hlsl_matrix_declaration_replay(broker, receipt, current);
 }

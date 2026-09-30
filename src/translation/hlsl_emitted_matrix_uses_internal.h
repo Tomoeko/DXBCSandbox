@@ -4,6 +4,7 @@
 
 #include "translation/shaderlab_emitted_matrix_uses.h"
 #include "translation/hlsl_matrix_lift.h"
+#include "translation/hlsl_stage_coverage_internal.h"
 
 struct HLSLEmitterContext;
 typedef struct {
@@ -25,6 +26,7 @@ typedef struct HLSLMatrixUseCapture {
     HLSLEmittedMatrixUse *uses;
     size_t use_count;
     HLSLExpressionSourceMap raw_map;
+    HLSLStageCoverage coverage;
     bool finished;
 } HLSLMatrixUseCapture;
 
@@ -34,6 +36,7 @@ struct ShaderLabEmittedMatrixUses {
     HLSLMatrixUseCapture *entries;
     size_t entry_count;
     size_t owned_input_bytes;
+    size_t owned_stage_node_count, owned_stage_event_count;
     bool sealed;
 };
 

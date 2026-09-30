@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "io/shader_object.h"
 
 /* Synthetic Unity player wrapper; caller owns the returned malloc allocation. */
 uint8_t *test_shaderlab_variant_blob(const uint8_t *dxbc, size_t dxbc_size, int32_t program_type,
@@ -15,5 +16,24 @@ uint8_t *test_shaderlab_variant_blob_keywords(const uint8_t *dxbc, size_t dxbc_s
 
 /* Authored single-matrix vertex tokens; no captured private byte array. */
 uint8_t *test_shaderlab_matrix_vertex_dxbc(size_t *out_size);
+
+typedef struct {
+    SerializedShader shader;
+    SerializedSubShader subshader;
+    SerializedPass pass;
+    SerializedSubProgram programs[2];
+    SerializedSubProgramIdentity identities[2];
+    SerializedVariable matrix;
+    SerializedConstantBuffer buffer;
+    SerializedResourceParam binding;
+    ShaderBlobArchive archive;
+    BlobEntry entries[2];
+    uint8_t *segments[2];
+    int lengths[2], platform;
+} TestShaderLabMatrixFixture;
+
+bool test_shaderlab_matrix_fixture_init(TestShaderLabMatrixFixture *fixture,
+    const char *pixel_path, bool builtin);
+void test_shaderlab_matrix_fixture_dispose(TestShaderLabMatrixFixture *fixture);
 
 #endif

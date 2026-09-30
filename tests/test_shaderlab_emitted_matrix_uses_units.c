@@ -14,73 +14,14 @@
     fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #condition); \
     return false; } } while (0)
 
-typedef struct {
-    SerializedShader shader;
-    SerializedSubShader subshader;
-    SerializedPass pass;
-    SerializedSubProgram programs[2];
-    SerializedSubProgramIdentity identities[2];
-    SerializedVariable matrix;
-    SerializedConstantBuffer buffer;
-    SerializedResourceParam binding;
-    ShaderBlobArchive archive;
-    BlobEntry entries[2];
-    uint8_t *segments[2];
-    int lengths[2], platform;
-} Fixture;
+typedef TestShaderLabMatrixFixture Fixture;
 
 static bool fixture_init(Fixture *fixture) {
-    memset(fixture, 0, sizeof(*fixture));
-    size_t size;
-    uint8_t *vertex = test_shaderlab_matrix_vertex_dxbc(&size);
-    CHECK(vertex);
-    size_t payload_size;
-    fixture->segments[0] = test_shaderlab_variant_blob(vertex, size, 16, NULL, &payload_size);
-    free(vertex);
-    CHECK(fixture->segments[0] && payload_size <= INT32_MAX);
-    fixture->lengths[0] = (int)payload_size;
-    CommonFileBytes bytes = {0};
-    CHECK(common_file_read_regular(MATRIX_USES_PIXEL_FIXTURE, 1024 * 1024, &bytes) == COMMON_FILE_OK);
-    DXBCUSBDTableView table;
-    DXBCUSBDRecordView pixel;
-    CHECK(dxbc_usbd_table_open(&table, bytes.data, bytes.size, NULL));
-    CHECK(dxbc_usbd_table_record(&table, 1, &pixel));
-    fixture->segments[1] = test_shaderlab_variant_blob(pixel.dxbc, pixel.dxbc_size, 17, NULL, &payload_size);
-    common_file_bytes_dispose(&bytes);
-    CHECK(fixture->segments[1] && payload_size <= INT32_MAX);
-    fixture->lengths[1] = (int)payload_size;
-    for (int stage = 0; stage < 2; ++stage) {
-        fixture->entries[stage] = (BlobEntry){0, fixture->lengths[stage], stage};
-        fixture->programs[stage] = (SerializedSubProgram){.blob_index = stage,
-            .program_type = stage ? 17 : 16, .shader_requirements = 0xe3};
-        fixture->identities[stage].hardware_tier_group = 3;
-        fixture->pass.subprogram_count[stage] = 1;
-        fixture->pass.subprograms[stage] = &fixture->programs[stage];
-        fixture->pass.subprogram_identities[stage] = &fixture->identities[stage];
-    }
-    fixture->matrix = (SerializedVariable){.name = "ObjectTransform", .layout = {0, 4, 4, 1, 0, 0}};
-    fixture->buffer = (SerializedConstantBuffer){.name = "Matrices", .size = 64,
-        .var_count = 1, .variables = &fixture->matrix};
-    fixture->binding = (SerializedResourceParam){.name = "Matrices",
-        .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER, .bind_index = 0};
-    fixture->pass.common_parameters[0] = (SerializedProgramParameters){.is_binary = true,
-        .cb_count = 1, .constant_buffers = &fixture->buffer, .res_count = 1, .resources = &fixture->binding};
-    fixture->platform = 4;
-    fixture->pass.has_serialized_platforms = true;
-    fixture->pass.platform_count = 1;
-    fixture->pass.platforms = &fixture->platform;
-    fixture->pass.program_mask = 6;
-    fixture->subshader = (SerializedSubShader){.pass_count = 1, .passes = &fixture->pass};
-    fixture->shader = (SerializedShader){.name = "Fixture/Quality/MatrixUses",
-        .subshader_count = 1, .subshaders = &fixture->subshader};
-    fixture->archive = (ShaderBlobArchive){.entries = fixture->entries, .entry_count = 2,
-        .segments = fixture->segments, .segment_lengths = fixture->lengths, .segment_count = 2};
-    return true;
+    return test_shaderlab_matrix_fixture_init(fixture, MATRIX_USES_PIXEL_FIXTURE, false);
 }
 
 static void fixture_dispose(Fixture *fixture) {
-    free(fixture->segments[0]);
-    free(fixture->segments[1]);
+    test_shaderlab_matrix_fixture_dispose(fixture);
 }
 
 static bool reject_entry(void *context, const ShaderLabSourceSyntaxReceipt *receipt) {

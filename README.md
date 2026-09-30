@@ -149,7 +149,11 @@ The opaque `shaderlab_emitted_matrix_uses_capture` and
 and join their owned read inventory to the normal compiler request's declaration
 receipts. Their initial scope is one ordinary vertex/fragment pass. Replay checks
 source, typed models, ASTs, instruction owners and the active compiler lease;
-these observations preserve the existing source-quality gaps.
+these observations preserve the existing source-quality gaps. Each request may
+also carry a separate `scoped_source_quality` result for its emitted entry and
+complete required external declaration fragments, using owned AST, formatter
+and decoded instruction facts. Include bodies, wrappers and asset/runtime
+dependencies remain outside that scope.
 Extraction reports historical bounded source inventories for ordinary high-level
 artifacts and binds the published view to the accepted file's size and hash.
 These snapshots preserve quality gaps and remain separate from compiler acceptance;

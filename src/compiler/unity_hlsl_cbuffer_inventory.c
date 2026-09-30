@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "compiler/unity_hlsl_cbuffer_inventory.h"
+#include "compiler/unity_hlsl_cbuffer_layout_internal.h"
 #include "compiler/unity_hlsl_expansion_internal.h"
 #include "common/sha256.h"
 #include "translation/hlsl_source_identifier.h"
@@ -16,6 +17,33 @@ void unity_hlsl_cbuffer_inventory_dispose(UnityHlslCBufferInventory *inventory) 
     if (!inventory) return;
     free(inventory->fields);
     unity_hlsl_cbuffer_inventory_init(inventory);
+}
+
+UnityHlslCBufferStatus unity_hlsl_cbuffer_layout_field(UnityHlslCBufferField *field,
+    uint32_t *cursor) {
+    if (!field || !cursor) return UNITY_HLSL_CBUFFER_INVALID_ARGUMENT;
+    if (field->scalar < UNITY_HLSL_CBUFFER_FLOAT || field->scalar > UNITY_HLSL_CBUFFER_BOOL ||
+        !field->rows || field->rows > 4 || !field->columns || field->columns > 4 ||
+        (field->is_matrix ? field->scalar != UNITY_HLSL_CBUFFER_FLOAT ||
+            field->rows != 4 || field->columns != 4 : field->rows != 1))
+        return UNITY_HLSL_CBUFFER_UNSUPPORTED_DECLARATION;
+    if (*cursor > 65536u) return UNITY_HLSL_CBUFFER_ANALYSIS_LIMIT;
+    const uint32_t size = field->is_matrix ? (uint32_t)field->columns * 16u : (uint32_t)field->columns * 4u;
+    uint32_t offset = *cursor;
+    if (field->is_matrix || (offset & 15u) + size > 16u) offset = (offset + 15u) & ~15u;
+    if (size > 65536u - offset) return UNITY_HLSL_CBUFFER_ANALYSIS_LIMIT;
+    field->byte_offset = offset;
+    field->byte_size = size;
+    *cursor = offset + size;
+    return UNITY_HLSL_CBUFFER_OK;
+}
+
+UnityHlslCBufferStatus unity_hlsl_cbuffer_layout_extent(uint32_t cursor,
+    uint32_t *byte_size) {
+    if (!byte_size) return UNITY_HLSL_CBUFFER_INVALID_ARGUMENT;
+    if (cursor > 65536u) return UNITY_HLSL_CBUFFER_ANALYSIS_LIMIT;
+    *byte_size = (cursor + 15u) & ~15u;
+    return UNITY_HLSL_CBUFFER_OK;
 }
 
 static bool token_name(const uint8_t *source, SourceToken token, char name[UNITY_HLSL_CBUFFER_NAME_LIMIT]) {
@@ -83,11 +111,8 @@ static UnityHlslCBufferStatus parse_block(const uint8_t *source, const SourceTok
             if (!strcmp(inventory->fields[previous].name, field.name))
                 return UNITY_HLSL_CBUFFER_CONFLICTING_DECLARATION;
         if (inventory->field_count == UNITY_HLSL_CBUFFER_FIELD_LIMIT) return UNITY_HLSL_CBUFFER_ANALYSIS_LIMIT;
-        field.byte_size = field.is_matrix ? (uint32_t)field.columns * 16u : (uint32_t)field.columns * 4u;
-        if (field.is_matrix || (cursor & 15u) + field.byte_size > 16u) cursor = (cursor + 15u) & ~15u;
-        if (field.byte_size > 65536u - cursor) return UNITY_HLSL_CBUFFER_ANALYSIS_LIMIT;
-        field.byte_offset = cursor;
-        cursor += field.byte_size;
+        const UnityHlslCBufferStatus layout_status = unity_hlsl_cbuffer_layout_field(&field, &cursor);
+        if (layout_status != UNITY_HLSL_CBUFFER_OK) return layout_status;
         field.source_end = tokens[at + 2].end;
         inventory->fields[inventory->field_count++] = field;
         ++block->field_count;
@@ -95,7 +120,8 @@ static UnityHlslCBufferStatus parse_block(const uint8_t *source, const SourceTok
     }
     if (at == count) return UNITY_HLSL_CBUFFER_MALFORMED_EXPANSION;
     if (!block->field_count) return UNITY_HLSL_CBUFFER_UNSUPPORTED_DECLARATION;
-    block->byte_size = (cursor + 15u) & ~15u;
+    const UnityHlslCBufferStatus extent_status = unity_hlsl_cbuffer_layout_extent(cursor, &block->byte_size);
+    if (extent_status != UNITY_HLSL_CBUFFER_OK) return extent_status;
     block->source_end = tokens[at++].end;
     if (at < count && source_token_equals(source, tokens[at], ";")) block->source_end = tokens[at++].end;
     *position = at;

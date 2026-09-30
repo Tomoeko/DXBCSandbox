@@ -124,26 +124,36 @@ bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
     return true;
 }
 
+bool hlsl_source_quality_local_cbuffer_supported(const HLSLEmitterContext *ctx, int index) {
+    if (!ctx || !ctx->program || !ctx->cbuffer_layouts_built || index < 0 ||
+        index >= ctx->cbuffer_layout_count || ctx->cbuffer_layout_count != ctx->program->cbuffer_count)
+        return false;
+    const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[index];
+    return (layout->compact_global_layout && !layout->omit_declaration && !layout->raw_storage &&
+            !layout->row_struct_storage && !layout->is_unity_builtin) ||
+        hlsl_source_quality_named_cbuffer_supported(ctx, index, NULL);
+}
+
+bool hlsl_source_quality_local_cbuffer_complete(const HLSLEmitterContext *ctx, int index) {
+    if (!hlsl_source_quality_local_cbuffer_supported(ctx, index)) return false;
+    const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[index];
+    return layout->compact_global_layout || (layout->source_quality_begin_emitted &&
+        layout->source_quality_end_emitted &&
+        layout->source_quality_fields_emitted == layout->variable_count);
+}
+
 bool hlsl_source_quality_cbuffer_inventory_supported(const HLSLEmitterContext *ctx) {
     if (!ctx || !ctx->program || !ctx->cbuffer_layouts_built ||
         ctx->cbuffer_layout_count != ctx->program->cbuffer_count) return false;
-    for (int index = 0; index < ctx->cbuffer_layout_count; ++index) {
-        const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[index];
-        if (layout->compact_global_layout && !layout->omit_declaration && !layout->raw_storage &&
-            !layout->row_struct_storage && !layout->is_unity_builtin) continue;
-        if (!hlsl_source_quality_named_cbuffer_supported(ctx, index, NULL)) return false;
-    }
+    for (int index = 0; index < ctx->cbuffer_layout_count; ++index)
+        if (!hlsl_source_quality_local_cbuffer_supported(ctx, index)) return false;
     return true;
 }
 
 bool hlsl_source_quality_cbuffer_inventory_complete(const HLSLEmitterContext *ctx) {
     if (!hlsl_source_quality_cbuffer_inventory_supported(ctx)) return false;
-    for (int index = 0; index < ctx->cbuffer_layout_count; ++index) {
-        const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[index];
-        if (!layout->compact_global_layout && (!layout->source_quality_begin_emitted ||
-            !layout->source_quality_end_emitted ||
-            layout->source_quality_fields_emitted != layout->variable_count)) return false;
-    }
+    for (int index = 0; index < ctx->cbuffer_layout_count; ++index)
+        if (!hlsl_source_quality_local_cbuffer_complete(ctx, index)) return false;
     return true;
 }
 
