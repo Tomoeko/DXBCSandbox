@@ -11,6 +11,9 @@
  * of captured compiler inputs. Scenario values retain the hull unit contract. */
 uint8_t *test_tessellation_hull_dxbc(uint32_t input_points, uint32_t output_points,
     uint8_t scenario, size_t *size);
+/* Custom FLOAT3 signature grammar for implicit control-point copies. */
+uint8_t *test_tessellation_hull_float3_dxbc(uint32_t input_points, uint32_t output_points,
+    uint8_t scenario, const char *semantic, size_t *size);
 uint8_t *test_tessellation_domain_dxbc(unsigned domain, uint32_t points,
     uint8_t location_mask, size_t *size);
 /* Writes the existing fixed signature grammar into a sufficiently sized test

@@ -15,10 +15,11 @@ static void write_u32(uint8_t *bytes, uint32_t value) {
 }
 
 /* Authored token grammar and signatures, with no captured byte array. */
-size_t test_tessellation_hull_signature(uint8_t *bytes, unsigned role, bool inner_first) {
+static size_t write_hull_signature(uint8_t *bytes, unsigned role, bool inner_first,
+                                   const char *point_semantic, bool float3) {
     const bool patch = role == 2;
     const unsigned count = patch ? 4 : 1;
-    const char *semantic = patch ? "SV_TessFactor" : "SV_POSITION";
+    const char *semantic = patch ? "SV_TessFactor" : point_semantic;
     const size_t name_offset = 8 + count * 24;
     const size_t size = name_offset + strlen(semantic) + 1 +
         (patch ? sizeof("SV_InsideTessFactor") : 0);
@@ -33,10 +34,10 @@ size_t test_tessellation_hull_signature(uint8_t *bytes, unsigned role, bool inne
         write_u32(element, (uint32_t)(name_offset +
             (patch && logical == 3 ? strlen(semantic) + 1 : 0)));
         write_u32(element + 4, patch && logical < 3 ? logical : 0);
-        write_u32(element + 8, patch ? (logical < 3 ? 13 : 14) : 1);
+        write_u32(element + 8, patch ? (logical < 3 ? 13 : 14) : float3 ? 0 : 1);
         write_u32(element + 12, 3);
         write_u32(element + 16, patch ? field : 0);
-        write_u32(element + 20, patch ? 0x0e01 : role ? 15 : 0x0f0f);
+        write_u32(element + 20, patch ? 0x0e01 : float3 ? (role ? 0x0807 : 0x0707) : role ? 15 : 0x0f0f);
     }
     memcpy(bytes + name_offset, semantic, strlen(semantic) + 1);
     if (patch)
@@ -45,7 +46,13 @@ size_t test_tessellation_hull_signature(uint8_t *bytes, unsigned role, bool inne
     return size + 8;
 }
 
-uint8_t *test_tessellation_hull_dxbc(uint32_t points, uint32_t output_points, uint8_t scenario, size_t *size) {
+size_t test_tessellation_hull_signature(uint8_t *bytes, unsigned role, bool inner_first) {
+    return write_hull_signature(bytes, role, inner_first, "SV_POSITION", false);
+}
+
+static uint8_t *make_hull_dxbc(uint32_t points, uint32_t output_points, uint8_t scenario,
+                             const char *point_semantic, bool float3, size_t *size) {
+    if (!point_semantic || strlen(point_semantic) > 128 || !size) return NULL;
     const uint32_t base_words[] = {
         INSTRUCTION(113, 1), INSTRUCTION(147, 1) | points << 11,
         INSTRUCTION(148, 1) | output_points << 11,
@@ -74,8 +81,8 @@ uint8_t *test_tessellation_hull_dxbc(uint32_t points, uint32_t output_points, ui
     for (size_t word = 0; word < sizeof(base_words) / 4; ++word) {
         if ((scenario == 4 || scenario == 5) && word == 9) {
             const uint32_t cp_header[] = {INSTRUCTION(114, 1), INSTRUCTION(95, 2), 0x00016000,
-                INSTRUCTION(95, 4), 0x002010f2, points, 0,
-                INSTRUCTION(101, 3), 0x001020f2, 0,
+                INSTRUCTION(95, 4), float3 ? 0x00201072 : 0x002010f2, points, 0,
+                INSTRUCTION(101, 3), float3 ? 0x00102072 : 0x001020f2, 0,
                 INSTRUCTION(104, 2), scenario == 5 ? 2 : 1,
                 INSTRUCTION(54, 4), 0x00100012, 0, 0x00016001};
             memcpy(words + word_count, cp_header, sizeof(cp_header));
@@ -85,7 +92,7 @@ uint8_t *test_tessellation_hull_dxbc(uint32_t points, uint32_t output_points, ui
                 memcpy(words + word_count, chained, sizeof(chained));
                 word_count += sizeof(chained) / 4;
             }
-            const uint32_t cp_body[] = {INSTRUCTION(56, 12), 0x001020f2, 0,
+            const uint32_t cp_body[] = {INSTRUCTION(56, 12), float3 ? 0x00102072 : 0x001020f2, 0,
                 0x00004002, 0x3fa00000, 0x3fa00000, 0x3fa00000, 0x3fa00000,
                 0x00a01e46, 0x0010000a, scenario == 5 ? 1 : 0, 0, INSTRUCTION(62, 1)};
             memcpy(words + word_count, cp_body, sizeof(cp_body));
@@ -171,7 +178,7 @@ uint8_t *test_tessellation_hull_dxbc(uint32_t points, uint32_t output_points, ui
     size_t offset = 48;
     for (unsigned role = 0; role < 3; ++role) {
         write_u32(bytes + 32 + 4 * role, (uint32_t)offset);
-        offset += test_tessellation_hull_signature(bytes + offset, role, scenario == 3);
+        offset += write_hull_signature(bytes + offset, role, scenario == 3, point_semantic, float3);
         offset = (offset + 3) & ~(size_t)3;
     }
     write_u32(bytes + 44, (uint32_t)offset);
@@ -187,6 +194,15 @@ uint8_t *test_tessellation_hull_dxbc(uint32_t points, uint32_t output_points, ui
     uint8_t *result = malloc(*size);
     if (result) memcpy(result, bytes, *size);
     return result;
+}
+
+uint8_t *test_tessellation_hull_dxbc(uint32_t points, uint32_t output_points, uint8_t scenario, size_t *size) {
+    return make_hull_dxbc(points, output_points, scenario, "SV_POSITION", false, size);
+}
+
+uint8_t *test_tessellation_hull_float3_dxbc(uint32_t points, uint32_t output_points,
+    uint8_t scenario, const char *semantic, size_t *size) {
+    return make_hull_dxbc(points, output_points, scenario, semantic, true, size);
 }
 
 

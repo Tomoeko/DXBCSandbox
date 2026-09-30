@@ -118,6 +118,13 @@ set(DXBC_SOURCES
     src/translation/native_texture_yaml_emitter.c
 )
 
+# These pure native-compute models do not invoke UnityShaderCompiler. Keep
+# their planning and comparison contracts available on every host.
+set(PORTABLE_COMPUTE_SOURCES
+    src/compiler/unity_compute_domain.c
+    src/compiler/unity_compute_verifier.c
+)
+
 # This library is the portable, dependency-free product boundary. OraclePack
 # is a deterministic file format and remains here; live Unity invocation does
 # not.
@@ -125,6 +132,7 @@ add_library(dxbc_core STATIC
     ${COMMON_SOURCES}
     ${IO_SOURCES}
     ${DXBC_SOURCES}
+    ${PORTABLE_COMPUTE_SOURCES}
 )
 add_library(DXBCSandbox::core ALIAS dxbc_core)
 target_include_directories(dxbc_core

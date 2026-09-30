@@ -107,7 +107,10 @@ independent scalar-factor fork phases, signature-backed implicit control-point
 passthrough and pure float4 control-point transforms using separate CFG/SSA scopes
 for triangle, quad and isoline domains. Temporary bounds and control-point indices
 retain their own phase authority. Explicit phases also admit output counts no
-larger than their input patches; implicit copies preserve the count. Complete
+larger than their input patches; implicit copies preserve the count. An implicit
+copy also admits one matching custom `float3` field, preserving its actual
+semantic as `pointValue` without inferring a coordinate space. Explicit FLOAT3
+control-point expressions remain unsupported. Complete
 linked vertex/hull/domain/fragment passes admit independently validated empty
 Globals metadata, preserving each stage's declaration and read scope. Custom
 scalar and scalar-array patch constants also admit bounded fork phases and a
@@ -217,6 +220,17 @@ preprocessing mode. It fails on actionable diagnostics or an unequal requested
 complete DXBC target. Without a target it validates the returned container only.
 This is a selected-request observation, not exhaustive keyword coverage, import,
 ClassID 72 production, a logical compute certificate or physical execution.
+
+The portable `unity_compute_domain` helper lazily enumerates supported returned
+keyword families with explicit budgets, preserving global/local scope and kernel
+macros. Ambiguous families and unknown conditional context remain unavailable.
+`unity_compute_verify_kernel` independently decodes a raw native payload and
+compares complete DXBC, declared groups and ordered common resource records.
+Constant-buffer selection remains unsupported at this comparison boundary.
+The manual `compute_domain_probe RELEASED_INPUT COMPUTE_OBJECT_NAME PROJECT_ROOT
+BUILD_PLATFORM COMPILER_PLATFORM [INCLUDES_DIR]` reconstructs from released bytes
+and checks every supported returned state against its decoded target. It exports
+no source or binary files and grants no original-control, import, semantic or runtime certificate.
 
 The import, bundle, and finite-visual gate commands accept an explicit Editor
 path and use isolated projects. Their installed C# bridges live in

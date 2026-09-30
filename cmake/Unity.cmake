@@ -106,6 +106,11 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
     target_link_libraries(unity_uv_helper_probe PRIVATE
         unity_compiler_support dxbc_build_options)
 
+    # Manual target-only HULL inverse and selected-native container comparison.
+    add_executable(hull_source_probe tests/probes/hull_source_probe.c)
+    target_link_libraries(hull_source_probe PRIVATE
+        unity_compiler_support dxbc_build_options)
+
     # Reproducible information-loss witness: two ShaderLab sources produce
     # identical stripped D3D11 bytes but distinct linked GLCore precision.
     # It uses one persistent compiler channel for all requests.
@@ -120,6 +125,11 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
     # Manual native compute preprocessing/compilation observation; no automatic live test.
     add_executable(compute_preprocess_probe tests/probes/compute_preprocess_probe.c)
     target_link_libraries(compute_preprocess_probe PRIVATE
+        unity_compiler_support dxbc_build_options)
+
+    # Bounded complete compute-family observation, run only with explicit inputs.
+    add_executable(compute_domain_probe tests/probes/compute_domain_probe.c)
+    target_link_libraries(compute_domain_probe PRIVATE
         unity_compiler_support dxbc_build_options)
 
     # Live severity witness for the shared `err:` callback: preprocessing

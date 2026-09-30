@@ -131,6 +131,17 @@ enumerate the whole keyword domain, prove memory semantics or validate dispatch
 and readback. These producers do not change any required logical plane or the
 closed certificate scope.
 
+Portable compute domain planning preserves ordered native family choices while
+retaining their global/local scope. Its enumeration order is independent of
+serialized ClassID 72 order; selected-domain evaluation must establish a unique
+kernel/keyword mapping and retain every requested target. Comparison reparses
+raw native payloads, checks full containers and declared groups, and compares
+all common resource fields. Unsupported buffer selection cannot become a
+metadata match. The manual evaluator retains the selected SerializedFile
+metadata and anchored input through its final request and source lease checks.
+These observations leave ClassID 72 production, original compiler controls,
+import, memory semantics and physical execution open.
+
 The optional `--compute-source-candidate` extraction publishes candidate source and
 evidence as distinct members of the existing compute package transaction. It never
 changes the original binary manifest or its source authority. Generation,

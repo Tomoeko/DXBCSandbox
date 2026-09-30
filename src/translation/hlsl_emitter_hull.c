@@ -21,6 +21,7 @@ typedef struct {
     int outer_registers[4], inner_registers[2];
     int phase, control_point_phase, outer_phase, inner_phase;
     bool inner_first;
+    unsigned point_width;
     HLSLInstructionOwners index_transports;
     char names[HULL_SOURCE_NAME_COUNT][96];
 } HullSourcePlan;
@@ -44,6 +45,40 @@ static bool position_signature(const DXBCSignatureElement *element) {
         element->mask == 15 && !element->stream_index && !element->min_precision &&
         !element->interpolation_mode &&
         !dxbc_ascii_strcasecmp(dxbc_signature_semantic_name(element), "SV_POSITION");
+}
+
+static bool point_signatures(const USILProgram *program, HullSourcePlan *plan,
+                             bool explicit_phase) {
+    const DXBCSignatureElement *input = program->inputs, *output = program->outputs;
+    if (position_signature(input) && position_signature(output) &&
+        !strcmp(dxbc_signature_semantic_name(input), dxbc_signature_semantic_name(output)) &&
+        input->rw_mask == 15 && !output->rw_mask) {
+        plan->point_width = 4;
+        return true;
+    }
+    /* An absent control-point phase copies the complete current signature.
+     * A custom FLOAT3 field has no inferred position or coordinate space.
+     * Explicit phase expressions retain their separate FLOAT4 contract. */
+    if (explicit_phase) return false;
+    const char *semantic = dxbc_signature_semantic_name(input);
+    if (!hlsl_source_identifier_valid(semantic) ||
+        ((semantic[0] == 'S' || semantic[0] == 's') &&
+         (semantic[1] == 'V' || semantic[1] == 'v') && semantic[2] == '_') ||
+        strcmp(semantic, dxbc_signature_semantic_name(output))) return false;
+    const size_t length = strlen(semantic);
+    /* HLSL splits a trailing decimal suffix into the semantic index. The
+     * scoped signature below owns index zero, not a rewritten suffix. */
+    if (semantic[length - 1] >= '0' && semantic[length - 1] <= '9') return false;
+    const DXBCSignatureElement *elements[] = {input, output};
+    for (unsigned index = 0; index < 2; ++index) {
+        const DXBCSignatureElement *element = elements[index];
+        if (element->register_id || element->semantic_index || element->system_value ||
+            element->component_type != 3 || element->mask != 7 ||
+            element->stream_index || element->min_precision || element->interpolation_mode ||
+            element->rw_mask != (index ? 8 : 7)) return false;
+    }
+    plan->point_width = 3;
+    return true;
 }
 
 bool hlsl_hull_phase_return_owned(const USILProgram *program, int instruction) {
@@ -194,9 +229,7 @@ static bool hull_contract(const USILProgram *program, HullSourcePlan *plan) {
         !program->tessellation.phases || program->input_count != 1 || program->output_count != 1 ||
         program->patch_constant_count != (int)factors || program->input_alloc < 1 || program->output_alloc < 1 ||
         program->patch_constant_alloc < (int)factors || !program->inputs || !program->outputs || !program->patch_constants ||
-        !position_signature(program->inputs) || !position_signature(program->outputs) ||
-        strcmp(dxbc_signature_semantic_name(program->inputs), dxbc_signature_semantic_name(program->outputs)) ||
-        program->inputs[0].rw_mask != 15 || program->outputs[0].rw_mask != 0 ||
+        !point_signatures(program, plan, control_point) ||
         program->signature_declaration_count != (int)(factors + indexed_groups + (control_point ? 3 : 0)) ||
         program->signature_declaration_alloc < program->signature_declaration_count ||
         !program->signature_declarations || program->cbuffer_count || program->texture_count ||
@@ -465,7 +498,8 @@ static bool allocate_names(HLSLEmitterContext *ctx, HullSourcePlan *plan) {
     ctx->reserved_preprocessor_identifiers = reserved;
     bool success = true;
     for (int name = 0; name < HULL_SOURCE_NAME_COUNT; ++name) {
-        if (!hlsl_allocate_interface_name(ctx, bases[name], plan->names[name])) { success = false; break; }
+        const char *base = name == POINT_FIELD && plan->point_width == 3 ? "pointValue" : bases[name];
+        if (!hlsl_allocate_interface_name(ctx, base, plan->names[name])) { success = false; break; }
         reserved[ctx->reserved_preprocessor_identifier_count++] = plan->names[name];
     }
     ctx->reserved_preprocessor_identifiers = original;
@@ -515,7 +549,7 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
     hlsl_expression_source_map_begin(ctx);
     StringBuilder *sb = ctx->sb;
     if (!begin_unit(ctx, 0, HLSL_SOURCE_UNIT_CONFIGURATION)) goto finish;
-    sb_appendf(sb, "struct %s {\n    float4 %s : %s;\n};\n\n", plan.names[POINT_TYPE], plan.names[POINT_FIELD],
+    sb_appendf(sb, "struct %s {\n    float%u %s : %s;\n};\n\n", plan.names[POINT_TYPE], plan.point_width, plan.names[POINT_FIELD],
         dxbc_signature_semantic_name(ctx->program->inputs));
     hlsl_source_quality_emission(ctx, 0, false, -1);
     sb_appendf(sb, "struct %s {\n", plan.names[FACTOR_TYPE]);

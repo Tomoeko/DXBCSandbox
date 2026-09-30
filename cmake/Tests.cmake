@@ -90,6 +90,10 @@ if(BUILD_TESTING)
         tests/test_compute_shader_object_units.c compute_shader_object_units)
     dxbc_add_core_test(test_unity_compute_binary_units
         tests/test_unity_compute_binary_units.c unity_compute_binary_units)
+    dxbc_add_core_test(test_unity_compute_domain_units
+        tests/test_unity_compute_domain_units.c unity_compute_domain_units)
+    dxbc_add_core_test(test_unity_compute_verifier_units
+        tests/test_unity_compute_verifier_units.c unity_compute_verifier_units)
     dxbc_add_core_test(test_compute_usil_units
         tests/test_compute_usil_units.c compute_usil_units)
     dxbc_add_core_test(test_compute_source_candidate_units

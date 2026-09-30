@@ -717,9 +717,98 @@ static bool owned_empty_hull_metadata(void) {
     return true;
 }
 
+static bool implicit_float3_points(void) {
+    static const char *const semantics[] = {"INTERNALTESSPOS", "POINTVALUE", "arbitraryValue"};
+    static const uint8_t scenarios[] = {0, 1, 3};
+    const unsigned counts[] = {1, 3, 32};
+    for (size_t test = 0; test < sizeof(semantics) / sizeof(semantics[0]); ++test) {
+        size_t size = 0;
+        uint8_t *bytes = test_tessellation_hull_float3_dxbc(counts[test], counts[test],
+            scenarios[test], semantics[test], &size);
+        HullFixture fixture;
+        CHECK(hull_fixture_parse(&fixture, bytes, size));
+        CHECK(usil_signature_authority_is_valid(&fixture.program));
+        CHECK(fixture.program.inputs[0].mask == 7 && fixture.program.inputs[0].rw_mask == 7 &&
+              fixture.program.outputs[0].mask == 7 && fixture.program.outputs[0].rw_mask == 8);
+        CHECK(hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+        CHECK(!hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_RECOMPILE));
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        HLSLSourceQualityResult quality;
+        HLSLExpressionSourceMap map;
+        HullLedger ledger = {.program = &fixture.program};
+        const char *reserved[] = {"pointValue", "HullPoint", "patchConstants"};
+        options.reserved_preprocessor_identifiers = reserved;
+        options.reserved_preprocessor_identifier_count = 3;
+        options.source_quality = &quality;
+        options.expression_source_map = &map;
+        options.source_quality_observer = observe_hull;
+        options.source_quality_observer_context = &ledger;
+        options.source_quality_pass_index = 4;
+        options.source_quality_entry_point_index = 3;
+        StringBuilder source;
+        sb_init(&source);
+        CHECK(hlsl_emit_with_options(&fixture.program, &source, NULL, NULL, NULL, &options));
+        char expected[256];
+        snprintf(expected, sizeof(expected), "float3 pointValue_1 : %s;", semantics[test]);
+        CHECK(strstr(source.buf, expected));
+        CHECK(strstr(source.buf, "return patch[pointIndex];"));
+        CHECK(!strstr(source.buf, "clipPosition") && !strstr(source.buf, "float4"));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.counts.unknown_provenance &&
+              !quality.counts.incomplete_units && quality.counts.inspected_units == 3);
+        CHECK(!ledger.bad_owner && ledger.units == 7 && ledger.expressions);
+        CHECK(hlsl_expression_source_map_matches(&map, &fixture.program, source.buf));
+        sb_free(&source);
+        const char *semantic_reserved[] = {semantics[test]};
+        options.reserved_preprocessor_identifiers = semantic_reserved;
+        options.reserved_preprocessor_identifier_count = 1;
+        sb_init(&source);
+        CHECK(!hlsl_emit_with_options(&fixture.program, &source, NULL, NULL, NULL, &options));
+        CHECK(quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        sb_free(&source);
+        fixture.program.tessellation.output_control_point_count = counts[test] == 32 ? 31 : counts[test] + 1;
+        CHECK(source_rejected(&fixture.program));
+        hull_fixture_dispose(&fixture);
+    }
+    /* An independently decoded custom FLOAT3 CP arithmetic phase remains
+     * outside the existing FLOAT4 expression producer. */
+    size_t size = 0;
+    uint8_t *bytes = test_tessellation_hull_float3_dxbc(3, 3, 4, "POINTVALUE", &size);
+    HullFixture fixture;
+    CHECK(hull_fixture_parse(&fixture, bytes, size));
+    CHECK(usil_signature_authority_is_valid(&fixture.program));
+    CHECK(fixture.program.tessellation.phases[0].kind == DXBC_HULL_PHASE_CONTROL_POINT);
+    CHECK(source_rejected(&fixture.program));
+    hull_fixture_dispose(&fixture);
+    static const char *const rejected[] = {"point", "POINTVALUE1"};
+    for (size_t test = 0; test < sizeof(rejected) / sizeof(rejected[0]); ++test) {
+        size = 0;
+        bytes = test_tessellation_hull_float3_dxbc(3, 3, 0, rejected[test], &size);
+        CHECK(hull_fixture_parse(&fixture, bytes, size));
+        CHECK(source_rejected(&fixture.program));
+        hull_fixture_dispose(&fixture);
+    }
+    /* Invalid system-semantic encodings and nonidentifier spellings are
+     * rejected by the shared signature decoder before source admission. */
+    static const char *const invalid[] = {"SV_Position", "sv_Custom", "bad-name"};
+    for (size_t test = 0; test < sizeof(invalid) / sizeof(invalid[0]); ++test) {
+        size = 0;
+        bytes = test_tessellation_hull_float3_dxbc(3, 3, 0, invalid[test], &size);
+        CHECK(bytes);
+        DXBCDocument document;
+        DXBCContainer semantic = {0};
+        dxbc_document_init(&document);
+        CHECK(dxbc_document_parse(&document, bytes, size, NULL));
+        free(bytes);
+        CHECK(!dxbc_document_decode_semantic(&document, &semantic));
+        dxbc_free(&semantic);
+        dxbc_document_free(&document);
+    }
+    return true;
+}
+
 int main(void) {
     return natural_hull_source() && arithmetic_and_phase_ownership() &&
         malformed_contracts() && reordered_phase_roles() && scoped_cfg_ownership() &&
         other_domains_and_control_point_counts() && explicit_control_point_phase() &&
-        differing_control_point_counts() && owned_empty_hull_metadata() ? 0 : 1;
+        differing_control_point_counts() && owned_empty_hull_metadata() && implicit_float3_points() ? 0 : 1;
 }
