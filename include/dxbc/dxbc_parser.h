@@ -170,6 +170,13 @@ typedef struct {
     uint32_t token;
     uint32_t file_offset;
     uint32_t byte_length;
+    /* Token instruction identity, including declarations and CUSTOMDATA.
+     * ICB presentation continuation rows retain the same raw owner; they are
+     * not additional token instructions. Hand-built semantic IR may omit this
+     * authority, but dxbc_parse always supplies it. */
+    uint32_t raw_instruction_index;
+    bool has_raw_instruction_index;
+    bool is_customdata_continuation;
     int structured_stride;
     bool has_texel_offset;
     int8_t texel_offsets[3];

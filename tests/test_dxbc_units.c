@@ -869,9 +869,18 @@ static int verify_dynamic_capacity_boundaries(void) {
     CHECK(container.icb_value_count == (int)icb_dword_count);
     CHECK(container.icb_value_alloc >= container.icb_value_count);
     CHECK(container.icb_values[1027] == 1027u);
+    CHECK(container.instruction_count == 258);
+    for (int row = 0; row < 257; ++row) {
+        CHECK(container.instructions[row].has_raw_instruction_index);
+        CHECK(container.instructions[row].raw_instruction_index == 0u);
+        CHECK(container.instructions[row].is_customdata_continuation == (row != 0));
+    }
+    CHECK(container.instructions[257].raw_instruction_index == 1u &&
+          !container.instructions[257].is_customdata_continuation);
     CHECK(usil_translate(&program, &container));
     CHECK(program.icb_value_count == (int)icb_dword_count);
     CHECK(program.icb_values[1027] == 1027u);
+    CHECK(program.instruction_count == 1 && program.instructions[0].source_instruction_index == 1u);
     StringBuilder icb_hlsl;
     sb_init(&icb_hlsl);
     CHECK(hlsl_emit(&program, &icb_hlsl, NULL, NULL, NULL));
@@ -3098,6 +3107,12 @@ static int verify_signature_declaration_contract(void) {
     declaration_operand->destination_mask = 0x10u;
     declaration_operand->swizzle_mode = 0u;
     instructions[1].opcode = 62u;
+    /* This relational fixture explicitly models parsed authority. Its raw
+     * owners are part of that authority, independent of presentation text. */
+    for (unsigned index = 0; index < 2u; ++index) {
+        instructions[index].has_raw_instruction_index = true;
+        instructions[index].raw_instruction_index = index;
+    }
 
     DXBCContainer container;
     memset(&container, 0, sizeof(container));

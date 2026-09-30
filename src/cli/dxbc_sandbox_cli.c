@@ -69,6 +69,7 @@ typedef struct {
     bool show_sources;
     bool export_materials;
     bool flat_shaders;
+    bool compute_source_candidate;
     CliShaderLabLiftOptions lift;
     bool lift_limits_set;
     const char* output_directory;
@@ -116,6 +117,8 @@ static void print_usage(FILE* output, const char* program) {
         "                     (default: SerializedFile digest subfolders)\n"
         "  --high-level       verify bounded high-level lifts; keep verified\n"
         "                     low-level fallback (optional macOS compiler build)\n"
+        "  --compute-source-candidate  also emit bounded, unverified .compute\n"
+        "                     candidates (extract --kind compute only)\n"
         "  --compile-profile FILE  captured Unity profile required for lifting\n"
         "  --project-root DIR      compiler project root (default: .)\n"
         "  --includes DIR          additional compiler include authority\n"
@@ -332,6 +335,8 @@ static bool parse_cli(int argc, char** argv, CliOptions* options,
             options->show_sources = true;
         } else if (!positional_only && strcmp(argument, "--high-level") == 0) {
             options->lift.enabled = true;
+        } else if (!positional_only && strcmp(argument, "--compute-source-candidate") == 0) {
+            options->compute_source_candidate = true;
         } else if (!positional_only && strcmp(argument, "--compile-profile") == 0) {
             if (!option_value(argc, argv, &i, argument, &options->lift.profile_path)) return false;
         } else if (!positional_only && strcmp(argument, "--project-root") == 0) {
@@ -506,6 +511,12 @@ static bool parse_cli(int argc, char** argv, CliOptions* options,
     if (options->command == CLI_COMMAND_LIST && options->flat_shaders) {
         fprintf(stderr,
                 "Error: --flat-shaders is valid only with extract.\n");
+        return false;
+    }
+    if (options->compute_source_candidate &&
+        (options->command != CLI_COMMAND_EXTRACT || options->shader_kind != CLI_SHADER_KIND_COMPUTE ||
+         options->lift.enabled || options->export_materials || options->flat_shaders)) {
+        fputs("Error: --compute-source-candidate requires extract --kind compute and cannot combine with graphics options.\n", stderr);
         return false;
     }
     if (options->lift.enabled) {
@@ -2713,9 +2724,13 @@ static bool append_compute_publication_json(
         sb_json_string(output, artifact->filename);
         sb_appendf(output,
                    ",\"is_manifest\":%s,"
+                   "\"is_compute_source_candidate\":%s,"
+                   "\"is_compute_source_candidate_evidence\":%s,"
                    "\"preflight_attempted\":%s,"
                    "\"preflight_status\":",
                    artifact->is_manifest ? "true" : "false",
+                   artifact->is_compute_source_candidate ? "true" : "false",
+                   artifact->is_compute_source_candidate_evidence ? "true" : "false",
                    artifact->preflight_attempted ? "true" : "false");
         sb_json_string(output, artifact->preflight_attempted
             ? common_output_preflight_status_name(
@@ -2734,6 +2749,77 @@ static bool append_compute_publication_json(
     }
     sb_append(output, "]}");
     return sb_ok(output);
+}
+
+static void append_compute_source_candidate_json(StringBuilder *output,
+                                                  const ShaderBatchRecordResult *record) {
+    sb_append(output, ",\"compute_source_candidate\":");
+    if (!record->compute_source_candidate_attempted) {
+        sb_append(output, "null");
+        return;
+    }
+    const ComputeSourceDiagnostic *diagnostic = &record->compute_source_candidate_diagnostic;
+    const bool generated = record->compute_source_candidate_generated;
+    const bool published = generated && record->publication_authorized;
+    sb_appendf(output, "{\"requested\":true,\"generated\":%s,\"published\":%s,\"status\":",
+               generated ? "true" : "false", published ? "true" : "false");
+    sb_json_string(output, compute_source_status_name(record->compute_source_candidate_status));
+    sb_appendf(output,
+        ",\"requested_counts_known\":%s,\"requested_kernels\":%zu,\"requested_variants\":%zu,"
+        "\"examined_variants\":%zu,\"represented_variants\":%zu,"
+        "\"compilation\":\"not-run\",\"exactness\":\"not-run\","
+        "\"semantic_certificate\":\"unavailable\",\"import\":\"not-run\",\"native\":\"not-run\","
+        "\"source_quality\":",
+        diagnostic->requested_counts_known ? "true" : "false", diagnostic->requested_kernels,
+        diagnostic->requested_variants, diagnostic->examined_variants, diagnostic->represented_variants);
+    if (generated)
+        hlsl_source_quality_append_json(&record->compute_source_candidate_quality, output);
+    else
+        sb_append(output, "null");
+    sb_append(output, ",\"modeled_input_sha256\":");
+    if (generated)
+        sb_hex_bytes(output, record->compute_source_candidate_modeled_input_sha256,
+                     COMMON_SHA256_DIGEST_SIZE);
+    else
+        sb_append(output, "null");
+    sb_append(output, ",\"source_sha256\":");
+    if (generated)
+        sb_hex_bytes(output, record->compute_source_candidate_source_sha256,
+                     COMMON_SHA256_DIGEST_SIZE);
+    else
+        sb_append(output, "null");
+    sb_append(output, ",\"output\":");
+    sb_json_string(output, published ? record->compute_source_candidate_path : NULL);
+    sb_append(output, ",\"evidence_output\":");
+    sb_json_string(output, published ? record->compute_source_candidate_evidence_path : NULL);
+    sb_append_char(output, '}');
+}
+
+static size_t unpublished_compute_source_candidates(const ShaderBatchResult *batch) {
+    size_t unavailable = 0;
+    for (size_t index = 0; index < batch->record_count; ++index) {
+        const ShaderBatchRecordResult *record = &batch->records[index];
+        if (record->compute_source_candidate_attempted &&
+            (!record->compute_source_candidate_generated || !record->publication_authorized))
+            ++unavailable;
+    }
+    return unavailable;
+}
+
+static void append_compute_source_candidate_table(StringBuilder *output,
+                                                   const ShaderBatchResult *batch) {
+    size_t requested = 0, generated = 0, published = 0;
+    for (size_t index = 0; index < batch->record_count; ++index) {
+        const ShaderBatchRecordResult *record = &batch->records[index];
+        if (!record->compute_source_candidate_attempted) continue;
+        ++requested;
+        generated += record->compute_source_candidate_generated;
+        published += record->compute_source_candidate_generated && record->publication_authorized;
+    }
+    if (requested)
+        sb_appendf(output, "Compute source candidates: requested=%zu generated=%zu published=%zu "
+                   "unavailable=%zu; compilation, import and native checks not run.\n",
+                   requested, generated, published, unpublished_compute_source_candidates(batch));
 }
 
 typedef struct {
@@ -2843,7 +2929,7 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                                       : "uncertified-shaderlab-candidate"));
     sb_append(output,
               "{\"report_schema\":\"dxbc-sandbox-report\","
-              "\"report_version\":7,\"command\":\"extract\","
+              "\"report_version\":8,\"command\":\"extract\","
               "\"selection_kind\":");
     sb_json_string(output, cli_shader_kind_name(selection_kind));
     sb_append(output,
@@ -2955,6 +3041,7 @@ static bool render_extract_json(const ShaderCatalog* catalog,
         sb_append(output, ",\"compute_source_authority\":");
         sb_json_string(output, compute_shader_source_authority_status_name(
                                    result->compute_source_authority_status));
+        append_compute_source_candidate_json(output, result);
         sb_append(output, ",\"input_status\":");
         sb_json_string(output,
                        unity_input_status_name(result->input_status));
@@ -3178,8 +3265,7 @@ static bool render_extract_table(const ShaderCatalog* catalog,
         sb_append(output,
             "Artifacts: exact serialized compute manifests and compiled "
             "program bytes. Embedded DXBC is also extracted when present; "
-            ".compute source is not emitted without a certified declaration "
-            "inverse.\n");
+            "Optional .compute candidates are separate unverified artifacts.\n");
     } else if (selection_kind == CLI_SHADER_KIND_GRAPHICS) {
         sb_append(output,
             "Artifacts: uncertified ShaderLab candidates. Successful "
@@ -3192,6 +3278,7 @@ static bool render_extract_table(const ShaderCatalog* catalog,
             "candidates; compute outputs preserve exact serialized binaries "
             "and manifests while .compute source remains fail-closed.\n");
     }
+    append_compute_source_candidate_table(output, batch);
     sb_appendf(output, "Registry: %s  %s\n",
                registry_digest, registry_path);
     if (!shader_catalog_is_complete(catalog)) {
@@ -3445,6 +3532,7 @@ static int dxbc_sandbox_main(int argc, char** argv) {
         shader_batch_options_default(&batch_options);
         batch_options.emit_shader_meta = options.export_materials;
         batch_options.flat_graphics_output = options.flat_shaders;
+        batch_options.emit_compute_source_candidate = options.compute_source_candidate;
         batch_options.defer_source_snapshot_close = false;
         cli_shaderlab_lift_attach(lift, &batch_options);
         ShaderBatchStatus batch_status = shader_batch_extract_ex(
@@ -3516,6 +3604,7 @@ static int dxbc_sandbox_main(int argc, char** argv) {
             if (!rendered || catalog.issue_count != 0U ||
                 batch.stats.selected == 0U ||
                 !shader_batch_is_complete(&batch) ||
+                (options.compute_source_candidate && unpublished_compute_source_candidates(&batch)) ||
                 (options.export_materials &&
                  (texture_status != NATIVE_TEXTURE_BATCH_OK ||
                   !texture_batch_render_complete ||

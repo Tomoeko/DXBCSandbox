@@ -1263,7 +1263,7 @@ static uint8_t compute_system_value_flag(DXBCOperandType type) {
 }
 
 static bool geometry_effect_matches(
-    const DXBCInstruction* source, size_t semantic_instruction_index,
+    const DXBCInstruction* source, uint32_t source_instruction_index,
     const DXBCStageContract* contract, size_t* effect_index,
     USILInstruction* destination) {
     const bool is_effect = source->opcode == 9u || source->opcode == 19u ||
@@ -1281,7 +1281,7 @@ static bool geometry_effect_matches(
             : USIL_GEOMETRY_EFFECT_RESTART_STRIP;
     const bool expected_explicit =
         source->opcode == 117u || source->opcode == 118u;
-    if (effect->instruction_index != semantic_instruction_index ||
+    if (effect->instruction_index != source_instruction_index ||
         effect->kind !=
             (expected_kind == USIL_GEOMETRY_EFFECT_APPEND
                  ? DXBC_GEOMETRY_EFFECT_APPEND
@@ -1309,6 +1309,47 @@ static bool geometry_effect_matches(
     destination->geometry_stream_explicit = expected_explicit;
     ++*effect_index;
     return true;
+}
+
+/* The semantic decoder keeps one presentation record per ICB row. Validate
+ * the repeated owner independently of that array position before using raw
+ * contract indices. Missing or altered authority in parsed input must not
+ * silently fall back to presentation indices. */
+static bool raw_instruction_authority_valid(
+    const DXBCContainer* container, const DXBCStageContract* contract) {
+    if (!container->parsed_signature_authority) return true;
+    uint32_t next_raw_index = 0u;
+    uint32_t remaining_icb_rows = 0u;
+    const DXBCInstruction* icb_owner = NULL;
+    for (int index = 0; index < container->instruction_count; ++index) {
+        const DXBCInstruction* instruction = &container->instructions[index];
+        if (!instruction->has_raw_instruction_index) return false;
+        if (instruction->is_customdata_continuation) {
+            if (!remaining_icb_rows || !icb_owner || instruction->opcode != 53u ||
+                instruction->operand_count != 0 ||
+                instruction->raw_instruction_index != icb_owner->raw_instruction_index ||
+                instruction->token != icb_owner->token ||
+                instruction->file_offset != icb_owner->file_offset ||
+                instruction->byte_length != icb_owner->byte_length) return false;
+            --remaining_icb_rows;
+            continue;
+        }
+        if (remaining_icb_rows || instruction->raw_instruction_index != next_raw_index)
+            return false;
+        ++next_raw_index;
+        icb_owner = NULL;
+        if (instruction->opcode == 53u) {
+            if (instruction->operand_count != 0 || instruction->byte_length < 24u ||
+                (instruction->byte_length - 8u) % 16u != 0u ||
+                ((instruction->token >> 11u) & UINT32_C(0x001fffff)) != 3u)
+                return false;
+            remaining_icb_rows = (instruction->byte_length - 8u) / 16u - 1u;
+            icb_owner = instruction;
+        }
+    }
+    return remaining_icb_rows == 0u &&
+        (!contract || (contract->first_instruction_index == 0u &&
+                       contract->end_instruction_index == next_raw_index));
 }
 
 static bool usil_translate_internal(
@@ -1345,6 +1386,10 @@ static bool usil_translate_internal(
         (container->icb_value_alloc == 0) !=
             (container->icb_values == NULL)) {
         LOG_ERROR("Invalid DXBC container passed to USIL translation");
+        return false;
+    }
+    if (!raw_instruction_authority_valid(container, stage_contract)) {
+        LOG_ERROR("Invalid raw instruction identity in DXBC semantic projection");
         return false;
     }
     if (!resource_declaration_list_valid(container->resources,
@@ -1486,6 +1531,8 @@ static bool usil_translate_internal(
     // Parse declarations and instructions
     for (int i = 0; i < container->instruction_count; i++) {
         const DXBCInstruction* src_inst = &container->instructions[i];
+        const uint32_t source_index = src_inst->has_raw_instruction_index
+            ? src_inst->raw_instruction_index : (uint32_t)i;
         if (src_inst->operand_count < 0 ||
             src_inst->operand_count > DXBC_MAX_OPERANDS) {
             LOG_ERROR("DXBC opcode %u has invalid operand count %d",
@@ -1509,7 +1556,7 @@ static bool usil_translate_internal(
                           : DXBC_HULL_PHASE_JOIN;
             USILHullPhase* phase =
                 &program->tessellation.phases[hull_phase_index];
-            if (phase->kind != kind ||
+            if (phase->kind != kind || phase->marker_source_instruction_index != source_index ||
                 phase->first_instruction_index != -1) {
                 LOG_ERROR("Hull phase kind/order disagrees with raw contract");
                 goto fail;
@@ -1531,7 +1578,7 @@ static bool usil_translate_internal(
             case 155: /* DCL_THREAD_GROUP */
             case 159: /* DCL_TGSM_RAW */
             case 160: /* DCL_TGSM_STRUCTURED */
-                if (!compute_declaration_matches(src_inst, (uint32_t)i,
+                if (!compute_declaration_matches(src_inst, source_index,
                                                    stage_contract, &seen_thread_group,
                                                    &compute_shared_memory_index))
                     goto declaration_fail;
@@ -1622,7 +1669,7 @@ static bool usil_translate_internal(
                     goto fail;
                 }
                 range->register_count = register_count;
-                range->source_instruction_index = (uint32_t)i;
+                range->source_instruction_index = source_index;
                 range->hull_phase_index = (int)(hull_phase_index - 1u);
                 program->index_range_count++;
                 break;
@@ -1656,7 +1703,7 @@ static bool usil_translate_internal(
             case 102: /* DCL_OUTPUT_SGV */
             case 103: /* DCL_OUTPUT_SIV */
                 if (!append_signature_declaration(
-                        program, src_inst, (uint32_t)i,
+                        program, src_inst, source_index,
                         active_signature_stream)) {
                     goto declaration_fail;
                 }
@@ -1749,13 +1796,13 @@ declaration_fail:
         }
         dest_inst->saturate = src_inst->saturate;
         dest_inst->condition_test = src_inst->condition_test;
-        dest_inst->source_instruction_index = (uint32_t)i;
-        if (!compute_barrier_matches(src_inst, (uint32_t)i, stage_contract,
+        dest_inst->source_instruction_index = source_index;
+        if (!compute_barrier_matches(src_inst, source_index, stage_contract,
                                       &compute_barrier_index, dest_inst)) {
             LOG_ERROR("Compute barrier disagrees with raw DXBC contract at instruction %d", i);
             goto fail;
         }
-        if (!geometry_effect_matches(src_inst, (size_t)i, stage_contract,
+        if (!geometry_effect_matches(src_inst, source_index, stage_contract,
                                      &geometry_effect_index, dest_inst)) {
             LOG_ERROR("Geometry stream effect disagrees with raw DXBC contract "
                       "at semantic instruction %d", i);

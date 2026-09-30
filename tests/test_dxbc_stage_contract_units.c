@@ -609,12 +609,188 @@ static bool verify_domain_contract(void) {
     return true;
 }
 
+/* Two presentation rows have one raw token owner. Stage contracts and USIL
+ * provenance must continue to use raw indices after this declaration. */
+#define TWO_ROW_ICB \
+    (53u | (3u << 11u)), 10u, \
+    UINT32_C(0x80000000), UINT32_C(0x7fc12345), 2u, 3u, 4u, 5u, 6u, 7u
+
+static bool parse_stage_words(const uint32_t* words, size_t word_count,
+                              uint32_t version, DXBCDocument* document,
+                              DXBCContainer* semantic, DXBCStageContract* contract) {
+    uint8_t bytes[PROGRAM_CAPACITY];
+    size_t size = 0;
+    DXBCDocumentDiagnostic document_diagnostic;
+    DXBCStageContractDiagnostic contract_diagnostic;
+    return make_program(bytes, version, words, word_count, &size) &&
+        dxbc_document_parse(document, bytes, size, &document_diagnostic) &&
+        dxbc_document_decode_semantic(document, semantic) &&
+        dxbc_stage_contract_decode(document, semantic, contract, &contract_diagnostic);
+}
+
+static bool rejected_projection_is_empty(DXBCContainer* semantic,
+                                          DXBCStageContract* contract) {
+    USILProgram rejected = {0};
+    CHECK(!usil_translate_with_stage_contract(&rejected, semantic, contract));
+    CHECK(rejected.instructions == NULL && rejected.instruction_count == 0);
+    CHECK(rejected.signature_declarations == NULL && rejected.icb_values == NULL);
+    CHECK(rejected.compute.shared_memory == NULL && rejected.tessellation.phases == NULL);
+    usil_free(&rejected);
+    return true;
+}
+
+static bool verify_icb_raw_geometry_owners(void) {
+    const uint32_t words[] = {
+        TWO_ROW_ICB,
+        instruction1(93, DXBC_INPUT_PRIMITIVE_POINT),
+        instruction1(92, DXBC_OUTPUT_TOPOLOGY_POINT_LIST),
+        instruction2(94, 0), 1u,
+        instruction1(19, 0), instruction1(9, 0), instruction1(62, 0),
+    };
+    DXBCDocument document;
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract;
+    USILProgram program = {0};
+    dxbc_document_init(&document);
+    dxbc_stage_contract_init(&contract);
+    CHECK(parse_stage_words(words, sizeof(words) / sizeof(words[0]),
+                            UINT32_C(0x00020050), &document, &semantic, &contract));
+    CHECK(document.instruction_count == 7u && semantic.instruction_count == 8);
+    CHECK(semantic.instructions[0].has_raw_instruction_index &&
+          semantic.instructions[0].raw_instruction_index == 0u &&
+          !semantic.instructions[0].is_customdata_continuation);
+    CHECK(semantic.instructions[1].has_raw_instruction_index &&
+          semantic.instructions[1].raw_instruction_index == 0u &&
+          semantic.instructions[1].is_customdata_continuation);
+    CHECK(semantic.instructions[0].file_offset == semantic.instructions[1].file_offset &&
+          semantic.instructions[0].byte_length == semantic.instructions[1].byte_length);
+    CHECK(semantic.instructions[2].raw_instruction_index == 1u);
+    CHECK(contract.geometry_effects[0].instruction_index == 4u &&
+          contract.geometry_effects[1].instruction_index == 5u);
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    CHECK(program.icb_value_count == 8 && program.icb_values[0] == UINT32_C(0x80000000) &&
+          program.icb_values[1] == UINT32_C(0x7fc12345));
+    CHECK(program.instruction_count == 3 &&
+          program.instructions[0].opcode == USIL_OP_GEOMETRY_APPEND &&
+          program.instructions[0].source_instruction_index == 4u &&
+          program.instructions[1].source_instruction_index == 5u &&
+          program.instructions[2].source_instruction_index == 6u);
+    usil_free(&program);
+
+    /* A contract using presentation indices is still wrong, even if that
+     * index happens to identify a different real token instruction. */
+    contract.geometry_effects[0].instruction_index = 5u;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    contract.geometry_effects[0].instruction_index = 4u;
+    semantic.instructions[5].raw_instruction_index = 5u;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.instructions[5].raw_instruction_index = 4u;
+    semantic.instructions[5].has_raw_instruction_index = false;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.instructions[5].has_raw_instruction_index = true;
+    semantic.instructions[1].raw_instruction_index = 1u;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.instructions[1].raw_instruction_index = 0u;
+    semantic.instructions[1].is_customdata_continuation = false;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.instructions[1].is_customdata_continuation = true;
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    usil_free(&program);
+    dxbc_stage_contract_free(&contract);
+    dxbc_free(&semantic);
+    dxbc_document_free(&document);
+    return true;
+}
+
+static bool verify_icb_raw_compute_owners(void) {
+    const uint32_t words[] = {
+        TWO_ROW_ICB,
+        UINT32_C(0x0400009b), 8u, 4u, 1u, /* thread group */
+        UINT32_C(0x0400009f), UINT32_C(0x0011f000), 0u, 64u, /* TGSM */
+        instruction2(95, 0), UINT32_C(0x00020012), /* dispatch id.x */
+        instruction1(190, 3), instruction1(62, 0),
+    };
+    DXBCDocument document;
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract;
+    USILProgram program = {0};
+    dxbc_document_init(&document);
+    dxbc_stage_contract_init(&contract);
+    CHECK(parse_stage_words(words, sizeof(words) / sizeof(words[0]),
+                            UINT32_C(0x00050050), &document, &semantic, &contract));
+    CHECK(document.instruction_count == 6u && semantic.instruction_count == 7);
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    CHECK(program.compute.declaration_source_instruction_index == 1u &&
+          program.compute.shared_memory_count == 1u &&
+          program.compute.shared_memory[0].instruction_index == 2u);
+    CHECK(program.signature_declaration_count == 1 &&
+          program.signature_declarations[0].source_instruction_index == 3u);
+    CHECK(program.instruction_count == 2 && program.instructions[0].opcode == USIL_OP_SYNC &&
+          program.instructions[0].source_instruction_index == 4u &&
+          program.instructions[1].source_instruction_index == 5u);
+    usil_free(&program);
+    ++contract.thread_group_declaration_instruction_index;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    --contract.thread_group_declaration_instruction_index;
+    ++contract.thread_group_shared_memory[0].instruction_index;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    --contract.thread_group_shared_memory[0].instruction_index;
+    ++contract.memory_barriers[0].instruction_index;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    --contract.memory_barriers[0].instruction_index;
+    dxbc_stage_contract_free(&contract);
+    dxbc_free(&semantic);
+    dxbc_document_free(&document);
+    return true;
+}
+
+static bool verify_icb_raw_hull_owners(void) {
+    const uint32_t words[] = {
+        instruction1(113, 0), TWO_ROW_ICB,
+        instruction1(147, 3), instruction1(148, 3),
+        instruction1(149, 2), instruction1(150, 3), instruction1(151, 3),
+        instruction1(115, 0), instruction2(153, 0), 3u,
+        UINT32_C(0x0400005b), UINT32_C(0x00102012), 0u, 3u,
+        instruction1(62, 0), instruction1(115, 0), instruction1(62, 0),
+    };
+    DXBCDocument document;
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract;
+    USILProgram program = {0};
+    dxbc_document_init(&document);
+    dxbc_stage_contract_init(&contract);
+    CHECK(parse_stage_words(words, sizeof(words) / sizeof(words[0]),
+                            UINT32_C(0x00030050), &document, &semantic, &contract));
+    CHECK(document.instruction_count == 13u && semantic.instruction_count == 14);
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    CHECK(program.tessellation.phase_count == 2u &&
+          program.tessellation.phases[0].marker_source_instruction_index == 7u &&
+          program.tessellation.phases[0].first_source_instruction_index == 8u &&
+          program.tessellation.phases[1].marker_source_instruction_index == 11u);
+    CHECK(program.index_range_count == 1 &&
+          program.index_ranges[0].source_instruction_index == 9u);
+    CHECK(program.instruction_count == 2 &&
+          program.instructions[0].source_instruction_index == 10u &&
+          program.instructions[1].source_instruction_index == 12u);
+    usil_free(&program);
+    ++contract.hull_phases[0].marker_instruction_index;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    --contract.hull_phases[0].marker_instruction_index;
+    dxbc_stage_contract_free(&contract);
+    dxbc_free(&semantic);
+    dxbc_document_free(&document);
+    return true;
+}
+
+#undef TWO_ROW_ICB
+
 int main(void) {
     const size_t allocations = g_allocations_count;
     const size_t bytes = g_allocated_bytes;
     if (!verify_stage_domains() || !verify_operand_types() ||
         !verify_geometry_contract() || !verify_hull_contract() ||
-        !verify_domain_contract()) {
+        !verify_domain_contract() || !verify_icb_raw_geometry_owners() ||
+        !verify_icb_raw_compute_owners() || !verify_icb_raw_hull_owners()) {
         return 1;
     }
     if (g_allocations_count != allocations || g_allocated_bytes != bytes) {

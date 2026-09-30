@@ -15,6 +15,8 @@
 #include "translation/material_yaml_emitter.h"
 #include "translation/shaderlab_emitter.h"
 
+#include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,6 +26,8 @@ typedef struct {
     uint8_t* bytes;
     size_t size;
     bool is_manifest;
+    bool is_compute_source_candidate;
+    bool is_compute_source_candidate_evidence;
 } StagedComputeArtifact;
 
 typedef struct {
@@ -49,6 +53,7 @@ typedef struct {
     const char* output_directory;
     ShaderBatchResult* result;
     bool emit_shader_meta;
+    bool emit_compute_source_candidate;
     bool flat_graphics_output;
     bool defer_source_snapshot_close;
     bool allocation_failed;
@@ -71,7 +76,7 @@ static void staged_shader_publication_dispose(
     free(staged->shader_bytes);
     free(staged->meta_bytes);
     for (size_t index = 0U;
-         index < staged->compute_artifact_count; ++index) {
+         staged->compute_artifacts && index < staged->compute_artifact_count; ++index) {
         free(staged->compute_artifacts[index].path);
         free(staged->compute_artifacts[index].bytes);
     }
@@ -208,6 +213,8 @@ void shader_batch_result_dispose(ShaderBatchResult* result) {
         free(result->records[i].shader_publication_residue_path);
         free(result->records[i].meta_publication_residue_path);
         free(result->records[i].compute_artifact_publications);
+        free(result->records[i].compute_source_candidate_path);
+        free(result->records[i].compute_source_candidate_evidence_path);
     }
     free(result->records);
     shader_batch_result_init(result);
@@ -571,6 +578,8 @@ static bool prepare_compute_publication_ledger(
         memcpy(ledger->filename, artifact->filename,
                strlen(artifact->filename) + 1U);
         ledger->is_manifest = artifact->is_manifest;
+        ledger->is_compute_source_candidate = artifact->is_compute_source_candidate;
+        ledger->is_compute_source_candidate_evidence = artifact->is_compute_source_candidate_evidence;
     }
     return true;
 }
@@ -679,6 +688,16 @@ static void commit_staged_compute_publication(
         &staged->compute_artifacts[staged->compute_manifest_index];
     result->output_path = manifest->path;
     manifest->path = NULL;
+    for (size_t index = 0; index < staged->compute_artifact_count; ++index) {
+        StagedComputeArtifact *artifact = &staged->compute_artifacts[index];
+        if (artifact->is_compute_source_candidate) {
+            result->compute_source_candidate_path = artifact->path;
+            artifact->path = NULL;
+        } else if (artifact->is_compute_source_candidate_evidence) {
+            result->compute_source_candidate_evidence_path = artifact->path;
+            artifact->path = NULL;
+        }
+    }
     result->publication_authorized =
         !source_identity_close_deferred;
     if (result->status == SHADER_BATCH_EMITTED) {
@@ -715,6 +734,73 @@ static bool duplicate_staged_compute_bytes(
     return true;
 }
 
+static bool append_compute_candidate_evidence(
+    const ComputeSourceCandidate *candidate, StringBuilder *output) {
+    char object_digest[COMMON_SHA256_HEX_SIZE];
+    char model_digest[COMMON_SHA256_HEX_SIZE];
+    char source_digest[COMMON_SHA256_HEX_SIZE];
+    common_sha256_digest_to_hex(candidate->serialized_object_sha256, object_digest);
+    common_sha256_digest_to_hex(candidate->modeled_input_sha256, model_digest);
+    common_sha256_digest_to_hex(candidate->source_sha256, source_digest);
+    sb_appendf(output, "{\"schema\":\"dxbc-sandbox-compute-source-candidate\",\"version\":1,"
+        "\"status\":\"candidate-unverified\",\"compiler\":\"not-run\",\"import\":\"not-run\","
+        "\"semantic\":\"not-run\",\"native\":\"not-run\",\"domain_complete\":%s,"
+        "\"source_scope\":\"bounded-selected-compute-model\","
+        "\"serialized_object_sha256\":\"%s\",\"modeled_input_sha256\":\"%s\",\"source_sha256\":\"%s\","
+        "\"kernels\":%zu,\"variants\":%zu,\"source_quality\":",
+        candidate->domain_complete ? "true" : "false", object_digest, model_digest, source_digest,
+        candidate->kernel_count, candidate->variant_count);
+    if (!hlsl_source_quality_append_json(&candidate->source_quality, output)) return false;
+    sb_append(output, ",\"variant_evidence\":[");
+    for (size_t index = 0; index < candidate->variant_count; ++index) {
+        const ComputeSourceVariant *variant = &candidate->variants[index];
+        char program_digest[COMMON_SHA256_HEX_SIZE], dxbc_digest[COMMON_SHA256_HEX_SIZE];
+        char entry_digest[COMMON_SHA256_HEX_SIZE];
+        common_sha256_digest_to_hex(variant->serialized_program_sha256, program_digest);
+        common_sha256_digest_to_hex(variant->dxbc_sha256, dxbc_digest);
+        common_sha256_digest_to_hex(variant->source_sha256, entry_digest);
+        sb_appendf(output, "%s{\"platform_index\":%zu,\"kernel_index\":%zu,\"variant_index\":%zu,"
+            "\"source_unit_id\":%u,\"keyword_mask\":%" PRIu64 ",\"requirements\":%" PRIu64 ","
+            "\"thread_group_size\":[%u,%u,%u],\"serialized_program_sha256\":\"%s\","
+            "\"dxbc_sha256\":\"%s\",\"entry_source_sha256\":\"%s\",\"source_quality\":",
+            index ? "," : "", variant->platform_index, variant->kernel_index, variant->variant_index,
+            variant->source_unit_id, variant->keyword_mask, variant->requirements,
+            variant->thread_group_size[0], variant->thread_group_size[1], variant->thread_group_size[2],
+            program_digest, dxbc_digest, entry_digest);
+        if (!hlsl_source_quality_append_json(&variant->entry_quality, output)) return false;
+        sb_append_char(output, '}');
+    }
+    sb_append(output, "]}\n");
+    return sb_ok(output);
+}
+
+static bool stage_compute_candidate_members(
+    const ComputeShaderArtifactPackage *package, const ComputeSourceCandidate *candidate,
+    StagedShaderPublication *staged, StringBuilder *evidence) {
+    static const char suffix[] = ".compute.json";
+    const size_t manifest_size = strlen(package->manifest_filename);
+    if (manifest_size <= sizeof(suffix) - 1 ||
+        strcmp(package->manifest_filename + manifest_size - (sizeof(suffix) - 1), suffix) != 0)
+        return false;
+    const size_t prefix_size = manifest_size - (sizeof(suffix) - 1);
+    StagedComputeArtifact *source_member = &staged->compute_artifacts[package->binary_count + 1];
+    StagedComputeArtifact *evidence_member = source_member + 1;
+    const int source_size = snprintf(source_member->filename, sizeof(source_member->filename),
+        "%.*s_candidate.compute", (int)prefix_size, package->manifest_filename);
+    const int evidence_size = snprintf(evidence_member->filename, sizeof(evidence_member->filename),
+        "%.*s_candidate.json", (int)prefix_size, package->manifest_filename);
+    if (source_size <= 0 || (size_t)source_size >= sizeof(source_member->filename) ||
+        evidence_size <= 0 || (size_t)evidence_size >= sizeof(evidence_member->filename) ||
+        !append_compute_candidate_evidence(candidate, evidence)) return false;
+    source_member->is_compute_source_candidate = true;
+    evidence_member->is_compute_source_candidate_evidence = true;
+    source_member->path = common_output_join_path(staged->directory_path, source_member->filename);
+    evidence_member->path = common_output_join_path(staged->directory_path, evidence_member->filename);
+    return source_member->path && evidence_member->path &&
+        duplicate_staged_compute_bytes(source_member, (const uint8_t *)candidate->source.buf, candidate->source.len) &&
+        duplicate_staged_compute_bytes(evidence_member, (const uint8_t *)evidence->buf, evidence->len);
+}
+
 static bool stage_compute_artifact(
     const ShaderCatalogRecord* catalog_record,
     const ComputeShaderObject* object, size_t record_index,
@@ -744,11 +830,30 @@ static bool stage_compute_artifact(
         compute_shader_artifact_package_dispose(&package);
         return false;
     }
-    if (package.binary_count == SIZE_MAX) {
+    ComputeSourceCandidate candidate;
+    compute_source_candidate_init(&candidate);
+    StringBuilder candidate_evidence;
+    sb_init(&candidate_evidence);
+    if (context->emit_compute_source_candidate) {
+        result->compute_source_candidate_attempted = true;
+        result->compute_source_candidate_status = compute_source_candidate_build(object, &candidate,
+            &result->compute_source_candidate_diagnostic);
+        result->compute_source_candidate_quality = candidate.source_quality;
+        result->compute_source_candidate_generated =
+            result->compute_source_candidate_status == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED;
+        if (result->compute_source_candidate_generated) {
+            memcpy(result->compute_source_candidate_modeled_input_sha256, candidate.modeled_input_sha256,
+                   sizeof(candidate.modeled_input_sha256));
+            memcpy(result->compute_source_candidate_source_sha256, candidate.source_sha256,
+                   sizeof(candidate.source_sha256));
+        }
+    }
+    const size_t extra_members = result->compute_source_candidate_generated ? 2 : 0;
+    if (package.binary_count > SIZE_MAX - 1 - extra_members) {
         result->failure = SHADER_BATCH_FAILURE_OUTPUT_NAME;
         goto compute_stage_done;
     }
-    staged.compute_artifact_count = package.binary_count + 1U;
+    staged.compute_artifact_count = package.binary_count + 1U + extra_members;
     if (staged.compute_artifact_count >
             SIZE_MAX / sizeof(*staged.compute_artifacts)) {
         result->failure = SHADER_BATCH_FAILURE_OUTPUT_NAME;
@@ -791,6 +896,11 @@ static bool stage_compute_artifact(
         result->failure = SHADER_BATCH_FAILURE_OUTPUT_NAME;
         goto compute_stage_done;
     }
+    if (result->compute_source_candidate_generated &&
+        !stage_compute_candidate_members(&package, &candidate, &staged, &candidate_evidence)) {
+        result->failure = SHADER_BATCH_FAILURE_CANDIDATE_EMISSION;
+        goto compute_stage_done;
+    }
     if (!append_staged_shader_publication(context, &staged)) {
         result->failure = SHADER_BATCH_FAILURE_OUTPUT_NAME;
         goto compute_stage_done;
@@ -798,6 +908,8 @@ static bool stage_compute_artifact(
     staged_appended = true;
 
 compute_stage_done:
+    sb_free(&candidate_evidence);
+    compute_source_candidate_dispose(&candidate);
     compute_shader_artifact_package_dispose(&package);
     staged_shader_publication_dispose(&staged);
     return staged_appended;
@@ -1052,6 +1164,7 @@ ShaderBatchStatus shader_batch_extract_ex(
         .output_directory = output_directory,
         .result = &pending,
         .emit_shader_meta = options->emit_shader_meta,
+        .emit_compute_source_candidate = options->emit_compute_source_candidate,
         .select_candidate = options->select_candidate,
         .candidate_context = options->candidate_context,
         .flat_graphics_output = options->flat_graphics_output,
@@ -1192,7 +1305,7 @@ static bool compute_publication_ledger_is_complete(
     }
     bool preflight_missing = false;
     bool publish_emitted = false;
-    size_t manifest_count = 0U;
+    size_t manifest_count = 0U, candidate_count = 0U, candidate_evidence_count = 0U;
     for (size_t index = 0U;
          index < record->compute_artifact_publication_count; ++index) {
         const ShaderBatchComputeArtifactPublication* artifact =
@@ -1206,7 +1319,11 @@ static bool compute_publication_ledger_is_complete(
             artifact->publication_residue) {
             return false;
         }
+        if ((artifact->is_manifest && (artifact->is_compute_source_candidate || artifact->is_compute_source_candidate_evidence)) ||
+            (artifact->is_compute_source_candidate && artifact->is_compute_source_candidate_evidence)) return false;
         if (artifact->is_manifest) ++manifest_count;
+        if (artifact->is_compute_source_candidate) ++candidate_count;
+        if (artifact->is_compute_source_candidate_evidence) ++candidate_evidence_count;
         if (artifact->preflight_status ==
             COMMON_OUTPUT_PREFLIGHT_MISSING) {
             preflight_missing = true;
@@ -1221,6 +1338,14 @@ static bool compute_publication_ledger_is_complete(
     const CommonOutputPublishStatus expected_publish =
         publish_emitted ? COMMON_OUTPUT_PUBLISH_EMITTED
                         : COMMON_OUTPUT_PUBLISH_UNCHANGED;
+    if (record->compute_source_candidate_generated) {
+        if (!record->compute_source_candidate_attempted ||
+            record->compute_source_candidate_status != COMPUTE_SOURCE_CANDIDATE_UNVERIFIED ||
+            record->compute_source_candidate_quality.classification != HLSL_SOURCE_QUALITY_CLEAN ||
+            !record->compute_source_candidate_path || !record->compute_source_candidate_evidence_path ||
+            candidate_count != 1 || candidate_evidence_count != 1) return false;
+    } else if (candidate_count || candidate_evidence_count || record->compute_source_candidate_path ||
+               record->compute_source_candidate_evidence_path) return false;
     return manifest_count == 1U &&
         record->compute_preflight_status == expected_preflight &&
         record->compute_publish_status == expected_publish &&

@@ -100,7 +100,12 @@ unsigned straight-line values and typed thread/group arguments. Complete Unity
 `.compute` artifact reconstruction and compute certification remain in progress.
 A bounded `compute_source_candidate_build` API reconstructs complete resource-free
 RET/barrier kernel domains with their captured names, keywords and group dimensions.
-Its result is explicitly unverified; it supplies no generic Class72 certificate.
+Use `dxbc-sandbox extract INPUT --kind compute --all --compute-source-candidate
+--out recovered --format json` to export these candidates alongside the exact binary
+package. Each `_candidate.compute` has a separate evidence file. Unsupported
+reconstruction retains the binary package and reports a failed requested candidate.
+Candidates remain explicitly unverified; this workflow supplies no generic Class72
+certificate, compiler equality, import or native result.
 
 The import, bundle, and finite-visual gate commands accept an explicit Editor
 path and use isolated projects. Their installed C# bridges live in

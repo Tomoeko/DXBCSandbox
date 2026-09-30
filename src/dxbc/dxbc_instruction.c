@@ -257,6 +257,7 @@ bool parse_shader_logic(ByteStream* stream, size_t next_pos, DXBCContainer* cont
     if (instruction_bytes != next_pos - stream->position) return false;
     size_t end_pos = stream->position + instruction_bytes;
     int instruction_id = 0;
+    uint32_t raw_instruction_index = 0u;
     int indexable_temp_counter = 0;
     (void)indexable_temp_counter;
     
@@ -298,6 +299,8 @@ bool parse_shader_logic(ByteStream* stream, size_t next_pos, DXBCContainer* cont
         inst->token = token;
         inst->file_offset = (uint32_t)start_pos;
         inst->byte_length = (uint32_t)(next_inst_pos - start_pos);
+        inst->raw_instruction_index = raw_instruction_index;
+        inst->has_raw_instruction_index = true;
         inst->opcode = opcode;
         
         const char* name = dxbc_opcode_name(opcode);
@@ -496,6 +499,11 @@ bool parse_shader_logic(ByteStream* stream, size_t next_pos, DXBCContainer* cont
                     v_inst->token = token;
                     v_inst->opcode = opcode;
                     v_inst->is_decl = true;
+                    v_inst->file_offset = (uint32_t)start_pos;
+                    v_inst->byte_length = (uint32_t)(next_inst_pos - start_pos);
+                    v_inst->raw_instruction_index = raw_instruction_index;
+                    v_inst->has_raw_instruction_index = true;
+                    v_inst->is_customdata_continuation = true;
                     
                     format_instruction_text(
                         v_inst->formatted_asm,
@@ -1179,6 +1187,7 @@ bool parse_shader_logic(ByteStream* stream, size_t next_pos, DXBCContainer* cont
         
         stream->position = next_inst_pos;
         container->instruction_count++;
+        ++raw_instruction_index;
     }
     if (stream->position != end_pos) return false;
     container->program_type = (DXBCProgramType)type;

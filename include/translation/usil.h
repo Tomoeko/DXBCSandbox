@@ -134,6 +134,9 @@ typedef struct {
     uint8_t resource_return_types[4];
     uint8_t resource_info_return_type;
     uint8_t sample_info_return_type;
+    /* Raw token instruction index when lowered from parsed DXBC. ICB
+     * presentation rows do not advance this owner. Hand-built semantic input
+     * without raw authority retains the legacy semantic array index. */
     uint32_t source_instruction_index;
     USILGeometryEffectKind geometry_effect;
     uint8_t geometry_stream_id;

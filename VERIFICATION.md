@@ -109,3 +109,10 @@ ShaderLab state or dependencies as clean. The bounded compute source candidate
 API likewise returns unverified source and owned per-kernel evidence. Controlled
 compiler equality does not supply the missing generic compute, import or native
 producers or enlarge the closed whole-shader scope above.
+
+The optional `--compute-source-candidate` extraction publishes candidate source and
+evidence as distinct members of the existing compute package transaction. It never
+changes the original binary manifest or its source authority. Generation,
+publication, source quality and requested verification remain separate report
+fields. A missing candidate returns command failure even when the binary package
+was successfully exported; unavailable checks cannot become successful ones.

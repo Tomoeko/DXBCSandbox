@@ -42,6 +42,32 @@ int main(void) {
     CHECK(strcmp(parsed_options.output_directory, "flat-output") == 0);
     cli_options_dispose(&parsed_options);
 
+    char *compute_arguments[] = {
+        (char *)"dxbc-sandbox", (char *)"extract", (char *)"fixture.assets",
+        (char *)"--kind", (char *)"compute", (char *)"--all",
+        (char *)"--out", (char *)"compute-output", (char *)"--compute-source-candidate",
+    };
+    CHECK(parse_cli(9, compute_arguments, &parsed_options, &help_requested));
+    CHECK(parsed_options.compute_source_candidate &&
+          parsed_options.shader_kind == CLI_SHADER_KIND_COMPUTE);
+    cli_options_dispose(&parsed_options);
+    compute_arguments[4] = (char *)"graphics";
+    CHECK(!parse_cli(9, compute_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+    compute_arguments[4] = (char *)"compute";
+    compute_arguments[1] = (char *)"list";
+    CHECK(!parse_cli(9, compute_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+    compute_arguments[1] = (char *)"extract";
+    char *compute_graphics_arguments[] = {
+        (char *)"dxbc-sandbox", (char *)"extract", (char *)"fixture.assets",
+        (char *)"--kind", (char *)"compute", (char *)"--all",
+        (char *)"--out", (char *)"compute-output", (char *)"--compute-source-candidate",
+        (char *)"--materials",
+    };
+    CHECK(!parse_cli(10, compute_graphics_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+
     char *lift_arguments[] = {
         (char *)"dxbc-sandbox", (char *)"extract", (char *)"fixture.assets",
         (char *)"--all", (char *)"--out", (char *)"lift-output",
@@ -149,18 +175,20 @@ int main(void) {
         &catalog, selected, &batch, NULL, NULL, CLI_SHADER_KIND_ALL,
         NULL, NULL, &report, &texture_batch_complete, NULL));
     CHECK(texture_batch_complete);
-    CHECK(strstr(report.buf, "\"report_version\":7") != NULL);
+    CHECK(strstr(report.buf, "\"report_version\":8") != NULL);
     CHECK(strstr(
         report.buf,
         "\"artifacts\":[{\"filename\":\"compute_Fixture__11.bin\","
-        "\"is_manifest\":false,\"preflight_attempted\":true,"
+        "\"is_manifest\":false,\"is_compute_source_candidate\":false,"
+        "\"is_compute_source_candidate_evidence\":false,\"preflight_attempted\":true,"
         "\"preflight_status\":\"missing\",\"publish_attempted\":true,"
         "\"publish_status\":\"emitted\","
         "\"publication_residue\":true}") != NULL);
     CHECK(strstr(
         report.buf,
         "{\"filename\":\"compute_Fixture__11.compute.json\","
-        "\"is_manifest\":true,\"preflight_attempted\":true,"
+        "\"is_manifest\":true,\"is_compute_source_candidate\":false,"
+        "\"is_compute_source_candidate_evidence\":false,\"preflight_attempted\":true,"
         "\"preflight_status\":\"unchanged\","
         "\"publish_attempted\":false,\"publish_status\":null,"
         "\"publication_residue\":false}") != NULL);
@@ -191,6 +219,38 @@ int main(void) {
         report.buf,
         "\"selection_kind\":\"compute\","
         "\"artifact_kind\":\"unpublished-compute-package\"") != NULL);
+
+    /* Generated analysis is independent of publication and certification.
+     * A failed package must not expose stale candidate paths or hide the
+     * requested candidate from the command's completion decision. */
+    batch_records[0].compute_source_candidate_attempted = true;
+    batch_records[0].compute_source_candidate_generated = true;
+    batch_records[0].compute_source_candidate_status = COMPUTE_SOURCE_CANDIDATE_UNVERIFIED;
+    batch_records[0].compute_source_candidate_path = (char *)"/stale/candidate.compute";
+    batch_records[0].compute_source_candidate_evidence_path = (char *)"/stale/candidate.json";
+    CHECK(unpublished_compute_source_candidates(&batch) == 1);
+    sb_free(&report);
+    sb_init(&report);
+    append_compute_source_candidate_json(&report, &batch_records[0]);
+    CHECK(strstr(report.buf, "\"generated\":true,\"published\":false"));
+    CHECK(strstr(report.buf, "\"status\":\"candidate-unverified\""));
+    CHECK(strstr(report.buf, "\"compilation\":\"not-run\",\"exactness\":\"not-run\""));
+    CHECK(strstr(report.buf, "\"semantic_certificate\":\"unavailable\""));
+    CHECK(strstr(report.buf, "\"output\":null,\"evidence_output\":null"));
+    CHECK(!strstr(report.buf, "/stale/"));
+    batch_records[0].publication_authorized = true;
+    CHECK(unpublished_compute_source_candidates(&batch) == 0);
+    batch_records[0].compute_source_candidate_generated = false;
+    batch_records[0].compute_source_candidate_status = COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE;
+    CHECK(unpublished_compute_source_candidates(&batch) == 1);
+    sb_free(&report);
+    sb_init(&report);
+    append_compute_source_candidate_json(&report, &batch_records[0]);
+    CHECK(strstr(report.buf, "\"generated\":false,\"published\":false"));
+    CHECK(strstr(report.buf, "\"source_quality\":null,\"modeled_input_sha256\":null,\"source_sha256\":null"));
+    CHECK(!strstr(report.buf, "/stale/"));
+    batch_records[0].compute_source_candidate_attempted = false;
+    batch_records[0].publication_authorized = false;
 
     /* A counter-only native success claim cannot make the report complete
      * when its sole record is failed and therefore unpublished. */

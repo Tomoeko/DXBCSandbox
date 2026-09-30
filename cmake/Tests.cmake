@@ -92,6 +92,9 @@ if(BUILD_TESTING)
         tests/test_compute_usil_units.c compute_usil_units)
     dxbc_add_core_test(test_compute_source_candidate_units
         tests/test_compute_source_candidate_units.c compute_source_candidate_units)
+    dxbc_add_core_test(test_compute_candidate_publication_units
+        tests/test_compute_candidate_publication_units.c compute_candidate_publication_units)
+    target_link_libraries(test_compute_candidate_publication_units PRIVATE UnityCommon::test_support)
     dxbc_add_core_test(test_material_object_units
         tests/test_material_object_units.c material_object_units)
     target_compile_definitions(test_material_object_units PRIVATE

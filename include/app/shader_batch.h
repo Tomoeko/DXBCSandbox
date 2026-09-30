@@ -8,6 +8,7 @@
 #include "common/output_publish.h"
 #include "io/compute_shader_artifact.h"
 #include "translation/shaderlab_emitter.h"
+#include "translation/compute_source_candidate.h"
 #include "translation/shaderlab_structural_certificate.h"
 
 typedef enum {
@@ -53,6 +54,8 @@ typedef struct {
     bool publish_attempted;
     bool publication_residue;
     bool is_manifest;
+    bool is_compute_source_candidate;
+    bool is_compute_source_candidate_evidence;
 } ShaderBatchComputeArtifactPublication;
 
 typedef struct {
@@ -63,6 +66,19 @@ typedef struct {
     ComputeShaderObjectStatus compute_object_status;
     ComputeShaderArtifactStatus compute_artifact_status;
     ComputeShaderSourceAuthorityStatus compute_source_authority_status;
+    /* Bounded opt-in candidate generation is independent of binary/source
+     * authority and complete publication. Only attempted records have a
+     * meaningful candidate status/diagnostic; generated never certifies it. */
+    bool compute_source_candidate_attempted;
+    bool compute_source_candidate_generated;
+    ComputeSourceStatus compute_source_candidate_status;
+    ComputeSourceDiagnostic compute_source_candidate_diagnostic;
+    HLSLSourceQualityResult compute_source_candidate_quality;
+    uint8_t compute_source_candidate_modeled_input_sha256[COMMON_SHA256_DIGEST_SIZE];
+    uint8_t compute_source_candidate_source_sha256[COMMON_SHA256_DIGEST_SIZE];
+    /* Owned paths appear only after every staged package member publishes. */
+    char *compute_source_candidate_path;
+    char *compute_source_candidate_evidence_path;
     UnityInputStatus input_status;
     ShaderLabCandidateDiagnostic candidate_diagnostic;
     ShaderLabStructuralDiagnostic structural_diagnostic;
@@ -160,6 +176,10 @@ typedef struct {
     /* Emit a deterministic ShaderImporter .meta next to each selected
      * graphics .shader. Required by associated Material export. */
     bool emit_shader_meta;
+    /* Add a distinct unverified .compute and evidence JSON to admitted
+     * ClassID72 binary packages. Unsupported candidates leave the original
+     * exact binary package available and retain an explicit diagnostic. */
+    bool emit_compute_source_candidate;
     /* Place graphics .shader files directly in output_directory and derive
      * their portable filenames from the serialized Shader name. Equal flat
      * names receive a deterministic source-identity suffix. Compute package
