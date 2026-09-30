@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 14U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 15U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -90,7 +90,7 @@ typedef enum HLSLEmitMode {
      * with higher-level Unity/source constructs to improve readability. */
     HLSL_EMIT_MODE_READABLE = 1,
 
-    /* Verification-eligible candidate, never a certificate by itself. v14
+    /* Verification-eligible candidate, never a certificate by itself. v15
      * admits at most 256 SM4/5 vertex/pixel instructions using full
      * float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP. It also
      * admits structured IF/ELSE/ENDIF with scalar input/temp bit conditions,
@@ -123,9 +123,14 @@ typedef enum HLSLEmitMode {
      * vertex/pixel stages with owned explicit level/bias/gradient values.
      * Pixel derivatives likewise retain their sites; coarse/fine forms require SM5.
      * Other resource effects, sampling modes and precision controls reject.
-     * A separate parsed point[1] geometry route admits one typed stream0,
-     * persistent named output fields and anchored Append/RestartStrip effects.
-     * Loops, adjacency, multiple streams and instances remain outside it.
+     * A separate parsed geometry route admits static point/line/triangle and
+     * adjacency input arrays, one typed stream0, persistent named output fields
+     * and anchored Append/RestartStrip effects. Dynamic input indexing, emission
+     * loops, multiple streams and instances remain outside it.
+     * Parsed triangle DOMAIN stages admit one float4 control-point field,
+     * static OutputPatch indexing, float3 domain coordinates, actual tessellation
+     * factors and generic SSA expressions, within their own 64-instruction cap.
+     * Patch-factor reads, resources and other domain forms remain unsupported.
      * Straight-line single-use expressions are nested once; shared values have
      * typed deterministic names. Unsupported input fails instead of silently using
      * presentation recognizers. Reuses compiler inverse operand/MAD spelling;

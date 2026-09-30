@@ -3210,9 +3210,24 @@ static int verify_signature_declaration_contract(void) {
     program.signature_declaration_count = 1;
     program.signature_declaration_alloc = 1;
     CHECK(usil_signature_authority_is_valid(&program));
-    intrinsic.mask = 3u;
-    CHECK(!usil_signature_authority_is_valid(&program));
+    for (uint8_t mask = 1; mask <= 7; ++mask) {
+        intrinsic.mask = mask;
+        CHECK(usil_signature_authority_is_valid(&program));
+    }
     program.tessellation.domain = DXBC_TESSELLATOR_DOMAIN_QUAD;
+    for (uint8_t mask = 1; mask <= 3; ++mask) {
+        intrinsic.mask = mask;
+        CHECK(usil_signature_authority_is_valid(&program));
+    }
+    intrinsic.mask = 4u;
+    CHECK(!usil_signature_authority_is_valid(&program));
+    intrinsic.mask = 3u;
+    program.program_type = DXBC_PROGRAM_TYPE_PIXEL;
+    CHECK(!usil_signature_authority_is_valid(&program));
+    program.program_type = DXBC_PROGRAM_TYPE_DOMAIN;
+    program.tessellation.domain = DXBC_TESSELLATOR_DOMAIN_UNDEFINED;
+    CHECK(!usil_signature_authority_is_valid(&program));
+    program.tessellation.domain = DXBC_TESSELLATOR_DOMAIN_ISOLINE;
     CHECK(usil_signature_authority_is_valid(&program));
     intrinsic.mask = 0u;
     CHECK(!usil_signature_authority_is_valid(&program));

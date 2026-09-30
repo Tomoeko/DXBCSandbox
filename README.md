@@ -94,6 +94,9 @@ The candidate emitter also reconstructs straight-line geometry with typed point,
 line, triangle and adjacency arrays, named output fields and ordered stream0
 `Append`/`RestartStrip` operations. Dynamic input indexing, emission loops,
 geometry instancing and multiple streams remain unsupported in this path.
+A bounded triangle domain path emits typed control-point patches, barycentric
+coordinates, tessellation-factor declarations and SSA expressions. Other domains,
+patch-factor reads, resources and generic hull phase reconstruction remain open.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,
@@ -146,7 +149,7 @@ fixtures. Those finite observations remain separate from runtime-selection proof
 
 - Parsing targets explicitly supported Unity 2021.3 schemas, not every version.
 - HLSL/ShaderLab emission is experimental. Unsupported variants fail closed;
-  hull and domain emission remain unavailable, and geometry support is limited.
+  generic hull emission and wider domain/geometry support remain unavailable.
 - Readable output is a presentation mode. Recompilation checks require exact
   mode and matching compiler, platform, keyword, and include authority.
 - Matching DXBC or a finite visual test does not prove universal visual equality

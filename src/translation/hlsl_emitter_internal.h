@@ -265,6 +265,20 @@ typedef struct HLSLEmitterContext {
     bool high_level_direct_return;
     bool high_level_interface;
     bool high_level_geometry;
+    bool high_level_domain;
+    char high_level_domain_point_type[96];
+    char high_level_domain_factors_type[96];
+    char high_level_domain_factors_variable[96];
+    bool high_level_domain_factors_struct_emitted;
+    uint32_t high_level_domain_factor_fields_emitted;
+    bool high_level_domain_factors_parameter_emitted;
+    char high_level_domain_patch_variable[96];
+    char high_level_domain_location_variable[96];
+    bool high_level_domain_point_struct_emitted;
+    uint32_t high_level_domain_point_fields_emitted;
+    bool high_level_domain_attribute_emitted;
+    bool high_level_domain_patch_parameter_emitted;
+    bool high_level_domain_location_parameter_emitted;
     /* Independent coverage of actual natural interface source spans. Names
      * and syntax eligibility are established from signatures before emission;
      * these masks are set only after the corresponding syntax was appended. */
@@ -398,6 +412,10 @@ bool hlsl_high_level_struct_interface_supported(const USILProgram *program, HLSL
 /* Actual point[1]/stream0 straight-line geometry contract. Effects remain
  * anchored at their decoded instruction sites and snapshot a persistent typed
  * output tuple; this is candidate admission, never a compiler certificate. */
+enum { HLSL_DOMAIN_SOURCE_INSTRUCTION_LIMIT = 64 };
+bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSLEmitMode mode);
+const DXBCSignatureElement *hlsl_high_level_domain_point_signature(
+    const USILProgram *program, const DXBCOperand *operand);
 bool hlsl_high_level_geometry_interface_supported(const USILProgram *program,
                                                   HLSLEmitMode mode);
 bool hlsl_high_level_geometry_effect_supported(const HLSLEmitterContext *ctx,

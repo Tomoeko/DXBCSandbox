@@ -255,7 +255,7 @@ static bool signature_input_builtin_mask_is_valid(DXBCOperandType type,
                                                   uint8_t mask) {
     switch (type) {
         case OPERAND_TYPE_DOMAIN_LOCATION:
-            return mask == 0x03u || mask == 0x07u;
+            return mask != 0u && (mask & ~0x07u) == 0u;
         case OPERAND_TYPE_INPUT_THREAD_ID:
         case OPERAND_TYPE_INPUT_THREAD_GROUP_ID:
         case OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP:
@@ -376,7 +376,7 @@ static bool signature_declaration_operand(
 }
 
 static bool signature_declaration_matches_element(
-    const USILSignatureDeclaration* declaration,
+    const USILProgram* program, const USILSignatureDeclaration* declaration,
     const DXBCSignatureElement* element, DXBCSignatureRole role) {
     if (!declaration || !element) {
         return false;
@@ -427,10 +427,19 @@ static bool signature_declaration_matches_element(
                 declaration->interpolation_mode ==
                     element->interpolation_mode);
     }
+    const bool domain_position_input = program &&
+        program->program_type == DXBC_PROGRAM_TYPE_DOMAIN && program->tessellation.valid &&
+        role == DXBC_SIGNATURE_ROLE_INPUT &&
+        declaration->kind == USIL_SIGNATURE_DECL_INPUT &&
+        declaration->operand_type == OPERAND_TYPE_INPUT_CONTROL_POINT &&
+        declaration->has_array_element_count &&
+        declaration->array_element_count == program->tessellation.input_control_point_count &&
+        element->system_value == 1u && element->component_type == 3u &&
+        signature_semantic_equals(dxbc_signature_semantic_name(element), "SV_Position");
     const bool plain_special_output =
         role != DXBC_SIGNATURE_ROLE_INPUT && element->system_value >= 64u &&
         element->system_value <= 70u;
-    return (element->system_value == 0u || plain_special_output) &&
+    return (element->system_value == 0u || plain_special_output || domain_position_input) &&
            (!declaration->has_interpolation ||
             declaration->interpolation_mode ==
                 element->interpolation_mode);
@@ -698,11 +707,13 @@ bool usil_signature_authority_is_valid(const USILProgram* program) {
                     stage_matches =
                         program->program_type == DXBC_PROGRAM_TYPE_DOMAIN &&
                         program->tessellation.valid &&
-                        declaration->mask ==
-                            (program->tessellation.domain ==
-                                     DXBC_TESSELLATOR_DOMAIN_TRIANGLE
-                                 ? 0x07u
-                                 : 0x03u);
+                        declaration->mask != 0u &&
+                        (program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE ||
+                         program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_QUAD ||
+                         program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_ISOLINE) &&
+                        (declaration->mask & (uint8_t)~
+                            (program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE
+                                 ? 0x07u : 0x03u)) == 0u;
                     break;
                 case OPERAND_TYPE_INPUT_PRIMITIVE_ID:
                 case OPERAND_TYPE_INPUT_GS_INSTANCE_ID:
@@ -731,7 +742,7 @@ bool usil_signature_authority_is_valid(const USILProgram* program) {
         uint8_t matched_signature_mask = 0u;
         for (int signature = 0; signature < program->input_count; ++signature)
             if (signature_declaration_matches_element(
-                    declaration, &program->inputs[signature],
+                    program, declaration, &program->inputs[signature],
                     DXBC_SIGNATURE_ROLE_INPUT)) {
                 matched = true;
                 matched_signature_mask |= program->inputs[signature].mask;
@@ -739,7 +750,7 @@ bool usil_signature_authority_is_valid(const USILProgram* program) {
         for (int signature = 0; signature < program->output_count;
              ++signature)
             if (signature_declaration_matches_element(
-                    declaration, &program->outputs[signature],
+                    program, declaration, &program->outputs[signature],
                     DXBC_SIGNATURE_ROLE_OUTPUT)) {
                 matched = true;
                 matched_signature_mask |= program->outputs[signature].mask;
@@ -747,7 +758,7 @@ bool usil_signature_authority_is_valid(const USILProgram* program) {
         for (int signature = 0; signature < program->patch_constant_count;
              ++signature)
             if (signature_declaration_matches_element(
-                    declaration, &program->patch_constants[signature],
+                    program, declaration, &program->patch_constants[signature],
                     DXBC_SIGNATURE_ROLE_PATCH_CONSTANT)) {
                 matched = true;
                 matched_signature_mask |=
@@ -769,7 +780,7 @@ bool usil_signature_authority_is_valid(const USILProgram* program) {
                  declaration < program->signature_declaration_count;           \
                  ++declaration) {                                               \
                 if (signature_declaration_matches_element(                     \
-                        &program->signature_declarations[declaration],          \
+                        program, &program->signature_declarations[declaration],          \
                         &(list)[signature], (role))) {                          \
                     covered_mask |=                                             \
                         program->signature_declarations[declaration]            \

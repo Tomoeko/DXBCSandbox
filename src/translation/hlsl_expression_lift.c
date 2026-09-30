@@ -173,7 +173,8 @@ static HLSLEmitReason float_program_contract(const USILProgram *program, bool fu
         (program->shader_model_major != 4 && program->shader_model_major != 5) ||
         (full_width && (program->cbuffer_count || program->texture_count || program->sampler_count)) ||
         program->uav_count || program->icb_value_count || program->indexable_temp_count ||
-        program->index_range_count || program->patch_constant_count ||
+        program->index_range_count || (program->patch_constant_count &&
+        !hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)) ||
         (program->has_global_flags && program->global_flags != 1u))
         return HLSL_EMIT_REASON_UNSUPPORTED_FEATURE;
     for (int kind = 0; kind < 2; ++kind) {
@@ -327,14 +328,16 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
         }
         if (!hlsl_lift_operand_is_plain(&unmodified))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
-        if (operand && value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_INPUT &&
+        const bool domain_input = ctx->high_level_domain &&
+            (value->type == OPERAND_TYPE_INPUT_CONTROL_POINT || value->type == OPERAND_TYPE_DOMAIN_LOCATION);
+        if (operand && !domain_input && value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_INPUT &&
             value->type != OPERAND_TYPE_IMMEDIATE32 &&
             (full_width || value->type != OPERAND_TYPE_CONSTANT_BUFFER))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         if (operand && value->type == OPERAND_TYPE_CONSTANT_BUFFER &&
             !material_source_supported(ctx, value, source_lanes(ctx, index, operand)))
             return reject(ctx, index, HLSL_EMIT_REASON_MISSING_METADATA_AUTHORITY);
-        if (operand && value->type == OPERAND_TYPE_INPUT && ctx->high_level_interface) {
+        if (operand && (value->type == OPERAND_TYPE_INPUT || domain_input) && ctx->high_level_interface) {
             ASTOperandProvenance origin;
             if (!hlsl_high_level_input_provenance(ctx, &unmodified,
                     source_lanes(ctx, index, operand), &origin))
@@ -493,7 +496,8 @@ static ASTExpr *formatted_source_atom(HLSLEmitterContext *ctx, const DXBCOperand
                 }
                 value = ast_create_emitter_operand_with_provenance(text.buf, &origin);
             }
-        } else if (source->type == OPERAND_TYPE_INPUT &&
+        } else if ((source->type == OPERAND_TYPE_INPUT || (ctx->high_level_domain &&
+                    (source->type == OPERAND_TYPE_INPUT_CONTROL_POINT || source->type == OPERAND_TYPE_DOMAIN_LOCATION))) &&
                    hlsl_high_level_input_provenance(ctx, source, mask, &origin)) {
             if (instruction >= 0) {
                 origin.instruction_index = instruction;
@@ -601,7 +605,9 @@ static ASTExpr *source_expression_unmodified(HLSLEmitterContext *ctx, int instru
         return selected;
     }
     if (mask == 15 && source->type != OPERAND_TYPE_CONSTANT_BUFFER &&
-        source->type != OPERAND_TYPE_INPUT)
+        source->type != OPERAND_TYPE_INPUT &&
+        !(ctx->high_level_domain && (source->type == OPERAND_TYPE_INPUT_CONTROL_POINT ||
+                                    source->type == OPERAND_TYPE_DOMAIN_LOCATION)))
         return hlsl_float4_source_atom(ctx, source);
     return vector_source_atom(ctx, source, mask, instruction, operand);
 }

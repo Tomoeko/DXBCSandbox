@@ -105,6 +105,116 @@ static const DXBCSignatureElement *geometry_input_signature(
   return match;
 }
 
+/* Static patch-point identities and fixed tessellator coordinates retain the
+ * independently parsed stage/declaration authority. No phase source synthesis. */
+const DXBCSignatureElement *hlsl_high_level_domain_point_signature(
+    const USILProgram *program, const DXBCOperand *operand) {
+  if (!program || !operand || program->program_type != DXBC_PROGRAM_TYPE_DOMAIN ||
+      !program->tessellation.valid || operand->type != OPERAND_TYPE_INPUT_CONTROL_POINT ||
+      !hlsl_lift_operand_is_plain(operand) || operand->register_index_dim != 2 ||
+      operand->register_index < 0 || operand->rel_offset0 < 0 ||
+      !operand->index_has_immediate[0] || !operand->index_has_immediate[1] ||
+      operand->index_representations[0] || operand->index_representations[1] ||
+      operand->index_value_exceeds_int[0] || operand->index_value_exceeds_int[1] ||
+      operand->index_values[0] != (uint32_t)operand->register_index ||
+      operand->index_values[1] != (uint32_t)operand->rel_offset0 ||
+      operand->index_values[0] >= program->tessellation.input_control_point_count) return NULL;
+  const DXBCSignatureElement *match = NULL;
+  for (int input = 0; input < program->input_count; ++input) {
+    const DXBCSignatureElement *element = &program->inputs[input];
+    if (element->register_id != operand->index_values[1]) continue;
+    if (match) return NULL;
+    match = element;
+  }
+  return match;
+}
+
+bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSLEmitMode mode) {
+  if (!program || mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
+      !program->has_stage_contract || !program->has_parsed_signature_authority ||
+      program->program_type != DXBC_PROGRAM_TYPE_DOMAIN || !program->tessellation.valid ||
+      program->shader_model_major != 5 || program->shader_model_minor ||
+      !memchr(program->shader_type_model, 0, sizeof(program->shader_type_model)) ||
+      strcmp(program->shader_type_model, "ds_5_0") ||
+      program->tessellation.domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE ||
+      program->tessellation.input_control_point_count != 3 ||
+      program->tessellation.output_control_point_count || program->tessellation.phase_count ||
+      program->tessellation.partitioning || program->tessellation.output_primitive ||
+      program->tessellation.has_max_tessellation_factor || program->tessellation.max_tessellation_factor_bits ||
+      program->geometry.valid || program->compute.valid ||
+      program->input_count != 1 || program->output_count != 1 || program->patch_constant_count != 4 ||
+      !program->inputs || !program->outputs || !program->patch_constants ||
+      program->input_alloc < 1 || program->output_alloc < 1 || program->patch_constant_alloc < 4 ||
+      program->cbuffer_count || program->texture_count || program->sampler_count || program->uav_count ||
+      program->icb_value_count || program->indexable_temp_count || program->index_range_count ||
+      program->instruction_count < 2 || program->instruction_count > HLSL_DOMAIN_SOURCE_INSTRUCTION_LIMIT ||
+      program->instruction_alloc < program->instruction_count || !program->instructions ||
+      !usil_signature_authority_is_valid(program)) return false;
+  for (int direction = 0; direction < 2; ++direction) {
+    const DXBCSignatureElement *field = direction ? program->outputs : program->inputs;
+    if (field->component_type != 3 || field->mask != 15 || field->system_value != 1 ||
+        field->register_id >= HLSL_SM5_IO_REGISTER_COUNT || field->min_precision ||
+        field->stream_index || field->semantic_index || field->interpolation_mode) return false;
+  }
+  for (int factor = 0; factor < 4; ++factor) {
+    const DXBCSignatureElement *field = &program->patch_constants[factor];
+    if (field->component_type != 3 || field->mask != 1 || field->rw_mask ||
+        field->register_id != (uint32_t)factor || field->min_precision || field->stream_index ||
+        field->system_value != (factor < 3 ? 13u : 14u) ||
+        field->semantic_index != (uint32_t)(factor < 3 ? factor : 0)) return false;
+  }
+  bool location = false, points = false, output = false;
+  uint8_t location_mask = 0;
+  for (int index = 0; index < program->signature_declaration_count; ++index) {
+    const USILSignatureDeclaration *d = &program->signature_declarations[index];
+    if (d->operand_type == OPERAND_TYPE_DOMAIN_LOCATION) {
+      if (location || d->kind != USIL_SIGNATURE_DECL_INPUT || d->has_signature_register ||
+          !d->mask || (d->mask & ~7u)) return false;
+      location = true; location_mask = d->mask;
+    } else if (d->operand_type == OPERAND_TYPE_INPUT_CONTROL_POINT) {
+      if (points || d->kind != USIL_SIGNATURE_DECL_INPUT || !d->has_array_element_count ||
+          d->array_element_count != 3 || d->register_id != program->inputs[0].register_id || d->mask != 15)
+        return false;
+      points = true;
+    } else if (d->operand_type == OPERAND_TYPE_OUTPUT) {
+      if (output || d->kind != USIL_SIGNATURE_DECL_OUTPUT_SIV || d->system_value_name != 1 ||
+          d->register_id != program->outputs[0].register_id || d->mask != 15) return false;
+      output = true;
+    } else return false;
+  }
+  if (!location || !points || !output || program->instructions[program->instruction_count - 1].opcode != USIL_OP_RET)
+    return false;
+  unsigned writes = 0;
+  for (int index = 0; index + 1 < program->instruction_count; ++index) {
+    const USILInstruction *inst = &program->instructions[index];
+    if ((inst->opcode != USIL_OP_MOV && inst->opcode != USIL_OP_ADD && inst->opcode != USIL_OP_MUL &&
+         inst->opcode != USIL_OP_MAD) || !usil_instruction_shape_valid(program, inst) ||
+        !hlsl_expression_effects_supported(program, inst) || inst->saturate || inst->precise_mask) return false;
+    for (int operand = 0; operand < inst->operand_count; ++operand) {
+      const DXBCOperand *value = &inst->operands[operand];
+      if (!hlsl_lift_operand_is_plain(value)) return false;
+      if (!operand) {
+        if (value->type == OPERAND_TYPE_OUTPUT) {
+          if (++writes != 1 || index != program->instruction_count - 2 ||
+              value->register_index != (int)program->outputs[0].register_id ||
+              usil_operand_destination_lane_mask(value) != 15) return false;
+        } else if (value->type != OPERAND_TYPE_TEMP) return false;
+      } else if (value->type == OPERAND_TYPE_INPUT_CONTROL_POINT) {
+        if (!hlsl_high_level_domain_point_signature(program, value)) return false;
+      } else if (value->type == OPERAND_TYPE_DOMAIN_LOCATION) {
+        if (value->register_index_dim || value->index_has_immediate[0] || value->index_has_immediate[1]) return false;
+        USILOperandUseInfo use;
+        if (!usil_instruction_operand_use(program, inst, operand, &use) || use.use != USIL_OPERAND_USE_SOURCE) return false;
+        for (int lane = 0; lane < 4; ++lane) if (use.source_lane_mask & (1u << lane)) {
+          const int selected = usil_operand_source_component(value, lane);
+          if (selected < 0 || selected >= 3 || !(location_mask & (1u << selected))) return false;
+        }
+      } else if (value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_IMMEDIATE32) return false;
+    }
+  }
+  return writes == 1;
+}
+
 static bool geometry_effect_supported(const USILProgram *program,
                                       const USILInstruction *instruction) {
   USILGeometryEffectKind kind;
@@ -248,7 +358,7 @@ bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext 
       !ctx->program->has_stage_contract ||
       (ctx->program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
        ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
-       !ctx->high_level_geometry)) return false;
+       !ctx->high_level_geometry && !ctx->high_level_domain)) return false;
   const USILProgram *program = ctx->program;
   uint32_t inputs, outputs;
   if (!natural_signature_registers(program->inputs, program->input_count, &inputs) ||
@@ -256,6 +366,10 @@ bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext 
       !outputs) return false;
   for (int input = 0; input < program->input_count; ++input)
     if (!hlsl_high_level_input_name(ctx, (int)program->inputs[input].register_id)) return false;
+  if (ctx->high_level_domain && (!hlsl_high_level_domain_interface_supported(program, ctx->emit_mode) ||
+      !ctx->high_level_domain_point_type[0] || !ctx->high_level_domain_patch_variable[0] ||
+      !ctx->high_level_domain_location_variable[0] || !ctx->high_level_domain_factors_type[0] ||
+      !ctx->high_level_domain_factors_variable[0])) return false;
   if (ctx->high_level_direct_return) return program->output_count == 1;
   if (!ctx->high_level_output_type[0] || !ctx->high_level_output_variable[0]) return false;
   if (ctx->high_level_geometry) {
@@ -277,6 +391,12 @@ bool hlsl_source_quality_interface_inventory_complete(const HLSLEmitterContext *
   if (ctx->high_level_input_parameters_emitted != inputs ||
       ctx->high_level_output_statements_emitted != outputs ||
       !ctx->high_level_entry_signature_emitted || !ctx->high_level_return_block_emitted)
+    return false;
+  if (ctx->high_level_domain && (!ctx->high_level_domain_point_struct_emitted ||
+      ctx->high_level_domain_point_fields_emitted != inputs || !ctx->high_level_domain_attribute_emitted ||
+      !ctx->high_level_domain_patch_parameter_emitted || !ctx->high_level_domain_location_parameter_emitted ||
+      !ctx->high_level_domain_factors_struct_emitted || ctx->high_level_domain_factor_fields_emitted != 15 ||
+      !ctx->high_level_domain_factors_parameter_emitted))
     return false;
   if (ctx->high_level_direct_return)
     return !ctx->high_level_output_struct_emitted && !ctx->high_level_result_local_emitted &&
@@ -366,6 +486,8 @@ const DXBCSignatureElement *hlsl_high_level_input_signature(
 
 const DXBCSignatureElement *hlsl_high_level_input_operand_signature(
     const HLSLEmitterContext *ctx, const DXBCOperand *operand) {
+  if (ctx && ctx->high_level_domain && operand && operand->type == OPERAND_TYPE_INPUT_CONTROL_POINT)
+    return hlsl_high_level_domain_point_signature(ctx->program, operand);
   if (!ctx || !ctx->high_level_interface || !operand || operand->type != OPERAND_TYPE_INPUT)
     return NULL;
   if (ctx->high_level_geometry) return geometry_input_signature(ctx->program, operand);
@@ -407,7 +529,12 @@ bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *n
       strcmp(ctx->high_level_output_variable, name) == 0 ||
       strcmp(ctx->high_level_geometry_input_type, name) == 0 ||
       strcmp(ctx->high_level_geometry_input_variable, name) == 0 ||
-      strcmp(ctx->high_level_geometry_stream_variable, name) == 0) return false;
+      strcmp(ctx->high_level_geometry_stream_variable, name) == 0 ||
+      strcmp(ctx->high_level_domain_point_type, name) == 0 ||
+      strcmp(ctx->high_level_domain_patch_variable, name) == 0 ||
+      strcmp(ctx->high_level_domain_location_variable, name) == 0 ||
+      strcmp(ctx->high_level_domain_factors_type, name) == 0 ||
+      strcmp(ctx->high_level_domain_factors_variable, name) == 0) return false;
   for (int buffer = 0; buffer < ctx->cbuffer_layout_count; ++buffer) {
     const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[buffer];
     if (layout->declaration_name && strcmp(layout->declaration_name, name) == 0) return false;
@@ -464,7 +591,7 @@ bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
     char base[80];
     const char *semantic = dxbc_signature_semantic_name(element);
     const char *role = semantic_input_role(semantic);
-    if (ctx->high_level_geometry && element->system_value == 1) role = "clipPosition";
+    if ((ctx->high_level_geometry || ctx->high_level_domain) && element->system_value == 1) role = "clipPosition";
     if (!role) {
       if (!hlsl_format_checked(ctx, base, sizeof(base), "attribute%d", input)) return false;
     } else if (strcmp(semantic, "TEXCOORD") == 0 || element->semantic_index) {
@@ -481,6 +608,12 @@ bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
        !allocate_interface_name(ctx, "input", ctx->high_level_geometry_input_variable) ||
        !allocate_interface_name(ctx, "stream", ctx->high_level_geometry_stream_variable)))
     goto unsupported;
+  if (ctx->high_level_domain &&
+      (!allocate_interface_name(ctx, ctx->preferred_input_struct_name, ctx->high_level_domain_point_type) ||
+       !allocate_interface_name(ctx, "patch", ctx->high_level_domain_patch_variable) ||
+       !allocate_interface_name(ctx, "barycentric", ctx->high_level_domain_location_variable) ||
+       !allocate_interface_name(ctx, "DomainFactors", ctx->high_level_domain_factors_type) ||
+       !allocate_interface_name(ctx, "factors", ctx->high_level_domain_factors_variable))) goto unsupported;
   if (!ctx->high_level_direct_return) {
     if (!allocate_interface_name(ctx, ctx->preferred_output_struct_name,
                                 ctx->high_level_output_type) ||
@@ -511,18 +644,25 @@ unsupported:
 
 bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
     const DXBCOperand *operand, uint8_t demanded_lanes, ASTOperandProvenance *provenance) {
-  if (!ctx || !operand || !provenance || operand->type != OPERAND_TYPE_INPUT ||
-      !demanded_lanes || (demanded_lanes & ~15u) ||
-      !hlsl_lift_operand_is_plain(operand)) return false;
+  if (!ctx || !operand || !provenance || !demanded_lanes ||
+      (demanded_lanes & ~15u) || !hlsl_lift_operand_is_plain(operand)) return false;
+  const bool location = ctx->high_level_domain &&
+      operand->type == OPERAND_TYPE_DOMAIN_LOCATION;
+  if (operand->type != OPERAND_TYPE_INPUT &&
+      !(ctx->high_level_domain && operand->type == OPERAND_TYPE_INPUT_CONTROL_POINT) &&
+      !location) return false;
   const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, operand);
-  if (!element || !hlsl_high_level_input_name(ctx, (int)element->register_id)) return false;
+  if (!location && (!element ||
+      !hlsl_high_level_input_name(ctx, (int)element->register_id))) return false;
+  if (location && operand->register_index_dim) return false;
   ast_operand_provenance_init(provenance);
   provenance->complete = true;
   provenance->value_role = AST_OPERAND_VALUE_LOGICAL;
-  provenance->logical_value_id = (UINT64_C(1) << 63) | element->register_id;
-  if (ctx->high_level_geometry)
+  provenance->logical_value_id = (UINT64_C(1) << 63) |
+      (location ? UINT64_C(0x400000000) : element->register_id);
+  if (ctx->high_level_geometry || (ctx->high_level_domain && !location))
     provenance->logical_value_id |= (uint64_t)operand->index_values[0] << 32u;
-  provenance->natural_components = (uint8_t)signature_width(element);
+  provenance->natural_components = location ? 3 : (uint8_t)signature_width(element);
   for (int component = 0; component < 4; ++component) {
     if (!(demanded_lanes & (1u << component))) continue;
     int selected = usil_operand_source_component(operand, component);
@@ -627,13 +767,13 @@ static const char *geometry_stream_type_name(DXBCOutputTopology value) {
 }
 
 void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const char* output_struct) {
-  if (ctx->high_level_direct_return) return;
+  if (ctx->high_level_direct_return && !ctx->high_level_domain) return;
   const USILProgram* program = ctx->program;
   StringBuilder* sb = ctx->sb;
   if (ctx->high_level_interface) {
-    if (ctx->high_level_geometry) {
+    if (ctx->high_level_geometry || ctx->high_level_domain) {
       const size_t input_begin = sb->len;
-      sb_appendf(sb, "struct %s {\n", ctx->high_level_geometry_input_type);
+      sb_appendf(sb, "struct %s {\n", ctx->high_level_domain ? ctx->high_level_domain_point_type : ctx->high_level_geometry_input_type);
       for (int input = 0; input < program->input_count; ++input) {
         const DXBCSignatureElement *element = &program->inputs[input];
         const char *name = hlsl_high_level_input_name(ctx, (int)element->register_id);
@@ -645,13 +785,33 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
           sb_appendf(sb, "%u", element->semantic_index);
         sb_append(sb, ";\n");
         hlsl_source_quality_emission(ctx, 0, false, -1);
-        if (sb_ok(sb))
-          ctx->high_level_geometry_input_fields_emitted |= UINT32_C(1) << element->register_id;
+        if (sb_ok(sb)) {
+          if (ctx->high_level_domain) ctx->high_level_domain_point_fields_emitted |= UINT32_C(1) << element->register_id;
+          else ctx->high_level_geometry_input_fields_emitted |= UINT32_C(1) << element->register_id;
+        }
       }
       sb_append(sb, "};\n\n");
       hlsl_source_quality_emission(ctx, 0, false, -1);
-      ctx->high_level_geometry_input_struct_emitted = sb_ok(sb) && sb->len > input_begin;
+      if (ctx->high_level_domain) ctx->high_level_domain_point_struct_emitted = sb_ok(sb) && sb->len > input_begin;
+      else ctx->high_level_geometry_input_struct_emitted = sb_ok(sb) && sb->len > input_begin;
     }
+    if (ctx->high_level_domain) {
+      size_t factors_begin = sb->len;
+      sb_appendf(sb, "struct %s {\n", ctx->high_level_domain_factors_type);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      /* The validated triangle PCSG has exactly three contiguous outer
+       * scalar factors and one inside factor, with their real system roles. */
+      sb_append(sb, "    float outer[3] : SV_TessFactor;\n");
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      if (sb_ok(sb)) ctx->high_level_domain_factor_fields_emitted |= 7;
+      sb_append(sb, "    float inner : SV_InsideTessFactor;\n");
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      if (sb_ok(sb)) ctx->high_level_domain_factor_fields_emitted |= 8;
+      sb_append(sb, "};\n\n");
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_domain_factors_struct_emitted = sb_ok(sb) && sb->len > factors_begin;
+    }
+    if (ctx->high_level_direct_return) return;
     size_t struct_begin = sb->len;
     sb_appendf(sb, "struct %s {\n", ctx->high_level_output_type);
     for (int output = 0; output < program->output_count; ++output) {
@@ -787,6 +947,26 @@ void emit_entry_point_declarations(HLSLEmitterContext* ctx,
 
   if (ctx->high_level_interface) {
     size_t entry_begin = sb->len;
+    if (ctx->high_level_domain) {
+      sb_append(sb, "[domain(\"tri\")]\n");
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_domain_attribute_emitted = sb_ok(sb);
+      sb_appendf(sb, "float4 %s(%s %s, ", entry_point,
+          ctx->high_level_domain_factors_type, ctx->high_level_domain_factors_variable);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_domain_factors_parameter_emitted = sb_ok(sb);
+      sb_appendf(sb, "const OutputPatch<%s, 3> %s, ",
+          ctx->high_level_domain_point_type, ctx->high_level_domain_patch_variable);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_domain_patch_parameter_emitted = sb_ok(sb);
+      for (int input = 0; input < program->input_count; ++input)
+        ctx->high_level_input_parameters_emitted |= UINT32_C(1) << program->inputs[input].register_id;
+      sb_appendf(sb, "float3 %s : SV_DomainLocation) : SV_POSITION {\n", ctx->high_level_domain_location_variable);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_domain_location_parameter_emitted = sb_ok(sb);
+      ctx->high_level_entry_signature_emitted = sb_ok(sb) && sb->len > entry_begin;
+      return;
+    }
     if (ctx->high_level_geometry) {
       const char *stream = geometry_stream_type_name(program->geometry.output_topology);
       if (!stream) { sb->failed = true; return; }

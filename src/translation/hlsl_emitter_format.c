@@ -1031,6 +1031,20 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
             }
             break;
         }
+        case OPERAND_TYPE_INPUT_CONTROL_POINT:
+            if (ctx->high_level_domain) {
+                const DXBCSignatureElement *element = hlsl_high_level_domain_point_signature(ctx->program, op);
+                const char *name = element ? hlsl_high_level_input_name(ctx, (int)element->register_id) : NULL;
+                if (!name) { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
+                else hlsl_builder_format_checked(ctx, &reg, "%s[%u].%s", ctx->high_level_domain_patch_variable,
+                                                  (unsigned)op->index_values[0], name);
+            } else { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
+            break;
+        case OPERAND_TYPE_DOMAIN_LOCATION:
+            if (ctx->high_level_domain && !op->register_index_dim)
+                hlsl_builder_copy_checked(ctx, &reg, ctx->high_level_domain_location_variable);
+            else { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
+            break;
         case OPERAND_TYPE_INPUT:
             if (ctx->high_level_interface) {
                 const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, op);
@@ -1168,12 +1182,16 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
         swizzle_formatted = true;
         swiz[0] = '\0';
     }
-    if (ctx->high_level_interface && op->type == OPERAND_TYPE_INPUT) {
+    if (ctx->high_level_interface && (op->type == OPERAND_TYPE_INPUT ||
+        (ctx->high_level_domain && (op->type == OPERAND_TYPE_INPUT_CONTROL_POINT ||
+                                   op->type == OPERAND_TYPE_DOMAIN_LOCATION)))) {
+        const bool location = ctx->high_level_domain &&
+            op->type == OPERAND_TYPE_DOMAIN_LOCATION;
         const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, op);
-        unsigned width = 0;
+        unsigned width = location ? 3 : 0;
         if (element) for (unsigned component = 0; component < 4; ++component)
             if (element->mask & (1u << component)) ++width;
-        if (!element || !format_cb_swizzle(op, width, 0, write_mask, preserve_vector,
+        if ((!element && !location) || !format_cb_swizzle(op, width, 0, write_mask, preserve_vector,
                                            swiz, sizeof(swiz))) {
             hlsl_builder_failed(ctx, output);
             sb_free(&idx);
@@ -1183,7 +1201,8 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
         swizzle_formatted = true;
     }
     
-    if (op->type == OPERAND_TYPE_INPUT || op->type == OPERAND_TYPE_OUTPUT) {
+    if (op->type == OPERAND_TYPE_INPUT || op->type == OPERAND_TYPE_OUTPUT ||
+        (ctx->high_level_domain && (op->type == OPERAND_TYPE_INPUT_CONTROL_POINT || op->type == OPERAND_TYPE_DOMAIN_LOCATION))) {
         sb_clear(&idx);
     } else if (op->register_index_dim == 1) {
         if (op->rel_op0) {

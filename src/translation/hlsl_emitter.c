@@ -630,15 +630,18 @@ static bool validate_operand_for_hlsl(const USILProgram *program,
              reg >= 0 && reg <= 3 && operand->index_has_immediate[0] &&
              operand->index_values[0] == (uint32_t)reg &&
              !operand->rel_op0 && !operand->rel_op1 && !operand->rel_op2;
+    case OPERAND_TYPE_INPUT_CONTROL_POINT:
+      return hlsl_high_level_domain_point_signature(program, operand) != NULL;
+    case OPERAND_TYPE_DOMAIN_LOCATION:
+      return program->program_type == DXBC_PROGRAM_TYPE_DOMAIN && program->tessellation.valid &&
+          program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE && operand->register_index_dim == 0;
     case OPERAND_TYPE_IMMEDIATE64:
     case OPERAND_TYPE_LABEL:
     case OPERAND_TYPE_INPUT_COVERAGE_MASK:
     case OPERAND_TYPE_RASTERIZER:
     case OPERAND_TYPE_INNER_COVERAGE:
     case OPERAND_TYPE_FORK_INSTANCE_ID:
-    case OPERAND_TYPE_INPUT_CONTROL_POINT:
     case OPERAND_TYPE_OUTPUT_CONTROL_POINT:
-    case OPERAND_TYPE_DOMAIN_LOCATION:
     case OPERAND_TYPE_UNKNOWN:
     default:
       /* These classes currently fall through to synthetic `unk` variables in
@@ -1047,18 +1050,20 @@ static bool validate_program_for_hlsl(const USILProgram *program,
                           HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
     return false;
   }
-  /* Hull/domain stages enter only through a complete source-backed inverse.
-   * The dedicated matcher consumes patch signatures, declaration grammar,
-   * phase-local ranges, resources, and every semantic instruction. */
+  /* Ordinary hull/domain emission retains its complete source-backed inverse.
+   * The separate candidate path admits a typed triangle domain interface and
+   * generic SSA expressions; it supplies no linked hull/compiler authority. */
   if (program->program_type == DXBC_PROGRAM_TYPE_HULL ||
       program->program_type == DXBC_PROGRAM_TYPE_DOMAIN) {
     if (hlsl_exact_tessellation_lift_matches(program)) return true;
-    hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
-                          HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
-                          HLSL_EMIT_REASON_UNSUPPORTED_STAGE);
-    return false;
+    if (!hlsl_high_level_domain_interface_supported(program, mode)) {
+      hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
+                            HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
+                            HLSL_EMIT_REASON_UNSUPPORTED_STAGE);
+      return false;
+    }
   }
-  if (program->patch_constant_count != 0) {
+  if (program->patch_constant_count != 0 && !hlsl_high_level_domain_interface_supported(program, mode)) {
     hlsl_emit_set_metadata_failure(
         diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
         HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
@@ -1067,7 +1072,8 @@ static bool validate_program_for_hlsl(const USILProgram *program,
         0, -1, -1);
     return false;
   }
-  if (!hlsl_high_level_geometry_interface_supported(program, mode) &&
+  if (!hlsl_high_level_domain_interface_supported(program, mode) &&
+      !hlsl_high_level_geometry_interface_supported(program, mode) &&
       !validate_geometry_program_for_hlsl(program)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                           HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
@@ -1547,14 +1553,16 @@ static bool source_quality_inventory_complete(const HLSLEmitterContext *ctx) {
       !hlsl_source_quality_interface_inventory_supported(ctx) ||
       !ctx->high_level_functions_prepared ||
       (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
-       program->program_type != DXBC_PROGRAM_TYPE_PIXEL && !ctx->high_level_geometry) ||
+       program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
+       !ctx->high_level_geometry && !ctx->high_level_domain) ||
       ctx->unity_uv_helper ||
       ctx->readable_screen_pos_helper || ctx->compiler_model.replacement_count ||
       ctx->use_uint_temps ||
       ctx->indexed_face_basis.valid || ctx->surface_tangent_frame.valid ||
       !hlsl_source_quality_resource_inventory_complete(ctx) || program->uav_count ||
       program->icb_value_count || program->indexable_temp_count ||
-      program->index_range_count || program->patch_constant_count ||
+      program->index_range_count ||
+      (program->patch_constant_count && !ctx->high_level_domain) ||
       !hlsl_source_quality_cbuffer_inventory_supported(ctx))
     return false;
   for (int group = 0; group < 2; ++group)
@@ -1867,7 +1875,8 @@ static bool hlsl_emit_with_options_impl(
       (program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT || !program->has_stage_contract ||
        (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
         program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
-        !hlsl_high_level_geometry_interface_supported(program, emit_mode)))) {
+        !hlsl_high_level_geometry_interface_supported(program, emit_mode) &&
+        !hlsl_high_level_domain_interface_supported(program, emit_mode)))) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                           HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
                           HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
@@ -1934,8 +1943,9 @@ static bool hlsl_emit_with_options_impl(
   ctx.high_level_direct_return = high_level_direct_return_supported(program, emit_mode) &&
       !(options && options->unity_uv_helper);
   ctx.high_level_geometry = hlsl_high_level_geometry_interface_supported(program, emit_mode);
+  ctx.high_level_domain = hlsl_high_level_domain_interface_supported(program, emit_mode);
   ctx.high_level_interface = ctx.high_level_direct_return ||
-      ctx.high_level_geometry ||
+      ctx.high_level_geometry || ctx.high_level_domain ||
       (hlsl_high_level_struct_interface_supported(program, emit_mode) &&
        !(options && options->unity_uv_helper));
   ctx.preferred_output_struct_name = output_struct;
@@ -1957,8 +1967,8 @@ static bool hlsl_emit_with_options_impl(
     return false;
   }
 
-  if (program->program_type == DXBC_PROGRAM_TYPE_HULL ||
-      program->program_type == DXBC_PROGRAM_TYPE_DOMAIN) {
+  if (!ctx.high_level_domain && (program->program_type == DXBC_PROGRAM_TYPE_HULL ||
+      program->program_type == DXBC_PROGRAM_TYPE_DOMAIN)) {
     if (!hlsl_source_quality_begin_entry(&ctx, false)) {
       free_emitter_context(&ctx);
       free(ctx_ptr);
