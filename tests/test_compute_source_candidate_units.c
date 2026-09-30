@@ -112,10 +112,12 @@ static bool expect_failure(Fixture *fixture, ComputeSourceCandidate *destination
                            ComputeSourceStatus expected) {
     const ComputeSourceCandidate before = *destination;
     ComputeSourceDiagnostic diagnostic;
-    CHECK(compute_source_candidate_build(&fixture->object, destination, &diagnostic) == expected);
+    const ComputeSourceStatus status = compute_source_candidate_build(&fixture->object, destination, &diagnostic);
+    if (status != expected) fprintf(stderr, "expected=%s actual=%s\n", compute_source_status_name(expected), compute_source_status_name(status));
+    CHECK(status == expected);
     CHECK(diagnostic.status == expected);
     CHECK(memcmp(&before, destination, sizeof(before)) == 0);
-    CHECK(destination->domain_complete && destination->source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    CHECK(destination->domain_complete && destination->source_quality.classification == before.source_quality.classification);
     return true;
 }
 
@@ -462,7 +464,7 @@ static bool check_typed_effect_rejections(void) {
     Fixture fixture; CHECK(typed_fixture(&fixture));
     ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
     CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
-    uint32_t changed[COUNT(typed_words) + 1];
+    uint32_t changed[COUNT(typed_words) + 7];
     memcpy(changed, typed_words, sizeof(typed_words)); changed[8] = 0x5555u; /* Float UAV. */
     CHECK(typed_code(&fixture, changed, COUNT(typed_words)));
     CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
@@ -472,11 +474,25 @@ static bool check_typed_effect_rejections(void) {
     memcpy(changed, typed_words, sizeof(typed_words)); changed[54] = 0x0011e032u; /* Partial store. */
     CHECK(typed_code(&fixture, changed, COUNT(typed_words)));
     CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* A dead read remains an effect; overwriting its result cannot remove it. */
+    memcpy(changed, typed_words, sizeof(typed_words));
+    const uint32_t overwrite[] = {0x08000036u, 0x001000f2u, 1u, 0x00004002u, 1u, 2u, 3u, 4u};
+    memcpy(changed + 43, overwrite, sizeof(overwrite));
+    memmove(changed + 51, typed_words + 53, (COUNT(typed_words) - 53) * sizeof(uint32_t));
+    CHECK(typed_code(&fixture, changed, COUNT(typed_words) - 2));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
     /* The same load cannot be emitted twice in an expression. */
     memcpy(changed, typed_words, sizeof(typed_words)); changed[43] = INSTRUCTION(30, 7);
     changed[48] = 0x00100e46u; changed[49] = 1u;
     memmove(changed + 50, changed + 53, (COUNT(typed_words) - 53) * sizeof(uint32_t));
     CHECK(typed_code(&fixture, changed, COUNT(typed_words) - 3));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* A shared pure intermediate must not expand the sole load twice. */
+    memcpy(changed, typed_words, sizeof(typed_words));
+    const uint32_t twice[] = {0x0700001eu, 0x001000f2u, 1u, 0x00100e46u, 1u, 0x00100e46u, 1u};
+    memcpy(changed + 53, twice, sizeof(twice));
+    memcpy(changed + 60, typed_words + 53, (COUNT(typed_words) - 53) * sizeof(uint32_t));
+    CHECK(typed_code(&fixture, changed, COUNT(typed_words) + 7));
     CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
     /* A retained device fence cannot become pure address computation. */
     memcpy(changed, typed_words, sizeof(typed_words));
@@ -485,6 +501,143 @@ static bool check_typed_effect_rejections(void) {
     CHECK(typed_code(&fixture, changed, COUNT(typed_words) + 1));
     CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
     compute_source_candidate_dispose(&candidate); return true;
+}
+
+
+/* Controlled structured declaration/load/store words. The byte stride does
+ * not retain the original element type, so the source exposes uint4 bits and
+ * its whole declaration unit remains incomplete rather than asserting CLEAN. */
+static const uint32_t structured_words[] = {
+    0x0100086au, 0x040000a2u, 0x00107000u, 0x00000000u, 0x00000010u, 0x0400009eu,
+    0x0011e000u, 0x00000000u, 0x00000010u, 0x0200005fu, 0x00020012u, 0x02000068u,
+    0x00000002u, 0x0400009bu, 0x00000004u, 0x00000001u, 0x00000001u, 0x0600001eu,
+    0x00100012u, 0x00000000u, 0x0002000au, 0x00004001u, 0x00000001u, 0x8b0000a7u,
+    0x80008302u, 0x00199983u, 0x001000f2u, 0x00000001u, 0x0010000au, 0x00000000u,
+    0x00004001u, 0x00000000u, 0x00107e46u, 0x00000000u, 0x0a00001eu, 0x001000f2u,
+    0x00000001u, 0x00100e46u, 0x00000001u, 0x00004002u, 0x0000000bu, 0x00000016u,
+    0x00000021u, 0x0000002cu, 0x090000a8u, 0x0011e0f2u, 0x00000000u, 0x0010000au,
+    0x00000000u, 0x00004001u, 0x00000000u, 0x00100e46u, 0x00000001u, 0x0100003eu
+};
+
+static bool structured_fixture(Fixture *fixture) {
+    CHECK(fixture_init(fixture, NULL, 0));
+    CHECK(typed_code(fixture, structured_words, COUNT(structured_words)));
+    const ComputeShaderStringView input = text(fixture, "SourceElements"), output = text(fixture, "DestinationElements");
+    for (size_t k = 0; k < 2; ++k) for (size_t v = 0; v < 4; ++v) {
+        fixture->groups[k][v][0] = 4; fixture->groups[k][v][1] = fixture->groups[k][v][2] = 1;
+        fixture->textures[k][v] = (ComputeShaderResource){.name = input, .bind_point = 0, .sampler_bind_point = -1, .texture_dimension = -1};
+        fixture->outputs[k][v] = (ComputeShaderResource){.name = output, .bind_point = 0, .sampler_bind_point = -1, .texture_dimension = -1};
+        fixture->variants[k][v].input_buffers = &fixture->textures[k][v]; fixture->variants[k][v].input_buffer_count = 1;
+        fixture->variants[k][v].output_buffers = &fixture->outputs[k][v]; fixture->variants[k][v].output_buffer_count = 1;
+    }
+    return true;
+}
+
+static bool check_structured_candidate(void) {
+    Fixture fixture; CHECK(structured_fixture(&fixture));
+    ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+    ComputeSourceDiagnostic diagnostic;
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(candidate.domain_complete && candidate.variant_count == 8 && candidate.resource_count == 2);
+    CHECK(candidate.source_quality.classification == HLSL_SOURCE_QUALITY_MIXED &&
+          candidate.source_quality.reasons == HLSL_SOURCE_QUALITY_REASON_INCOMPLETE_SOURCE &&
+          candidate.source_quality.counts.incomplete_units == 1);
+    CHECK(!candidate.source_quality.counts.residual_total && !candidate.source_quality.counts.unknown_provenance &&
+          !candidate.source_quality.counts.raw_buffer_reconstruction && !candidate.source_quality.counts.storage_bitcasts);
+    CHECK(strstr(candidate.source.buf, "StructuredBuffer<uint4> SourceElements;\n"));
+    CHECK(strstr(candidate.source.buf, "RWStructuredBuffer<uint4> DestinationElements;\n"));
+    CHECK(strstr(candidate.source.buf, "SourceElements.Load(((dispatchThreadId.x) + 1u))"));
+    CHECK(strstr(candidate.source.buf, "+ uint4(11u, 22u, 33u, 44u)"));
+    CHECK(!strstr(candidate.source.buf, "asuint") && !strstr(candidate.source.buf, "asfloat"));
+    for (size_t resource = 0; resource < 2; ++resource) {
+        CHECK(candidate.resources[resource].kind == COMPUTE_SOURCE_STRUCTURED_UINT4_BITS &&
+              candidate.resources[resource].byte_stride == 16 && !candidate.resources[resource].original_element_type_known &&
+              candidate.resources[resource].witness_count == 8);
+    }
+    for (size_t row = 0; row < candidate.variant_count; ++row) {
+        const ComputeSourceVariant *entry = &candidate.variants[row];
+        CHECK(entry->entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && entry->expression_count == 3);
+        CHECK(entry->memory_effect_count == 2 && entry->memory_effects[0].opcode == USIL_OP_LD_STRUCTURED &&
+              entry->memory_effects[1].opcode == USIL_OP_STORE_STRUCTURED &&
+              entry->memory_effects[0].instruction_index < entry->memory_effects[1].instruction_index);
+    }
+    /* Scalar semantic coordinates and high unsigned bits retain their owned
+     * arithmetic domain rather than passing through float storage. */
+    for (unsigned axis = 1; axis <= 2; ++axis) {
+        uint32_t coordinate_words[COUNT(structured_words)];
+        memcpy(coordinate_words, structured_words, sizeof(coordinate_words));
+        coordinate_words[10] = axis == 1 ? 0x00020022u : 0x00020042u;
+        coordinate_words[20] = axis == 1 ? 0x0002001au : 0x0002002au;
+        coordinate_words[40] = UINT32_MAX; coordinate_words[41] = UINT32_C(0x80000000);
+        CHECK(typed_code(&fixture, coordinate_words, COUNT(coordinate_words)));
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        CHECK(strstr(candidate.source.buf, axis == 1 ? "dispatchThreadId.y" : "dispatchThreadId.z"));
+        CHECK(strstr(candidate.source.buf, "uint4(4294967295u, 2147483648u, 33u, 44u)"));
+        CHECK(candidate.source_quality.classification == HLSL_SOURCE_QUALITY_MIXED &&
+              !candidate.source_quality.counts.residual_total && !candidate.source_quality.counts.unknown_provenance);
+    }
+    CHECK(typed_code(&fixture, structured_words, COUNT(structured_words)));
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    ComputeShaderResource saved = fixture.textures[0][0];
+    fixture.textures[0][0].texture_dimension = 2;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.textures[0][0] = saved;
+    fixture.variants[0][0].input_buffers = NULL;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.variants[0][0].input_buffers = &fixture.textures[0][0];
+    fixture.variants[0][0].texture_count = 1; fixture.variants[0][0].textures = &fixture.textures[0][0];
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.variants[0][0].texture_count = 0;
+    fixture.textures[0][0].bind_point = 1;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED)); fixture.textures[0][0] = saved;
+    fixture.textures[0][1].name = text(&fixture, "DifferentElements");
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.textures[0][1] = saved;
+    uint32_t changed[COUNT(structured_words) + 7];
+    const struct { size_t word; uint32_t value; } negatives[] = {
+        {4, 32}, {8, 32}, /* Changed retained stride, not a uint4 element. */
+        {31, 4}, {50, 4}, /* A byte-offset field cannot become an element index. */
+        {26, 0x00100032u}, {45, 0x0011e032u}, /* Partial load/store. */
+        {32, 0x001071b6u}, {51, 0x001001b6u}, /* Reversed resource/value lanes. */
+        {5, 0x0401009eu}, /* Coherence cannot be dropped. */
+        {34, 0x0a000000u}, /* Float ADD does not authorize uint arithmetic. */
+        {38, 2}, {20, 0x0002003au} /* Missing SSA owner or widened scalar address. */
+    };
+    for (size_t n = 0; n < COUNT(negatives); ++n) {
+        memcpy(changed, structured_words, sizeof(structured_words)); changed[negatives[n].word] = negatives[n].value;
+        CHECK(typed_code(&fixture, changed, COUNT(structured_words)));
+        CHECK(expect_failure(&fixture, &candidate, n == 0 ? COMPUTE_SOURCE_STAGE_CONTRACT_FAILED : COMPUTE_SOURCE_EMISSION_FAILED));
+    }
+    /* Preserve the original structured read even if its result is overwritten. */
+    memcpy(changed, structured_words, sizeof(structured_words));
+    const uint32_t overwrite[] = {0x08000036u, 0x001000f2u, 1u, 0x00004002u, 11u, 22u, 33u, 44u};
+    memcpy(changed + 34, overwrite, sizeof(overwrite));
+    memmove(changed + 42, structured_words + 44, (COUNT(structured_words) - 44) * sizeof(uint32_t));
+    CHECK(typed_code(&fixture, changed, COUNT(structured_words) - 2));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* The same indirect effect reuse is rejected for structured elements. */
+    memcpy(changed, structured_words, sizeof(structured_words));
+    const uint32_t twice[] = {0x0700001eu, 0x001000f2u, 1u, 0x00100e46u, 1u, 0x00100e46u, 1u};
+    memcpy(changed + 44, twice, sizeof(twice));
+    memcpy(changed + 51, structured_words + 44, (COUNT(structured_words) - 44) * sizeof(uint32_t));
+    CHECK(typed_code(&fixture, changed, COUNT(structured_words) + 7));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* Matched wider declarations are still an unsupported element layout. */
+    memcpy(changed, structured_words, sizeof(structured_words)); changed[4] = changed[8] = 32;
+    changed[24] = 0x80010302u;
+    CHECK(typed_code(&fixture, changed, COUNT(structured_words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    CHECK(typed_code(&fixture, structured_words, COUNT(structured_words)));
+    ComputeSourceCandidate renamed; compute_source_candidate_init(&renamed);
+    const ComputeShaderStringView name = text(&fixture, "RenamedSourceElements");
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    for (size_t k = 0; k < 2; ++k) for (size_t v = 0; v < 4; ++v) fixture.textures[k][v].name = name;
+    CHECK(compute_source_candidate_build(&fixture.object, &renamed, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(memcmp(candidate.modeled_input_sha256, renamed.modeled_input_sha256, 32));
+    CHECK(!memcmp(candidate.serialized_object_sha256, renamed.serialized_object_sha256, 32));
+    CHECK(strstr(candidate.source.buf, "SourceElements.Load") && strstr(renamed.source.buf, "RenamedSourceElements.Load"));
+    memset(fixture.bytes, 0, sizeof(fixture.bytes));
+    StringBuilder retained; sb_init(&retained); ast_format_expr(candidate.variants[0].expressions[2], &retained);
+    CHECK(sb_ok(&retained) && strstr(retained.buf, "SourceElements.Load")); sb_free(&retained);
+    CHECK(!strcmp(candidate.resources[0].name, "SourceElements"));
+    compute_source_candidate_dispose(&candidate); compute_source_candidate_dispose(&renamed);
+    return true;
 }
 
 static bool check_owned_quality_resolver(void) {
@@ -528,7 +681,7 @@ static bool check_owned_quality_resolver(void) {
 }
 
 int main(void) {
-    return check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }

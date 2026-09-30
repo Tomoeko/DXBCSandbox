@@ -166,6 +166,8 @@ static bool check_publication(const char *input, const char *root) {
     CHECK(contains(&evidence, "\"status\":\"candidate-unverified\""));
     CHECK(contains(&evidence, "\"compiler\":\"not-run\""));
     CHECK(contains(&evidence, "\"native\":\"not-run\""));
+    CHECK(contains(&evidence, "\"version\":2") && contains(&evidence, "\"resource_declarations\":[]"));
+    CHECK(contains(&evidence, "\"memory_effects\":[]"));
     CHECK(!contains(&evidence, "ReturnOnly") && !contains(&evidence, "ComputeFixture"));
     size_t source_members = 0, evidence_members = 0;
     for (size_t index = 0; index < record->compute_artifact_publication_count; ++index) {

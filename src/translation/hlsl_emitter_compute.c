@@ -108,12 +108,15 @@ static bool typed_resources_valid(HLSLEmitterContext *ctx, const HLSLComputeType
                  resource->binding_register == typed->resources[previous].binding_register))
                 return reject_stage(ctx);
         const uint8_t *formats;
+        const char *dimension = resource->structured ? "structured" : "2d";
+        const int stride = resource->structured ? 16 : 0;
+        if (resource->structured != typed->resources[0].structured) return reject_stage(ctx);
         if (resource->writable) {
             const USILUav *uav = &program->uavs[0];
             if (resource->binding_register != (uint32_t)uav->reg_idx ||
                 uav->reg_idx < 0 || uav->reg_idx >= HLSL_SM5_UAV_REGISTER_COUNT ||
-                !memchr(uav->dimension, 0, sizeof(uav->dimension)) || strcmp(uav->dimension, "2d") ||
-                uav->stride || uav->sample_count || uav->globally_coherent ||
+                !memchr(uav->dimension, 0, sizeof(uav->dimension)) || strcmp(uav->dimension, dimension) ||
+                uav->stride != stride || uav->sample_count || uav->globally_coherent ||
                 uav->rasterizer_ordered || uav->has_order_preserving_counter)
                 return reject_stage(ctx);
             formats = uav->return_types;
@@ -122,12 +125,12 @@ static bool typed_resources_valid(HLSLEmitterContext *ctx, const HLSLComputeType
             const USILTexture *texture = &program->textures[0];
             if (resource->binding_register != (uint32_t)texture->reg_idx ||
                 texture->reg_idx < 0 || texture->reg_idx >= HLSL_SM5_RESOURCE_REGISTER_COUNT ||
-                !memchr(texture->dimension, 0, sizeof(texture->dimension)) || strcmp(texture->dimension, "2d") ||
-                texture->stride || texture->sample_count) return reject_stage(ctx);
+                !memchr(texture->dimension, 0, sizeof(texture->dimension)) || strcmp(texture->dimension, dimension) ||
+                texture->stride != stride || texture->sample_count) return reject_stage(ctx);
             formats = texture->return_types;
         }
         for (unsigned component = 0; component < 4; ++component)
-            if (formats[component] != 4u) return reject_stage(ctx); /* D3D UINT */
+            if (formats[component] != (resource->structured ? 0u : 4u)) return reject_stage(ctx);
     }
     return true;
 }
@@ -414,6 +417,7 @@ typedef struct {
     int store;
     int load;
     unsigned expanded_nodes;
+    unsigned load_expansions;
 } ComputeMemoryPlan;
 
 static const HLSLComputeTypedResource *typed_binding(const HLSLComputeTypedSource *typed,
@@ -426,6 +430,31 @@ static const HLSLComputeTypedResource *typed_binding(const HLSLComputeTypedSourc
 
 static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
     const USILInstruction *instruction = &ctx->program->instructions[index];
+    if (instruction->opcode == USIL_OP_LD_STRUCTURED || instruction->opcode == USIL_OP_STORE_STRUCTURED) {
+        USILMemoryAccess memory;
+        USILEffectFlags effects;
+        const bool load = instruction->opcode == USIL_OP_LD_STRUCTURED;
+        if (!usil_instruction_memory_access(ctx->program, instruction, &memory) ||
+            memory.kind != USIL_MEMORY_STRUCTURED || memory.byte_stride != 16u ||
+            memory.space != (load ? USIL_MEMORY_SHADER_RESOURCE : USIL_MEMORY_UNORDERED_ACCESS) ||
+            memory.address_lanes != 1u || memory.memory_component_lanes != 15u ||
+            (load ? memory.destination_lanes != 15u : memory.value_lanes != 15u) ||
+            memory.atomic || memory.globally_coherent || memory.rasterizer_ordered ||
+            memory.has_order_preserving_counter || memory.reads != load || memory.writes == load ||
+            instruction->geometry_stream_id || instruction->geometry_stream_explicit ||
+            instruction->resource_info_return_type || instruction->sample_info_return_type ||
+            !usil_instruction_effects(ctx->program, instruction, &effects) ||
+            effects != (load ? USIL_EFFECT_RESOURCE_READ : USIL_EFFECT_EXTERNAL_WRITE))
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+        const DXBCOperand *binding = &instruction->operands[memory.binding_operand];
+        if (load) for (int lane = 0; lane < 4; ++lane)
+            if (usil_operand_source_component(binding, lane) != lane)
+                return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+        for (int operand = 1; operand < instruction->operand_count; ++operand)
+            if (operand != memory.binding_operand && !operand_plain(&instruction->operands[operand]))
+                return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+        return true;
+    }
     if (instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_STORE_UAV_TYPED) {
         if (instruction->opcode != USIL_OP_MOV && instruction->opcode != USIL_OP_IADD &&
             instruction->opcode != USIL_OP_RET)
@@ -533,30 +562,45 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
     if (instruction->opcode == USIL_OP_MOV)
         return memory_operand(plan, definition, 1, lanes, depth + 1);
     if (instruction->opcode == USIL_OP_IADD) {
-        if (width != 2u && width != 4u) return NULL;
+        if (width != 1u && width != 2u && width != 4u) return NULL;
         ASTExpr *left = memory_operand(plan, definition, 1, lanes, depth + 1);
         ASTExpr *right = memory_operand(plan, definition, 2, lanes, depth + 1);
         ASTExpr *expression = left && right ? ast_create_binary(USIL_OP_IADD, left, right) : NULL;
         if (!expression) { ast_free_expr(left); ast_free_expr(right); return NULL; }
         return memory_origin(plan, expression, definition, lanes, AST_SCALAR_UINT32, width);
     }
-    if (instruction->opcode != USIL_OP_LD || lanes != 15u || definition != plan->load) return NULL;
+    if ((instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_STRUCTURED) ||
+        lanes != 15u || definition != plan->load) return NULL;
+    /* Direct SSA use counts do not expose duplication through a shared pure
+     * intermediate. Count the actual expanded effect node independently. */
+    if (++plan->load_expansions != 1u) return NULL;
     for (unsigned component = 0; component < 4; ++component)
         if (hlsl_definition_use_count(plan->ctx, definition, (int)component) != 1u) return NULL;
     /* LOD is a proven zero source lane. The fourth transport lane is unused by
      * this 2D load; SSA liveness below accounts for its absence explicitly. */
     int literal_owner; uint8_t literal_lanes;
-    if (!memory_zero_lane(plan, definition, 1, 2, depth + 1, &literal_owner, &literal_lanes)) return NULL;
-    ASTExpr *coordinates = memory_operand(plan, definition, 1, 3u, depth + 1);
-    const uint32_t zero = 0u;
-    ASTExpr *lod = memory_origin(plan, ast_create_literal_bits(&zero, 1, AST_SCALAR_SINT32),
-                                 literal_owner, literal_lanes, AST_SCALAR_SINT32, 1);
-    ASTExpr *arguments[2] = {coordinates, lod};
-    ASTExpr *location = coordinates && lod ? ast_create_call("int3", arguments, 2) : NULL;
-    if (!location) { ast_free_expr(coordinates); ast_free_expr(lod); return NULL; }
-    location = memory_origin(plan, location, definition, 7u, AST_SCALAR_SINT32, 3);
+    ASTExpr *location = NULL;
+    int binding_operand = 2;
+    if (instruction->opcode == USIL_OP_LD_STRUCTURED) {
+        USILMemoryAccess memory;
+        if (!usil_instruction_memory_access(plan->ctx->program, instruction, &memory) ||
+            !memory_zero_lane(plan, definition, memory.byte_offset_operand, 0, depth + 1,
+                              &literal_owner, &literal_lanes)) return NULL;
+        location = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
+        binding_operand = memory.binding_operand;
+    } else {
+        if (!memory_zero_lane(plan, definition, 1, 2, depth + 1, &literal_owner, &literal_lanes)) return NULL;
+        ASTExpr *coordinates = memory_operand(plan, definition, 1, 3u, depth + 1);
+        const uint32_t zero = 0u;
+        ASTExpr *lod = memory_origin(plan, ast_create_literal_bits(&zero, 1, AST_SCALAR_SINT32),
+                                     literal_owner, literal_lanes, AST_SCALAR_SINT32, 1);
+        ASTExpr *arguments[2] = {coordinates, lod};
+        location = coordinates && lod ? ast_create_call("int3", arguments, 2) : NULL;
+        if (!location) { ast_free_expr(coordinates); ast_free_expr(lod); return NULL; }
+        location = memory_origin(plan, location, definition, 7u, AST_SCALAR_SINT32, 3);
+    }
     if (!location) return NULL;
-    const DXBCOperand *resource = &instruction->operands[2];
+    const DXBCOperand *resource = &instruction->operands[binding_operand];
     const HLSLComputeTypedResource *binding = typed_binding(plan->typed, false, (uint32_t)resource->register_index);
     if (!binding) { ast_free_expr(location); return NULL; }
     char method[264];
@@ -603,25 +647,32 @@ static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operan
     }
     const ComputeBuiltin *builtin = compute_builtin(operand->type);
     if (!builtin || builtin->flag != USIL_COMPUTE_DISPATCH_THREAD_ID || !static_indices(operand, 0) ||
-        width != 2 || !(plan->ctx->program->compute.system_value_mask & builtin->flag)) return NULL;
+        (width != 1 && width != 2) || !(plan->ctx->program->compute.system_value_mask & builtin->flag)) return NULL;
+    uint8_t selected_components[2] = {0, 0};
     unsigned component = 0;
-    for (int lane = 0; lane < 4; ++lane) if (lanes & (1u << lane))
-        if (usil_operand_source_component(operand, lane) != (int)component++) return NULL;
+    for (int lane = 0; lane < 4; ++lane) if (lanes & (1u << lane)) {
+        const int selected = usil_operand_source_component(operand, lane);
+        if (selected < 0 || selected >= 3 || (width == 2 && selected != (int)component)) return NULL;
+        selected_components[component++] = (uint8_t)selected;
+    }
     ASTOperandProvenance origin;
     ast_operand_provenance_init(&origin);
     origin.complete = true;
     origin.value_role = AST_OPERAND_VALUE_LOGICAL;
     origin.logical_value_id = UINT64_C(0x100000000) | builtin->flag;
     origin.natural_components = 3;
-    origin.result_components = 2;
+    origin.result_components = (uint8_t)width;
     origin.selection_role = AST_COMPONENT_SELECTION_SEMANTIC;
-    origin.selected_components[0] = 0;
-    origin.selected_components[1] = 1;
+    origin.selected_components[0] = selected_components[0];
+    origin.selected_components[1] = selected_components[1];
     origin.instruction_index = consumer;
     origin.source_instruction_index = instruction->source_instruction_index;
     origin.operand_index = operand_index;
     origin.destination_lanes = lanes;
-    return ast_create_emitter_operand_with_provenance("dispatchThreadId.xy", &origin);
+    char name[32];
+    snprintf(name, sizeof(name), "dispatchThreadId.%s", width == 2 ? "xy" :
+             (selected_components[0] == 0 ? "x" : selected_components[0] == 1 ? "y" : "z"));
+    return ast_create_emitter_operand_with_provenance(name, &origin);
 }
 
 static bool observe_memory_expression(ComputeMemoryPlan *plan, ASTExpr *expression, int owner) {
@@ -645,7 +696,9 @@ static bool observe_memory_expression(ComputeMemoryPlan *plan, ASTExpr *expressi
 static void emit_typed_declarations(HLSLEmitterContext *ctx, const HLSLComputeTypedSource *typed) {
     for (size_t index = 0; index < typed->resource_count; ++index) {
         const HLSLComputeTypedResource *resource = &typed->resources[index];
-        sb_appendf(ctx->sb, "%s<uint4> %s;\n", resource->writable ? "RWTexture2D" : "Texture2D", resource->name);
+        const char *type = resource->structured ? (resource->writable ? "RWStructuredBuffer" : "StructuredBuffer")
+                                                : (resource->writable ? "RWTexture2D" : "Texture2D");
+        sb_appendf(ctx->sb, "%s<uint4> %s;\n", type, resource->name);
         HLSLSourceQualityFacts fact;
         hlsl_source_quality_facts_init(&fact);
         fact.known = true;
@@ -663,11 +716,11 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
     const USILProgram *program = ctx->program;
     for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *instruction = &program->instructions[index];
-        if (instruction->opcode == USIL_OP_STORE_UAV_TYPED) {
+        if (instruction->opcode == USIL_OP_STORE_UAV_TYPED || instruction->opcode == USIL_OP_STORE_STRUCTURED) {
             if (plan.store >= 0 || index != program->instruction_count - 2)
                 return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             plan.store = index;
-        } else if (instruction->opcode == USIL_OP_LD) {
+        } else if (instruction->opcode == USIL_OP_LD || instruction->opcode == USIL_OP_LD_STRUCTURED) {
             if (plan.load >= 0) return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             plan.load = index;
         }
@@ -693,11 +746,31 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
     resource_origin.source_instruction_index = store->source_instruction_index;
     resource_origin.operand_index = 0;
     ASTExpr *resource = ast_create_emitter_operand_with_provenance(destination->name, &resource_origin);
-    ASTExpr *coordinates = memory_operand(&plan, plan.store, 1, 3u, 0);
-    ASTExpr *value = memory_operand(&plan, plan.store, 2, 15u, 0);
+    int address_operand = 1, value_operand = 2;
+    uint8_t address_lanes = 3u;
+    if (store->opcode == USIL_OP_STORE_STRUCTURED) {
+        USILMemoryAccess memory;
+        int literal_owner; uint8_t literal_lanes;
+        if (!usil_instruction_memory_access(program, store, &memory) ||
+            !memory_zero_lane(&plan, plan.store, memory.byte_offset_operand, 0, 0, &literal_owner, &literal_lanes)) {
+            ast_free_expr(resource);
+            return reject_instruction(ctx, plan.store, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+        }
+        address_operand = memory.address_operand;
+        value_operand = memory.value_operand;
+        address_lanes = memory.address_lanes;
+    }
+    ASTExpr *coordinates = memory_operand(&plan, plan.store, address_operand, address_lanes, 0);
+    ASTExpr *value = memory_operand(&plan, plan.store, value_operand, 15u, 0);
     if (!resource || !coordinates || !value) {
         ast_free_expr(resource); ast_free_expr(coordinates); ast_free_expr(value);
         return reject_instruction(ctx, plan.store, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+    }
+    /* A retained resource read is an effect even when SSA liveness finds no
+     * consumer. It cannot disappear behind a later pure redefinition. */
+    if (plan.load >= 0 && (plan.consumed[plan.load] != 15u || plan.load_expansions != 1u)) {
+        ast_free_expr(resource); ast_free_expr(coordinates); ast_free_expr(value);
+        return reject_instruction(ctx, plan.load, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     }
     for (int index = 0; index < plan.store; ++index) {
         const uint8_t written = usil_operand_destination_lane_mask(&program->instructions[index].operands[0]);
@@ -870,7 +943,8 @@ static bool emit_compute_stage(const USILProgram *program, StringBuilder *output
      * Direct uint system values and all body expressions retain authority.
      * Shared memory still preserves only byte layout and remains incomplete.
      * Complete coverage does not erase instruction-assignment residuals. */
-    if (!hlsl_source_quality_begin_entry(&ctx, program->compute.shared_memory_count == 0))
+    const bool structured_declarations = typed && typed->emit_declarations && typed->resource_count && typed->resources[0].structured;
+    if (!hlsl_source_quality_begin_entry(&ctx, program->compute.shared_memory_count == 0 && !structured_declarations))
         goto cleanup;
     if (!build_control_flow_graph(&ctx) || !compute_dominance(&ctx.cfg) ||
         !build_hlsl_ssa_graph(&ctx)) {

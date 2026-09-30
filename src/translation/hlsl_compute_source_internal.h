@@ -13,6 +13,7 @@ typedef struct {
     const char *name;
     uint32_t binding_register;
     bool writable;
+    bool structured; /* Explicit uint4-bit representation, original type unknown. */
 } HLSLComputeTypedResource;
 
 typedef struct {

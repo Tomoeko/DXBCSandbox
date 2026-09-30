@@ -5,6 +5,54 @@
 #include <limits.h>
 #include <string.h>
 
+static bool hull_temp_operand_is_declared(const DXBCOperand *operand, uint32_t count, unsigned *remaining) {
+    if (!operand || !remaining || !*remaining) return false;
+    --*remaining; /* Each operand node consumes at least one encoded token. */
+    if (operand->type == OPERAND_TYPE_TEMP &&
+        (operand->register_index < 0 || (uint32_t)operand->register_index >= count)) return false;
+    const DXBCOperand *roots[3] = {operand->rel_op0, operand->rel_op1, operand->rel_op2};
+    for (unsigned axis = 0; axis < 3; ++axis)
+        if (roots[axis] && !hull_temp_operand_is_declared(roots[axis], count, remaining)) return false;
+    return true;
+}
+
+bool usil_hull_phase_temp_registers_are_valid(const USILProgram *program) {
+    if (!program || program->program_type != DXBC_PROGRAM_TYPE_HULL ||
+        !program->has_stage_contract || !program->tessellation.valid ||
+        program->instruction_count <= 0 || program->instruction_alloc < program->instruction_count ||
+        !program->instructions || program->temp_count < 0 || program->temp_count > 4096 ||
+        !program->tessellation.phase_count ||
+        program->tessellation.phase_count > (size_t)program->instruction_count ||
+        program->tessellation.phase_capacity < program->tessellation.phase_count || !program->tessellation.phases)
+        return false;
+    uint32_t maximum = 0;
+    int next = 0;
+    for (size_t phase = 0; phase < program->tessellation.phase_count; ++phase) {
+        const USILHullPhase *scope = &program->tessellation.phases[phase];
+        if (scope->first_instruction_index != next || scope->end_instruction_index <= next ||
+            scope->end_instruction_index > program->instruction_count ||
+            scope->marker_source_instruction_index >= scope->first_source_instruction_index ||
+            scope->first_source_instruction_index >= scope->end_source_instruction_index ||
+            (scope->has_temp_count ? scope->temp_count > 4096 ||
+                scope->temp_count_source_instruction_index < scope->first_source_instruction_index ||
+                scope->temp_count_source_instruction_index >= scope->end_source_instruction_index
+                : scope->temp_count || scope->temp_count_source_instruction_index)) return false;
+        if (scope->temp_count > maximum) maximum = scope->temp_count;
+        for (int index = next; index < scope->end_instruction_index; ++index) {
+            const USILInstruction *instruction = &program->instructions[index];
+            if (instruction->source_instruction_index < scope->first_source_instruction_index ||
+                instruction->source_instruction_index >= scope->end_source_instruction_index ||
+                instruction->operand_count < 0 || instruction->operand_count > DXBC_MAX_OPERANDS) return false;
+            for (int operand = 0; operand < instruction->operand_count; ++operand) {
+                unsigned remaining = DXBC_MAX_NESTED_OPERAND_TOKENS;
+                if (!hull_temp_operand_is_declared(&instruction->operands[operand], scope->temp_count, &remaining)) return false;
+            }
+        }
+        next = scope->end_instruction_index;
+    }
+    return next == program->instruction_count && maximum == (uint32_t)program->temp_count;
+}
+
 uint8_t usil_operand_destination_lane_mask(const DXBCOperand *destination) {
     if (!destination || destination->type == OPERAND_TYPE_NULL) return 0;
     uint8_t mask = (uint8_t)(destination->destination_mask >> 4);

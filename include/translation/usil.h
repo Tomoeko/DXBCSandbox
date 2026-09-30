@@ -250,6 +250,11 @@ typedef struct {
     int end_instruction_index;
     bool instance_count_declared;
     uint32_t instance_count;
+    /* Temporary storage belongs to this execution phase. The stage maximum
+     * is only an allocation bound and does not authorize cross-phase reads. */
+    bool has_temp_count;
+    uint32_t temp_count;
+    uint32_t temp_count_source_instruction_index;
 } USILHullPhase;
 
 typedef struct {

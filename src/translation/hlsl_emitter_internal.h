@@ -563,6 +563,11 @@ typedef struct {
     const HLSLInstructionOwners *omitted_instructions;
     bool (*destination_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
     bool (*append_destination)(HLSLEmitterContext *ctx, int instruction, void *context);
+    /* Optional typed stage reads retain their own declaration/index authority.
+     * The AST factory returns an owned, unmodified value for the demanded mask. */
+    bool (*source_supported)(HLSLEmitterContext *ctx, int instruction, int operand, void *context);
+    ASTExpr *(*source_expression)(HLSLEmitterContext *ctx, int instruction, int operand,
+                                  uint8_t mask, void *context);
     void *context;
 } HLSLPureExpressionScope;
 bool hlsl_emit_pure_expression_scope(HLSLEmitterContext *ctx,

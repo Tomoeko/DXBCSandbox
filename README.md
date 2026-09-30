@@ -103,9 +103,10 @@ or quad/isoline coordinates, tessellation-factor declarations in their retained
 interface order, and SSA expressions. It admits static point indices in patches
 of up to 32 points and retains a separate 64-instruction limit. Patch-factor reads,
 resources and wider phase forms remain open. A bounded hull path reconstructs
-independent scalar-factor fork phases and signature-backed implicit control-point
-passthrough using separate CFG/SSA scopes for triangle, quad and isoline domains.
-Explicit control-point transforms, join phases and patch-resource reads remain unsupported.
+independent scalar-factor fork phases, signature-backed implicit control-point
+passthrough and pure float4 control-point transforms using separate CFG/SSA scopes
+for triangle, quad and isoline domains. Temporary bounds and control-point indices
+retain their own phase authority. Join phases and patch-resource reads remain unsupported.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,
@@ -126,14 +127,20 @@ unsigned straight-line values and typed thread/group arguments. Complete Unity
 A bounded `compute_source_candidate_build` API reconstructs complete kernel domains
 with their captured names, keywords and group dimensions. It supports resource-free
 RET/barrier bodies and a typed `Texture2D<uint4>` load / `RWTexture2D<uint4>` store
-path with dispatch coordinates and unsigned expressions. Other resource, control,
-shared-memory and atomic forms report their unsupported boundary.
+path with dispatch coordinates and unsigned expressions. A 16-byte structured
+load/store path uses an explicit `uint4` bit representation, preserving the actual
+index and memory-effect order. Release metadata does not retain the original
+structured element type; that declaration gap keeps whole source quality `mixed`
+even when the unsigned entry bodies are `clean`. Wider strides, float arithmetic,
+other resources, control flow, shared memory and atomics remain unsupported.
 Use `dxbc-sandbox extract INPUT --kind compute --all --compute-source-candidate
 --out recovered --format json` to export these candidates alongside the exact binary
 package. Each `_candidate.compute` has a separate evidence file. Unsupported
 reconstruction retains the binary package and reports a failed requested candidate.
 Candidates remain explicitly unverified; this workflow supplies no generic Class72
-certificate, compiler equality, import or native result.
+certificate, compiler equality, import or native result. Version2 candidate evidence
+records resource representations, original-type availability, declaration witnesses
+and original ordered memory-effect owners alongside source-quality results.
 
 The import, bundle, and finite-visual gate commands accept an explicit Editor
 path and use isolated projects. Their installed C# bridges live in

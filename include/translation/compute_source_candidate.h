@@ -75,6 +75,8 @@ typedef struct {
     uint8_t serialized_program_sha256[COMMON_SHA256_DIGEST_SIZE];
     uint8_t dxbc_sha256[COMMON_SHA256_DIGEST_SIZE];
     uint8_t source_sha256[COMMON_SHA256_DIGEST_SIZE];
+    /* Entry syntax and owned execution AST only. Enclosing resource declaration
+     * coverage, including unknown original element types, is in source_quality. */
     HLSLSourceQualityResult entry_quality;
     /* Owned effect/syntax events; AST expressions are retained separately.
      * No expression observation is flattened into an emission event. */
@@ -88,10 +90,21 @@ typedef struct {
     size_t memory_effect_count;
 } ComputeSourceVariant;
 
+/* Structured declarations retain byte stride, but not their original element
+ * scalar type. UINT4_BITS is an explicit bit-preserving source representation;
+ * it does not assert that the original declaration was uint4. */
+typedef enum {
+    COMPUTE_SOURCE_TEXTURE2D_UINT4 = 0,
+    COMPUTE_SOURCE_STRUCTURED_UINT4_BITS
+} ComputeSourceResourceKind;
+
 typedef struct {
     char *name;
     uint32_t binding_register;
     bool writable;
+    ComputeSourceResourceKind kind;
+    uint32_t byte_stride;
+    bool original_element_type_known;
     /* Owned original candidate-row IDs containing this exact declaration. */
     uint32_t *variant_witnesses;
     size_t witness_count;
@@ -106,7 +119,8 @@ typedef struct {
     size_t local_keyword_count;
     size_t kernel_count;
     /* Strong declaration union: names, type and binding agree in every entry.
-     * UINT4 Texture2D / RWTexture2D are the only admitted resource types. */
+     * UINT4 textures and explicit UINT4-bit structured representations remain
+     * distinct. Unknown original structured types keep whole source MIXED. */
     ComputeSourceTypedResource resources[COMPUTE_SOURCE_MAX_TYPED_RESOURCES];
     size_t resource_count;
     uint8_t serialized_object_sha256[COMMON_SHA256_DIGEST_SIZE];
@@ -131,7 +145,9 @@ void compute_source_candidate_dispose(ComputeSourceCandidate *candidate);
  * counts and the first precise unsupported coordinate. Initial source support
  * is one Windows64 D3D11 platform, exhaustive Boolean keyword domains, no
  * shared-memory declarations, and cs5 RET/SYNC-only bodies or one typed UINT4
- * Texture2D load and one RWTexture2D store with bounded unsigned expressions. */
+ * Texture2D load/store, or one 16-byte structured load/store represented as
+ * uint4 bits with bounded unsigned expressions. Structured candidates retain
+ * an incomplete declaration-quality unit and no original-element-type claim. */
 ComputeSourceStatus compute_source_candidate_build(
     const ComputeShaderObject *object, ComputeSourceCandidate *candidate,
     ComputeSourceDiagnostic *diagnostic);

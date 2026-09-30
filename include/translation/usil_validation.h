@@ -5,6 +5,11 @@
 
 #include "translation/usil.h"
 
+/* Scalar r# declarations and uses are independent in each retained HULL
+ * execution phase. The stage-wide count is exactly their allocation maximum;
+ * this does not certify indexable-temp arrays or cross-phase storage. */
+bool usil_hull_phase_temp_registers_are_valid(const USILProgram *program);
+
 typedef enum {
     USIL_OPERAND_USE_INVALID = 0,
     USIL_OPERAND_USE_DESTINATION,

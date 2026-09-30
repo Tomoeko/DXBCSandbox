@@ -742,7 +742,7 @@ static bool append_compute_candidate_evidence(
     common_sha256_digest_to_hex(candidate->serialized_object_sha256, object_digest);
     common_sha256_digest_to_hex(candidate->modeled_input_sha256, model_digest);
     common_sha256_digest_to_hex(candidate->source_sha256, source_digest);
-    sb_appendf(output, "{\"schema\":\"dxbc-sandbox-compute-source-candidate\",\"version\":1,"
+    sb_appendf(output, "{\"schema\":\"dxbc-sandbox-compute-source-candidate\",\"version\":2,"
         "\"status\":\"candidate-unverified\",\"compiler\":\"not-run\",\"import\":\"not-run\","
         "\"semantic\":\"not-run\",\"native\":\"not-run\",\"domain_complete\":%s,"
         "\"source_scope\":\"bounded-selected-compute-model\","
@@ -751,7 +751,21 @@ static bool append_compute_candidate_evidence(
         candidate->domain_complete ? "true" : "false", object_digest, model_digest, source_digest,
         candidate->kernel_count, candidate->variant_count);
     if (!hlsl_source_quality_append_json(&candidate->source_quality, output)) return false;
-    sb_append(output, ",\"variant_evidence\":[");
+    sb_append(output, ",\"resource_declarations\":[");
+    for (size_t index = 0; index < candidate->resource_count; ++index) {
+        const ComputeSourceTypedResource *resource = &candidate->resources[index];
+        /* Candidate names have already passed the ASCII identifier guard. */
+        sb_appendf(output, "%s{\"name\":\"%s\",\"binding_register\":%u,\"writable\":%s,"
+            "\"representation\":\"%s\",\"byte_stride\":%u,\"original_element_type_known\":%s,"
+            "\"variant_witnesses\":[", index ? "," : "", resource->name, resource->binding_register,
+            resource->writable ? "true" : "false",
+            resource->kind == COMPUTE_SOURCE_STRUCTURED_UINT4_BITS ? "structured-uint4-bits" : "texture2d-uint4",
+            resource->byte_stride, resource->original_element_type_known ? "true" : "false");
+        for (size_t witness = 0; witness < resource->witness_count; ++witness)
+            sb_appendf(output, "%s%u", witness ? "," : "", resource->variant_witnesses[witness]);
+        sb_append(output, "]}");
+    }
+    sb_append(output, "],\"variant_evidence\":[");
     for (size_t index = 0; index < candidate->variant_count; ++index) {
         const ComputeSourceVariant *variant = &candidate->variants[index];
         char program_digest[COMMON_SHA256_HEX_SIZE], dxbc_digest[COMMON_SHA256_HEX_SIZE];
@@ -768,7 +782,15 @@ static bool append_compute_candidate_evidence(
             variant->thread_group_size[0], variant->thread_group_size[1], variant->thread_group_size[2],
             program_digest, dxbc_digest, entry_digest);
         if (!hlsl_source_quality_append_json(&variant->entry_quality, output)) return false;
-        sb_append_char(output, '}');
+        sb_append(output, ",\"memory_effects\":[");
+        for (size_t effect = 0; effect < variant->memory_effect_count; ++effect) {
+            const ComputeSourceMemoryEffect *memory = &variant->memory_effects[effect];
+            sb_appendf(output, "%s{\"opcode\":%u,\"effect_flags\":%u,\"instruction_index\":%d,"
+                "\"source_instruction_index\":%u,\"binding_register\":%u}", effect ? "," : "",
+                (unsigned)memory->opcode, memory->effect_flags, memory->instruction_index,
+                memory->source_instruction_index, memory->binding_register);
+        }
+        sb_append(output, "]}");
     }
     sb_append(output, "]}\n");
     return sb_ok(output);

@@ -375,6 +375,27 @@ static bool signature_declaration_operand(
     return true;
 }
 
+/* Ordinary arrayed INPUT and plain Position OUTPUT declarations have a
+ * distinct HULL control-point ABI. Their raw owner must be in the single
+ * initial CP phase; FORK/JOIN and other stages do not inherit this exception. */
+static bool signature_hull_control_point_declaration_owned(
+    const USILProgram *program, const USILSignatureDeclaration *declaration) {
+    if (!program || !declaration || program->program_type != DXBC_PROGRAM_TYPE_HULL ||
+        !program->has_stage_contract || !program->tessellation.valid ||
+        !program->tessellation.phases || !program->tessellation.phase_count ||
+        program->tessellation.phase_count > 64 ||
+        program->tessellation.phase_capacity < program->tessellation.phase_count) return false;
+    const USILHullPhase *phase = &program->tessellation.phases[0];
+    if (phase->kind != DXBC_HULL_PHASE_CONTROL_POINT ||
+        phase->marker_source_instruction_index >= phase->first_source_instruction_index ||
+        phase->first_source_instruction_index >= phase->end_source_instruction_index ||
+        declaration->source_instruction_index < phase->first_source_instruction_index ||
+        declaration->source_instruction_index >= phase->end_source_instruction_index) return false;
+    for (size_t index = 1; index < program->tessellation.phase_count; ++index)
+        if (program->tessellation.phases[index].kind == DXBC_HULL_PHASE_CONTROL_POINT) return false;
+    return true;
+}
+
 static bool signature_declaration_matches_element(
     const USILProgram* program, const USILSignatureDeclaration* declaration,
     const DXBCSignatureElement* element, DXBCSignatureRole role) {
@@ -436,10 +457,22 @@ static bool signature_declaration_matches_element(
         declaration->array_element_count == program->tessellation.input_control_point_count &&
         element->system_value == 1u && element->component_type == 3u &&
         signature_semantic_equals(dxbc_signature_semantic_name(element), "SV_Position");
+    const bool hull_control_point_position =
+        signature_hull_control_point_declaration_owned(program, declaration) &&
+        element->system_value == 1u && element->component_type == 3u &&
+        element->semantic_index == 0u && element->mask == 15u && declaration->mask == 15u &&
+        !element->min_precision && !element->stream_index && !element->interpolation_mode &&
+        signature_semantic_equals(dxbc_signature_semantic_name(element), "SV_Position") &&
+        ((role == DXBC_SIGNATURE_ROLE_INPUT && declaration->kind == USIL_SIGNATURE_DECL_INPUT &&
+          declaration->operand_type == OPERAND_TYPE_INPUT && declaration->has_array_element_count &&
+          declaration->array_element_count == program->tessellation.input_control_point_count) ||
+         (role == DXBC_SIGNATURE_ROLE_OUTPUT && declaration->kind == USIL_SIGNATURE_DECL_OUTPUT &&
+          declaration->operand_type == OPERAND_TYPE_OUTPUT && !declaration->has_array_element_count));
     const bool plain_special_output =
         role != DXBC_SIGNATURE_ROLE_INPUT && element->system_value >= 64u &&
         element->system_value <= 70u;
-    return (element->system_value == 0u || plain_special_output || domain_position_input) &&
+    return (element->system_value == 0u || plain_special_output || domain_position_input ||
+            hull_control_point_position) &&
            (!declaration->has_interpolation ||
             declaration->interpolation_mode ==
                 element->interpolation_mode);
@@ -672,9 +705,10 @@ bool usil_signature_authority_is_valid(const USILProgram* program) {
                                   .source_instruction_index) ||
             (declaration->has_array_element_count &&
              ((declaration->operand_type == OPERAND_TYPE_INPUT &&
-               (!program->geometry.valid ||
-                declaration->array_element_count !=
-                    program->geometry.input_vertex_count)) ||
+               !((program->program_type == DXBC_PROGRAM_TYPE_GEOMETRY && program->geometry.valid &&
+                  declaration->array_element_count == program->geometry.input_vertex_count) ||
+                 (signature_hull_control_point_declaration_owned(program, declaration) &&
+                  declaration->array_element_count == program->tessellation.input_control_point_count))) ||
               (declaration->operand_type ==
                    OPERAND_TYPE_INPUT_CONTROL_POINT &&
                (!program->tessellation.valid ||
@@ -1731,7 +1765,18 @@ static bool usil_translate_internal(
             case 104: /* DCL_TEMPS */
                 if (src_inst->operand_count == 1 &&
                     src_inst->operands[0].register_index >= 0) {
-                    program->temp_count = src_inst->operands[0].register_index;
+                    const int count = src_inst->operands[0].register_index;
+                    if (stage_contract && stage_contract->program_type == DXBC_PROGRAM_TYPE_HULL) {
+                        if (!hull_phase_index || hull_phase_index > program->tessellation.phase_count || count > 4096)
+                            goto declaration_fail;
+                        USILHullPhase *phase = &program->tessellation.phases[hull_phase_index - 1];
+                        if (phase->has_temp_count || source_index < phase->first_source_instruction_index ||
+                            source_index >= phase->end_source_instruction_index) goto declaration_fail;
+                        phase->has_temp_count = true;
+                        phase->temp_count = (uint32_t)count;
+                        phase->temp_count_source_instruction_index = source_index;
+                        if (count > program->temp_count) program->temp_count = count;
+                    } else program->temp_count = count;
                 } else goto declaration_fail;
                 break;
             case 106: /* DCL_GLOBAL_FLAGS */
@@ -1907,11 +1952,17 @@ declaration_fail:
         }
     }
     
-    if (program->temp_count == 0 && max_temp_idx >= 0) {
+    if (program->program_type != DXBC_PROGRAM_TYPE_HULL && program->temp_count == 0 && max_temp_idx >= 0) {
         if (max_temp_idx == INT_MAX) goto fail;
         program->temp_count = max_temp_idx + 1;
     }
     
+    if (program->program_type == DXBC_PROGRAM_TYPE_HULL &&
+        !usil_hull_phase_temp_registers_are_valid(program)) {
+        LOG_ERROR("Hull temporary uses disagree with phase declarations");
+        goto fail;
+    }
+
     if (!reserve_usil_array((void**)&program->icb_values,
                             &program->icb_value_alloc,
                             program->icb_value_count,

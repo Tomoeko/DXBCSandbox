@@ -332,11 +332,13 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
         const bool stage_destination = !operand && scope &&
             value->type == OPERAND_TYPE_OUTPUT && scope->destination_supported &&
             scope->destination_supported(ctx, index, scope->context);
-        if (!stage_destination && !hlsl_lift_operand_is_plain(&unmodified))
+        const bool stage_source = operand && scope && scope->source_supported &&
+            scope->source_supported(ctx, index, operand, scope->context);
+        if (!stage_destination && !stage_source && !hlsl_lift_operand_is_plain(&unmodified))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         const bool domain_input = ctx->high_level_domain &&
             (value->type == OPERAND_TYPE_INPUT_CONTROL_POINT || value->type == OPERAND_TYPE_DOMAIN_LOCATION);
-        if (operand && !domain_input && value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_INPUT &&
+        if (operand && !domain_input && !stage_source && value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_INPUT &&
             value->type != OPERAND_TYPE_IMMEDIATE32 &&
             (full_width || value->type != OPERAND_TYPE_CONSTANT_BUFFER))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
@@ -389,7 +391,8 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             for (int operand = 1; operand < inst->operand_count; ++operand)
                 if (inst->operands[operand].type != OPERAND_TYPE_TEMP &&
-                    inst->operands[operand].type != OPERAND_TYPE_IMMEDIATE32)
+                    inst->operands[operand].type != OPERAND_TYPE_IMMEDIATE32 &&
+                    !(scope->source_supported && scope->source_supported(ctx, index, operand, scope->context)))
                     return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         }
         if (inst->precise_mask || inst->saturate)
@@ -701,15 +704,19 @@ static ASTExpr *source_expression_unmodified(HLSLEmitterContext *ctx, int instru
 
 static ASTExpr *source_expression(HLSLEmitterContext *ctx, int instruction, int operand,
                                   const unsigned *uses, ASTExpr **pending, HLSLInstructionOwners *pending_owners,
-                                  HLSLInstructionOwners *owners, const uint8_t *logical_widths) {
+                                  HLSLInstructionOwners *owners, const uint8_t *logical_widths,
+                                  const HLSLPureExpressionScope *scope) {
     const DXBCOperand *original = &ctx->program->instructions[instruction].operands[operand];
     DXBCOperand unmodified = *original;
     unmodified.has_abs = unmodified.has_neg = false;
     unmodified.extended_tokens = NULL;
     unmodified.extended_token_count = 0;
-    ASTExpr *expression = source_expression_unmodified(ctx, instruction, operand, uses,
-        pending, pending_owners, owners, &unmodified, logical_widths);
     const uint8_t lanes = source_lanes(ctx, instruction, operand);
+    ASTExpr *expression = scope && scope->source_supported &&
+        scope->source_supported(ctx, instruction, operand, scope->context)
+        ? scope->source_expression(ctx, instruction, operand, lanes, scope->context)
+        : source_expression_unmodified(ctx, instruction, operand, uses,
+            pending, pending_owners, owners, &unmodified, logical_widths);
     if (expression && original->has_abs) {
         const unsigned width = expression_width(expression);
         ASTExpr *call = ast_create_call("abs", &expression, 1);
@@ -1056,22 +1063,22 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
         } else {
             ASTExpr *left =
                 source_expression(ctx, index, 1, uses, pending, pending_owners, &owners,
-                                  logical_widths);
+                                  logical_widths, scope);
             if (hlsl_texture_sample_opcode(inst->opcode)) {
                 ASTExpr *parameter = inst->operand_count < 5 ? NULL
                     : source_expression(ctx, index, 4, uses, pending, pending_owners, &owners,
-                                        logical_widths);
+                                        logical_widths, scope);
                 ASTExpr *second_parameter = inst->operand_count < 6 ? NULL
                     : source_expression(ctx, index, 5, uses, pending, pending_owners, &owners,
-                                        logical_widths);
+                                        logical_widths, scope);
                 expression = hlsl_texture_sample_expression(ctx, index, left, parameter, second_parameter);
             } else {
                 ASTExpr *right = inst->operand_count < 3 ? NULL
                     : source_expression(ctx, index, 2, uses, pending, pending_owners, &owners,
-                                        logical_widths);
+                                        logical_widths, scope);
                 ASTExpr *third = inst->opcode == USIL_OP_MAD
                     ? source_expression(ctx, index, 3, uses, pending, pending_owners, &owners,
-                                        logical_widths) : NULL;
+                                        logical_widths, scope) : NULL;
                 expression = vector_operation(ctx, index, left, right, third);
             }
         }
@@ -1148,7 +1155,8 @@ cleanup:
 bool hlsl_emit_pure_expression_scope(HLSLEmitterContext *ctx,
                                       const HLSLPureExpressionScope *scope) {
     if (!ctx || !ctx->program || !scope || !scope->destination_supported ||
-        !scope->append_destination || scope->first_instruction < 0 ||
+        !scope->append_destination || (!!scope->source_supported != !!scope->source_expression) ||
+        scope->first_instruction < 0 ||
         scope->end_instruction <= scope->first_instruction ||
         scope->end_instruction > ctx->program->instruction_count ||
         ctx->program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||

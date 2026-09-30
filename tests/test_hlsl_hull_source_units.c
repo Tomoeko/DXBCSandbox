@@ -3,6 +3,7 @@
 #include "dxbc/dxbc_hash.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +82,25 @@ static uint8_t *make_controlled_dxbc(uint32_t points, uint8_t scenario, size_t *
     uint32_t words[128];
     size_t word_count = 0;
     for (size_t word = 0; word < sizeof(base_words) / 4; ++word) {
+        if ((scenario == 4 || scenario == 5) && word == 9) {
+            const uint32_t cp_header[] = {INSTRUCTION(114, 1), INSTRUCTION(95, 2), 0x00016000,
+                INSTRUCTION(95, 4), 0x002010f2, points, 0,
+                INSTRUCTION(101, 3), 0x001020f2, 0,
+                INSTRUCTION(104, 2), scenario == 5 ? 2 : 1,
+                INSTRUCTION(54, 4), 0x00100012, 0, 0x00016001};
+            memcpy(words + word_count, cp_header, sizeof(cp_header));
+            word_count += sizeof(cp_header) / 4;
+            if (scenario == 5) {
+                const uint32_t chained[] = {INSTRUCTION(54, 5), 0x00100012, 1, 0x0010000a, 0};
+                memcpy(words + word_count, chained, sizeof(chained));
+                word_count += sizeof(chained) / 4;
+            }
+            const uint32_t cp_body[] = {INSTRUCTION(56, 12), 0x001020f2, 0,
+                0x00004002, 0x3fa00000, 0x3fa00000, 0x3fa00000, 0x3fa00000,
+                0x00a01e46, 0x0010000a, scenario == 5 ? 1 : 0, 0, INSTRUCTION(62, 1)};
+            memcpy(words + word_count, cp_body, sizeof(cp_body));
+            word_count += sizeof(cp_body) / 4;
+        }
         /* New authored arithmetic follows the instance-index transport.
          * The inner read control deliberately has no phase-local definition. */
         if ((scenario == 1 || scenario == 2) && word == 36) {
@@ -88,6 +108,10 @@ static uint8_t *make_controlled_dxbc(uint32_t points, uint8_t scenario, size_t *
                 0x00004001, 0x3fc00000, 0x00004001, 0x40000000};
             memcpy(words + word_count, product, sizeof(product));
             word_count += sizeof(product) / 4;
+        }
+        if (scenario == 2 && base_words[word] == INSTRUCTION(54, 5) && base_words[word + 1] == 0x00102012) {
+            words[word_count++] = INSTRUCTION(104, 2);
+            words[word_count++] = 2;
         }
         words[word_count++] = base_words[word];
     }
@@ -598,8 +622,154 @@ static bool other_domains_and_control_point_counts(void) {
     return true;
 }
 
+static bool explicit_control_point_phase(void) {
+    const unsigned counts[] = {1, 3, 4, 32};
+    for (size_t index = 0; index < sizeof(counts) / sizeof(counts[0]); ++index) {
+        HullFixture fixture;
+        CHECK(hull_fixture_init(&fixture, counts[index], 4));
+        CHECK(fixture.program.tessellation.phase_count == 3);
+        CHECK(fixture.program.tessellation.phases[0].kind == DXBC_HULL_PHASE_CONTROL_POINT);
+        CHECK(usil_signature_authority_is_valid(&fixture.program));
+        CHECK(!hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_RECOMPILE));
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        HLSLSourceQualityResult quality;
+        HLSLExpressionSourceMap map;
+        HullLedger ledger = {.program = &fixture.program};
+        options.source_quality = &quality;
+        options.expression_source_map = &map;
+        options.source_quality_observer = observe_hull;
+        options.source_quality_observer_context = &ledger;
+        options.source_quality_pass_index = 4;
+        options.source_quality_entry_point_index = 3;
+        StringBuilder source;
+        sb_init(&source);
+        CHECK(hlsl_emit_with_options(&fixture.program, &source, NULL, NULL, NULL, &options));
+        CHECK(strstr(source.buf, "controlPoint.clipPosition ="));
+        CHECK(strstr(source.buf, "patch[pointIndex].clipPosition"));
+        CHECK(!strstr(source.buf, "return patch[pointIndex];"));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+        CHECK(!ledger.bad_owner && ledger.units == 7);
+        CHECK(hlsl_expression_source_map_matches(&map, &fixture.program, source.buf));
+        CHECK(map.origins[0].kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION);
+        CHECK(map.origins[0].source_end > map.origins[0].source_begin);
+        CHECK(map.origins[2].kind == HLSL_EXPRESSION_ORIGIN_RETURN);
+        CHECK(map.origins[2].source_end > map.origins[2].source_begin);
+        sb_free(&source);
+        hull_fixture_dispose(&fixture);
+    }
+    HullFixture fixture;
+    CHECK(hull_fixture_init(&fixture, 3, 5));
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLSourceQualityResult quality;
+    HLSLExpressionSourceMap map;
+    options.source_quality = &quality;
+    options.expression_source_map = &map;
+    StringBuilder source;
+    sb_init(&source);
+    CHECK(hlsl_emit_with_options(&fixture.program, &source, NULL, NULL, NULL, &options));
+    CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    CHECK(map.origins[0].source_begin == map.origins[1].source_begin);
+    CHECK(hlsl_expression_source_map_matches(&map, &fixture.program, source.buf));
+    sb_free(&source);
+    /* The first phase's relative identity is not a global temporary fact. */
+    CHECK(fixture.program.temp_count == 2);
+    CHECK(fixture.program.tessellation.phases[0].temp_count == 2);
+    CHECK(fixture.program.tessellation.phases[1].temp_count == 1);
+    CHECK(usil_hull_phase_temp_registers_are_valid(&fixture.program));
+    fixture.program.tessellation.phases[0].temp_count = 1;
+    fixture.program.tessellation.phases[1].temp_count = 2;
+    CHECK(!usil_hull_phase_temp_registers_are_valid(&fixture.program));
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.tessellation.phases[0].temp_count = 2;
+    fixture.program.tessellation.phases[1].temp_count = 1;
+    fixture.program.tessellation.phases[0].temp_count_source_instruction_index =
+        fixture.program.tessellation.phases[1].first_source_instruction_index;
+    CHECK(!usil_hull_phase_temp_registers_are_valid(&fixture.program));
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.tessellation.phases[0].temp_count_source_instruction_index =
+        fixture.program.tessellation.phases[0].first_source_instruction_index + 3;
+    fixture.program.temp_count = 3;
+    CHECK(!usil_hull_phase_temp_registers_are_valid(&fixture.program));
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.temp_count = 2;
+    CHECK(usil_hull_phase_temp_registers_are_valid(&fixture.program));
+    fixture.program.instructions[1].operands[1].register_index = 1;
+    fixture.program.instructions[1].operands[1].index_values[0] = 1;
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.instructions[1].operands[1].register_index = 0;
+    fixture.program.instructions[1].operands[1].index_values[0] = 0;
+    fixture.program.instructions[1].opcode = USIL_OP_ADD;
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.instructions[1].opcode = USIL_OP_MOV;
+    DXBCOperand *point = &fixture.program.instructions[2].operands[2];
+    point->rel_op0->rel_op0 = point->rel_op0;
+    CHECK(!usil_hull_phase_temp_registers_are_valid(&fixture.program));
+    CHECK(source_rejected(&fixture.program));
+    point->rel_op0->rel_op0 = NULL;
+    point->index_values[1] = 1;
+    point->rel_offset0 = 1;
+    CHECK(source_rejected(&fixture.program));
+    point->index_values[1] = 0;
+    point->rel_offset0 = 0;
+    point->swizzle[0] = 1;
+    CHECK(source_rejected(&fixture.program));
+    point->swizzle[0] = 0;
+    fixture.program.instructions[2].operands[0].destination_mask = 3;
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.instructions[2].operands[0].destination_mask = 240;
+    USILSignatureDeclaration *input = &fixture.program.signature_declarations[1];
+    input->array_element_count = 4;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    CHECK(source_rejected(&fixture.program));
+    input->array_element_count = 3;
+    input->source_instruction_index = fixture.program.tessellation.phases[0].marker_source_instruction_index;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    input->source_instruction_index = fixture.program.tessellation.phases[0].first_source_instruction_index + 1;
+    fixture.program.inputs[0].system_value = 2;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    fixture.program.inputs[0].system_value = 1;
+    fixture.program.outputs[0].system_value = 2;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    fixture.program.outputs[0].system_value = 1;
+    fixture.program.tessellation.phases[0].kind = DXBC_HULL_PHASE_FORK;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.tessellation.phases[0].kind = DXBC_HULL_PHASE_CONTROL_POINT;
+    fixture.program.tessellation.phases[1].kind = DXBC_HULL_PHASE_CONTROL_POINT;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    CHECK(source_rejected(&fixture.program));
+    fixture.program.tessellation.phases[1].kind = DXBC_HULL_PHASE_FORK;
+    input->mask = 3;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    input->mask = 15;
+    fixture.program.inputs[0].component_type = 1;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    fixture.program.inputs[0].component_type = 3;
+    fixture.program.program_type = DXBC_PROGRAM_TYPE_DOMAIN;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    fixture.program.program_type = DXBC_PROGRAM_TYPE_GEOMETRY;
+    fixture.program.geometry.valid = true;
+    fixture.program.geometry.input_vertex_count = 3;
+    CHECK(!usil_signature_authority_is_valid(&fixture.program));
+    fixture.program.program_type = DXBC_PROGRAM_TYPE_HULL;
+    fixture.program.geometry.valid = false;
+    CHECK(usil_signature_authority_is_valid(&fixture.program));
+    CHECK(hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+    /* A later larger declaration must never authorize an earlier phase's
+     * register use. Reproject the actual authored semantic token model. */
+    unsigned declarations = 0;
+    for (int index = 0; index < fixture.semantic.instruction_count; ++index)
+        if (fixture.semantic.instructions[index].opcode == 104)
+            fixture.semantic.instructions[index].operands[0].register_index = ++declarations == 1 ? 1 : 2;
+    USILProgram rejected = {0};
+    CHECK(!usil_translate_with_stage_contract(&rejected, &fixture.semantic, &fixture.contract));
+    usil_free(&rejected);
+    hull_fixture_dispose(&fixture);
+    return true;
+}
+
 int main(void) {
     return natural_hull_source() && arithmetic_and_phase_ownership() &&
         malformed_contracts() && reordered_phase_roles() && scoped_cfg_ownership() &&
-        other_domains_and_control_point_counts() ? 0 : 1;
+        other_domains_and_control_point_counts() && explicit_control_point_phase() ? 0 : 1;
 }
