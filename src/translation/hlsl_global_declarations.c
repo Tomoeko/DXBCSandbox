@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "translation/hlsl_global_declarations.h"
 #include "translation/dxbc_cbuffer_projection.h"
+#include "translation/usil_validation.h"
+#include "common/shader_stage.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +10,9 @@
 struct HLSLGlobalDeclarationUnion {
     int stage, current;
     DXBCProgramType dxbc_stage;
-    uint32_t shell_size;
+    uint32_t shell_size, program_mask;
+    int32_t gpu_program_type;
+    bool empty_residual_shell, empty_common_shell;
     HLSLGlobalDeclarationField *fields;
     size_t field_count;
 };
@@ -104,6 +108,29 @@ static bool metadata_shape(const SerializedProgramParameters *parameters) {
                            (!parameters->res_count || parameters->resources));
 }
 
+/* LoadParametersFromData retains this exact loose shell even when a stage
+ * has no constant declarations. A zero-sized named/partial buffer is a different
+ * authority; no arbitrary empty-looking record is discarded. */
+static bool empty_parameters(const SerializedProgramParameters *parameters, bool *has_shell) {
+    if (!metadata_shape(parameters)) return false;
+    if (!parameters) return true;
+    if (parameters->res_count || parameters->cb_count > 1) return false;
+    if (!parameters->cb_count) return true;
+    const SerializedConstantBuffer *buffer = parameters->constant_buffers;
+    if (!buffer->name || strcmp(buffer->name, "$Globals") ||
+        buffer->role != SERIALIZED_CBUFFER_LOOSE_PARAMETERS || buffer->size ||
+        buffer->has_is_partial || buffer->is_partial || buffer->var_count ||
+        buffer->variables || buffer->struct_count || buffer->struct_params) return false;
+    *has_shell = true;
+    return true;
+}
+
+static bool empty_authority(const SerializedProgramParameters *residual,
+                            const SerializedProgramParameters *common, bool *has_shell) {
+    *has_shell = false;
+    return empty_parameters(residual, has_shell) && empty_parameters(common, has_shell);
+}
+
 static bool identifier(const char *name) {
     if (!name || !name[0])
         return false;
@@ -146,6 +173,9 @@ static HLSLGlobalDeclarationStatus shell(const SerializedProgramParameters *resi
     if (!metadata_shape(residual) || !metadata_shape(common))
         return HLSL_GLOBAL_DECLARATIONS_INVALID;
     *size = 0;
+    bool has_empty_shell;
+    if (empty_authority(residual, common, &has_empty_shell))
+        return has_empty_shell ? HLSL_GLOBAL_DECLARATIONS_OK : HLSL_GLOBAL_DECLARATIONS_NOT_APPLICABLE;
     bool bound = false;
     const SerializedProgramParameters *sources[2] = {residual, common};
     for (unsigned source = 0; source < 2; ++source) {
@@ -260,6 +290,15 @@ bool hlsl_global_declarations_same_family(const SerializedPass *pass, int stage,
            (!sub->has_hardware_tier || sub->hardware_tier == target->hardware_tier);
 }
 
+static bool empty_stage_scope(const HLSLGlobalDeclarationUnion *value, uint8_t major, uint8_t minor) {
+    ShaderStageTuple tuple = {.serialized_stage = (UnitySerializedProgramStage)value->stage,
+        .serialized_program_mask = value->program_mask,
+        .gpu_program_type = (UnityGPUProgramType)value->gpu_program_type,
+        .dxbc_program_type = value->dxbc_stage, .shader_model_major = major, .shader_model_minor = minor};
+    return shader_stage_serialized_to_compiler(tuple.serialized_stage, &tuple.compiler_program) &&
+        shader_stage_validate_d3d11_tuple(&tuple) == SHADER_STAGE_TUPLE_OK;
+}
+
 HLSLGlobalDeclarationStatus
 hlsl_global_declarations_build(const SerializedPass *pass, int stage, int current,
                                const HLSLGlobalDeclarationWitness *witnesses, size_t count,
@@ -301,6 +340,17 @@ hlsl_global_declarations_build(const SerializedPass *pass, int stage, int curren
     value->dxbc_stage = stages[stage];
     const SerializedSubProgram *target = &pass->subprograms[stage][current];
     const SerializedSubProgramIdentity *target_id = &pass->subprogram_identities[stage][current];
+    value->program_mask = pass->program_mask;
+    value->gpu_program_type = target->program_type;
+    if (!selected_shell) {
+        if (!empty_stage_scope(value, 4, 0) && !empty_stage_scope(value, 5, 0)) {
+            status = HLSL_GLOBAL_DECLARATIONS_SCOPE_CONFLICT; goto fail;
+        }
+        if (!empty_parameters(selected->residual, &value->empty_residual_shell) ||
+            !empty_parameters(&pass->common_parameters[stage], &value->empty_common_shell)) {
+            status = HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT; goto fail;
+        }
+    }
     size_t eligible = 0;
     for (int i = 0; i < pass->subprogram_count[stage]; ++i) {
         if (hlsl_global_declarations_same_family(pass, stage, current, i))
@@ -339,6 +389,11 @@ hlsl_global_declarations_build(const SerializedPass *pass, int stage, int curren
             status = HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT;
             goto fail;
         }
+        if (!selected_shell) {
+            bool has_empty_shell;
+            if (!empty_authority(witnesses[i].residual, &pass->common_parameters[stage], &has_empty_shell) ||
+                !has_empty_shell) { status = HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT; goto fail; }
+        }
         status = append_parameters(value, witnesses[i].residual, (uint32_t)index, index == current);
         if (status == HLSL_GLOBAL_DECLARATIONS_OK)
             status = append_parameters(value, &pass->common_parameters[stage], (uint32_t)index,
@@ -371,6 +426,46 @@ int hlsl_global_declarations_current_variant(const HLSLGlobalDeclarationUnion *v
     return value ? value->current : -1;
 }
 
+static bool operand_has_no_cbuffer(const DXBCOperand *operand, unsigned *remaining) {
+    if (!operand || !*remaining || operand->type == OPERAND_TYPE_CONSTANT_BUFFER) return false;
+    --*remaining; /* Every nested operand consumes at least one encoded token. */
+    const DXBCOperand *relative[3] = {operand->rel_op0, operand->rel_op1, operand->rel_op2};
+    for (unsigned index = 0; index < 3; ++index)
+        if (relative[index] && !operand_has_no_cbuffer(relative[index], remaining)) return false;
+    return true;
+}
+
+HLSLGlobalDeclarationStatus hlsl_global_declarations_validate_empty_target(
+    const HLSLGlobalDeclarationUnion *value, const USILProgram *program,
+    const SerializedProgramParameters *residual, const SerializedProgramParameters *common) {
+    bool has_empty_shell;
+    if (!program || !empty_authority(residual, common, &has_empty_shell))
+        return HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT;
+    bool residual_shell = false, common_shell = false;
+    if (!empty_parameters(residual, &residual_shell) || !empty_parameters(common, &common_shell))
+        return HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT;
+    if (value ? value->shell_size || value->field_count || program->program_type != value->dxbc_stage || !has_empty_shell ||
+                residual_shell != value->empty_residual_shell || common_shell != value->empty_common_shell ||
+                !empty_stage_scope(value, program->shader_model_major, program->shader_model_minor)
+              : has_empty_shell)
+        return HLSL_GLOBAL_DECLARATIONS_SCOPE_CONFLICT;
+    if (program->cbuffer_count || program->instruction_count < 0 || program->instruction_count > 4096 ||
+        program->instruction_alloc < program->instruction_count ||
+        (program->instruction_count && !program->instructions))
+        return HLSL_GLOBAL_DECLARATIONS_CURRENT_READ_UNAUTHORIZED;
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILInstruction *instruction = &program->instructions[index];
+        if (!usil_instruction_shape_valid(program, instruction))
+            return HLSL_GLOBAL_DECLARATIONS_CURRENT_READ_UNAUTHORIZED;
+        for (int operand = 0; operand < instruction->operand_count; ++operand) {
+            unsigned remaining = DXBC_MAX_NESTED_OPERAND_TOKENS;
+            if (!operand_has_no_cbuffer(&instruction->operands[operand], &remaining))
+                return HLSL_GLOBAL_DECLARATIONS_CURRENT_READ_UNAUTHORIZED;
+        }
+    }
+    return HLSL_GLOBAL_DECLARATIONS_OK;
+}
+
 HLSLGlobalDeclarationStatus hlsl_global_declarations_validate_target(
     const HLSLGlobalDeclarationUnion *value, const USILProgram *program,
     const SerializedProgramParameters *residual, const SerializedProgramParameters *common) {
@@ -383,6 +478,7 @@ HLSLGlobalDeclarationStatus hlsl_global_declarations_validate_target(
     HLSLGlobalDeclarationStatus status = shell(residual, common, &size);
     if (status != HLSL_GLOBAL_DECLARATIONS_OK || size != value->shell_size)
         return HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT;
+    if (!size) return hlsl_global_declarations_validate_empty_target(value, program, residual, common);
     HLSLGlobalDeclarationUnion own = {.shell_size = size};
     status = append_parameters(&own, residual, (uint32_t)value->current, true);
     if (status == HLSL_GLOBAL_DECLARATIONS_OK)

@@ -582,6 +582,16 @@ if(BUILD_TESTING)
             unity_compiler_support dxbc_build_options)
         add_test(NAME shaderlab_lift_units COMMAND test_shaderlab_lift_units)
 
+        add_executable(test_shaderlab_lift_inventory_units
+            tests/test_shaderlab_lift_inventory_units.c tests/test_shaderlab_fixture.c)
+        target_include_directories(test_shaderlab_lift_inventory_units PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(test_shaderlab_lift_inventory_units PRIVATE
+            SHADERLAB_INVENTORY_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
+        target_link_libraries(test_shaderlab_lift_inventory_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME shaderlab_lift_inventory_units COMMAND test_shaderlab_lift_inventory_units)
+
         add_executable(test_generated_domain_certifier_units
             tests/test_generated_domain_certifier_units.c)
         target_include_directories(test_generated_domain_certifier_units

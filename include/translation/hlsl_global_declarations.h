@@ -67,6 +67,14 @@ const HLSLGlobalDeclarationField *
 hlsl_global_declarations_fields(const HLSLGlobalDeclarationUnion *declarations, size_t *count);
 uint32_t hlsl_global_declarations_shell_size(const HLSLGlobalDeclarationUnion *declarations);
 int hlsl_global_declarations_current_variant(const HLSLGlobalDeclarationUnion *declarations);
+/* Closed empty authority: NULL preserves the historical absent-metadata path;
+ * an owned empty union must match its stage and replay empty loose $Globals
+ * parameters. Nonempty/foreign/partial metadata, resources, CB declarations and
+ * even nested executable CB reads reject. This emits no declaration and grants
+ * no executable read or sibling field authority. */
+HLSLGlobalDeclarationStatus hlsl_global_declarations_validate_empty_target(
+    const HLSLGlobalDeclarationUnion *declarations, const USILProgram *program,
+    const SerializedProgramParameters *residual, const SerializedProgramParameters *common);
 /* Re-checks the target's original metadata and projects actual DXBC reads onto
  * only those original fields. Imported fields cannot fill an executable hole. */
 HLSLGlobalDeclarationStatus hlsl_global_declarations_validate_target(

@@ -1546,7 +1546,9 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
       }
     }
   }
-  if (ctx->global_declarations && !union_applied) return false;
+  if (ctx->global_declarations && !union_applied &&
+      hlsl_global_declarations_validate_empty_target(ctx->global_declarations, ctx->program,
+          ctx->params, ctx->common_params) != HLSL_GLOBAL_DECLARATIONS_OK) return false;
   ctx->cbuffer_layouts_built = true;
   return true;
 }

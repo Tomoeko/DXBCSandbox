@@ -107,7 +107,10 @@ independent scalar-factor fork phases, signature-backed implicit control-point
 passthrough and pure float4 control-point transforms using separate CFG/SSA scopes
 for triangle, quad and isoline domains. Temporary bounds and control-point indices
 retain their own phase authority. Explicit phases also admit output counts no
-larger than their input patches; implicit copies preserve the count. Join phases and patch-resource reads remain unsupported.
+larger than their input patches; implicit copies preserve the count. Complete
+linked vertex/hull/domain/fragment passes admit independently validated empty
+Globals metadata, preserving each stage's declaration and read scope. Join phases
+and patch-resource reads remain unsupported.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,
@@ -128,6 +131,10 @@ API observes the unchanged graphics invocation with canonical request and contro
 identities. A bounded cbuffer inventory records expanded declarations, packing and
 extent. These receipts cover declarations only; callers still need actual target
 bindings, instruction reads and include semantics before granting source quality.
+Extraction reports historical bounded source inventories for ordinary high-level
+artifacts and binds the published view to the accepted file's size and hash.
+These snapshots preserve quality gaps and remain separate from compiler acceptance;
+retain the core inventory and original inputs when typed receipt replay is needed.
 
 Compute inspection retains group dimensions, shared-memory declarations, barrier
 flags and memory effects in the IR. A bounded HLSL entry-point projection supports

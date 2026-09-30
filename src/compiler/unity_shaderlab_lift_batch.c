@@ -49,6 +49,7 @@ static bool select_candidate(void *opaque, const ShaderBatchCandidateInput *inpu
         .source_path = input->source_path,
         .source_directory = input->source_directory,
         .source_basename = input->source_basename,
+        .source_object = input->object,
     };
     UnityShaderLabLiftResult **result = &batch->results[input->catalog_record_index];
     (void)unity_shaderlab_lift_run(&lift, NULL, &batch->limits, result);

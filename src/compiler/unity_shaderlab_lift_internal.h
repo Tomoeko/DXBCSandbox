@@ -29,4 +29,7 @@ bool unity_shaderlab_lift_emit(const SerializedShader *shader, const ShaderBlobA
                                ShaderLabExpressionSourceMap *map,
                                ShaderLabCandidateDiagnostic *diagnostic);
 
+void unity_shaderlab_lift_record_inventory(
+    const UnityShaderLabLiftInput *input, UnityShaderLabLiftArtifact *artifact);
+
 #endif

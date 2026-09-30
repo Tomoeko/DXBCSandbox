@@ -175,6 +175,7 @@ int main(void) {
         &catalog, selected, &batch, NULL, NULL, CLI_SHADER_KIND_ALL,
         NULL, NULL, &report, &texture_batch_complete, NULL));
     CHECK(texture_batch_complete);
+    CHECK(strstr(report.buf, "\"published_bounded_source_inventory\":{\"status\":\"not-run\",\"quality\":null}"));
     CHECK(strstr(report.buf, "\"report_version\":8") != NULL);
     CHECK(strstr(
         report.buf,

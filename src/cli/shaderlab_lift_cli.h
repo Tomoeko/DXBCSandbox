@@ -24,6 +24,9 @@ bool cli_shaderlab_lift_append_json(const CliShaderLabLift *lift, size_t record,
 const char *cli_shaderlab_lift_selection(const CliShaderLabLift *lift, size_t record);
 bool cli_shaderlab_lift_output_verified(const CliShaderLabLift *lift, size_t record,
                                         const ShaderBatchRecordResult *publication);
+bool cli_shaderlab_lift_append_published_inventory_json(
+    const CliShaderLabLift *lift, size_t record,
+    const ShaderBatchRecordResult *publication, StringBuilder *out);
 void cli_shaderlab_lift_free(CliShaderLabLift *lift);
 
 #endif

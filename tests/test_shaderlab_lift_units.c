@@ -402,6 +402,15 @@ static int test_verified_and_fallback(void) {
         CHECK(strstr(json, "\"source_quality_scope\":\"emitted-stage-entry\""));
         CHECK(strstr(json, "\"source_quality\":{\"scope\":\"observed-source-units\""));
         CHECK(strstr(json, "\"whole_source_quality\":\"unavailable\""));
+        CHECK(baseline->bounded_source_inventory.status == UNITY_SHADERLAB_INVENTORY_UNSUPPORTED_MODE);
+        CHECK(candidate->bounded_source_inventory.status == (passes == 1 ?
+            UNITY_SHADERLAB_INVENTORY_OBSERVED : UNITY_SHADERLAB_INVENTORY_SCOPE_UNAVAILABLE));
+        if (passes == 1) {
+            CHECK(candidate->bounded_source_inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+            CHECK(candidate->bounded_source_inventory.quality.gaps & SHADERLAB_SOURCE_GAP_SCHEMA_AUTHORITY);
+            CHECK(strstr(json, "\"bounded_source_inventory\":{\"scope\":\"emitted-shaderlab-with-explicit-gaps\""));
+            CHECK(strstr(json, "\"classification\":\"mixed\""));
+        }
         CHECK(strstr(json, "\"recorded\":true,\"response_received\":true"));
         char lift_identity[128];
         snprintf(lift_identity, sizeof(lift_identity), "\"lift\":{\"id\":\"%s\",\"version\":%u}",
@@ -471,6 +480,12 @@ static int test_verified_and_fallback(void) {
               (authority_changed ? NULL : unity_shaderlab_lift_baseline(result)));
         CHECK(unity_shaderlab_lift_baseline(result)->status == HLSL_LIFT_VERIFIED);
         CHECK(unity_shaderlab_lift_candidate(result)->status == status);
+        CHECK(unity_shaderlab_lift_candidate(result)->bounded_source_inventory.status ==
+            UNITY_SHADERLAB_INVENTORY_OBSERVED);
+        /* A failed compiler/preprocess attempt still retains source-only
+         * observations, while its selected low-level fallback stays unavailable. */
+        CHECK(unity_shaderlab_lift_baseline(result)->bounded_source_inventory.status ==
+            UNITY_SHADERLAB_INVENTORY_UNSUPPORTED_MODE);
         char *json = unity_shaderlab_lift_format_json(result);
         CHECK(json && strstr(json, authority_changed ? "\"selection\":\"unverified\""
                                                     : "\"selection\":\"low-level-fallback\""));

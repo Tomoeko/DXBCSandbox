@@ -377,6 +377,8 @@ static HLSLLiftStatus attempt(LiftContext *context, UnityShaderLabLiftArtifact *
     const bool emitted = unity_shaderlab_lift_emit(
         input->shader, archive, high_level, unity_uv_helpers, &artifact->source,
         &artifact->source_map, &artifact->emission_diagnostic);
+    if (emitted)
+        unity_shaderlab_lift_record_inventory(input, artifact);
     status = work_status(context);
     if (status != HLSL_LIFT_VERIFIED)
         return status;

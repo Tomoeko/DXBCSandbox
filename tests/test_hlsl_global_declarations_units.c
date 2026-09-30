@@ -54,7 +54,7 @@ static DXBCOperand operand(DXBCOperandType type, uint32_t row, uint8_t lanes) {
     value.register_index_dim = 1;
     value.index_has_immediate[0] = true;
     value.index_values[0] = 0;
-    value.destination_mask = lanes << 4;
+    value.destination_mask = (uint8_t)((unsigned)lanes << 4);
     value.swizzle_mode = 1;
     for (unsigned lane = 0; lane < 4; ++lane)
         value.swizzle[lane] = (uint8_t)lane;
@@ -612,12 +612,85 @@ static bool check_packed_common_metadata(void) {
     return true;
 }
 
+static void empty_fixture_init(Fixture *f) {
+    fixture_init(f);
+    f->pass.program_mask = 6; /* Serialized fragment slot is bit two. */
+    for (unsigned index = 0; index < 2; ++index) {
+        f->parameters[index].res_count = 0;
+        f->parameters[index].resources = NULL;
+        f->buffers[index] = (SerializedConstantBuffer){.name = "$Globals",
+            .role = SERIALIZED_CBUFFER_LOOSE_PARAMETERS};
+    }
+    f->program.cbuffer_count = 0;
+    f->program.cbuffers = NULL;
+    f->instructions[0].operands[1] = operand(OPERAND_TYPE_TEMP, 0, 0);
+    f->program.temp_count = 1;
+}
+
+static bool check_owned_empty_authority(void) {
+    Fixture f;
+    empty_fixture_init(&f);
+    HLSLGlobalDeclarationUnion *u = NULL;
+    HLSLGlobalDeclarationDiagnostic diagnostic;
+    CHECK(hlsl_global_declarations_scope_status(&f.parameters[0], NULL) == HLSL_GLOBAL_DECLARATIONS_OK);
+    CHECK(hlsl_global_declarations_build(&f.pass, 1, 0, f.witnesses, 2, &u, &diagnostic) == HLSL_GLOBAL_DECLARATIONS_OK);
+    size_t fields = 99;
+    CHECK(u && !hlsl_global_declarations_shell_size(u) &&
+          !hlsl_global_declarations_fields(u, &fields) && !fields);
+    CHECK(hlsl_global_declarations_validate_target(u, &f.program, &f.parameters[0], NULL) == HLSL_GLOBAL_DECLARATIONS_OK);
+    CHECK(hlsl_global_declarations_validate_empty_target(NULL, &f.program, NULL, NULL) == HLSL_GLOBAL_DECLARATIONS_OK);
+    CHECK(hlsl_global_declarations_validate_empty_target(NULL, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, NULL, &f.parameters[0]) != HLSL_GLOBAL_DECLARATIONS_OK);
+    f.program.program_type = DXBC_PROGRAM_TYPE_HULL;
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    f.program.program_type = DXBC_PROGRAM_TYPE_PIXEL;
+    f.program.shader_model_major = 4;
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    f.program.shader_model_major = 5;
+    f.program.cbuffer_count = 1; f.program.cbuffers = &f.cbuffer;
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    f.program.cbuffer_count = 0; f.program.cbuffers = NULL;
+    f.instructions[0].operands[1] = operand(OPERAND_TYPE_CONSTANT_BUFFER, 0, 0);
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    f.instructions[0].operands[1] = operand(OPERAND_TYPE_TEMP, 0, 0);
+    DXBCOperand nested = operand(OPERAND_TYPE_CONSTANT_BUFFER, 0, 0);
+    f.instructions[0].operands[1].rel_op0 = &nested;
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    f.instructions[0].operands[1].rel_op0 = &f.instructions[0].operands[1];
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    f.instructions[0].operands[1].rel_op0 = NULL;
+    f.buffers[0].size = 16;
+    CHECK(hlsl_global_declarations_validate_empty_target(u, &f.program, &f.parameters[0], NULL) != HLSL_GLOBAL_DECLARATIONS_OK);
+    hlsl_global_declarations_free(u);
+    for (unsigned mutation = 0; mutation < 12; ++mutation) {
+        empty_fixture_init(&f); u = NULL;
+        switch (mutation) {
+        case 0: f.buffers[1].size = 16; break;
+        case 1: f.buffers[1].var_count = 1; f.buffers[1].variables = f.variables[1]; break;
+        case 2: f.buffers[1].name = "Foreign"; break;
+        case 3: f.buffers[1].role = SERIALIZED_CBUFFER_NAMED; break;
+        case 4: f.buffers[1].has_is_partial = true; break;
+        case 5: f.buffers[1].struct_count = 1; break;
+        case 6: f.parameters[1].res_count = 1; f.parameters[1].resources = f.bindings + 1; break;
+        case 7: f.sub[1].shader_requirements ^= 1; break;
+        case 8: f.player[1].program_type = 21; break;
+        case 9: f.pass.program_mask = 2; break;
+        case 10: f.sub[0].program_type = f.sub[1].program_type = 21;
+                 f.player[0].program_type = f.player[1].program_type = 21; break;
+        case 11: f.parameters[1].cb_count = 0; break;
+        }
+        CHECK(hlsl_global_declarations_build(&f.pass, 1, 0, f.witnesses, 2, &u, &diagnostic) != HLSL_GLOBAL_DECLARATIONS_OK);
+        CHECK(!u);
+    }
+    return true;
+}
+
 int main(void) {
     const size_t allocations = g_allocations_count, bytes = g_allocated_bytes;
     if (!check_owned_union_and_target_authority() || !check_conflicting_witnesses() ||
         !check_family_filter() || !check_emission_and_witness_quality() ||
         !check_packed_typed_declarations() || !check_packed_conflicts_and_invalid_layouts() ||
-        !check_packed_common_metadata())
+        !check_packed_common_metadata() || !check_owned_empty_authority())
         return 1;
     if (g_allocations_count != allocations || g_allocated_bytes != bytes) {
         fputs("Packed global union tests leaked tracked allocations.\n", stderr);

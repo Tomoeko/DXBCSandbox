@@ -4,6 +4,7 @@
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
+#include "translation/hlsl_global_declarations.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -845,9 +846,53 @@ static bool differing_control_point_counts(void) {
     return true;
 }
 
+static bool owned_empty_hull_metadata(void) {
+    for (unsigned scenario = 0; scenario <= 4; scenario += 4) {
+        HullFixture fixture;
+        CHECK(hull_fixture_init(&fixture, 3, (uint8_t)scenario));
+        int platform = 4;
+        SerializedSubProgram sub = {.program_type = 21};
+        SerializedSubProgramIdentity identity = {.hardware_tier_group = 3};
+        SerializedPass pass = {.has_serialized_platforms = true, .platform_count = 1,
+            .platforms = &platform, .program_mask = 16};
+        pass.subprogram_count[3] = 1; pass.subprograms[3] = &sub;
+        pass.subprogram_identities[3] = &identity;
+        PlayerSubProgramMetadata player = {.program_type = 21, .has_player_blob_header = true};
+        SerializedConstantBuffer shell = {.name = "$Globals", .role = SERIALIZED_CBUFFER_LOOSE_PARAMETERS};
+        SerializedProgramParameters parameters = {.cb_count = 1, .constant_buffers = &shell};
+        HLSLGlobalDeclarationWitness witness = {0, &player, &parameters};
+        HLSLGlobalDeclarationUnion *declarations = NULL;
+        CHECK(hlsl_global_declarations_build(&pass, 3, 0, &witness, 1, &declarations, NULL) == HLSL_GLOBAL_DECLARATIONS_OK);
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        HLSLSourceQualityResult quality;
+        HLSLExpressionSourceMap map;
+        HLSLEmitDiagnostic diagnostic;
+        options.source_quality = &quality; options.expression_source_map = &map;
+        StringBuilder original, owned;
+        sb_init(&original); sb_init(&owned);
+        CHECK(hlsl_emit_with_options_diagnostic(&fixture.program, &original, NULL, NULL, NULL, &options, &diagnostic));
+        options.global_declarations = declarations;
+        CHECK(hlsl_emit_with_options_diagnostic(&fixture.program, &owned, &parameters, NULL, NULL, &options, &diagnostic));
+        CHECK(original.len == owned.len && !memcmp(original.buf, owned.buf, original.len));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.counts.unknown_provenance &&
+              !quality.counts.incomplete_units && hlsl_expression_source_map_matches(&map, &fixture.program, owned.buf));
+        sb_free(&owned); sb_init(&owned);
+        shell.size = 16;
+        CHECK(!hlsl_emit_with_options_diagnostic(&fixture.program, &owned, &parameters, NULL, NULL, &options, &diagnostic));
+        CHECK(quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        sb_free(&owned); sb_init(&owned); shell.size = 0;
+        CHECK(!hlsl_emit_with_options_diagnostic(&fixture.program, &owned, NULL, &parameters, NULL, &options, &diagnostic));
+        sb_free(&owned); sb_init(&owned); options.global_declarations = NULL;
+        CHECK(!hlsl_emit_with_options_diagnostic(&fixture.program, &owned, &parameters, NULL, NULL, &options, &diagnostic));
+        sb_free(&owned); sb_free(&original);
+        hlsl_global_declarations_free(declarations); hull_fixture_dispose(&fixture);
+    }
+    return true;
+}
+
 int main(void) {
     return natural_hull_source() && arithmetic_and_phase_ownership() &&
         malformed_contracts() && reordered_phase_roles() && scoped_cfg_ownership() &&
         other_domains_and_control_point_counts() && explicit_control_point_phase() &&
-        differing_control_point_counts() ? 0 : 1;
+        differing_control_point_counts() && owned_empty_hull_metadata() ? 0 : 1;
 }

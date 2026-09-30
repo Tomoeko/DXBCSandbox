@@ -91,6 +91,39 @@ bool cli_shaderlab_lift_output_verified(const CliShaderLabLift *lift, size_t rec
     return memcmp(digest, publication->published_shader_digest, sizeof(digest)) == 0;
 }
 
+static bool append_published_artifact_inventory(
+    const UnityShaderLabLiftArtifact *accepted, bool lift_available,
+    const ShaderBatchRecordResult *publication, StringBuilder *out) {
+    if (!out || !sb_ok(out)) return false;
+    const char *unavailable = !lift_available ? "not-run" : "not-published";
+    if (lift_available && publication && publication->publication_authorized &&
+        publication->published_shader_content_recorded) {
+        if (publication->source_identity_close_deferred)
+            unavailable = "identity-close-deferred";
+        else if (publication->publication_residue || publication->shader_publication_residue ||
+                 publication->meta_publication_residue)
+            unavailable = "publication-residue";
+        else if (accepted && accepted->source.buf && sb_ok(&accepted->source) &&
+                 accepted->source.len == publication->published_shader_size) {
+            uint8_t actual[COMMON_SHA256_DIGEST_SIZE];
+            common_sha256(accepted->source.buf, accepted->source.len, actual);
+            if (!memcmp(actual, publication->published_shader_digest, sizeof(actual)))
+                return unity_shaderlab_lift_append_inventory_json(accepted, out);
+            unavailable = "source-binding-mismatch";
+        } else unavailable = "source-binding-mismatch";
+    }
+    sb_appendf(out, "{\"status\":\"%s\",\"quality\":null}", unavailable);
+    return sb_ok(out);
+}
+
+bool cli_shaderlab_lift_append_published_inventory_json(
+    const CliShaderLabLift *lift, size_t record,
+    const ShaderBatchRecordResult *publication, StringBuilder *out) {
+    const UnityShaderLabLiftArtifact *accepted = lift ? unity_shaderlab_lift_accepted(
+        unity_shaderlab_lift_batch_result(lift->batch, record)) : NULL;
+    return append_published_artifact_inventory(accepted, lift != NULL, publication, out);
+}
+
 void cli_shaderlab_lift_free(CliShaderLabLift *lift) {
     if (lift) {
         unity_shaderlab_lift_batch_free(lift->batch);
@@ -132,5 +165,14 @@ bool cli_shaderlab_lift_output_verified(const CliShaderLabLift *lift, size_t rec
     (void)publication;
     return false;
 }
+bool cli_shaderlab_lift_append_published_inventory_json(
+    const CliShaderLabLift *lift, size_t record,
+    const ShaderBatchRecordResult *publication, StringBuilder *out) {
+    (void)lift; (void)record; (void)publication;
+    if (!out || !sb_ok(out)) return false;
+    sb_append(out, "{\"status\":\"not-run\",\"quality\":null}");
+    return sb_ok(out);
+}
+
 void cli_shaderlab_lift_free(CliShaderLabLift *lift) { (void)lift; }
 #endif

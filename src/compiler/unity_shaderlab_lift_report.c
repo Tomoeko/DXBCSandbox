@@ -243,6 +243,8 @@ static void artifact(StringBuilder *out, const UnityShaderLabLiftArtifact *value
     }
     sb_append(out, "],\"source_map\":");
     source_map(out, &value->source_map);
+    sb_append(out, ",\"bounded_source_inventory\":");
+    unity_shaderlab_lift_append_inventory_json(value, out);
     sb_append_char(out, '}');
 }
 
@@ -293,6 +295,8 @@ char *unity_shaderlab_lift_format_json(const UnityShaderLabLiftResult *result) {
     sb_append(&out, ",\"candidate\":");
     artifact(&out, &result->helper_candidate);
     sb_append_char(&out, '}');
+    sb_append(&out, ",\"bounded_source_inventory\":");
+    unity_shaderlab_lift_append_inventory_json(result->accepted, &out);
     sb_append(&out, "}\n");
     if (!sb_ok(&out)) {
         sb_free(&out);

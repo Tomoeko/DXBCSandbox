@@ -3111,6 +3111,11 @@ static bool render_extract_json(const ShaderCatalog* catalog,
             sb_append(output, ",\"published_local_domain_verified\":");
             sb_append(output, lifted_output_verified ? "true" : "false");
         }
+        sb_append(output, ",\"published_bounded_source_inventory\":");
+        if (!cli_shaderlab_lift_append_published_inventory_json(lift, i, result, output)) {
+            free(texture_publications);
+            return false;
+        }
         sb_append(output, ",\"artifact_kind\":");
         sb_json_string(output, record->class_id == 72
             ? (result->publication_authorized

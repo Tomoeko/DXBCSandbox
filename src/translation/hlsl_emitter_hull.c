@@ -3,6 +3,7 @@
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_source_identifier.h"
 #include "translation/usil_validation.h"
+#include "translation/hlsl_global_declarations.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -501,9 +502,9 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
     HullSourcePlan plan = {0};
     bool emitted = false;
     if (!hull_contract(ctx->program, &plan) || !allocate_names(ctx, &plan) ||
-        (ctx->params && (ctx->params->cb_count || ctx->params->res_count)) ||
-        (ctx->common_params && (ctx->common_params->cb_count || ctx->common_params->res_count)) ||
-        ctx->global_declarations || ctx->unity_uv_helper || ctx->readable_screen_pos_helper) goto finish;
+        hlsl_global_declarations_validate_empty_target(ctx->global_declarations, ctx->program,
+            ctx->params, ctx->common_params) != HLSL_GLOBAL_DECLARATIONS_OK ||
+        ctx->unity_uv_helper || ctx->readable_screen_pos_helper) goto finish;
     for (int index = 0; index < HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT; ++index) ctx->float4_functions.group[index] = -1;
     /* Analyze both independent phases before appending source. */
     for (size_t phase = 0; phase < ctx->program->tessellation.phase_count; ++phase)
