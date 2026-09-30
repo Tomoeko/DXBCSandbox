@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 19U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 20U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -133,7 +133,8 @@ typedef enum HLSLEmitMode {
      * interfaces and generic SSA expressions, within their own 64-instruction cap.
      * HULL candidates admit independent scalar-factor fork phases, implicit
      * control-point passthrough and a pure float4 control-point phase with
-     * phase-owned temporary bounds and index provenance. Join phases, patch-factor
+     * phase-owned temporary bounds and index provenance, with output counts no
+     * larger than their input patches. Join phases, patch-factor
      * reads and resources remain unsupported.
      * Straight-line single-use expressions are nested once; shared values have
      * typed deterministic names. Unsupported input fails instead of silently using

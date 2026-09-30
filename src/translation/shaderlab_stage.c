@@ -10,6 +10,7 @@
 #include "translation/hlsl_global_declarations.h"
 #include "translation/hlsl_unity_uv_lift.h"
 #include "translation/shaderlab_emitter_internal.h"
+#include "translation/shaderlab_source_quality_internal.h"
 #include "translation/usil.h"
 
 #include <inttypes.h>
@@ -1545,6 +1546,8 @@ bool emit_stage_hlsl_with_variant_plan_mode(
   if (source_map && (!high_level || trace->subshader_index < 0 || trace->pass_index < 0))
     return false;
   const size_t first_record = source_map ? source_map->count : 0;
+  ShaderLabSourceQualityCapture *quality_capture = trace ? trace->quality_capture : NULL;
+  const size_t first_quality_body = quality_capture ? quality_capture->body_count : 0;
   const ShaderLabPassStageVariantPlan *stage =
       &variant_plan->stages[stage_index];
   const bool symbolic_selector =
@@ -1762,8 +1765,12 @@ bool emit_stage_hlsl_with_variant_plan_mode(
         append_indent(&stage_output, 3);
         sb_append(&stage_output, "// Single exact planned variant\n");
       }
+      const size_t quality_body_begin = stage_output.len;
       append_indented_source(&stage_output, &variant_hlsl,
                              source_map ? &record.instructions : NULL);
+      if (!shaderlab_source_quality_capture_body(quality_capture, quality_body_begin,
+            stage_output.len, source_map ? source_map->count : SIZE_MAX))
+        stage_output.failed = true;
       const bool map_appended = !source_map || !sb_ok(&stage_output) ||
           shaderlab_expression_source_map_append(source_map, &record);
       if (!map_appended) stage_output.failed = true;
@@ -1803,7 +1810,10 @@ bool emit_stage_hlsl_with_variant_plan_mode(
   const size_t stage_begin = output->len;
   sb_append_len(output, stage_output.buf, stage_output.len);
   const bool success = sb_ok(output) &&
-      shaderlab_expression_source_map_offset(source_map, first_record, stage_begin);
+      shaderlab_expression_source_map_offset(source_map, first_record, stage_begin) &&
+      shaderlab_source_quality_capture_stage(quality_capture, output, stage_begin,
+          first_quality_body, trace ? trace->subshader_index : -1,
+          trace ? trace->pass_index : -1, stage_index);
   sb_free(&stage_output);
   mem_free(generated_used,
            (size_t)variant_plan->shader->keyword_names.count *

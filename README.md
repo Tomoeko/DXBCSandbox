@@ -106,7 +106,8 @@ resources and wider phase forms remain open. A bounded hull path reconstructs
 independent scalar-factor fork phases, signature-backed implicit control-point
 passthrough and pure float4 control-point transforms using separate CFG/SSA scopes
 for triangle, quad and isoline domains. Temporary bounds and control-point indices
-retain their own phase authority. Join phases and patch-resource reads remain unsupported.
+retain their own phase authority. Explicit phases also admit output counts no
+larger than their input patches; implicit copies preserve the count. Join phases and patch-resource reads remain unsupported.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,
@@ -117,8 +118,12 @@ The generic expression planner admits up to 256 instructions, retaining source
 ownership across the complete graph. Geometry and compute keep their narrower
 stage bounds. Larger or unsupported graphs report an explicit analysis limit.
 Extraction's JSON lift report carries independent quality counters and reasons
-for each emitted stage entry. The enclosing ShaderLab's complete source quality
-remains unavailable until its state, routing and external dependencies are covered.
+for each emitted stage entry. The bounded `shaderlab_source_quality_emit` API records contiguous receipts for
+one ordinary vertex/fragment pass, including properties, render state and variant
+routing. It retains each linked entry's independent quality and replays receipt
+authority against the current source/model. Whole ShaderLab remains `mixed` while
+external include or dependency coverage is incomplete; no stage aggregate grants
+whole-source cleanliness.
 
 Compute inspection retains group dimensions, shared-memory declarations, barrier
 flags and memory effects in the IR. A bounded HLSL entry-point projection supports

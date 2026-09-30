@@ -156,6 +156,17 @@ static bool declarations_owned(const USILProgram *program, const HullSourcePlan 
         coverage == (uint8_t)((1u << (plan->shape.outer_count + plan->shape.inner_count)) - 1u);
 }
 
+static bool control_point_counts_supported(const USILProgram *program, bool explicit_phase) {
+    const uint32_t inputs = program->tessellation.input_control_point_count;
+    const uint32_t outputs = program->tessellation.output_control_point_count;
+    if (!inputs || inputs > 32 || !outputs || outputs > 32) return false;
+    /* An actual CP invocation's unsigned ID is in [0, outputs). The scoped
+     * source proof below only admits unmodified ID copies, so outputs <= inputs
+     * proves each dynamic patch read is in range. An absent CP phase copies
+     * all input points and must preserve the count. */
+    return explicit_phase ? outputs <= inputs : outputs == inputs;
+}
+
 static bool hull_contract(const USILProgram *program, HullSourcePlan *plan) {
     HLSLDomainShape shape;
     if (!program || !hlsl_domain_shape(program->tessellation.domain, &shape)) return false;
@@ -171,8 +182,7 @@ static bool hull_contract(const USILProgram *program, HullSourcePlan *plan) {
         program->program_type != DXBC_PROGRAM_TYPE_HULL || program->shader_model_major != 5 ||
         program->shader_model_minor || !memchr(program->shader_type_model, 0, sizeof(program->shader_type_model)) ||
         strcmp(program->shader_type_model, "hs_5_0") || !program->tessellation.valid ||
-        !program->tessellation.input_control_point_count || program->tessellation.input_control_point_count > 32 ||
-        program->tessellation.output_control_point_count != program->tessellation.input_control_point_count ||
+        !control_point_counts_supported(program, control_point) ||
         !partitioning_name(program->tessellation.partitioning) ||
         (program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_ISOLINE
             ? program->tessellation.output_primitive != DXBC_TESSELLATOR_OUTPUT_LINE
@@ -338,7 +348,8 @@ static bool control_point_source_supported(HLSLEmitterContext *ctx, int index, i
     const USILInstruction *instruction = &ctx->program->instructions[index];
     if (operand < 1 || operand >= instruction->operand_count) return false;
     const DXBCOperand *source = &instruction->operands[operand];
-    if (plan->phase != plan->control_point_phase || source->type != OPERAND_TYPE_INPUT ||
+    if (plan->phase != plan->control_point_phase || !control_point_counts_supported(ctx->program, true) ||
+        source->type != OPERAND_TYPE_INPUT ||
         source->register_index_dim != 2 ||
         source->register_index || source->rel_offset0 || source->swizzle_mode != 1 || source->min_precision ||
         source->has_abs || source->has_neg || source->extended_tokens || source->extended_token_count ||

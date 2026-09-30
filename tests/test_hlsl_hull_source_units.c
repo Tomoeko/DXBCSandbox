@@ -55,10 +55,10 @@ static size_t write_signature(uint8_t *bytes, unsigned role, bool inner_first) {
     return size + 8;
 }
 
-static uint8_t *make_controlled_dxbc(uint32_t points, uint8_t scenario, size_t *size) {
+static uint8_t *make_controlled_dxbc(uint32_t points, uint32_t output_points, uint8_t scenario, size_t *size) {
     const uint32_t base_words[] = {
         INSTRUCTION(113, 1), INSTRUCTION(147, 1) | points << 11,
-        INSTRUCTION(148, 1) | points << 11,
+        INSTRUCTION(148, 1) | output_points << 11,
         INSTRUCTION(149, 1) | 2u << 11,
         INSTRUCTION(150, 1) | 1u << 11,
         INSTRUCTION(151, 1) | 3u << 11,
@@ -225,10 +225,14 @@ static bool hull_fixture_parse(HullFixture *fixture, uint8_t *bytes, size_t size
     return true;
 }
 
-static bool hull_fixture_init(HullFixture *fixture, uint32_t points, uint8_t scenario) {
+static bool hull_fixture_init_counts(HullFixture *fixture, uint32_t points, uint32_t output_points, uint8_t scenario) {
     size_t size = 0;
-    uint8_t *bytes = make_controlled_dxbc(points, scenario, &size);
+    uint8_t *bytes = make_controlled_dxbc(points, output_points, scenario, &size);
     return hull_fixture_parse(fixture, bytes, size);
+}
+
+static bool hull_fixture_init(HullFixture *fixture, uint32_t points, uint8_t scenario) {
+    return hull_fixture_init_counts(fixture, points, points, scenario);
 }
 
 static void hull_fixture_dispose(HullFixture *fixture) {
@@ -768,8 +772,82 @@ static bool explicit_control_point_phase(void) {
     return true;
 }
 
+static bool differing_control_point_counts(void) {
+    const uint32_t pairs[][2] = {{4, 3}, {32, 3}, {3, 1}, {32, 31}, {2, 1}};
+    for (size_t index = 0; index < sizeof(pairs) / sizeof(pairs[0]); ++index) {
+        HullFixture fixture;
+        const uint32_t inputs = pairs[index][0], outputs = pairs[index][1];
+        CHECK(hull_fixture_init_counts(&fixture, inputs, outputs, 5));
+        CHECK(fixture.contract.input_control_point_count == inputs);
+        CHECK(fixture.contract.output_control_point_count == outputs);
+        CHECK(fixture.program.tessellation.input_control_point_count == inputs);
+        CHECK(fixture.program.tessellation.output_control_point_count == outputs);
+        CHECK(fixture.program.signature_declarations[1].array_element_count == inputs);
+        CHECK(usil_signature_authority_is_valid(&fixture.program));
+        CHECK(hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        HLSLSourceQualityResult quality;
+        HLSLExpressionSourceMap map;
+        options.source_quality = &quality;
+        options.expression_source_map = &map;
+        StringBuilder source;
+        sb_init(&source);
+        CHECK(hlsl_emit_with_options(&fixture.program, &source, NULL, NULL, NULL, &options));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+        CHECK(hlsl_expression_source_map_matches(&map, &fixture.program, source.buf));
+        CHECK(map.origins[0].source_begin == map.origins[1].source_begin);
+        char expected[64];
+        snprintf(expected, sizeof(expected), "InputPatch<HullPoint, %u>", (unsigned)inputs);
+        CHECK(strstr(source.buf, expected));
+        snprintf(expected, sizeof(expected), "[outputcontrolpoints(%u)]", (unsigned)outputs);
+        CHECK(strstr(source.buf, expected));
+        CHECK(strstr(source.buf, "controlPoint.clipPosition ="));
+        CHECK(!strstr(source.buf, "return patch[pointIndex];"));
+        sb_free(&source);
+        fixture.program.tessellation.output_control_point_count = 0;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.tessellation.output_control_point_count = 33;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.tessellation.output_control_point_count = outputs;
+        fixture.program.tessellation.input_control_point_count = 0;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.tessellation.input_control_point_count = 33;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.tessellation.input_control_point_count = inputs;
+        fixture.program.signature_declarations[1].array_element_count = outputs;
+        CHECK(!usil_signature_authority_is_valid(&fixture.program));
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.signature_declarations[1].array_element_count = inputs;
+        fixture.program.instructions[0].operands[1].type = OPERAND_TYPE_FORK_INSTANCE_ID;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.instructions[0].operands[1].type = OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID;
+        fixture.program.instructions[1].opcode = USIL_OP_ADD;
+        fixture.program.instructions[1].operand_count = 3;
+        fixture.program.instructions[1].operands[2] = fixture.program.instructions[1].operands[1];
+        CHECK(usil_instruction_shape_valid(&fixture.program, &fixture.program.instructions[1]));
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.instructions[1].opcode = USIL_OP_MOV;
+        fixture.program.instructions[1].operand_count = 2;
+        memset(&fixture.program.instructions[1].operands[2], 0, sizeof(DXBCOperand));
+        CHECK(hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+        hull_fixture_dispose(&fixture);
+    }
+    HullFixture fixture;
+    CHECK(hull_fixture_init_counts(&fixture, 3, 4, 4));
+    CHECK(usil_signature_authority_is_valid(&fixture.program));
+    CHECK(!hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+    CHECK(source_rejected(&fixture.program));
+    hull_fixture_dispose(&fixture);
+    CHECK(hull_fixture_init_counts(&fixture, 4, 3, 0));
+    CHECK(!hlsl_high_level_hull_source_supported(&fixture.program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+    CHECK(source_rejected(&fixture.program));
+    hull_fixture_dispose(&fixture);
+    return true;
+}
+
 int main(void) {
     return natural_hull_source() && arithmetic_and_phase_ownership() &&
         malformed_contracts() && reordered_phase_roles() && scoped_cfg_ownership() &&
-        other_domains_and_control_point_counts() && explicit_control_point_phase() ? 0 : 1;
+        other_domains_and_control_point_counts() && explicit_control_point_phase() &&
+        differing_control_point_counts() ? 0 : 1;
 }

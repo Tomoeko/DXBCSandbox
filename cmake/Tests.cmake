@@ -320,6 +320,12 @@ if(BUILD_TESTING)
         shaderlab_variant_plan_units)
     dxbc_add_core_test(test_shaderlab_source_units
         tests/test_shaderlab_source_units.c shaderlab_source_units)
+    dxbc_add_core_test(test_shaderlab_source_quality_units
+        tests/test_shaderlab_source_quality_units.c shaderlab_source_quality_units)
+    target_sources(test_shaderlab_source_quality_units PRIVATE
+        tests/test_shaderlab_fixture.c)
+    target_compile_definitions(test_shaderlab_source_quality_units PRIVATE
+        SHADERLAB_QUALITY_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
     dxbc_add_core_test(test_dxbc_document_units
         tests/test_dxbc_document_units.c dxbc_document_units)
     target_compile_definitions(test_dxbc_document_units PRIVATE

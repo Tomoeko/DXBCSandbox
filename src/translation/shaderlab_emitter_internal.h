@@ -85,6 +85,7 @@ bool emit_stage_hlsl_with_variant_plan(
 
 typedef struct {
     ShaderLabExpressionSourceMap *map;
+    struct ShaderLabSourceQualityCapture *quality_capture;
     int subshader_index;
     int pass_index;
     bool unity_uv_helpers;
