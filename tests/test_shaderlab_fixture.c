@@ -152,7 +152,7 @@ bool test_shaderlab_matrix_fixture_init(TestShaderLabMatrixFixture *fixture,
     size_t size;
     uint8_t *vertex = test_shaderlab_matrix_vertex_dxbc(&size);
     FIXTURE_REQUIRE(vertex);
-    size_t payload_size;
+    size_t payload_size = 0;
     fixture->segments[0] = test_shaderlab_variant_blob(vertex, size, 16, NULL, &payload_size);
     free(vertex);
     FIXTURE_REQUIRE(fixture->segments[0] && payload_size <= INT32_MAX);
