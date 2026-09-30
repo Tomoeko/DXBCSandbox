@@ -142,6 +142,16 @@ metadata and anchored input through its final request and source lease checks.
 These observations leave ClassID 72 production, original compiler controls,
 import, memory semantics and physical execution open.
 
+Scalar HULL source admission uses the existing cbuffer layout and declaration
+inventory. A complete named 16-byte buffer at b0 must authorize the float field
+at byte zero; a common partial field requires its current complete shell.
+Unmodified fork-ID copies retain their actual singleton SSA lane. Natural
+`min`/`max` expressions remain in instruction operand order. The optional manual
+scalar fixture probe supplies an explicit controlled API layout and checks it
+against native reflection; this supplies no player metadata authority. A clean
+source result and successful warm replay do not turn a failed cold complete
+container comparison into an exact match.
+
 The optional `--compute-source-candidate` extraction publishes candidate source and
 evidence as distinct members of the existing compute package transaction. It never
 changes the original binary manifest or its source authority. Generation,

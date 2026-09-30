@@ -144,6 +144,12 @@ if(BUILD_TESTING)
     target_compile_definitions(test_release_shader_evidence_units PRIVATE
         DXBC_RELEASE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/release_shader/empty.assets"
         DXBC_RELEASE_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry")
+    dxbc_add_core_test(test_shader_catalog_dependencies_units
+        tests/test_shader_catalog_dependencies_units.c shader_catalog_dependencies_units)
+    target_link_libraries(test_shader_catalog_dependencies_units PRIVATE UnityCommon::test_support)
+    target_compile_definitions(test_shader_catalog_dependencies_units PRIVATE
+        DXBC_DEPENDENCIES_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/release_shader/empty.assets"
+        DXBC_DEPENDENCIES_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/schemas/unity-2021.3-player-shader.registry")
     if(_dxbc_has_regression_corpus)
         dxbc_add_core_test(test_release_shader_object_certificate_units
             tests/test_release_shader_object_certificate_units.c
@@ -362,6 +368,9 @@ if(BUILD_TESTING)
     dxbc_add_core_test(test_hlsl_patch_phase_units
         tests/test_hlsl_patch_phase_units.c hlsl_patch_phase_units)
     target_sources(test_hlsl_hull_source_units PRIVATE tests/test_tessellation_fixture.c)
+    dxbc_add_core_test(test_hlsl_hull_cbuffer_units
+        tests/test_hlsl_hull_cbuffer_units.c hlsl_hull_cbuffer_units)
+    target_sources(test_hlsl_hull_cbuffer_units PRIVATE tests/test_tessellation_fixture.c)
     dxbc_add_core_test(test_tessellation_usil_units
         tests/test_tessellation_usil_units.c tessellation_usil_units)
     target_compile_definitions(test_tessellation_usil_units PRIVATE

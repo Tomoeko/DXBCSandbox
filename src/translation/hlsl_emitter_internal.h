@@ -695,6 +695,12 @@ bool resolve_variable_info(const SerializedProgramParameters* params, const char
 bool resolve_variable_layout_ctx(const HLSLEmitterContext* ctx,
                                  const char* var_name,
                                  DecodedVariableLayout* out_layout);
+/* Shared metadata-backed material atoms. Stage scopes retain their own operand,
+ * phase and scalar-width admission; these helpers never grant stage authority. */
+bool hlsl_material_source_supported(HLSLEmitterContext *ctx,
+                                    const DXBCOperand *source, uint8_t lanes);
+ASTExpr *hlsl_material_source_expression(HLSLEmitterContext *ctx, int instruction,
+                                         int operand, uint8_t lanes);
 int resolve_variable_type(const HLSLEmitterContext* ctx, const char* var_name);
 bool resolve_variable_is_matrix(const HLSLEmitterContext* ctx, const char* var_name);
 bool resolve_variable_is_row_major(const HLSLEmitterContext* ctx, const char* var_name);

@@ -112,7 +112,12 @@ copy also admits one matching custom `float3` field, preserving its actual
 semantic as `pointValue` without inferring a coordinate space. Explicit FLOAT3
 control-point expressions remain unsupported. Complete
 linked vertex/hull/domain/fragment passes admit independently validated empty
-Globals metadata, preserving each stage's declaration and read scope. Custom
+Globals metadata, preserving each stage's declaration and read scope. Tessellation
+factor phases also admit one metadata-backed float at byte zero of a static
+16-byte buffer at b0, including a complete current buffer paired with a common
+partial field. They retain natural `min`/`max` expressions and the actual
+singleton SSA lane of unmodified fork-ID copies. Indexed ICB arrays, control-point
+buffer reads and broader buffer layouts remain unsupported. Custom
 scalar and scalar-array patch constants also admit bounded fork phases and a
 one-instance join phase that reads earlier fork-owned constants. Hull and domain
 stages share the retained patch layout. Disjoint signature-backed `float2` and

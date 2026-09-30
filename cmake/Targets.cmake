@@ -24,6 +24,7 @@ set(IO_SOURCES
     src/io/serialized_glcore_target.c
     src/app/shader_catalog.c
     src/app/shader_catalog_object.c
+    src/app/shader_catalog_dependencies.c
     src/app/shader_catalog_pptr.c
     src/app/shader_batch.c
     src/app/material_batch.c

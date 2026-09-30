@@ -2,7 +2,10 @@
 
 #include "translation/shaderlab_emitted_matrix_uses.h"
 #include "translation/hlsl_emitted_matrix_uses_internal.h"
+#include "translation/hlsl_emitter_internal.h"
 #include "common/file_io.h"
+#include "dxbc/dxbc_document.h"
+#include "dxbc/dxbc_stage_contract.h"
 #include "dxbc/usbd.h"
 #include "test_shaderlab_fixture.h"
 
@@ -27,6 +30,117 @@ static void fixture_dispose(Fixture *fixture) {
 static bool reject_entry(void *context, const ShaderLabSourceSyntaxReceipt *receipt) {
     (void)context;
     return receipt->kind != SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY;
+}
+
+static StringBuilder coverage_source(const HLSLStageCoverage *coverage) {
+    return (StringBuilder){.buf = coverage->source, .len = coverage->source_size,
+        .capacity = coverage->source_size + 1};
+}
+
+static bool opcode_ledger_mutations(const ShaderLabSourceQualityRequest *request,
+    ShaderLabEmittedMatrixUses *owned, const ShaderLabEmittedMatrixUses *independent) {
+    HLSLStageCoverage *coverage = &owned->entries[0].coverage;
+    const HLSLStageCoverage *other = &independent->entries[0].coverage;
+    StringBuilder source = coverage_source(coverage);
+    CHECK(coverage->instruction_count == 5 && coverage->opcodes[0] == USIL_OP_MUL);
+    CHECK(coverage->opcodes[1] == USIL_OP_MAD && coverage->opcodes[4] == USIL_OP_RET);
+    CHECK(hlsl_stage_coverage_validate(coverage, &source));
+    CHECK(hlsl_stage_coverage_equal(coverage, other));
+    const USILOpcode original = coverage->opcodes[0];
+    const uint32_t obligations = coverage->obligations;
+
+    coverage->opcodes[0] = USIL_OP_ADD;
+    CHECK(!hlsl_stage_coverage_validate(coverage, &source));
+    CHECK(!hlsl_stage_coverage_equal(coverage, other));
+    CHECK(!shaderlab_emitted_matrix_uses_replay(request, owned));
+    coverage->opcodes[0] = original;
+    CHECK(shaderlab_emitted_matrix_uses_replay(request, owned));
+
+    coverage->recorded_opcodes[0] = USIL_OP_ADD;
+    CHECK(!hlsl_stage_coverage_validate(coverage, &source));
+    CHECK(!hlsl_stage_coverage_equal(coverage, other));
+    CHECK(!shaderlab_emitted_matrix_uses_replay(request, owned));
+    coverage->recorded_opcodes[0] = original;
+    CHECK(shaderlab_emitted_matrix_uses_replay(request, owned));
+
+    /* Coordinated edits still differ from the independent capture of the
+     * retained target. Matching two edited private arrays is not authority. */
+    coverage->opcodes[0] = coverage->recorded_opcodes[0] = USIL_OP_ADD;
+    CHECK(hlsl_stage_coverage_validate(coverage, &source));
+    CHECK(!hlsl_stage_coverage_equal(coverage, other));
+    CHECK(!shaderlab_emitted_matrix_uses_replay(request, owned));
+    coverage->opcodes[0] = coverage->recorded_opcodes[0] = (USILOpcode)-1;
+    CHECK(!hlsl_stage_coverage_validate(coverage, &source));
+    CHECK(!hlsl_stage_coverage_equal(coverage, other));
+    CHECK(!shaderlab_emitted_matrix_uses_replay(request, owned));
+    coverage->opcodes[0] = coverage->recorded_opcodes[0] = original;
+    CHECK(hlsl_stage_coverage_validate(coverage, &source));
+    CHECK(hlsl_stage_coverage_equal(coverage, other));
+
+    const size_t instruction_count = coverage->instruction_count;
+    coverage->instruction_count = HLSL_STAGE_COVERAGE_ROOT_LIMIT + 1;
+    CHECK(!hlsl_stage_coverage_validate(coverage, &source));
+    CHECK(!hlsl_stage_coverage_equal(coverage, coverage));
+    coverage->instruction_count = instruction_count;
+    CHECK(!hlsl_stage_coverage_equal(NULL, coverage));
+    CHECK(coverage->obligations == obligations);
+    CHECK(shaderlab_emitted_matrix_uses_replay(request, owned));
+    return true;
+}
+
+static bool opcode_owner_drift(const HLSLMatrixUseCapture *entry) {
+    DXBCDocument document;
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract;
+    USILProgram program = {0};
+    DXBCDocumentDiagnostic document_diagnostic;
+    DXBCStageContractDiagnostic contract_diagnostic;
+    dxbc_document_init(&document);
+    dxbc_stage_contract_init(&contract);
+    CHECK(dxbc_document_parse(&document, entry->target, entry->target_size, &document_diagnostic));
+    CHECK(dxbc_document_decode_semantic(&document, &semantic));
+    CHECK(dxbc_stage_contract_decode(&document, &semantic, &contract, &contract_diagnostic));
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    CHECK(program.instruction_count == 5 && program.instructions[0].opcode == USIL_OP_MUL);
+
+    /* Exercise sealing independently of the source-quality producer. This
+     * deliberately incomplete capture cannot clear its existing obligations. */
+    HLSLMatrixUseCapture capture = {0}, changed = {0};
+    StringBuilder source = coverage_source(&entry->coverage);
+    HLSLEmitterContext context = {.program = &program, .sb = &source,
+        .matrix_use_capture = &capture, .emit_mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE};
+    CHECK(hlsl_stage_coverage_begin(&context));
+    CHECK(capture.coverage.opcodes[0] == USIL_OP_MUL);
+    program.instructions[0].opcode = USIL_OP_ADD;
+    hlsl_stage_coverage_finish(&context);
+    CHECK(!capture.coverage.finished && !hlsl_stage_coverage_validate(&capture.coverage, &source));
+    program.instructions[0].opcode = USIL_OP_MUL;
+    hlsl_stage_coverage_finish(&context);
+    CHECK(capture.coverage.finished && hlsl_stage_coverage_validate(&capture.coverage, &source));
+    CHECK(capture.coverage.obligations & HLSL_STAGE_COVERAGE_BODY);
+    CHECK(capture.coverage.obligations & HLSL_STAGE_COVERAGE_SYNTAX);
+
+    /* An owner changed after sealing is visible in a new actual-program
+     * capture even when the supplied source text is identical. */
+    context.matrix_use_capture = &changed;
+    program.instructions[0].opcode = USIL_OP_ADD;
+    CHECK(hlsl_stage_coverage_begin(&context));
+    hlsl_stage_coverage_finish(&context);
+    CHECK(hlsl_stage_coverage_validate(&changed.coverage, &source));
+    CHECK(!hlsl_stage_coverage_equal(&capture.coverage, &changed.coverage));
+    hlsl_stage_coverage_dispose(&changed.coverage);
+    program.instructions[0].opcode = USIL_OP_MUL;
+    CHECK(hlsl_stage_coverage_begin(&context));
+    hlsl_stage_coverage_finish(&context);
+    CHECK(hlsl_stage_coverage_validate(&changed.coverage, &source));
+    CHECK(hlsl_stage_coverage_equal(&capture.coverage, &changed.coverage));
+    hlsl_stage_coverage_dispose(&changed.coverage);
+    hlsl_stage_coverage_dispose(&capture.coverage);
+    usil_free(&program);
+    dxbc_stage_contract_free(&contract);
+    dxbc_free(&semantic);
+    dxbc_document_free(&document);
+    return true;
 }
 
 static bool positive_and_mutations(void) {
@@ -62,6 +176,8 @@ static bool positive_and_mutations(void) {
 
     ShaderLabEmittedMatrixUses *independent = NULL;
     CHECK(shaderlab_emitted_matrix_uses_capture(&request, &independent) == SHADERLAB_MATRIX_USES_OK);
+    CHECK(opcode_ledger_mutations(&request, owned, independent));
+    CHECK(opcode_owner_drift(&owned->entries[0]));
     ASTExpr *left_tree = owned->entries[0].uses[0].tree;
     ASTExpr *right_tree = independent->entries[0].uses[0].tree;
     CHECK(hlsl_matrix_uses_trees_equal(left_tree, right_tree));

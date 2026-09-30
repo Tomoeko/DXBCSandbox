@@ -13,6 +13,10 @@ static HLSLStageCoverage *current_coverage(HLSLEmitterContext *ctx) {
     return ctx && ctx->matrix_use_capture ? &ctx->matrix_use_capture->coverage : NULL;
 }
 
+static bool opcode_valid(USILOpcode opcode) {
+    return (unsigned)opcode <= (unsigned)USIL_OP_IMM_ATOMIC_CMP_EXCH;
+}
+
 /* Every demanded lane of an omitted block needs its actual current matrix-read
  * owner. Known scalar/vector fields outside that inventory cannot silently
  * inherit the matrix declaration attachment. */
@@ -52,7 +56,7 @@ static bool omitted_matrix_block_supported(const HLSLEmitterContext *ctx, int in
 bool hlsl_stage_coverage_begin(HLSLEmitterContext *ctx) {
     HLSLStageCoverage *coverage = current_coverage(ctx);
     if (!coverage) return true;
-    if (coverage->began || !ctx->program || ctx->program->instruction_count < 1 ||
+    if (coverage->began || !ctx->program || !ctx->program->instructions || ctx->program->instruction_count < 1 ||
         ctx->program->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT) return false;
     coverage->began = true;
     coverage->stage = ctx->program->program_type;
@@ -60,6 +64,8 @@ bool hlsl_stage_coverage_begin(HLSLEmitterContext *ctx) {
     if (!hlsl_source_quality_body_inventory_supported(ctx)) coverage->obligations |= HLSL_STAGE_COVERAGE_BODY;
     for (int index = 0; index < ctx->program->instruction_count; ++index) {
         const USILInstruction *owner = &ctx->program->instructions[index];
+        if (!opcode_valid(owner->opcode)) return false;
+        coverage->opcodes[index] = owner->opcode;
         coverage->source_instructions[index] = owner->source_instruction_index;
         coverage->destination_lanes[index] = owner->operand_count
             ? usil_operand_destination_lane_mask(&owner->operands[0]) : 0;
@@ -150,6 +156,15 @@ bool hlsl_stage_coverage_span(HLSLStageCoverage *coverage, const ASTExpr *root, 
 void hlsl_stage_coverage_finish(HLSLEmitterContext *ctx) {
     HLSLStageCoverage *coverage = current_coverage(ctx);
     if (!coverage || !coverage->began || coverage->finished) return;
+    /* A changed operation owner during emission cannot be frozen as an
+     * immutable successful ledger. Leave the capture unfinished on drift. */
+    if (!ctx->program || !ctx->program->instructions || ctx->program->instruction_count < 1 ||
+        coverage->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
+        (size_t)ctx->program->instruction_count != coverage->instruction_count ||
+        ctx->program->program_type != coverage->stage) return;
+    for (size_t index = 0; index < coverage->instruction_count; ++index)
+        if (!opcode_valid(coverage->opcodes[index]) ||
+            ctx->program->instructions[index].opcode != coverage->opcodes[index]) return;
     if (!hlsl_source_quality_interface_inventory_complete(ctx) ||
         !hlsl_source_quality_resource_inventory_complete(ctx)) coverage->obligations |= HLSL_STAGE_COVERAGE_SYNTAX;
     for (int index = 0; index < ctx->cbuffer_layout_count; ++index)
@@ -167,6 +182,7 @@ void hlsl_stage_coverage_finish(HLSLEmitterContext *ctx) {
             coverage->obligations |= HLSL_STAGE_COVERAGE_AST;
     memcpy(coverage->recorded_operand_counts, coverage->operand_counts, sizeof(coverage->operand_counts));
     memcpy(coverage->recorded_operand_uses, coverage->operand_uses, sizeof(coverage->operand_uses));
+    memcpy(coverage->recorded_opcodes, coverage->opcodes, sizeof(coverage->opcodes));
     coverage->recorded_syntax_count = coverage->syntax_count;
     coverage->recorded_root_count = coverage->root_count;
     if (coverage->syntax_count) {
@@ -280,7 +296,9 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
             (!coverage->syntax_count || coverage->syntax[coverage->syntax_count - 1].source_end != source->len)))
         return false;
     for (size_t index = 0; index < coverage->instruction_count; ++index) {
-        if (coverage->operand_counts[index] > DXBC_MAX_OPERANDS ||
+        if (!opcode_valid(coverage->opcodes[index]) ||
+            coverage->opcodes[index] != coverage->recorded_opcodes[index] ||
+            coverage->operand_counts[index] > DXBC_MAX_OPERANDS ||
             coverage->operand_counts[index] != coverage->recorded_operand_counts[index]) return false;
         for (unsigned operand = 0; operand < coverage->operand_counts[index]; ++operand)
             if (!operand_uses_equal(&coverage->operand_uses[index][operand],
@@ -314,14 +332,20 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
 }
 
 bool hlsl_stage_coverage_equal(const HLSLStageCoverage *a, const HLSLStageCoverage *b) {
-    if (a->obligations != b->obligations || a->required_binding_mask != b->required_binding_mask ||
+    if (!a || !b || !a->instruction_count || a->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
+        a->obligations != b->obligations || a->required_binding_mask != b->required_binding_mask ||
         a->stage != b->stage || a->instruction_count != b->instruction_count || a->source_size != b->source_size ||
         a->node_count != b->node_count || a->root_count != b->root_count || a->syntax_count != b->syntax_count ||
         a->recorded_root_count != b->recorded_root_count || a->recorded_syntax_count != b->recorded_syntax_count ||
         !a->finished || !b->finished || !a->source || !b->source ||
         memcmp(a->source, b->source, a->source_size + 1)) return false;
     for (size_t index = 0; index < a->instruction_count; ++index) {
-        if (a->operand_counts[index] > DXBC_MAX_OPERANDS ||
+        if (!opcode_valid(a->opcodes[index]) || !opcode_valid(b->opcodes[index]) ||
+            a->opcodes[index] != a->recorded_opcodes[index] ||
+            b->opcodes[index] != b->recorded_opcodes[index] ||
+            a->opcodes[index] != b->opcodes[index] ||
+            a->recorded_opcodes[index] != b->recorded_opcodes[index] ||
+            a->operand_counts[index] > DXBC_MAX_OPERANDS ||
             a->source_instructions[index] != b->source_instructions[index] ||
             a->destination_lanes[index] != b->destination_lanes[index] ||
             a->operand_counts[index] != b->operand_counts[index] ||

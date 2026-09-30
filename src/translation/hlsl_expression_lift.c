@@ -268,8 +268,10 @@ bool hlsl_float_source_modifier_supported(const DXBCOperand *operand) {
     return operand->extended_tokens[0] == (1u | (modifier << 6));
 }
 
-static bool material_source_supported(HLSLEmitterContext *ctx, const DXBCOperand *source,
-                                      uint8_t mask) {
+bool hlsl_material_source_supported(HLSLEmitterContext *ctx, const DXBCOperand *source,
+                                    uint8_t mask) {
+    if (!ctx || !ctx->program || !source || source->type != OPERAND_TYPE_CONSTANT_BUFFER ||
+        !mask || (mask & ~15u)) return false;
     for (int index = 0; index < ctx->program->cbuffer_count; ++index) {
         const USILConstantBuffer *buffer = &ctx->program->cbuffers[index];
         if (buffer->reg_idx == source->register_index && buffer->dynamic_indexed)
@@ -350,7 +352,7 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
             (full_width || value->type != OPERAND_TYPE_CONSTANT_BUFFER))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         if (operand && value->type == OPERAND_TYPE_CONSTANT_BUFFER &&
-            !material_source_supported(ctx, value, source_lanes(ctx, index, operand)))
+            !hlsl_material_source_supported(ctx, value, source_lanes(ctx, index, operand)))
             return reject(ctx, index, HLSL_EMIT_REASON_MISSING_METADATA_AUTHORITY);
         if (operand && (value->type == OPERAND_TYPE_INPUT || domain_input) && ctx->high_level_interface) {
             ASTOperandProvenance origin;
@@ -506,7 +508,7 @@ static ASTExpr *formatted_source_atom(HLSLEmitterContext *ctx, const DXBCOperand
         ASTOperandProvenance origin;
         ast_operand_provenance_init(&origin);
         if (source->type == OPERAND_TYPE_CONSTANT_BUFFER &&
-            material_source_supported(ctx, source, mask)) {
+            hlsl_material_source_supported(ctx, source, mask)) {
             int lane = 0;
             while (!(mask & (1u << lane))) ++lane;
             int offset = 0;
@@ -571,6 +573,16 @@ static ASTExpr *formatted_source_atom(HLSLEmitterContext *ctx, const DXBCOperand
     }
     sb_free(&text);
     return value;
+}
+
+ASTExpr *hlsl_material_source_expression(HLSLEmitterContext *ctx, int instruction,
+                                          int operand, uint8_t lanes) {
+    if (!ctx || !ctx->program || instruction < 0 || instruction >= ctx->program->instruction_count ||
+        operand < 1 || operand >= ctx->program->instructions[instruction].operand_count ||
+        lanes != source_lanes(ctx, instruction, operand)) return NULL;
+    const DXBCOperand *source = &ctx->program->instructions[instruction].operands[operand];
+    if (!hlsl_material_source_supported(ctx, source, lanes)) return NULL;
+    return formatted_source_atom(ctx, source, lanes, false, instruction, operand);
 }
 
 /* An actual domain coordinate is a pure logical parameter. Compose a vector

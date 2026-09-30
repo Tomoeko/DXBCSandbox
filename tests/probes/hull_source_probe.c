@@ -18,8 +18,36 @@ enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096 };
 
 /* Manual selected-native HULL comparison. V/D/F are authored compilation
  * stubs. It grants no Editor, import, linked-stage or runtime certificate. */
-static const char *const probe_shader_name =
+static const char *const default_shader_name =
     "Fixture/HighLevel/HullFloat3Implicit";
+
+/* Explicit API calibration, never a player metadata capture. The supplied
+ * fixture layout is checked against native callbacks, rather than treating
+ * those callbacks as serialized current/common declaration authority. */
+static bool scalar_fixture_reflection(const UnityCompilerBinaryResponse *response) {
+    if (!response || !response->reflection_records || !response->reflection_record_count)
+        return false;
+    const int32_t expected_values[][6] = {{16, 1}, {0, 0, 0, 1, 1, 0}, {0}};
+    const UnityCompilerReflectionKind kinds[] = {
+        UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER, UNITY_COMPILER_REFLECTION_CONSTANT,
+        UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING};
+    const char *const names[] = {"FactorInputs", "_Factor", "FactorInputs"};
+    const size_t counts[] = {2, 6, 1};
+    unsigned seen = 0;
+    for (size_t index = 0; index < response->reflection_record_count; ++index) {
+        const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
+        if (record->kind == UNITY_COMPILER_REFLECTION_INPUT ||
+            record->kind == UNITY_COMPILER_REFLECTION_STATS) continue;
+        unsigned expected = 0;
+        while (expected < 3 && record->kind != kinds[expected]) ++expected;
+        if (expected == 3 || (seen & (1u << expected)) || !record->name ||
+            strcmp(record->name, names[expected]) || record->value_count != counts[expected] ||
+            memcmp(record->values, expected_values[expected], counts[expected] * sizeof(int32_t)))
+            return false;
+        seen |= 1u << expected;
+    }
+    return seen == 7;
+}
 
 static void print_digest(const char *role, const uint8_t digest[32]) {
     char hex[COMMON_SHA256_HEX_SIZE];
@@ -128,7 +156,7 @@ verify_compile_identity(UnityCompilerChannel *channel,
 }
 
 static bool compile_source(UnityCompilerChannel *channel, const char *role,
-                           const char *source, const char *directory,
+                           const char *source, const char *directory, const char *shader_name,
                            uint32_t valid_apis,
                            UnityCompilerPreprocessResponse *preprocess,
                            UnityCompilerSnippetCompileRequest *request,
@@ -138,7 +166,7 @@ static bool compile_source(UnityCompilerChannel *channel, const char *role,
     const UnityCompilerShaderPreprocessRequest preprocessing = {
         .source = source,
         .source_directory = directory,
-        .shader_name = probe_shader_name,
+        .shader_name = shader_name,
         .caching_preprocessor = true,
         .build_platform = 1,
         .valid_apis = valid_apis};
@@ -188,10 +216,12 @@ static bool compile_source(UnityCompilerChannel *channel, const char *role,
            verify_compile_identity(channel, request, compiled, provenance);
 }
 
-/* The source inverse consumes only the compiler's complete target container.
- * Neither authored source nor its preprocessing contract enters this function.
+/* The source inverse consumes the complete target and, in the explicit scalar
+ * calibration, a fixed controlled API layout. Neither authored source nor its
+ * preprocessing contract enters this function. No player authority is inferred.
  */
 static bool reconstruct_hull(const DXBCContainerView *target,
+                             const SerializedProgramParameters *parameters,
                              StringBuilder *source) {
     DXBCDocument document;
     dxbc_document_init(&document);
@@ -221,7 +251,25 @@ static bool reconstruct_hull(const DXBCContainerView *target,
     options.expression_source_map = &map;
     options.source_quality = &quality;
     const HLSLEmitNames names = {.entry_point = "hull"};
-    if (!hlsl_emit_with_options_diagnostic(&program, source, NULL, NULL, &names,
+    if (parameters) {
+        printf("scalar_target phases=%zu cbuffers=%d icb_words=%d instructions=%d\n",
+               program.tessellation.phase_count, program.cbuffer_count,
+               program.icb_value_count, program.instruction_count);
+        for (size_t index = 0; index < program.tessellation.phase_count; ++index) {
+            const USILHullPhase *phase = &program.tessellation.phases[index];
+            printf("scalar_phase=%zu kind=%u instances=%u first=%d end=%d\n",
+                   index, (unsigned)phase->kind, phase->instance_count,
+                   phase->first_instruction_index, phase->end_instruction_index);
+        }
+        for (int index = 0; index < program.instruction_count; ++index) {
+            const USILInstruction *instruction = &program.instructions[index];
+            printf("scalar_instruction=%d opcode=%u operands=%d destination_mask=%u\n",
+                   index, (unsigned)instruction->opcode, instruction->operand_count,
+                   instruction->operand_count ? usil_operand_destination_lane_mask(
+                       &instruction->operands[0]) : 0);
+        }
+    }
+    if (!hlsl_emit_with_options_diagnostic(&program, source, parameters, NULL, &names,
                                            &options, &diagnostic)) {
         fprintf(stderr, "source status=%s phase=%s reason=%s instruction=%d\n",
                 hlsl_emit_status_name(diagnostic.status),
@@ -235,9 +283,10 @@ static bool reconstruct_hull(const DXBCContainerView *target,
     accepted = quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
                !quality.counts.unknown_provenance &&
                !quality.counts.incomplete_units && map_valid;
-    printf("source scope=target-only-hull quality=%s map_valid=%d "
+    printf("source scope=%s quality=%s map_valid=%d "
            "instructions=%d units=%zu "
            "input_mask=%u input_rw=%u output_mask=%u output_rw=%u\n",
+           parameters ? "controlled-scalar-API-calibration" : "target-only-hull",
            hlsl_source_quality_class_name(quality.classification), map_valid,
            program.instruction_count, quality.counts.inspected_units,
            program.inputs[0].mask, program.inputs[0].rw_mask,
@@ -251,7 +300,7 @@ done:
 }
 
 static bool candidate_wrapper(const StringBuilder *hull,
-                              StringBuilder *wrapper) {
+                              StringBuilder *wrapper, const char *shader_name) {
     sb_appendf(
         wrapper,
         "// SPDX-License-Identifier: GPL-3.0-only\n"
@@ -275,30 +324,34 @@ static bool candidate_wrapper(const StringBuilder *hull,
         "float4 frag() : SV_Target { return float4(0.25f, 0.5f, 0.75f, 1.0f); "
         "}\n"
         "ENDHLSL\n        }\n    }\n}\n",
-        probe_shader_name, hull->buf);
+        shader_name, hull->buf);
     return sb_ok(wrapper);
 }
 
 static bool changed_factor_wrapper(const StringBuilder *hull,
-                                   StringBuilder *wrapper) {
-    static const char original[] = "factors.outer[factorIndex] = 3.0f;";
-    static const char changed[] = "factors.outer[factorIndex] = 5.0f;";
-    /* This is an adversary for the explicit constant-factor fixture, not an
-     * alternate source producer. Match once inside the owned inverse text. */
+                                   StringBuilder *wrapper, const char *shader_name,
+                                   bool scalar_fixture) {
+    const char *original = scalar_fixture ? "factors.outer[factorIndex] = min((_Factor), 32.0f);"
+                                         : "factors.outer[factorIndex] = 3.0f;";
+    const char *changed = scalar_fixture ? "factors.outer[factorIndex] = min((_Factor * 2.0f), 32.0f);"
+                                        : "factors.outer[factorIndex] = 5.0f;";
+    const size_t original_length = strlen(original);
+    /* Match exactly one owned factor assignment in either controlled fixture.
+     * A failed cold comparison remains a failure after this replay check. */
     if (!sb_ok(hull) || !hull->buf || hull->len > PROBE_SOURCE_LIMIT)
         return false;
     const char *match = strstr(hull->buf, original);
-    if (!match || strstr(match + sizeof(original) - 1, original))
+    if (!match || strstr(match + original_length, original))
         return false;
     StringBuilder mutated;
     sb_init(&mutated);
     sb_append_len(&mutated, hull->buf, (size_t)(match - hull->buf));
     sb_append(&mutated, changed);
-    sb_append(&mutated, match + sizeof(original) - 1);
-    const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper);
+    sb_append(&mutated, match + original_length);
+    const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name);
     if (built) {
-        printf("warm_mutation matched_owned_inverse_occurrences=1 "
-               "outer_factor_before=3.0f outer_factor_after=5.0f\n");
+        printf("warm_mutation matched_owned_inverse_occurrences=1 scalar_fixture=%d\n",
+               scalar_fixture);
         print_hash("mutated_hull_sha256", mutated.buf, mutated.len);
     }
     sb_free(&mutated);
@@ -393,9 +446,11 @@ compiler_environment_equal(const UnityCompilerToolchainProvenance *left,
 static void usage(const char *name) {
     fprintf(
         stderr,
-        "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR\n"
+        "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--scalar-fixture]\n"
         "Use '-' for no additional includes. Selected-native HULL comparison "
-        "only; no files written.\n",
+        "only; no source or binary files exported.\n"
+        "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
+        "validated against native reflection; no player metadata authority.\n",
         name);
 }
 
@@ -404,11 +459,21 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
-    if (argc != 4) {
+    if (argc != 4 && (argc != 5 || strcmp(argv[4], "--scalar-fixture"))) {
         usage(argv[0]);
         return 2;
     }
     CommonFileBytes authored = {0};
+    const bool scalar_fixture = argc == 5;
+    const char *shader_name = scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
+                                            : default_shader_name;
+    SerializedVariable field = {.name = "_Factor", .layout = {0, 0, 0, 1, 0, 0}};
+    SerializedConstantBuffer buffer = {.name = "FactorInputs", .size = 16,
+        .role = SERIALIZED_CBUFFER_NAMED, .variables = &field, .var_count = 1};
+    SerializedResourceParam binding = {.name = "FactorInputs",
+        .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER, .array_size = 1};
+    SerializedProgramParameters parameters = {.constant_buffers = &buffer,
+        .cb_count = 1, .resources = &binding, .res_count = 1};
     UnityCompilerChannel channel = {.socket_fd = -1};
     UnityCompilerPreprocessResponse preprocessing[4];
     UnityCompilerBinaryResponse compiled[4];
@@ -445,15 +510,22 @@ int main(int argc, char **argv) {
            "session raw_mask=0x%08" PRIx32 " valid_apis=0x%08" PRIx32 "\n",
            capabilities.raw_available_platform_mask, valid_apis);
     print_hash("authored_source_sha256", authored.data, authored.size);
+    printf("metadata_authority=%s player_metadata=not-supplied\n",
+           scalar_fixture ? "controlled-API-fixture" : "none-required");
     if (!compile_source(&channel, "authored-target", (char *)authored.data,
-                        directory, valid_apis, &preprocessing[0], &requests[0],
+                        directory, shader_name, valid_apis, &preprocessing[0], &requests[0],
                         &compiled[0], &provenance[0]))
         goto done;
     DXBCContainerView target = {0}, candidate = {0};
+    if (scalar_fixture && !scalar_fixture_reflection(&compiled[0])) {
+        fputs("Controlled scalar fixture reflection mismatch.\n", stderr);
+        goto done;
+    }
+    if (scalar_fixture) printf("controlled_API_layout_native_reflection_checked=1\n");
     if (!dxbc_container_view_first(compiled[0].data, compiled[0].size,
                                    &target) ||
-        !reconstruct_hull(&target, &hull) ||
-        !candidate_wrapper(&hull, &wrapper))
+        !reconstruct_hull(&target, scalar_fixture ? &parameters : NULL, &hull) ||
+        !candidate_wrapper(&hull, &wrapper, shader_name))
         goto done;
     print_hash("target_complete_dxbc_sha256", target.data, target.size);
     print_hash("reconstructed_hull_sha256", hull.buf, hull.len);
@@ -478,11 +550,12 @@ int main(int argc, char **argv) {
     printf(
         "process_count=2 candidate_cold=1 session_capabilities_identical=1\n");
     if (!compile_source(&channel, "target-only-hull-candidate", wrapper.buf,
-                        directory, valid_apis, &preprocessing[1], &requests[1],
+                        directory, shader_name, valid_apis, &preprocessing[1], &requests[1],
                         &compiled[1], &provenance[1]) ||
         !dxbc_container_view_first(compiled[1].data, compiled[1].size,
                                    &candidate))
         goto done;
+    if (scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
     const bool controls_equal =
         selected_controls_equal(&requests[0], &requests[1]);
     const bool toolchain_equal =
@@ -507,7 +580,12 @@ int main(int argc, char **argv) {
     printf("complete_container_comparison=%s expected_bytes=%zu "
            "actual_bytes=%zu\n",
            dxbc_compare_status_name(status), target.size, candidate.size);
-    if (!controls_equal || !toolchain_equal || status != DXBC_COMPARE_EQUAL)
+    printf("comparison chunk=%u instruction=%u token=%u expected=0x%" PRIx64
+           " actual=0x%" PRIx64 "\n", comparison.chunk_index,
+           comparison.instruction_index, comparison.token_index,
+           comparison.expected_value, comparison.actual_value);
+    const bool cold_equal = status == DXBC_COMPARE_EQUAL;
+    if (!controls_equal || !toolchain_equal || (!cold_equal && !scalar_fixture))
         goto done;
 
     /* A changed source must affect a warm compiler, and returning to the
@@ -515,15 +593,16 @@ int main(int argc, char **argv) {
     const pid_t candidate_process = channel.process_id;
     DXBCContainerView changed = {0}, repeated = {0};
     if (!candidate_process ||
-        !changed_factor_wrapper(&hull, &changed_wrapper) ||
+        !changed_factor_wrapper(&hull, &changed_wrapper, shader_name, scalar_fixture) ||
         !compile_source(&channel, "warm-mutated-hull", changed_wrapper.buf,
-                        directory, valid_apis, &preprocessing[2], &requests[2],
+                        directory, shader_name, valid_apis, &preprocessing[2], &requests[2],
                         &compiled[2], &provenance[2]) ||
         !dxbc_container_view_first(compiled[2].data, compiled[2].size,
                                    &changed))
         goto done;
+    if (scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
     const DXBCCompareStatus mutation_status = dxbc_compare_exact(
-        target.data, target.size, changed.data, changed.size, &comparison);
+        candidate.data, candidate.size, changed.data, changed.size, &comparison);
     const bool mutation_diff =
         mutation_status != DXBC_COMPARE_EQUAL &&
         mutation_status != DXBC_COMPARE_INVALID_ARGUMENT &&
@@ -544,13 +623,14 @@ int main(int argc, char **argv) {
     if (!mutation_diff || !mutation_authority)
         goto done;
     if (!compile_source(&channel, "warm-original-hull", wrapper.buf, directory,
-                        valid_apis, &preprocessing[3], &requests[3],
+                        shader_name, valid_apis, &preprocessing[3], &requests[3],
                         &compiled[3], &provenance[3]) ||
         !dxbc_container_view_first(compiled[3].data, compiled[3].size,
                                    &repeated))
         goto done;
+    if (scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
     const DXBCCompareStatus repeated_status = dxbc_compare_exact(
-        target.data, target.size, repeated.data, repeated.size, &comparison);
+        candidate.data, candidate.size, repeated.data, repeated.size, &comparison);
     const bool repeated_identity =
         !memcmp(compiled[1].request_digest, compiled[3].request_digest, 32) &&
         !memcmp(compiled[1].controls_digest, compiled[3].controls_digest, 32);
@@ -562,12 +642,12 @@ int main(int argc, char **argv) {
         candidate_process == channel.process_id;
     print_hash("warm_original_complete_dxbc_sha256", repeated.data,
                repeated.size);
-    printf("warm_original_equal=%d comparison=%s canonical_identity_equal=%d "
+    printf("warm_original_equal=%d comparison=%s reference=cold-candidate canonical_identity_equal=%d "
            "authority_equal=%d same_process=%d\n",
            repeated_status == DXBC_COMPARE_EQUAL,
            dxbc_compare_status_name(repeated_status), repeated_identity,
            repeated_authority, candidate_process == channel.process_id);
-    result = repeated_status == DXBC_COMPARE_EQUAL && repeated_identity &&
+    result = cold_equal && repeated_status == DXBC_COMPARE_EQUAL && repeated_identity &&
                      repeated_authority
                  ? 0
                  : 1;

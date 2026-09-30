@@ -46,6 +46,10 @@ typedef struct {
     uint32_t obligations, required_binding_mask;
     DXBCProgramType stage;
     uint32_t source_instructions[HLSL_STAGE_COVERAGE_ROOT_LIMIT];
+    /* Decoded operation owners come from the actual program at emission, not
+     * from AST spellings or a caller-supplied source inventory. */
+    USILOpcode opcodes[HLSL_STAGE_COVERAGE_ROOT_LIMIT];
+    USILOpcode recorded_opcodes[HLSL_STAGE_COVERAGE_ROOT_LIMIT];
     uint8_t destination_lanes[HLSL_STAGE_COVERAGE_ROOT_LIMIT];
     uint8_t operand_counts[HLSL_STAGE_COVERAGE_ROOT_LIMIT];
     HLSLStageOwnedOperandUse operand_uses[HLSL_STAGE_COVERAGE_ROOT_LIMIT][DXBC_MAX_OPERANDS];
