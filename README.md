@@ -163,17 +163,22 @@ A bounded `compute_source_candidate_build` API reconstructs complete kernel doma
 with their captured names, keywords and group dimensions. It supports resource-free
 RET/barrier bodies and a typed `Texture2D<uint4>` load / `RWTexture2D<uint4>` store
 path with dispatch coordinates, unsigned addition, bitwise operations and logical
-shifts. A single `RWTexture2D<uint4>` also admits one complete read and final store
+shifts. A single `RWTexture2D<uint4>` also admits one read and a complete final store
 with the same physical SSA address producer, including proven replicated lanes
 of its unsigned operation. Both access operands retain their original lane owners.
-Coherent UAVs, multiple retained reads and partial typed reads remain unsupported.
+Partial identity-selected UAV reads use meaningful scalar/vector projections of
+the declared UINT4 value. Every loaded component must be consumed once; distinct
+SSA producers compose the complete stored value in its original order.
+Coherent UAVs and multiple retained reads remain unsupported.
 A 16-byte structured load/store path uses an explicit `uint4` bit
 representation, preserving the actual index, byte window and memory-effect order. Release metadata does not retain the original
 structured element type; that declaration gap keeps whole source quality `mixed`
 even when the unsigned entry bodies are `clean`. These memory paths require one
-read followed by one complete store. Structured reads admit aligned, ascending
+complete final store and at most one retained read, preceding the store when
+present. Structured reads admit aligned, ascending
 word projections within the element and compose distinct SSA producers as natural
-scalar/vector constructor arguments; typed texture reads still require `uint4`.
+scalar/vector constructor arguments. Typed texture declarations retain `uint4`;
+the separate read-only `Texture2D` path still requires a complete read.
 Wider strides, float arithmetic, other resources, control flow, shared memory
 and atomics remain unsupported.
 Use `dxbc-sandbox extract INPUT --kind compute --all --compute-source-candidate

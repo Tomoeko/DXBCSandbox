@@ -502,8 +502,9 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
     } else {
         const DXBCOperand *destination = &instruction->operands[0];
         const DXBCOperand *resource = &instruction->operands[2];
+        const uint8_t destination_lanes = usil_operand_destination_lane_mask(destination);
         if (destination->type != OPERAND_TYPE_TEMP || !static_indices(destination, 1) ||
-            usil_operand_destination_lane_mask(destination) != 15u || destination->swizzle_mode ||
+            !destination_lanes || (!uav_read && destination_lanes != 15u) || destination->swizzle_mode ||
             destination->has_abs || destination->has_neg || destination->min_precision ||
             destination->rel_op0 || destination->rel_op1 || destination->rel_op2 ||
             destination->extended_token_count || destination->extended_tokens ||
@@ -517,8 +518,8 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
             USILMemoryAccess memory;
             if (!usil_instruction_memory_access(ctx->program, instruction, &memory) ||
                 memory.kind != USIL_MEMORY_TYPED || memory.space != USIL_MEMORY_UNORDERED_ACCESS ||
-                memory.address_lanes != 3u || memory.destination_lanes != 15u ||
-                memory.memory_component_lanes != 15u || !memory.reads || memory.writes ||
+                memory.address_lanes != 3u || memory.destination_lanes != destination_lanes ||
+                memory.memory_component_lanes != destination_lanes || !memory.reads || memory.writes ||
                 memory.atomic || memory.globally_coherent || memory.rasterizer_ordered ||
                 memory.has_order_preserving_counter)
                 return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
@@ -582,6 +583,27 @@ static bool memory_zero_lane(ComputeMemoryPlan *plan, int consumer, int operand_
         &bits, literal_owner, literal_lanes) && !bits;
 }
 
+/* Both bits-view structured reads and typed UINT4 reads select components of
+ * one four-word value. Preserve their actual ascending selection and width;
+ * a result-register mask is never a new resource element type. */
+static bool memory_load_projection(const DXBCOperand *resource, uint8_t lanes,
+                                   unsigned word_offset, int projection[4], bool *project) {
+    unsigned component = 0;
+    int previous = -1;
+    for (int lane = 0; lane < 4; ++lane) if (lanes & (1u << lane)) {
+        const int selected = usil_operand_source_component(resource, lane);
+        if (selected < 0 || selected > 3) return false;
+        const unsigned physical = word_offset + (unsigned)selected;
+        if (physical >= 4u || (int)physical <= previous) return false;
+        projection[component] = (int)physical;
+        *project |= physical != component;
+        previous = (int)physical;
+        ++component;
+    }
+    *project |= component != 4u;
+    return component != 0;
+}
+
 static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8_t lanes,
                                    unsigned depth) {
     if (depth > COMPUTE_SOURCE_INSTRUCTION_LIMIT || ++plan->expanded_nodes > 512u) return NULL;
@@ -626,25 +648,15 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
             !memory_literal_lane(plan, definition, memory.byte_offset_operand, 0, depth + 1,
                 &byte_offset, &literal_owner, &literal_lanes) ||
             byte_offset >= 16u || (byte_offset & 3u)) return NULL;
-        unsigned component = 0;
-        int previous = -1;
         const DXBCOperand *resource = &instruction->operands[memory.binding_operand];
-        for (int lane = 0; lane < 4; ++lane) if (lanes & (1u << lane)) {
-            const int selected = usil_operand_source_component(resource, lane);
-            if (selected < 0 || selected > 3) return NULL;
-            const unsigned physical = byte_offset / 4u + (unsigned)selected;
-            if (physical >= 4u || (int)physical <= previous) return NULL;
-            projection[component] = (int)physical;
-            project |= physical != component;
-            previous = (int)physical;
-            ++component;
-        }
-        project |= width != 4u;
+        if (!memory_load_projection(resource, lanes, byte_offset / 4u, projection, &project)) return NULL;
         location = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
         binding_operand = memory.binding_operand;
     } else if (instruction->opcode == USIL_OP_LD_UAV_TYPED) {
         USILMemoryAccess memory;
-        if (!usil_instruction_memory_access(plan->ctx->program, instruction, &memory)) return NULL;
+        if (!usil_instruction_memory_access(plan->ctx->program, instruction, &memory) ||
+            !memory_load_projection(&instruction->operands[memory.binding_operand],
+                lanes, 0u, projection, &project)) return NULL;
         ASTExpr *coordinates = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
         ASTExpr *arguments[] = {coordinates};
         location = coordinates ? ast_create_call("int2", arguments, 1) : NULL;
@@ -673,9 +685,9 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
     ASTExpr *load_arguments[] = {location};
     ASTExpr *load = ast_create_call(method, load_arguments, 1);
     if (!load) { ast_free_expr(location); return NULL; }
-    /* The declared bits view has four words. The following projection owns
-     * only the actual aligned byte window and retains its load instruction;
-     * it does not assert the unavailable original structured element type. */
+    /* The declared value has four words. A typed read retains its UINT4 type;
+     * a structured bits view grants no unavailable original element type.
+     * Any following selection retains this single load's instruction owner. */
     load = memory_origin(plan, load, definition, lanes, AST_SCALAR_UINT32, 4);
     if (!load || !project) return load;
     ASTExpr *selection = ast_create_swizzle(load, projection, (int)width);
