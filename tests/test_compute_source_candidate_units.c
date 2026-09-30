@@ -640,6 +640,87 @@ static bool check_structured_candidate(void) {
     return true;
 }
 
+/* Controlled unsigned bit operations use the same one-read/one-write
+ * effect plan. Typed texture and unknown structured element provenance remain
+ * distinct even when their entry expression vocabulary agrees. */
+static bool check_typed_uint_operations(void) {
+    const struct { uint32_t opcode; const char *syntax; bool unary; } operations[] = {
+        {1, " & ", false}, {60, " | ", false}, {87, " ^ ", false},
+        {59, "~", true}, {41, " << ", false}, {85, " >> ", false}
+    };
+    for (unsigned structured = 0; structured < 2; ++structured) {
+        const uint32_t *base = structured ? structured_words : typed_words;
+        const size_t count = structured ? COUNT(structured_words) : COUNT(typed_words);
+        const size_t operation = structured ? 34 : 43;
+        for (size_t index = 0; index < COUNT(operations); ++index) {
+            Fixture fixture;
+            CHECK(structured ? structured_fixture(&fixture) : typed_fixture(&fixture));
+            uint32_t changed[COUNT(typed_words)];
+            memcpy(changed, base, count * sizeof(*changed));
+            size_t changed_count = count;
+            if (operations[index].unary) {
+                changed[operation] = INSTRUCTION(operations[index].opcode, 5);
+                memmove(changed + operation + 5, base + operation + 10,
+                    (count - operation - 10) * sizeof(*changed));
+                changed_count -= 5;
+            } else {
+                changed[operation] = INSTRUCTION(operations[index].opcode, 10);
+                /* Unsigned high bits are actual bit values, never float
+                 * storage; different shift counts retain their lane owners. */
+                if (operations[index].opcode != 41 && operations[index].opcode != 85) {
+                    changed[operation + 6] = UINT32_MAX;
+                    changed[operation + 7] = UINT32_C(0x80000000);
+                }
+            }
+            CHECK(typed_code(&fixture, changed, changed_count));
+            ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+            CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) ==
+                COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+            CHECK(candidate.domain_complete && candidate.variant_count == 8);
+            CHECK(strstr(candidate.source.buf, operations[index].syntax));
+            CHECK(!strstr(candidate.source.buf, "asfloat") && !strstr(candidate.source.buf, "asuint"));
+            CHECK(!candidate.source_quality.counts.residual_total &&
+                  !candidate.source_quality.counts.unknown_provenance);
+            CHECK(candidate.source_quality.classification == (structured ?
+                HLSL_SOURCE_QUALITY_MIXED : HLSL_SOURCE_QUALITY_CLEAN));
+            for (size_t row = 0; row < candidate.variant_count; ++row) {
+                const ComputeSourceVariant *entry = &candidate.variants[row];
+                CHECK(entry->entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                    entry->memory_effect_count == 2 && entry->expression_count == 3);
+                CHECK(entry->memory_effects[0].instruction_index < entry->memory_effects[1].instruction_index);
+            }
+            changed[operation] |= UINT32_C(1) << 13; /* Saturation cannot become a bit operation. */
+            CHECK(typed_code(&fixture, changed, changed_count));
+            CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+            compute_source_candidate_dispose(&candidate);
+        }
+        Fixture fixture;
+        CHECK(structured ? structured_fixture(&fixture) : typed_fixture(&fixture));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) ==
+            COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        uint32_t changed[COUNT(typed_words)];
+        const uint32_t unsupported[] = {42, 0}; /* Signed right shift and float ADD. */
+        for (size_t index = 0; index < COUNT(unsupported); ++index) {
+            memcpy(changed, base, count * sizeof(*changed));
+            changed[operation] = INSTRUCTION(unsupported[index], 10);
+            CHECK(typed_code(&fixture, changed, count));
+            CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+        }
+        /* XOR cannot hide duplication of the same retained resource read. */
+        memcpy(changed, base, count * sizeof(*changed));
+        changed[operation] = INSTRUCTION(87, 7);
+        changed[operation + 5] = UINT32_C(0x00100e46);
+        changed[operation + 6] = 1;
+        memmove(changed + operation + 7, base + operation + 10,
+            (count - operation - 10) * sizeof(*changed));
+        CHECK(typed_code(&fixture, changed, count - 3));
+        CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+        compute_source_candidate_dispose(&candidate);
+    }
+    return true;
+}
+
 static bool check_owned_quality_resolver(void) {
     HLSLSourceQualityFacts facts;
     hlsl_source_quality_facts_init(&facts);
@@ -681,7 +762,7 @@ static bool check_owned_quality_resolver(void) {
 }
 
 int main(void) {
-    return check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }

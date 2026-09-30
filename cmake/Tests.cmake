@@ -265,6 +265,7 @@ if(BUILD_TESTING)
         tests/test_hlsl_texture_lift_units.c hlsl_texture_lift_units)
     dxbc_add_core_test(test_hlsl_domain_source_units
         tests/test_hlsl_domain_source_units.c hlsl_domain_source_units)
+    target_sources(test_hlsl_domain_source_units PRIVATE tests/test_tessellation_fixture.c)
     dxbc_add_core_test(test_hlsl_geometry_flow_units
         tests/test_hlsl_geometry_flow_units.c hlsl_geometry_flow_units)
     dxbc_add_core_test(test_hlsl_geometry_source_units
@@ -323,7 +324,8 @@ if(BUILD_TESTING)
     dxbc_add_core_test(test_shaderlab_source_quality_units
         tests/test_shaderlab_source_quality_units.c shaderlab_source_quality_units)
     target_sources(test_shaderlab_source_quality_units PRIVATE
-        tests/test_shaderlab_fixture.c)
+        tests/test_shaderlab_fixture.c tests/test_geometry_fixture.c
+        tests/test_tessellation_fixture.c)
     target_compile_definitions(test_shaderlab_source_quality_units PRIVATE
         SHADERLAB_QUALITY_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
     dxbc_add_core_test(test_dxbc_document_units
@@ -342,6 +344,7 @@ if(BUILD_TESTING)
         DXBC_LIMIT_TEST2_GS_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/limit_test2_extrusion_gs.dxbc.b64")
     dxbc_add_core_test(test_hlsl_hull_source_units
         tests/test_hlsl_hull_source_units.c hlsl_hull_source_units)
+    target_sources(test_hlsl_hull_source_units PRIVATE tests/test_tessellation_fixture.c)
     dxbc_add_core_test(test_tessellation_usil_units
         tests/test_tessellation_usil_units.c tessellation_usil_units)
     target_compile_definitions(test_tessellation_usil_units PRIVATE

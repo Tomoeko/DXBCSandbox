@@ -567,6 +567,14 @@ static int test_independent_geometry_candidate(void) {
         CHECK(candidate->certified_pass_count == (size_t)passes &&
               shaderlab_expression_source_map_matches_source(&candidate->source_map,
                                                               &candidate->source));
+        CHECK(candidate->bounded_source_inventory.status == (passes == 1
+            ? UNITY_SHADERLAB_INVENTORY_OBSERVED : UNITY_SHADERLAB_INVENTORY_SCOPE_UNAVAILABLE));
+        if (passes == 1) {
+            CHECK(candidate->bounded_source_inventory.quality.classification == HLSL_SOURCE_QUALITY_MIXED);
+            CHECK(candidate->bounded_source_inventory.quality.linked_entry_count == 3);
+            CHECK(unity_shaderlab_lift_inventory_matches_source(candidate, candidate->source.len,
+                candidate->bounded_source_inventory.source_digest));
+        }
         CHECK(strstr(candidate->source.buf, "TriangleStream<") &&
               strstr(candidate->source.buf, ".Append(") &&
               strstr(candidate->source.buf, ".RestartStrip()"));

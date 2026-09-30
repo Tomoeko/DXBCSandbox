@@ -122,7 +122,8 @@ ownership across the complete graph. Geometry and compute keep their narrower
 stage bounds. Larger or unsupported graphs report an explicit analysis limit.
 Extraction's JSON lift report carries independent quality counters and reasons
 for each emitted stage entry. The bounded `shaderlab_source_quality_emit` API records contiguous receipts for
-one ordinary vertex/fragment pass, including properties, render state and variant
+one ordinary vertex/fragment pass with optional supported geometry or paired
+hull/domain stages, including properties, render state and variant
 routing. It retains each linked entry's independent quality and replays receipt
 authority against the current source/model. Whole ShaderLab remains `mixed` while
 external include or dependency coverage is incomplete; no stage aggregate grants
@@ -143,12 +144,15 @@ unsigned straight-line values and typed thread/group arguments. Complete Unity
 A bounded `compute_source_candidate_build` API reconstructs complete kernel domains
 with their captured names, keywords and group dimensions. It supports resource-free
 RET/barrier bodies and a typed `Texture2D<uint4>` load / `RWTexture2D<uint4>` store
-path with dispatch coordinates and unsigned expressions. A 16-byte structured
-load/store path uses an explicit `uint4` bit representation, preserving the actual
+path with dispatch coordinates, unsigned addition, bitwise operations and logical
+shifts. A 16-byte structured load/store path uses an explicit `uint4` bit
+representation, preserving the actual
 index and memory-effect order. Release metadata does not retain the original
 structured element type; that declaration gap keeps whole source quality `mixed`
-even when the unsigned entry bodies are `clean`. Wider strides, float arithmetic,
-other resources, control flow, shared memory and atomics remain unsupported.
+even when the unsigned entry bodies are `clean`. These memory paths require one
+complete `uint4` read followed by one store; partial reads remain unsupported.
+Wider strides, float arithmetic, other resources, control flow, shared memory
+and atomics remain unsupported.
 Use `dxbc-sandbox extract INPUT --kind compute --all --compute-source-candidate
 --out recovered --format json` to export these candidates alongside the exact binary
 package. Each `_candidate.compute` has a separate evidence file. Unsupported

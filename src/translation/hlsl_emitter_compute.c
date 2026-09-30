@@ -54,6 +54,15 @@ static const char *uint_type(unsigned width) {
 }
 
 
+/* These operators preserve 32-bit unsigned words at each natural width.
+ * The shared AST retains their actual opcode; no signed shift, conversion or
+ * floating-point operation is admitted through this vocabulary. */
+static bool uint_operation(USILOpcode opcode) {
+    return opcode == USIL_OP_IADD || opcode == USIL_OP_AND || opcode == USIL_OP_OR ||
+           opcode == USIL_OP_XOR || opcode == USIL_OP_NOT ||
+           opcode == USIL_OP_ISHL || opcode == USIL_OP_USHR;
+}
+
 static bool reject_stage(HLSLEmitterContext *ctx) {
     hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
                    HLSL_EMIT_REASON_UNSUPPORTED_STAGE);
@@ -258,10 +267,7 @@ static bool instruction_valid(HLSLEmitterContext *ctx, int index, bool natural_p
     if (instruction->opcode == USIL_OP_RET)
         return index == program->instruction_count - 1 ||
                reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
-    if (instruction->opcode != USIL_OP_MOV && instruction->opcode != USIL_OP_IADD &&
-        instruction->opcode != USIL_OP_AND && instruction->opcode != USIL_OP_OR &&
-        instruction->opcode != USIL_OP_XOR && instruction->opcode != USIL_OP_NOT &&
-        instruction->opcode != USIL_OP_ISHL && instruction->opcode != USIL_OP_USHR)
+    if (instruction->opcode != USIL_OP_MOV && !uint_operation(instruction->opcode))
         return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_OPCODE);
     USILEffectFlags effects;
     if (!usil_instruction_effects(program, instruction, &effects) || effects != USIL_EFFECT_NONE)
@@ -456,7 +462,7 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
         return true;
     }
     if (instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_STORE_UAV_TYPED) {
-        if (instruction->opcode != USIL_OP_MOV && instruction->opcode != USIL_OP_IADD &&
+        if (instruction->opcode != USIL_OP_MOV && !uint_operation(instruction->opcode) &&
             instruction->opcode != USIL_OP_RET)
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_OPCODE);
         return instruction_valid(ctx, index, false);
@@ -561,11 +567,15 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
     plan->consumed[definition] |= lanes;
     if (instruction->opcode == USIL_OP_MOV)
         return memory_operand(plan, definition, 1, lanes, depth + 1);
-    if (instruction->opcode == USIL_OP_IADD) {
+    if (uint_operation(instruction->opcode)) {
         if (width != 1u && width != 2u && width != 4u) return NULL;
         ASTExpr *left = memory_operand(plan, definition, 1, lanes, depth + 1);
-        ASTExpr *right = memory_operand(plan, definition, 2, lanes, depth + 1);
-        ASTExpr *expression = left && right ? ast_create_binary(USIL_OP_IADD, left, right) : NULL;
+        const bool unary = instruction->opcode == USIL_OP_NOT;
+        ASTExpr *right = unary ? NULL : memory_operand(plan, definition, 2, lanes, depth + 1);
+        ASTExpr *expression = NULL;
+        if (left && (unary || right))
+            expression = unary ? ast_create_unary(instruction->opcode, left)
+                               : ast_create_binary(instruction->opcode, left, right);
         if (!expression) { ast_free_expr(left); ast_free_expr(right); return NULL; }
         return memory_origin(plan, expression, definition, lanes, AST_SCALAR_UINT32, width);
     }

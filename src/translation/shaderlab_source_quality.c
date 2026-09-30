@@ -145,15 +145,24 @@ static ShaderLabSourceQualityStatus validate_scope(const ShaderLabSourceQualityR
         pass->has_instancing_variant || pass->has_procedural_instancing_variant ||
         !tags_bounded(&pass->tags) || !bounded_text(pass->state.name, 1024))
         return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
+    bool tessellation_stage_present[2] = {false, false};
     for (int stage = 0; stage < 6; ++stage) {
         if (pass->subprogram_count[stage] < 0 || pass->subprogram_count[stage] > 32 ||
             (pass->subprogram_count[stage] && !pass->subprograms[stage]))
             return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
-        if (stage < 2) continue;
-        for (int index = 0; index < pass->subprogram_count[stage]; ++index)
-            if (serialized_pass_subprogram_is_platform(pass, stage, index, 4))
+        for (int index = 0; index < pass->subprogram_count[stage]; ++index) {
+            if (!serialized_pass_subprogram_is_platform(pass, stage, index, 4)) continue;
+            if (stage == 5)
                 return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
+            if (stage == 3 || stage == 4) tessellation_stage_present[stage - 3] = true;
+        }
     }
+    /* This is a one-pass inventory of the linked generated route. A lone hull
+     * or domain stage has no admitted linked tessellation route. Individual
+     * contracts and variants are still validated by the shared stage emitter;
+     * their quality is never supplied by these wrapper observations. */
+    if (tessellation_stage_present[0] != tessellation_stage_present[1])
+        return SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE;
     return SHADERLAB_SOURCE_QUALITY_OK;
 }
 

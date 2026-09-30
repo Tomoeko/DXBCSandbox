@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/shaderlab_source_quality.h"
+#include "translation/shaderlab_source_quality_internal.h"
 #include "common/file_io.h"
 #include "dxbc/usbd.h"
 #include "test_shaderlab_fixture.h"
+#include "test_geometry_fixture.h"
+#include "test_tessellation_fixture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,14 +21,15 @@ typedef struct {
     SerializedShader shader;
     SerializedSubShader subshader;
     SerializedPass pass;
-    SerializedSubProgram programs[2];
-    SerializedSubProgramIdentity identities[2];
+    SerializedSubProgram programs[5];
+    SerializedSubProgramIdentity identities[5];
     ParsedShaderProperty properties[2];
     int platform;
     ShaderBlobArchive archive;
-    BlobEntry entries[2];
-    uint8_t *segments[2];
-    int lengths[2];
+    BlobEntry entries[5];
+    uint8_t *segments[5];
+    int lengths[5];
+    size_t expected_entries;
 } Fixture;
 
 static bool fixture_init(Fixture *fixture) {
@@ -50,6 +54,7 @@ static bool fixture_init(Fixture *fixture) {
         fixture->pass.subprograms[stage] = &fixture->programs[stage];
         fixture->pass.subprogram_identities[stage] = &fixture->identities[stage];
     }
+    fixture->expected_entries = 2;
     fixture->platform = 4;
     fixture->pass.has_serialized_platforms = true;
     fixture->pass.platform_count = 1;
@@ -70,7 +75,7 @@ static bool fixture_init(Fixture *fixture) {
 }
 
 static void fixture_dispose(Fixture *fixture) {
-    for (int stage = 0; stage < 2; ++stage) free(fixture->segments[stage]);
+    for (int stage = 0; stage < 5; ++stage) free(fixture->segments[stage]);
     common_file_bytes_dispose(&fixture->bytes);
 }
 
@@ -83,7 +88,7 @@ static bool check_current_inventory(Fixture *fixture, StringBuilder *source,
     CHECK((result.gaps & (SHADERLAB_SOURCE_GAP_EXTERNAL_INCLUDE | SHADERLAB_SOURCE_GAP_DEPENDENCY_INVENTORY |
         SHADERLAB_SOURCE_GAP_SCHEMA_AUTHORITY)) == (SHADERLAB_SOURCE_GAP_EXTERNAL_INCLUDE |
         SHADERLAB_SOURCE_GAP_DEPENDENCY_INVENTORY | SHADERLAB_SOURCE_GAP_SCHEMA_AUTHORITY));
-    CHECK(result.linked_entry_count == 2 && result.wrapper_receipt_count > 12);
+    CHECK(result.linked_entry_count == fixture->expected_entries && result.wrapper_receipt_count > 12);
     CHECK(result.required_external_include_root_count == 1);
     return true;
 }
@@ -110,6 +115,10 @@ static bool check_inventory_mutations(Fixture *fixture, StringBuilder *source,
         CHECK(check_bad_inventory(fixture, source, inventory)); *receipt = saved;
         receipt->source_digest[0] ^= 1;
         CHECK(check_bad_inventory(fixture, source, inventory)); *receipt = saved;
+        ++receipt->stage_index;
+        CHECK(check_bad_inventory(fixture, source, inventory)); *receipt = saved;
+        ++receipt->pass_index;
+        CHECK(check_bad_inventory(fixture, source, inventory)); *receipt = saved;
         if (receipt->kind == SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY) {
             receipt->entry_record_index = SIZE_MAX;
             CHECK(check_bad_inventory(fixture, source, inventory)); *receipt = saved;
@@ -131,10 +140,20 @@ static bool check_inventory_mutations(Fixture *fixture, StringBuilder *source,
         const bool present = entry->has_source_quality;
         entry->has_source_quality = false;
         CHECK(check_bad_inventory(fixture, source, inventory)); entry->has_source_quality = present;
+        ++entry->stage_index;
+        CHECK(check_bad_inventory(fixture, source, inventory)); --entry->stage_index;
+        ++entry->hardware_tier_group;
+        CHECK(check_bad_inventory(fixture, source, inventory)); --entry->hardware_tier_group;
+        ++entry->blob_index;
+        CHECK(check_bad_inventory(fixture, source, inventory)); --entry->blob_index;
         ++entry->serialized_state;
         CHECK(check_bad_inventory(fixture, source, inventory)); --entry->serialized_state;
         entry->target_digest[0] ^= 1;
         CHECK(check_bad_inventory(fixture, source, inventory)); entry->target_digest[0] ^= 1;
+        CHECK(entry->instructions.count != 0);
+        ++entry->instructions.origins[0].source_instruction_index;
+        CHECK(check_bad_inventory(fixture, source, inventory));
+        --entry->instructions.origins[0].source_instruction_index;
         ++entry->source_quality.counts.unknown_provenance;
         CHECK(check_bad_inventory(fixture, source, inventory)); --entry->source_quality.counts.unknown_provenance;
     }
@@ -362,6 +381,266 @@ static bool check_texture_properties_and_schema_guards(void) {
     return true;
 }
 
+static bool fixture_add_stage(Fixture *fixture, int stage) {
+    size_t dxbc_size = 0;
+    uint8_t *dxbc = stage == 2 ? test_geometry_dxbc(false, true, &dxbc_size) :
+        stage == 3 ? test_tessellation_hull_dxbc(3, 3, 0, &dxbc_size) :
+        test_tessellation_domain_dxbc(2, 3, 7, &dxbc_size);
+    CHECK(dxbc);
+    const int types[] = {15, 17, 19, 21, 22};
+    size_t blob_size = 0;
+    fixture->segments[stage] = test_shaderlab_variant_blob(dxbc, dxbc_size,
+        types[stage], NULL, &blob_size);
+    free(dxbc);
+    CHECK(fixture->segments[stage] && blob_size <= INT32_MAX);
+    fixture->lengths[stage] = (int)blob_size;
+    fixture->entries[stage] = (BlobEntry){0, (int32_t)blob_size, stage};
+    fixture->programs[stage] = (SerializedSubProgram){.blob_index = stage,
+        .program_type = types[stage], .shader_requirements = 0xe3};
+    fixture->identities[stage].hardware_tier_group = 3;
+    fixture->pass.subprogram_count[stage] = 1;
+    fixture->pass.subprograms[stage] = &fixture->programs[stage];
+    fixture->pass.subprogram_identities[stage] = &fixture->identities[stage];
+    fixture->pass.program_mask |= 2u << stage;
+    if (fixture->archive.entry_count <= stage)
+        fixture->archive.entry_count = fixture->archive.segment_count = stage + 1;
+    ++fixture->expected_entries;
+    return true;
+}
+
+static bool check_stage_receipts(Fixture *fixture, StringBuilder *source,
+                                 ShaderLabSourceQualityInventory *inventory, int stage) {
+    size_t guards = 0, bodies = 0, routes = 0;
+    size_t linked_index = SIZE_MAX;
+    for (size_t index = 0; index < inventory->receipt_count; ++index) {
+        const ShaderLabSourceSyntaxReceipt *receipt = &inventory->receipts[index];
+        if (receipt->stage_index != stage) continue;
+        if (receipt->kind == SHADERLAB_SOURCE_SYNTAX_STAGE_GUARD) ++guards;
+        if (receipt->kind == SHADERLAB_SOURCE_SYNTAX_ROUTING) ++routes;
+        if (receipt->kind == SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY) {
+            ++bodies;
+            linked_index = receipt->entry_record_index;
+        }
+    }
+    CHECK(guards == 2 && bodies == 1 && routes != 0);
+    CHECK(linked_index < inventory->entries.count);
+    const ShaderLabExpressionSourceRecord *entry = &inventory->entries.records[linked_index];
+    CHECK(entry->stage_index == stage && entry->has_source_quality && entry->instructions.complete);
+    const HLSLSourceQualityResult original = entry->source_quality;
+    ShaderLabSourceQualityRequest request = {.shader = &fixture->shader, .archive = &fixture->archive};
+    ShaderLabSourceQualityResult result;
+    CHECK(shaderlab_source_quality_inventory_analyze(&request, source, inventory, &result, NULL) == SHADERLAB_SOURCE_QUALITY_OK);
+    CHECK(!memcmp(&original, &entry->source_quality, sizeof(original)));
+    CHECK(result.classification != HLSL_SOURCE_QUALITY_CLEAN);
+
+    const char *guards_text[] = {NULL, NULL, "#if defined(GEOMETRY)",
+        "#if defined(HULL)", "#if defined(DOMAIN)"};
+    char *guard = strstr(source->buf, guards_text[stage]);
+    CHECK(guard); const char saved = guard[0]; guard[0] ^= 1;
+    CHECK(check_bad_inventory(fixture, source, inventory));
+    /* Public digest fields cannot grant coverage to changed routing bytes. */
+    uint8_t source_digest[32], map_digest[32];
+    memcpy(source_digest, inventory->source_digest, 32);
+    memcpy(map_digest, inventory->entries.source_digest, 32);
+    common_sha256(source->buf, source->len, inventory->source_digest);
+    memcpy(inventory->entries.source_digest, inventory->source_digest, 32);
+    size_t guard_receipt = SIZE_MAX;
+    for (size_t index = 0; index < inventory->receipt_count; ++index) {
+        ShaderLabSourceSyntaxReceipt *receipt = &inventory->receipts[index];
+        if (receipt->kind == SHADERLAB_SOURCE_SYNTAX_STAGE_GUARD && receipt->stage_index == stage) {
+            guard_receipt = index;
+            break;
+        }
+    }
+    CHECK(guard_receipt != SIZE_MAX);
+    ShaderLabSourceSyntaxReceipt *receipt = &inventory->receipts[guard_receipt];
+    const ShaderLabSourceSyntaxReceipt original_receipt = *receipt;
+    common_sha256(source->buf + receipt->source_begin, receipt->source_end - receipt->source_begin,
+        receipt->source_digest);
+    CHECK(check_bad_inventory(fixture, source, inventory));
+    *receipt = original_receipt; guard[0] = saved;
+    memcpy(inventory->source_digest, source_digest, 32);
+    memcpy(inventory->entries.source_digest, map_digest, 32);
+    /* Removing a specific stage guard cannot be hidden by retaining the rest
+     * of its body and contiguous source map. */
+    memmove(receipt, receipt + 1, (inventory->receipt_count - guard_receipt - 1) * sizeof(*receipt));
+    --inventory->receipt_count;
+    CHECK(check_bad_inventory(fixture, source, inventory));
+    memmove(receipt + 1, receipt, (inventory->receipt_count - guard_receipt) * sizeof(*receipt));
+    ++inventory->receipt_count; *receipt = original_receipt;
+    const uint64_t requirements = fixture->programs[stage].shader_requirements;
+    fixture->programs[stage].shader_requirements ^= 1u;
+    CHECK(check_bad_inventory(fixture, source, inventory));
+    fixture->programs[stage].shader_requirements = requirements;
+    fixture->identities[stage].hardware_tier_group = 1;
+    CHECK(check_bad_inventory(fixture, source, inventory));
+    fixture->identities[stage].hardware_tier_group = 3;
+    SerializedSubProgramIdentity *identities = fixture->pass.subprogram_identities[stage];
+    fixture->pass.subprogram_identities[stage] = NULL;
+    CHECK(check_bad_inventory(fixture, source, inventory));
+    fixture->pass.subprogram_identities[stage] = identities;
+    const int type = fixture->programs[stage].program_type;
+    fixture->programs[stage].program_type = 15;
+    CHECK(check_bad_inventory(fixture, source, inventory)); fixture->programs[stage].program_type = type;
+    return true;
+}
+
+static bool check_linked_graphics_stages(void) {
+    for (unsigned tessellation = 0; tessellation < 2; ++tessellation) {
+        Fixture fixture; CHECK(fixture_init(&fixture));
+        CHECK(fixture_add_stage(&fixture, tessellation ? 3 : 2));
+        if (tessellation) CHECK(fixture_add_stage(&fixture, 4));
+        ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
+        StringBuilder source, baseline, rejected;
+        sb_init(&source); sb_init(&baseline); sb_init(&rejected);
+        ShaderLabSourceQualityInventory inventory = {0};
+        ShaderLabSourceQualityDiagnostic diagnostic;
+        const ShaderLabSourceQualityStatus emitted = shaderlab_source_quality_emit(&request, &source, &inventory, &diagnostic);
+        if (emitted != SHADERLAB_SOURCE_QUALITY_OK)
+            fprintf(stderr, "linked emission failed: tessellation=%u quality=%u candidate=%u stage=%d status=%u emitter=%u reason=%u target=%u\n",
+                tessellation, emitted, diagnostic.emission.status, diagnostic.emission.stage.stage_index,
+                diagnostic.emission.stage.status, diagnostic.emission.stage.hlsl.status,
+                diagnostic.emission.stage.hlsl.reason, diagnostic.emission.target.status);
+        CHECK(emitted == SHADERLAB_SOURCE_QUALITY_OK);
+        CHECK(shaderlab_emit_high_level_candidate(&fixture.shader, fixture.archive.entries,
+            fixture.archive.entry_count, fixture.archive.segments, fixture.archive.segment_lengths,
+            fixture.archive.segment_count, &baseline, NULL));
+        CHECK(source.len == baseline.len && !memcmp(source.buf, baseline.buf, source.len));
+        CHECK(check_current_inventory(&fixture, &source, &inventory));
+        CHECK(check_inventory_mutations(&fixture, &source, &inventory));
+        for (int stage = tessellation ? 3 : 2; stage <= (tessellation ? 4 : 2); ++stage)
+            CHECK(check_stage_receipts(&fixture, &source, &inventory, stage));
+        const ShaderLabSourceQualityInventory saved = inventory;
+        const int stage = tessellation ? 3 : 2;
+        fixture.pass.subprogram_count[stage] = 0;
+        CHECK(shaderlab_source_quality_inventory_analyze(&request, &source, &inventory,
+            &(ShaderLabSourceQualityResult){0}, NULL) != SHADERLAB_SOURCE_QUALITY_OK);
+        fixture.pass.subprogram_count[stage] = 1;
+        if (tessellation) {
+            fixture.pass.subprogram_count[4] = 0;
+            CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+            CHECK(!rejected.len && !memcmp(&saved, &inventory, sizeof(saved)));
+            fixture.pass.subprogram_count[4] = 1;
+        }
+        SerializedPass two_passes[2] = {fixture.pass, fixture.pass};
+        fixture.subshader.pass_count = 2; fixture.subshader.passes = two_passes;
+        CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_SCOPE_UNAVAILABLE);
+        CHECK(!rejected.len && !memcmp(&saved, &inventory, sizeof(saved)));
+        fixture.subshader.pass_count = 1; fixture.subshader.passes = &fixture.pass;
+        const ShaderLabSourceSyntaxKind kinds[] = {SHADERLAB_SOURCE_SYNTAX_STAGE_GUARD,
+            SHADERLAB_SOURCE_SYNTAX_ROUTING, SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY};
+        for (size_t index = 0; index < sizeof(kinds) / sizeof(kinds[0]); ++index) {
+            request.observer = reject_receipt; request.observer_context = (void *)&kinds[index];
+            CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_OBSERVER_REJECTED);
+            CHECK(!rejected.len && !memcmp(&saved, &inventory, sizeof(saved)));
+        }
+        shaderlab_source_quality_inventory_dispose(&inventory);
+        sb_free(&source); sb_free(&baseline); sb_free(&rejected); fixture_dispose(&fixture);
+    }
+    return true;
+}
+
+static bool check_inventory_limits(void) {
+    Fixture fixture; CHECK(fixture_init(&fixture));
+    char *names[] = {"FIRST", "SECOND", "THIRD", "FOURTH"};
+    uint8_t flags[] = {1, 1, 1, 1};
+    uint16_t mask[] = {0, 1, 2, 3};
+    int keyword_indices[16][4] = {{0}};
+    char *selected_names[16][4] = {{0}};
+    SerializedSubProgram programs[2][16] = {{{0}}};
+    SerializedSubProgramIdentity identities[2][16] = {{{0}}};
+    uint8_t *segments[33] = {0};
+    int lengths[33] = {0};
+    BlobEntry entries[33] = {{0}};
+    DXBCUSBDTableView table;
+    CHECK(dxbc_usbd_table_open(&table, fixture.bytes.data, fixture.bytes.size, NULL));
+    for (int state = 0; state < 16; ++state) {
+        int keyword_count = 0;
+        const char *blob_keywords[4] = {0};
+        for (int keyword = 0; keyword < 4; ++keyword) {
+            if (!(state & (1 << keyword))) continue;
+            keyword_indices[state][keyword_count] = keyword;
+            selected_names[state][keyword_count] = names[keyword];
+            blob_keywords[keyword_count++] = names[keyword];
+        }
+        for (int stage = 0; stage < 2; ++stage) {
+            DXBCUSBDRecordView record;
+            CHECK(dxbc_usbd_table_record(&table, (uint32_t)stage, &record));
+            const int index = stage * 16 + state;
+            size_t size = 0;
+            segments[index] = test_shaderlab_variant_blob_keywords(record.dxbc,
+                record.dxbc_size, stage ? 17 : 15, blob_keywords, (size_t)keyword_count, &size);
+            CHECK(segments[index] && size <= INT32_MAX);
+            lengths[index] = (int)size;
+            entries[index] = (BlobEntry){0, (int32_t)size, index};
+            programs[stage][state] = fixture.programs[stage];
+            programs[stage][state].blob_index = index;
+            programs[stage][state].local_keyword_count = keyword_count;
+            programs[stage][state].local_keywords = selected_names[state];
+            identities[stage][state] = fixture.identities[stage];
+            identities[stage][state].local_keyword_index_count = keyword_count;
+            identities[stage][state].local_keyword_indices = keyword_indices[state];
+        }
+    }
+    fixture.shader.keyword_names = (SerializedKeywordList){4, names};
+    fixture.shader.keyword_flags = flags;
+    fixture.pass.serialized_keyword_state_mask_count = 4;
+    fixture.pass.serialized_keyword_state_mask = mask;
+    for (int stage = 0; stage < 2; ++stage) {
+        fixture.pass.subprogram_count[stage] = 16;
+        fixture.pass.subprograms[stage] = programs[stage];
+        fixture.pass.subprogram_identities[stage] = identities[stage];
+    }
+    fixture.expected_entries = 32;
+    fixture.archive = (ShaderBlobArchive){.entries = entries, .entry_count = 32,
+        .segments = segments, .segment_lengths = lengths, .segment_count = 32};
+    const ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
+    StringBuilder source, rejected; sb_init(&source); sb_init(&rejected);
+    ShaderLabSourceQualityInventory inventory = {0};
+    CHECK(shaderlab_source_quality_emit(&request, &source, &inventory, NULL) == SHADERLAB_SOURCE_QUALITY_OK);
+    CHECK(inventory.entries.count == 32 && inventory.receipt_count <= 256);
+    CHECK(check_current_inventory(&fixture, &source, &inventory));
+    const size_t entry_count = inventory.entries.count;
+    inventory.entries.count = 33;
+    CHECK(check_bad_inventory(&fixture, &source, &inventory)); inventory.entries.count = entry_count;
+    const size_t receipt_count = inventory.receipt_count;
+    inventory.receipt_count = 257;
+    CHECK(check_bad_inventory(&fixture, &source, &inventory)); inventory.receipt_count = receipt_count;
+    const ShaderLabSourceQualityInventory saved = inventory;
+    /* Four exhaustive axes create 16 V and 16 F bodies. One independent G
+     * body raises the actual linked record inventory to exactly 33. */
+    CHECK(fixture_add_stage(&fixture, 2));
+    fixture.programs[2].blob_index = 32;
+    segments[32] = fixture.segments[2]; lengths[32] = fixture.lengths[2];
+    entries[32] = (BlobEntry){0, lengths[32], 32};
+    fixture.archive.entry_count = fixture.archive.segment_count = 33;
+    CHECK(shaderlab_source_quality_emit(&request, &rejected, &inventory, NULL) != SHADERLAB_SOURCE_QUALITY_OK);
+    CHECK(!rejected.len && !memcmp(&saved, &inventory, sizeof(saved)));
+    CHECK(check_bad_inventory(&fixture, &source, &inventory));
+    shaderlab_source_quality_inventory_dispose(&inventory);
+    sb_free(&source); sb_free(&rejected);
+    for (int index = 0; index < 32; ++index) free(segments[index]);
+    fixture_dispose(&fixture);
+
+    /* The streaming receipt boundary is independently bounded even when an
+     * internal producer attempts more syntax than admitted wrapper models. */
+    StringBuilder bounded; sb_init(&bounded);
+    ShaderLabSourceQualityInventory receipts = {0};
+    ShaderLabSourceQualityCapture capture = {.inventory = &receipts};
+    for (size_t index = 0; index < 256; ++index) {
+        sb_append_char(&bounded, 'x');
+        CHECK(shaderlab_source_quality_capture_receipt(&capture, &bounded,
+            SHADERLAB_SOURCE_SYNTAX_ROUTING, -1, 0, 0, 2, SIZE_MAX));
+    }
+    CHECK(receipts.receipt_count == 256 && !capture.failed);
+    sb_append_char(&bounded, 'x');
+    CHECK(!shaderlab_source_quality_capture_receipt(&capture, &bounded,
+        SHADERLAB_SOURCE_SYNTAX_ROUTING, -1, 0, 0, 2, SIZE_MAX));
+    CHECK(capture.failed && receipts.receipt_count == 256 && capture.cursor == 256);
+    shaderlab_source_quality_inventory_dispose(&receipts); sb_free(&bounded);
+    return true;
+}
+
 int main(void) {
     Fixture fixture;
     if (!fixture_init(&fixture)) return 1;
@@ -377,7 +656,8 @@ int main(void) {
         check_inventory_mutations(&fixture, &source, &inventory) &&
         check_transaction_and_model(&fixture, &source, &inventory) &&
         check_named_wrapper_fields(&fixture) && check_keyword_routing() &&
-        check_texture_properties_and_schema_guards();
+        check_texture_properties_and_schema_guards() && check_linked_graphics_stages() &&
+        check_inventory_limits();
     shaderlab_source_quality_inventory_dispose(&inventory);
     sb_free(&source); sb_free(&baseline); fixture_dispose(&fixture);
     passed = passed && g_allocated_bytes == 0 && g_allocations_count == 0;

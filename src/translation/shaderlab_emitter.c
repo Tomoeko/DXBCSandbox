@@ -874,6 +874,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
       if (pass_has_platform_stage(pass, 3, 4)) {
         append_indent(sb, 3);
         sb_append(sb, "#if defined(HULL) || defined(SHADER_STAGE_HULL)\n");
+        CAPTURE(STAGE_GUARD, -1, i, j, 3);
         if (require_complete_stages) {
           ShaderLabStageDiagnostic diagnostic;
           if (!emit_stage_hlsl_with_variant_plan_mode(
@@ -889,6 +890,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         }
         append_indent(sb, 3);
         sb_append(sb, "#endif\n\n");
+        CAPTURE(STAGE_GUARD, -1, i, j, 3);
       }
 
       // Domain Shader. Like hull emission, this is gated by an exact decoded
@@ -896,6 +898,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
       if (pass_has_platform_stage(pass, 4, 4)) {
         append_indent(sb, 3);
         sb_append(sb, "#if defined(DOMAIN) || defined(SHADER_STAGE_DOMAIN)\n");
+        CAPTURE(STAGE_GUARD, -1, i, j, 4);
         if (require_complete_stages) {
           ShaderLabStageDiagnostic diagnostic;
           if (!emit_stage_hlsl_with_variant_plan_mode(
@@ -911,6 +914,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         }
         append_indent(sb, 3);
         sb_append(sb, "#endif\n\n");
+        CAPTURE(STAGE_GUARD, -1, i, j, 4);
       }
 
       // Geometry Shader. The stage emitter itself is fail-closed and accepts
@@ -919,6 +923,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         append_indent(sb, 3);
         sb_append(sb,
                   "#if defined(GEOMETRY) || defined(SHADER_STAGE_GEOMETRY)\n");
+        CAPTURE(STAGE_GUARD, -1, i, j, 2);
         if (require_complete_stages) {
           ShaderLabStageDiagnostic diagnostic;
           if (!emit_stage_hlsl_with_variant_plan_mode(
@@ -934,6 +939,7 @@ static bool shaderlab_emit_internal(const SerializedShader *shader,
         }
         append_indent(sb, 3);
         sb_append(sb, "#endif\n\n");
+        CAPTURE(STAGE_GUARD, -1, i, j, 2);
       }
 
       // Fragment Shader

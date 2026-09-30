@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "dxbc/dxbc_document.h"
+#include "test_tessellation_fixture.h"
 #include "dxbc/dxbc_hash.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter_internal.h"
@@ -15,92 +16,6 @@
         return false; \
     } \
 } while (0)
-#define INSTRUCTION(opcode, length) \
-    ((uint32_t)(opcode) | (uint32_t)(length) << 24)
-
-static void write_u32(uint8_t *bytes, uint32_t value) {
-    for (unsigned byte = 0; byte < 4; ++byte)
-        bytes[byte] = (uint8_t)(value >> (8 * byte));
-}
-
-/* Authored token grammar and signatures, with no captured byte array. */
-static size_t write_signature(uint8_t *bytes, unsigned role, unsigned domain) {
-    const bool patch = role == 2;
-    const unsigned outer = domain == 2 ? 3 : domain == 3 ? 4 : 2;
-    const unsigned inner = domain == 2 ? 1 : domain == 3 ? 2 : 0;
-    const unsigned count = patch ? outer + inner : 1;
-    const char *semantic = patch ? "SV_TessFactor" : "SV_POSITION";
-    const size_t name_offset = 8 + count * 24;
-    const size_t size = name_offset + strlen(semantic) + 1 +
-        (patch ? sizeof("SV_InsideTessFactor") : 0);
-    memcpy(bytes, patch ? "PCSG" : role ? "OSGN" : "ISGN", 4);
-    write_u32(bytes + 4, (uint32_t)size);
-    bytes += 8;
-    write_u32(bytes, count);
-    write_u32(bytes + 4, 8);
-    for (unsigned field = 0; field < count; ++field) {
-        uint8_t *element = bytes + 8 + 24 * field;
-        write_u32(element, (uint32_t)(name_offset +
-            (patch && field >= outer ? strlen(semantic) + 1 : 0)));
-        write_u32(element + 4, patch ? (field < outer ? field : field - outer) : 0);
-        const unsigned system = domain == 2 ? (field < outer ? 13 : 14) :
-            domain == 3 ? (field < outer ? 11 : 12) : (field ? 15 : 16);
-        write_u32(element + 8, patch ? system : 1);
-        write_u32(element + 12, 3);
-        write_u32(element + 16, patch ? field : 0);
-        write_u32(element + 20, patch ? 1 : role ? 15 : 0x0f0f);
-    }
-    memcpy(bytes + name_offset, semantic, strlen(semantic) + 1);
-    if (patch)
-        memcpy(bytes + name_offset + strlen(semantic) + 1,
-               "SV_InsideTessFactor", sizeof("SV_InsideTessFactor"));
-    return size + 8;
-}
-
-static uint8_t *make_controlled_dxbc(unsigned domain, uint32_t points, uint8_t location_mask,
-                                     size_t *size) {
-    const unsigned coordinate_y = domain == 1 ? 0 : 1;
-    const unsigned coordinate_z = domain == 2 ? 2 : 0;
-    const uint32_t words[] = {
-        INSTRUCTION(147, 1) | (points << 11),
-        INSTRUCTION(149, 1) | ((uint32_t)domain << 11),
-        INSTRUCTION(106, 1) | (1u << 11),
-        INSTRUCTION(95, 2), 0x0001c002u | (uint32_t)location_mask << 4,
-        INSTRUCTION(95, 4), 0x002190f2, points, 0,
-        INSTRUCTION(103, 4), 0x001020f2, 0, 1,
-        INSTRUCTION(104, 2), 1,
-        INSTRUCTION(56, 7), 0x001000f2, 0, 0x0001c006u | ((uint32_t)coordinate_y * 0x55u << 4),
-            0x00219e46, 1, 0,
-        INSTRUCTION(50, 9), 0x001000f2, 0, 0x00219e46, 0, 0,
-            0x0001c006, 0x00100e46, 0,
-        INSTRUCTION(50, 9), 0x001020f2, 0, 0x00219e46, points == 2 ? 1u : 2u, 0,
-            0x0001c006u | ((uint32_t)coordinate_z * 0x55u << 4), 0x00100e46, 0,
-        INSTRUCTION(62, 1)
-    };
-    uint8_t bytes[1024] = {0};
-    memcpy(bytes, "DXBC", 4);
-    write_u32(bytes + 20, 1);
-    write_u32(bytes + 28, 4);
-    size_t offset = 48;
-    for (unsigned role = 0; role < 3; ++role) {
-        write_u32(bytes + 32 + 4 * role, (uint32_t)offset);
-        offset += write_signature(bytes + offset, role, domain);
-        offset = (offset + 3) & ~(size_t)3;
-    }
-    write_u32(bytes + 44, (uint32_t)offset);
-    memcpy(bytes + offset, "SHEX", 4);
-    write_u32(bytes + offset + 4, sizeof(words) + 8);
-    write_u32(bytes + offset + 8, 0x00040050);
-    write_u32(bytes + offset + 12, sizeof(words) / 4 + 2);
-    for (unsigned word = 0; word < sizeof(words) / 4; ++word)
-        write_u32(bytes + offset + 16 + 4 * word, words[word]);
-    *size = offset + 16 + sizeof(words);
-    write_u32(bytes + 24, (uint32_t)*size);
-    if (!dxbc_compute_hash(bytes, *size, bytes + 4)) return NULL;
-    uint8_t *result = malloc(*size);
-    if (result) memcpy(result, bytes, *size);
-    return result;
-}
 
 typedef struct {
     DXBCDocument document;
@@ -115,7 +30,7 @@ static bool domain_fixture_init_shape(DomainFixture *fixture, unsigned domain, u
     dxbc_document_init(&fixture->document);
     dxbc_stage_contract_init(&fixture->contract);
     size_t size = 0;
-    uint8_t *bytes = make_controlled_dxbc(domain, points, location_mask, &size);
+    uint8_t *bytes = test_tessellation_domain_dxbc(domain, points, location_mask, &size);
     CHECK(bytes);
     DXBCDocumentDiagnostic document_diagnostic;
     DXBCStageContractDiagnostic contract_diagnostic;
