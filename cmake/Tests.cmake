@@ -509,6 +509,16 @@ if(BUILD_TESTING)
             test_compiler_client_units)
         add_test(NAME compiler_broker_units COMMAND test_compiler_broker_units)
 
+        add_executable(test_unity_hlsl_expansion_units tests/test_unity_hlsl_expansion_units.c)
+        target_link_libraries(test_unity_hlsl_expansion_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME unity_hlsl_expansion_units COMMAND test_unity_hlsl_expansion_units)
+
+        add_executable(test_unity_hlsl_cbuffer_inventory_units tests/test_unity_hlsl_cbuffer_inventory_units.c)
+        target_link_libraries(test_unity_hlsl_cbuffer_inventory_units PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME unity_hlsl_cbuffer_inventory_units COMMAND test_unity_hlsl_cbuffer_inventory_units)
+
         add_executable(test_unity_uv_helper_units tests/test_unity_uv_helper_units.c)
         target_link_libraries(test_unity_uv_helper_units PRIVATE
             unity_compiler_support dxbc_build_options)

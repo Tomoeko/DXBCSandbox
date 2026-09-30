@@ -123,7 +123,11 @@ one ordinary vertex/fragment pass, including properties, render state and varian
 routing. It retains each linked entry's independent quality and replays receipt
 authority against the current source/model. Whole ShaderLab remains `mixed` while
 external include or dependency coverage is incomplete; no stage aggregate grants
-whole-source cleanliness.
+whole-source cleanliness. The compiler-side `unity_hlsl_expansion_inspect_request`
+API observes the unchanged graphics invocation with canonical request and control
+identities. A bounded cbuffer inventory records expanded declarations, packing and
+extent. These receipts cover declarations only; callers still need actual target
+bindings, instruction reads and include semantics before granting source quality.
 
 Compute inspection retains group dimensions, shared-memory declarations, barrier
 flags and memory effects in the IR. A bounded HLSL entry-point projection supports

@@ -4,7 +4,7 @@
 #define UNITY_UV_HELPER_H
 
 #include "common/string_builder.h"
-#include "compiler/unity_compiler_broker.h"
+#include "compiler/unity_hlsl_expansion.h"
 #include "translation/hlsl_unity_uv_lift.h"
 
 #include <stddef.h>
@@ -59,16 +59,7 @@ bool unity_uv_helper_append_probe(StringBuilder *source);
  * Failure clears out_expansion. */
 UnityUvHelperStatus unity_uv_helper_validate_expansion(const uint8_t *source, size_t size,
                                                        UnityUvHelperExpansion *out_expansion);
-typedef struct {
-    /* Optional service injection for the owning transaction's limits and tests.
-     * NULL callbacks use the broker. A digest must use the canonical request
-     * serializer, including live source/include/toolchain authority. */
-    bool (*request_digest)(void *context, const UnityCompilerSnippetCompileRequest *request,
-                           uint8_t digest[32]);
-    bool (*compile)(void *context, const UnityCompilerSnippetCompileRequest *request,
-                    UnityCompilerBinaryResponse *response);
-    void *context;
-} UnityUvHelperServices;
+typedef UnityHlslExpansionServices UnityUvHelperServices;
 
 typedef struct {
     UnityUvHelperExpansion expansion;

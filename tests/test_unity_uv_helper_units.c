@@ -240,7 +240,8 @@ typedef enum {
     REQUEST_DRIFT,
     REQUEST_UNAVAILABLE,
     REQUEST_REJECTED,
-    REQUEST_WRONG_DEFINITION
+    REQUEST_WRONG_DEFINITION,
+    REQUEST_WRONG_CONTROLS
 } RequestCase;
 
 typedef struct {
@@ -319,6 +320,8 @@ static bool fake_compile(void *opaque, const UnityCompilerSnippetCompileRequest 
         memset(response->controls_digest, 0, 32);
     if (fixture->mode == REQUEST_WRONG_IDENTITY)
         response->request_digest[0] ^= 1;
+    if (fixture->mode == REQUEST_WRONG_CONTROLS)
+        response->controls_digest[0] ^= 1;
     if (fixture->mode == REQUEST_DRIFT)
         fixture->environment_digest[0] ^= 1;
     StringBuilder source;
@@ -367,7 +370,8 @@ static bool typed_request_authority(void) {
                                             UNITY_UV_HELPER_AUTHORITY_MISMATCH,
                                             UNITY_UV_HELPER_COMPILER_UNAVAILABLE,
                                             UNITY_UV_HELPER_COMPILER_REJECTED,
-                                            UNITY_UV_HELPER_CHANGED_DEFINITION};
+                                            UNITY_UV_HELPER_CHANGED_DEFINITION,
+                                            UNITY_UV_HELPER_AUTHORITY_MISMATCH};
     for (int language = 0; language < 2; ++language)
         for (int stage = 0; stage < 2; ++stage)
             for (int stereo = 0; stereo < 2; ++stereo) {
@@ -386,7 +390,7 @@ static bool typed_request_authority(void) {
                         NULL, &request, &services, &response, &evidence);
                     CHECK(status == statuses[mode]);
                     CHECK(fixture.compiles == 1 && fixture.controls_preserved);
-                    CHECK(fixture.digest_calls >= 2 && fixture.digest_calls <= 4);
+                    CHECK(fixture.digest_calls >= 3 && fixture.digest_calls <= 6);
                     if (status == UNITY_UV_HELPER_OK) {
                         uint8_t expected[32];
                         CHECK(canonical_digest(&fixture, &request, expected));

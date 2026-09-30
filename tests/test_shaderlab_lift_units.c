@@ -314,6 +314,12 @@ static bool compile_service(void *opaque, const UnityCompilerSnippetCompileReque
             response->request_digest[0] ^= 1;
     }
     if (request->preprocess_only) {
+        /* Expanded-source inspection now verifies the complete canonical
+         * controls identity. A nonzero placeholder is not request authority. */
+        UnityCompilerSnippetCompileRequest controls = *request;
+        controls.snippet_source = "";
+        if (!request_digest_service(service, &controls, response->controls_digest))
+            return false;
         StringBuilder expansion;
         test_uv_expansion(&expansion);
         if (!sb_ok(&expansion)) {
