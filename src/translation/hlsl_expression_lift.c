@@ -949,6 +949,16 @@ static ASTExpr *vector_operation(HLSLEmitterContext *ctx, int index, ASTExpr *le
                                  ASTExpr *right, ASTExpr *third,
                                  const HLSLPureExpressionScope *scope) {
     const USILOpcode opcode = ctx->program->instructions[index].opcode;
+    if (opcode == USIL_OP_MIN && scope && scope->hull_factor_clamp_supported &&
+        scope->hull_factor_clamp_supported(ctx, index, scope->context)) {
+        const uint8_t lanes = usil_operand_destination_lane_mask(
+            &ctx->program->instructions[index].operands[0]);
+        const bool scalar = left && right && expression_width(left) == 1 &&
+            expression_width(right) == 1 && lanes && !(lanes & (uint8_t)(lanes - 1u));
+        ast_free_expr(right);
+        if (!scalar) { ast_free_expr(left); return NULL; }
+        return logical_expression(ctx, left, index, lanes, 1);
+    }
     if (opcode == USIL_OP_ADD && scope && scope->ordered_add_supported &&
         scope->ordered_add_supported(ctx, index, scope->context)) {
         const uint8_t lanes = usil_operand_destination_lane_mask(
@@ -1235,6 +1245,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
             }
             continue;
         }
+        const size_t assignment_begin = ctx->sb->len;
         sb_append_spaces(ctx->sb, ctx->indent);
         if (destination->type == OPERAND_TYPE_TEMP) {
             char name[48];
@@ -1265,6 +1276,8 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
         if (!finish_expression_origins(&trace, false))
             ctx->sb->failed = true;
         sb_append(ctx->sb, ";\n");
+        if (scope && scope->assignment_span)
+            scope->assignment_span(ctx, index, assignment_begin, ctx->sb->len, scope->context);
         hlsl_source_quality_emission(ctx,
             destination->type == OPERAND_TYPE_OUTPUT && !scope && !ctx->high_level_interface
                 ? HLSL_SOURCE_ARTIFACT_REGISTER_STORAGE : 0, false, index);
@@ -1315,6 +1328,8 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
         program->instruction_count > EXPRESSION_INSTRUCTION_LIMIT ||
         map->count != (size_t)program->instruction_count)
         return false;
+    if (program->program_type == DXBC_PROGRAM_TYPE_HULL &&
+        !hlsl_hull_factor_clamp_map_kinds_match(map, program)) return false;
     const size_t source_length = strlen(source);
     for (size_t index = 0; index < map->count; ++index) {
         const HLSLExpressionOrigin *origin = &map->origins[index];
@@ -1331,6 +1346,10 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
         if (origin->destination_lanes != lanes)
             return false;
         switch (origin->kind) {
+        case HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP:
+            if (!hlsl_hull_factor_clamp_origin_matches(origin, program, source))
+                return false;
+            break;
         case HLSL_EXPRESSION_ORIGIN_UNITY_UV:
             if (index != 0 || !hlsl_unity_uv_lift_matches(program))
                 return false;
@@ -1413,6 +1432,8 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
         return HLSL_UNITY_UV_LIFT_ID;
     case HLSL_EXPRESSION_ORIGIN_EFFECT:
         return "effect";
+    case HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP:
+        return "hull-factor-clamp";
     default:
         return "unmapped";
     }
@@ -1422,7 +1443,7 @@ bool hlsl_expression_origin_has_span(HLSLExpressionOriginKind kind) {
     return kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION || kind == HLSL_EXPRESSION_ORIGIN_RETURN ||
            kind == HLSL_EXPRESSION_ORIGIN_CONTROL || kind == HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL ||
            kind == HLSL_EXPRESSION_ORIGIN_FUNCTION || kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV ||
-           kind == HLSL_EXPRESSION_ORIGIN_EFFECT;
+           kind == HLSL_EXPRESSION_ORIGIN_EFFECT || kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP;
 }
 
 bool hlsl_expression_origin_ranges_valid(const HLSLExpressionOrigin *origin, size_t source_length) {
@@ -1439,7 +1460,24 @@ bool hlsl_expression_origin_ranges_valid(const HLSLExpressionOrigin *origin, siz
     if (origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION)
         return origin->definition_begin < origin->definition_end &&
                origin->definition_end <= origin->source_begin;
+    if (origin->kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP)
+        return origin->definition_begin < origin->definition_end &&
+               origin->definition_end <= source_length &&
+               origin->source_end <= origin->definition_begin &&
+               origin->source_begin == origin->hull_factor_clamp.assignment_source_begin &&
+               origin->source_end == origin->hull_factor_clamp.assignment_source_end &&
+               origin->definition_begin == origin->hull_factor_clamp.maximum_attribute_source_begin &&
+               origin->definition_end == origin->hull_factor_clamp.maximum_attribute_source_end;
     return !origin->definition_begin && !origin->definition_end;
+}
+
+bool hlsl_expression_origins_equal(const HLSLExpressionOrigin *a, const HLSLExpressionOrigin *b) {
+    return a && b && a->kind == b->kind && a->instruction_index == b->instruction_index &&
+        a->source_instruction_index == b->source_instruction_index &&
+        a->destination_lanes == b->destination_lanes &&
+        a->source_begin == b->source_begin && a->source_end == b->source_end &&
+        a->definition_begin == b->definition_begin && a->definition_end == b->definition_end &&
+        hlsl_hull_factor_clamp_origins_equal(&a->hull_factor_clamp, &b->hull_factor_clamp);
 }
 
 bool hlsl_expression_source_map_offset(HLSLExpressionSourceMap *map, size_t offset) {
@@ -1456,9 +1494,16 @@ bool hlsl_expression_source_map_offset(HLSLExpressionSourceMap *map, size_t offs
             continue;
         origin->source_begin += offset;
         origin->source_end += offset;
-        if (origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION) {
+        if (origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION ||
+            origin->kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP) {
             origin->definition_begin += offset;
             origin->definition_end += offset;
+        }
+        if (origin->kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP) {
+            origin->hull_factor_clamp.assignment_source_begin += offset;
+            origin->hull_factor_clamp.assignment_source_end += offset;
+            origin->hull_factor_clamp.maximum_attribute_source_begin += offset;
+            origin->hull_factor_clamp.maximum_attribute_source_end += offset;
         }
     }
     return true;
@@ -1477,11 +1522,16 @@ bool hlsl_expression_source_map_rebase_line(HLSLExpressionSourceMap *map,
         HLSLExpressionOrigin *to = &map->origins[i];
         if (!hlsl_expression_origin_has_span(from->kind))
             continue;
-        const size_t starts[] = {from->source_begin, from->definition_begin};
-        const size_t ends[] = {from->source_end, from->definition_end};
-        size_t *to_starts[] = {&to->source_begin, &to->definition_begin};
-        size_t *to_ends[] = {&to->source_end, &to->definition_end};
-        const int ranges = from->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION ? 2 : 1;
+        const size_t starts[] = {from->source_begin, from->definition_begin,
+            from->hull_factor_clamp.assignment_source_begin, from->hull_factor_clamp.maximum_attribute_source_begin};
+        const size_t ends[] = {from->source_end, from->definition_end,
+            from->hull_factor_clamp.assignment_source_end, from->hull_factor_clamp.maximum_attribute_source_end};
+        size_t *to_starts[] = {&to->source_begin, &to->definition_begin,
+            &to->hull_factor_clamp.assignment_source_begin, &to->hull_factor_clamp.maximum_attribute_source_begin};
+        size_t *to_ends[] = {&to->source_end, &to->definition_end,
+            &to->hull_factor_clamp.assignment_source_end, &to->hull_factor_clamp.maximum_attribute_source_end};
+        const int ranges = from->kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP ? 4 :
+                           from->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION ? 2 : 1;
         for (int range = 0; range < ranges; ++range) {
             /* A newline end precedes new indentation; a start follows it. */
             if (starts[range] >= line_begin && starts[range] < line_end)

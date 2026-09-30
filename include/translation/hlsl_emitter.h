@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 29U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 30U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -29,8 +29,29 @@ typedef enum {
     HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL,
     HLSL_EXPRESSION_ORIGIN_FUNCTION,
     HLSL_EXPRESSION_ORIGIN_UNITY_UV,
-    HLSL_EXPRESSION_ORIGIN_EFFECT
+    HLSL_EXPRESSION_ORIGIN_EFFECT,
+    HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP
 } HLSLExpressionOriginKind;
+
+/* Bounded compiler lowering of a final scalar tessellation factor. The decoded
+ * operation remains owned even though HLSL's maxtessfactor attribute emits its
+ * clamp. These are replay coordinates, not a correctness certificate. */
+typedef struct {
+    uint32_t maximum_bits;
+    uint32_t maximum_source_instruction_index;
+    int phase_index;
+    uint32_t phase_marker_source_instruction_index;
+    int output_instruction_index;
+    uint32_t output_source_instruction_index;
+    uint8_t value_operand_index, maximum_operand_index, value_source_component;
+    int value_definition_instruction_index;
+    /* Initial traced ranges travel together through legitimate prefix/line
+     * rebasing. Redirecting one public span cannot change its retained owner.
+     * Coordinated public fact edits still require independent target replay. */
+    size_t assignment_source_begin, assignment_source_end;
+    size_t maximum_attribute_source_begin, maximum_attribute_source_end;
+    uint8_t decoded_owner_digest[32];
+} HLSLHullFactorClampOrigin;
 
 typedef struct {
     HLSLExpressionOriginKind kind;
@@ -39,10 +60,12 @@ typedef struct {
     uint8_t destination_lanes;
     size_t source_begin;
     size_t source_end; /* Exclusive byte offset in the emitter's output builder. */
-    /* FUNCTION only: this instruction's operation in the shared definition.
-     * source_begin/end instead identify this particular call site. */
+    /* FUNCTION: this instruction's operation in the shared definition.
+     * HULL_FACTOR_CLAMP: the exact maxtessfactor attribute which owns lowering;
+     * source_begin/end instead identify the final factor assignment. */
     size_t definition_begin;
     size_t definition_end;
+    HLSLHullFactorClampOrigin hull_factor_clamp;
 } HLSLExpressionOrigin;
 
 /* One record per decoded instruction for the bounded float4 lift. Nested
@@ -57,6 +80,8 @@ typedef struct {
  * retained compiler-expansion contract, so definition_begin/end stay zero.
  * EFFECT owns an anchored geometry Append/RestartStrip statement with no
  * destination lanes; effect instructions can never be marked dead.
+ * HULL_FACTOR_CLAMP retains a final MIN's decoded owner and links its factor
+ * assignment to the stage attribute, which may follow the assignment in source.
  * This is provenance, never an independent correctness certificate. */
 typedef struct HLSLExpressionSourceMap {
     HLSLExpressionOrigin origins[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
@@ -79,6 +104,10 @@ bool hlsl_expression_source_map_rebase_line(HLSLExpressionSourceMap *map,
     size_t output_begin);
 bool hlsl_expression_origin_ranges_valid(const HLSLExpressionOrigin *origin,
                                          size_t source_length);
+/* Typed replay equality, including stage-lowering authority; no C padding or
+ * allocation identity participates. */
+bool hlsl_expression_origins_equal(const HLSLExpressionOrigin *left,
+                                   const HLSLExpressionOrigin *right);
 
 typedef enum HLSLEmitMode {
     /* Emit from the decoded instruction stream without source-level semantic

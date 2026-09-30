@@ -573,6 +573,12 @@ typedef struct {
      * callback retains the decoded children; it cannot reorder or reassociate
      * reads. Other scopes keep their existing source-order policy. */
     bool (*ordered_add_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
+    /* The HULL stage producer owns a final scalar MIN's exact declared maximum
+     * and single-use output route. Its attribute reintroduces the operation;
+     * the instruction remains mapped as HULL_FACTOR_CLAMP after formatting. */
+    bool (*hull_factor_clamp_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
+    void (*assignment_span)(HLSLEmitterContext *ctx, int instruction, size_t begin,
+                            size_t end, void *context);
     const HLSLInstructionOwners *omitted_instructions;
     bool (*destination_supported)(HLSLEmitterContext *ctx, int instruction, void *context);
     bool (*append_destination)(HLSLEmitterContext *ctx, int instruction, void *context);
@@ -635,6 +641,11 @@ bool hlsl_emit_high_level_hull_join(HLSLEmitterContext *ctx);
 bool hlsl_high_level_patch_domain_supported(const USILProgram *program, HLSLEmitMode mode);
 bool hlsl_emit_high_level_patch_domain(HLSLEmitterContext *ctx);
 bool hlsl_hull_phase_return_owned(const USILProgram *program, int instruction);
+bool hlsl_hull_factor_clamp_origin_matches(const HLSLExpressionOrigin *origin,
+    const USILProgram *program, const char *source);
+bool hlsl_hull_factor_clamp_map_kinds_match(const HLSLExpressionSourceMap *map, const USILProgram *program);
+bool hlsl_hull_factor_clamp_origins_equal(const HLSLHullFactorClampOrigin *left,
+                                         const HLSLHullFactorClampOrigin *right);
 bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx);
 /* Always consumes all supplied expressions, including on failure. Parameters
  * are absent for Sample, one for level/bias, and two for gradients. */

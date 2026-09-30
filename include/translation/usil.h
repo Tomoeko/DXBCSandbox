@@ -266,6 +266,8 @@ typedef struct {
     DXBCTessellatorOutputPrimitive output_primitive;
     bool has_max_tessellation_factor;
     uint32_t max_tessellation_factor_bits;
+    /* Raw declaration owner, retained only by stage-aware translation. */
+    uint32_t max_tessellation_factor_source_instruction_index;
     size_t phase_count;
     size_t phase_capacity;
     USILHullPhase *phases;

@@ -44,6 +44,12 @@ if(BUILD_TESTING)
     target_link_libraries(test_bundle_corpus PRIVATE
         dxbc_core dxbc_build_options)
 
+    # Manual released-input dependency/source replay, with no exported source bank.
+    add_executable(catalog_dependencies_probe tests/probes/catalog_dependencies_probe.c)
+    target_include_directories(catalog_dependencies_probe PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(catalog_dependencies_probe PRIVATE dxbc_core dxbc_build_options)
+
     function(dxbc_add_core_test target source test_name)
         add_executable(${target} ${source})
         target_include_directories(${target} PRIVATE

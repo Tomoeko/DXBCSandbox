@@ -116,7 +116,10 @@ Globals metadata, preserving each stage's declaration and read scope. Tessellati
 factor phases also admit one metadata-backed float at byte zero of a static
 16-byte buffer at b0, including a complete current buffer paired with a common
 partial field. They retain natural `min`/`max` expressions and the actual
-singleton SSA lane of unmodified fork-ID copies. Indexed ICB arrays, control-point
+singleton SSA lane of unmodified fork-ID copies. A final scalar `min` with the
+exact declared maximum and a sole factor-output consumer can use the compiler's
+`maxtessfactor` lowering. Its decoded instruction remains owned by both the
+assignment and attribute spans. Indexed ICB arrays, control-point
 buffer reads and broader buffer layouts remain unsupported. Custom
 scalar and scalar-array patch constants also admit bounded fork phases and a
 one-instance join phase that reads earlier fork-owned constants. Hull and domain

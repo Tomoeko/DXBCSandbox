@@ -466,22 +466,11 @@ static bool receipts_equal(const ShaderLabSourceSyntaxReceipt *a, const ShaderLa
         a->entry_record_index == b->entry_record_index && !memcmp(a->source_digest, b->source_digest, 32);
 }
 
-static bool instruction_origins_equal(const HLSLExpressionOrigin *a, const HLSLExpressionOrigin *b) {
-    return a->kind == b->kind &&
-        a->instruction_index == b->instruction_index &&
-        a->source_instruction_index == b->source_instruction_index &&
-        a->destination_lanes == b->destination_lanes &&
-        a->source_begin == b->source_begin &&
-        a->source_end == b->source_end &&
-        a->definition_begin == b->definition_begin &&
-        a->definition_end == b->definition_end;
-}
-
 static bool instruction_maps_equal(const HLSLExpressionSourceMap *a, const HLSLExpressionSourceMap *b) {
     if (a->count != b->count || a->complete != b->complete || a->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT)
         return false;
     for (size_t index = 0; index < a->count; ++index)
-        if (!instruction_origins_equal(&a->origins[index], &b->origins[index])) return false;
+        if (!hlsl_expression_origins_equal(&a->origins[index], &b->origins[index])) return false;
     return true;
 }
 

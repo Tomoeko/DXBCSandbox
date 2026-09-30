@@ -150,7 +150,20 @@ Unmodified fork-ID copies retain their actual singleton SSA lane. Natural
 scalar fixture probe supplies an explicit controlled API layout and checks it
 against native reflection; this supplies no player metadata authority. A clean
 source result and successful warm replay do not turn a failed cold complete
-container comparison into an exact match.
+container comparison into an exact match. The bounded final-factor rule retains
+the parsed maximum-declaration coordinate, exact literal bits, original MIN
+operand order, phase and sole output consumer. Its assignment and attribute
+spans replay against the current decoded owners; callback mutation guards cover
+the admitted stage and current/common metadata. These provenance guards do not
+replace immutable complete-target capture or the compiler comparator.
+
+The manual `catalog_dependencies_probe` reads one released input of at most
+1 MiB in place. It observes empty dependency tables, then independently replays
+the ordinary owned source inventory. Source, receipt, historical-quality and
+root mutations must fail, and restored observations must replay. It exports
+compact summaries only. Nonempty graphs remain unavailable; this factory and
+probe do not close any existing source-quality gap or invoke a compiler or
+runtime gate.
 
 The optional `--compute-source-candidate` extraction publishes candidate source and
 evidence as distinct members of the existing compute package transaction. It never

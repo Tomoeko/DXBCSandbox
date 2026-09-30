@@ -1810,13 +1810,22 @@ static bool usil_translate_internal(
             case 148: /* DCL_OUTPUT_CONTROL_POINT_COUNT */
             case 150: /* DCL_TESS_PARTITIONING */
             case 151: /* DCL_TESS_OUTPUT_PRIMITIVE */
-            case 152: /* DCL_HS_MAX_TESSFACTOR */
             case 153: /* DCL_HS_FORK_PHASE_INSTANCE_COUNT */
             case 154: /* DCL_HS_JOIN_PHASE_INSTANCE_COUNT */
                 if (!stage_contract ||
                     stage_contract->program_type != DXBC_PROGRAM_TYPE_HULL) {
                     goto declaration_fail;
                 }
+                break;
+            case 152: /* DCL_HS_MAX_TESSFACTOR */
+                if (!stage_contract || stage_contract->program_type != DXBC_PROGRAM_TYPE_HULL ||
+                    !stage_contract->has_max_tessellation_factor ||
+                    src_inst->operand_count != 1 ||
+                    src_inst->operands[0].imm_value_count != 1 ||
+                    src_inst->operands[0].imm_values[0] != stage_contract->max_tessellation_factor_bits) {
+                    goto declaration_fail;
+                }
+                program->tessellation.max_tessellation_factor_source_instruction_index = source_index;
                 break;
             case 147: /* DCL_INPUT_CONTROL_POINT_COUNT */
             case 149: /* DCL_TESS_DOMAIN */

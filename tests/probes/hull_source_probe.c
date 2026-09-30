@@ -280,15 +280,19 @@ static bool reconstruct_hull(const DXBCContainerView *target,
     }
     const bool map_valid =
         hlsl_expression_source_map_matches(&map, &program, source->buf);
+    size_t compiler_clamps = 0;
+    for (size_t index = 0; index < map.count; ++index)
+        if (map.origins[index].kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP)
+            ++compiler_clamps;
     accepted = quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
                !quality.counts.unknown_provenance &&
                !quality.counts.incomplete_units && map_valid;
     printf("source scope=%s quality=%s map_valid=%d "
-           "instructions=%d units=%zu "
+           "instructions=%d units=%zu compiler_clamps=%zu "
            "input_mask=%u input_rw=%u output_mask=%u output_rw=%u\n",
            parameters ? "controlled-scalar-API-calibration" : "target-only-hull",
            hlsl_source_quality_class_name(quality.classification), map_valid,
-           program.instruction_count, quality.counts.inspected_units,
+           program.instruction_count, quality.counts.inspected_units, compiler_clamps,
            program.inputs[0].mask, program.inputs[0].rw_mask,
            program.outputs[0].mask, program.outputs[0].rw_mask);
 done:
@@ -331,15 +335,21 @@ static bool candidate_wrapper(const StringBuilder *hull,
 static bool changed_factor_wrapper(const StringBuilder *hull,
                                    StringBuilder *wrapper, const char *shader_name,
                                    bool scalar_fixture) {
-    const char *original = scalar_fixture ? "factors.outer[factorIndex] = min((_Factor), 32.0f);"
-                                         : "factors.outer[factorIndex] = 3.0f;";
-    const char *changed = scalar_fixture ? "factors.outer[factorIndex] = min((_Factor * 2.0f), 32.0f);"
-                                        : "factors.outer[factorIndex] = 5.0f;";
-    const size_t original_length = strlen(original);
     /* Match exactly one owned factor assignment in either controlled fixture.
      * A failed cold comparison remains a failure after this replay check. */
     if (!sb_ok(hull) || !hull->buf || hull->len > PROBE_SOURCE_LIMIT)
         return false;
+    const char *original = "factors.outer[factorIndex] = 3.0f;";
+    const char *changed = "factors.outer[factorIndex] = 5.0f;";
+    if (scalar_fixture) {
+        original = "factors.outer[factorIndex] = (_Factor);";
+        changed = "factors.outer[factorIndex] = (_Factor * 2.0f);";
+        if (!strstr(hull->buf, original)) {
+            original = "factors.outer[factorIndex] = min((_Factor), 32.0f);";
+            changed = "factors.outer[factorIndex] = min((_Factor * 2.0f), 32.0f);";
+        }
+    }
+    const size_t original_length = strlen(original);
     const char *match = strstr(hull->buf, original);
     if (!match || strstr(match + original_length, original))
         return false;

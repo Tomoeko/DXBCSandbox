@@ -569,11 +569,7 @@ static bool observations_equal(const ShaderLabEmittedMatrixUses *a, const Shader
         for (size_t instruction = 0; instruction < left->raw_map.count; ++instruction) {
             const HLSLExpressionOrigin *x = &left->raw_map.origins[instruction];
             const HLSLExpressionOrigin *y = &right->raw_map.origins[instruction];
-            if (x->kind != y->kind || x->instruction_index != y->instruction_index ||
-                x->source_instruction_index != y->source_instruction_index ||
-                x->destination_lanes != y->destination_lanes ||
-                x->source_begin != y->source_begin || x->source_end != y->source_end ||
-                x->definition_begin != y->definition_begin || x->definition_end != y->definition_end) return false;
+            if (!hlsl_expression_origins_equal(x, y)) return false;
         }
         for (size_t field = 0; field < left->reads.field_count; ++field)
             if (!fields_equal(&left->reads.fields[field], &right->reads.fields[field])) return false;
