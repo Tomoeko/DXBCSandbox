@@ -47,9 +47,9 @@ bool hlsl_source_identifier_valid(const char *name) {
     for (size_t index = 0; index < sizeof(reserved) / sizeof(reserved[0]); ++index)
         if (strcmp(name, reserved[index]) == 0) return false;
     for (size_t index = 0; index < sizeof(scalars) / sizeof(scalars[0]); ++index) {
-        const size_t length = strlen(scalars[index]);
-        if (strncmp(name, scalars[index], length) != 0) continue;
-        const char *suffix = name + length;
+        const size_t scalar_length = strlen(scalars[index]);
+        if (strncmp(name, scalars[index], scalar_length) != 0) continue;
+        const char *suffix = name + scalar_length;
         if (!*suffix || (suffix[0] >= '1' && suffix[0] <= '4' &&
             (!suffix[1] || (suffix[1] == 'x' && suffix[2] >= '1' && suffix[2] <= '4' && !suffix[3]))))
             return false;

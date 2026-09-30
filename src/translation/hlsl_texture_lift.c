@@ -40,8 +40,8 @@ static bool sample_binding(const HLSLEmitterContext *ctx, int index,
     const int sampler = instruction->operands[3].register_index;
     if (sampler >= HLSL_SM5_SAMPLER_REGISTER_COUNT || !ctx->sampler_names[sampler]) return false;
     int declarations = 0;
-    for (int index = 0; index < ctx->program->sampler_count; ++index) {
-        const USILSampler *value = &ctx->program->samplers[index];
+    for (int declaration = 0; declaration < ctx->program->sampler_count; ++declaration) {
+        const USILSampler *value = &ctx->program->samplers[declaration];
         if (value->reg_idx != sampler) continue;
         if (value->mode) return false;
         ++declarations;

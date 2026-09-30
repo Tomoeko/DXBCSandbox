@@ -174,7 +174,7 @@ static bool prepare_nested_matrix(HLSLEmitterContext *ctx, int start,
      * name or an assumed UnityObjectToClipPos implementation. */
     DXBCOperand position = ctx->program->instructions[start].operands[1];
     position.swizzle_mode = 1;
-    for (int lane = 0; lane < 4; ++lane) position.swizzle[lane] = lane;
+    for (int lane = 0; lane < 4; ++lane) position.swizzle[lane] = (uint8_t)lane;
     ASTOperandProvenance position_origin;
     if (!hlsl_high_level_input_provenance(ctx, &position, 7, &position_origin)) return false;
     position_origin.instruction_index = start;
@@ -334,7 +334,7 @@ static bool prepare_single_matrix(HLSLEmitterContext *ctx, int start,
     if (!matrix_name) return false;
     DXBCOperand vector = chain[0].operands[1];
     vector.swizzle_mode = 1;
-    for (int lane = 0; lane < 4; ++lane) vector.swizzle[lane] = lane;
+    for (int lane = 0; lane < 4; ++lane) vector.swizzle[lane] = (uint8_t)lane;
     ASTOperandProvenance provenance;
     if (!hlsl_high_level_input_provenance(ctx, &vector, 15, &provenance)) return false;
     provenance.instruction_index = start;
