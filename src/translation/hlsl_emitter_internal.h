@@ -413,6 +413,14 @@ bool hlsl_high_level_struct_interface_supported(const USILProgram *program, HLSL
  * anchored at their decoded instruction sites and snapshot a persistent typed
  * output tuple; this is candidate admission, never a compiler certificate. */
 enum { HLSL_DOMAIN_SOURCE_INSTRUCTION_LIMIT = 64 };
+typedef struct {
+    const char *attribute;
+    uint8_t coordinate_count, outer_count, inner_count;
+    uint32_t outer_system_values[4], inner_system_values[2];
+} HLSLDomainShape;
+bool hlsl_domain_shape(DXBCTessellatorDomain domain, HLSLDomainShape *shape);
+bool hlsl_domain_factor_order(const USILProgram *program, bool *inner_first);
+bool hlsl_float_source_modifier_supported(const DXBCOperand *operand);
 bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSLEmitMode mode);
 const DXBCSignatureElement *hlsl_high_level_domain_point_signature(
     const USILProgram *program, const DXBCOperand *operand);

@@ -2371,6 +2371,39 @@ static bool is_commutative(USILOpcode opcode) {
     }
 }
 
+/* Selected-compiler candidate inverse for a full-width static patch-point
+ * difference. Negation in the first decoded ADD source needs the positive
+ * source first in HLSL. This preserves the two owned operands and sign bits;
+ * the exact compiler transaction remains the acceptance authority. */
+static bool compiler_domain_point_add_reverses_source(
+    const USILProgram *program, const USILInstruction *instruction) {
+    if (!program || !program->has_stage_contract ||
+        !program->has_parsed_signature_authority ||
+        !compiler_instruction_shape(instruction, USIL_OP_ADD, 3) ||
+        instruction->operands[0].destination_mask != HLSL_XYZW_MASK ||
+        (instruction->operands[0].type != OPERAND_TYPE_TEMP &&
+         instruction->operands[0].type != OPERAND_TYPE_OUTPUT) ||
+        program->tessellation.input_control_point_count < 1 ||
+        program->tessellation.input_control_point_count > 32)
+        return false;
+    const DXBCOperand *negative = &instruction->operands[1];
+    const DXBCOperand *positive = &instruction->operands[2];
+    if (!negative->has_neg || negative->has_abs ||
+        positive->has_neg || positive->has_abs ||
+        negative->swizzle_mode != 1 || positive->swizzle_mode != 1 ||
+        negative->register_index == positive->register_index)
+        return false;
+    for (unsigned lane = 0; lane < 4; ++lane)
+        if (negative->swizzle[lane] != lane || positive->swizzle[lane] != lane)
+            return false;
+    const DXBCSignatureElement *left =
+        hlsl_high_level_domain_point_signature(program, negative);
+    const DXBCSignatureElement *right =
+        hlsl_high_level_domain_point_signature(program, positive);
+    return left && left == right && left->component_type == 3 &&
+           left->mask == 15 && !left->min_precision;
+}
+
 static bool base_binary_order(const USILInstruction *inst,
                               const USILInstruction *previous) {
     if (!is_commutative(inst->opcode) || inst->operand_count < 3) return false;
@@ -2659,7 +2692,8 @@ bool analyze_d3dcompiler_model(HLSLEmitterContext *ctx) {
         const USILInstruction *previous =
             index > 0 ? &ctx->program->instructions[index - 1] : NULL;
         bool swap = base_binary_order(inst, previous);
-        if (compiler_cross_product_mul_reverses_source(ctx->program,
+        if (compiler_domain_point_add_reverses_source(ctx->program, inst) ||
+            compiler_cross_product_mul_reverses_source(ctx->program,
                                                        index) ||
             is_saturated_cubic_mul(ctx->program, index) ||
             semantic_binary_operand_order(ctx, index) == 1)

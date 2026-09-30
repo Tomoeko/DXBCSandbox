@@ -633,8 +633,8 @@ static bool validate_operand_for_hlsl(const USILProgram *program,
     case OPERAND_TYPE_INPUT_CONTROL_POINT:
       return hlsl_high_level_domain_point_signature(program, operand) != NULL;
     case OPERAND_TYPE_DOMAIN_LOCATION:
-      return program->program_type == DXBC_PROGRAM_TYPE_DOMAIN && program->tessellation.valid &&
-          program->tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE && operand->register_index_dim == 0;
+      return hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) &&
+          operand->register_index_dim == 0;
     case OPERAND_TYPE_IMMEDIATE64:
     case OPERAND_TYPE_LABEL:
     case OPERAND_TYPE_INPUT_COVERAGE_MASK:

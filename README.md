@@ -94,9 +94,11 @@ The candidate emitter also reconstructs straight-line geometry with typed point,
 line, triangle and adjacency arrays, named output fields and ordered stream0
 `Append`/`RestartStrip` operations. Dynamic input indexing, emission loops,
 geometry instancing and multiple streams remain unsupported in this path.
-A bounded triangle domain path emits typed control-point patches, barycentric
-coordinates, tessellation-factor declarations and SSA expressions. Other domains,
-patch-factor reads, resources and generic hull phase reconstruction remain open.
+A bounded domain path emits typed control-point patches, triangle barycentric
+or quad/isoline coordinates, tessellation-factor declarations in their retained
+interface order, and SSA expressions. It admits static point indices in patches
+of up to 32 points and retains a separate 64-instruction limit. Patch-factor reads,
+resources and generic hull phase reconstruction remain open.
 
 Source quality is a separate semantic/provenance result. The optional
 `HLSLEmitOptions.source_quality` ledger records residual register machinery,

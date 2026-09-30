@@ -257,7 +257,8 @@ static bool float_dot(USILOpcode opcode) {
     return opcode == USIL_OP_DP2 || opcode == USIL_OP_DP3 || opcode == USIL_OP_DP4;
 }
 
-static bool float_source_modifier_valid(const DXBCOperand *operand) {
+bool hlsl_float_source_modifier_supported(const DXBCOperand *operand) {
+    if (!operand) return false;
     if (!operand->extended_token_count) return operand->extended_tokens == NULL;
     if (operand->extended_token_count != 1 || !operand->extended_tokens || operand->min_precision)
         return false;
@@ -320,7 +321,7 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
         const DXBCOperand *value = &inst->operands[operand];
         DXBCOperand unmodified = *value;
         if (!full_width && operand) {
-            if (!float_source_modifier_valid(value))
+            if (!hlsl_float_source_modifier_supported(value))
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             unmodified.has_abs = unmodified.has_neg = false;
             unmodified.extended_tokens = NULL;

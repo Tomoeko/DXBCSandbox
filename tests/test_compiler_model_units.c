@@ -991,6 +991,70 @@ static int verify_modified_input_product_order(void) {
     return 0;
 }
 
+static int verify_static_domain_difference_order(void) {
+    USILInstruction instructions[2] = {0};
+    init_instruction(&instructions[0], USIL_OP_ADD, 3);
+    init_register_operand(&instructions[0].operands[0], OPERAND_TYPE_TEMP, 0);
+    instructions[0].operands[0].destination_mask = MASK_XYZW;
+    uint32_t negative_modifier = 1u | (1u << 6);
+    for (unsigned source = 1; source <= 2; ++source) {
+        DXBCOperand *operand = &instructions[0].operands[source];
+        init_register_operand(operand, OPERAND_TYPE_INPUT_CONTROL_POINT, (int)source - 1);
+        operand->register_index_dim = 2;
+        operand->index_has_immediate[1] = true;
+        operand->index_values[1] = 0;
+        operand->rel_offset0 = 0;
+    }
+    DXBCOperand *negative = &instructions[0].operands[1];
+    negative->has_neg = true;
+    negative->extended_token_count = 1;
+    negative->extended_tokens = &negative_modifier;
+    init_instruction(&instructions[1], USIL_OP_RET, 0);
+    USILProgram program;
+    init_program(&program, instructions, 2, 1);
+    program.program_type = DXBC_PROGRAM_TYPE_DOMAIN;
+    program.has_stage_contract = program.has_parsed_signature_authority = true;
+    program.tessellation.valid = true;
+    program.tessellation.input_control_point_count = 4;
+    DXBCSignatureElement field = {0};
+    field.component_type = 3;
+    field.mask = 15;
+    program.inputs = &field;
+    program.input_count = program.input_alloc = 1;
+    CHECK(model_swaps_binary(&program, 0, true) == 0);
+
+    instructions[0].precise_mask = 1;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    instructions[0].precise_mask = 0;
+    instructions[0].saturate = true;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    instructions[0].saturate = false;
+    instructions[0].operands[0].destination_mask = MASK_XYZ;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    instructions[0].operands[0].destination_mask = MASK_XYZW;
+    negative->has_abs = true;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    negative->has_abs = false;
+    negative_modifier = 1u | (3u << 6);
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    negative_modifier = 1u | (1u << 6);
+    negative->index_representations[0] = 2;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    negative->index_representations[0] = 0;
+    program.tessellation.input_control_point_count = 1;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    program.tessellation.input_control_point_count = 4;
+    field.component_type = 2;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    field.component_type = 3;
+    program.has_stage_contract = false;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    program.has_stage_contract = true;
+    program.program_type = DXBC_PROGRAM_TYPE_PIXEL;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    return 0;
+}
+
 int main(void) {
     CHECK(verify_tangent_frame_inverse_is_mutation_safe() == 0);
     CHECK(verify_screen_position_inverses_are_mutation_safe() == 0);
@@ -1001,5 +1065,6 @@ int main(void) {
     CHECK(verify_fresh_destination_order_is_mutation_safe() == 0);
     CHECK(verify_full_width_extrema_input_order() == 0);
     CHECK(verify_modified_input_product_order() == 0);
+    CHECK(verify_static_domain_difference_order() == 0);
     return 0;
 }

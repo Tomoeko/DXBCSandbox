@@ -19,8 +19,10 @@ Launch the selected Editor with `-batchmode -nographics -quit`, the isolated
 `-projectPath`, `-executeMethod CaptureFixtureBundle.Build`, and an explicit
 `-logFile`. On Wine, supply paths in the selected prefix's Windows syntax.
 Keep binaries, raw logs, toolchain fingerprints, and request-specific include
-evidence in private local reports. Check the complete Editor log for compute
-compilation errors as well as the helper's shader error check.
+evidence in private local reports. The helper checks shader messages, captures
+Editor errors during import/build, and scans the full Editor log for compilation
+errors before emitting its success marker. Require an error-free complete log,
+a successful process exit, and that marker before using the captured bundle.
 
 Use `dxbc-sandbox list BUNDLE --format json` to retain the released inventory.
 `golden_target_cli extract --shader NAME --subshader N --pass N --output FILE

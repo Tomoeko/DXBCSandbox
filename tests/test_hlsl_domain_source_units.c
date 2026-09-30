@@ -24,9 +24,11 @@ static void write_u32(uint8_t *bytes, uint32_t value) {
 }
 
 /* Authored token grammar and signatures, with no captured byte array. */
-static size_t write_signature(uint8_t *bytes, unsigned role) {
+static size_t write_signature(uint8_t *bytes, unsigned role, unsigned domain) {
     const bool patch = role == 2;
-    const unsigned count = patch ? 4 : 1;
+    const unsigned outer = domain == 2 ? 3 : domain == 3 ? 4 : 2;
+    const unsigned inner = domain == 2 ? 1 : domain == 3 ? 2 : 0;
+    const unsigned count = patch ? outer + inner : 1;
     const char *semantic = patch ? "SV_TessFactor" : "SV_POSITION";
     const size_t name_offset = 8 + count * 24;
     const size_t size = name_offset + strlen(semantic) + 1 +
@@ -39,9 +41,11 @@ static size_t write_signature(uint8_t *bytes, unsigned role) {
     for (unsigned field = 0; field < count; ++field) {
         uint8_t *element = bytes + 8 + 24 * field;
         write_u32(element, (uint32_t)(name_offset +
-            (patch && field == 3 ? strlen(semantic) + 1 : 0)));
-        write_u32(element + 4, patch && field < 3 ? field : 0);
-        write_u32(element + 8, patch ? (field < 3 ? 13 : 14) : 1);
+            (patch && field >= outer ? strlen(semantic) + 1 : 0)));
+        write_u32(element + 4, patch ? (field < outer ? field : field - outer) : 0);
+        const unsigned system = domain == 2 ? (field < outer ? 13 : 14) :
+            domain == 3 ? (field < outer ? 11 : 12) : (field ? 15 : 16);
+        write_u32(element + 8, patch ? system : 1);
         write_u32(element + 12, 3);
         write_u32(element + 16, patch ? field : 0);
         write_u32(element + 20, patch ? 1 : role ? 15 : 0x0f0f);
@@ -53,22 +57,24 @@ static size_t write_signature(uint8_t *bytes, unsigned role) {
     return size + 8;
 }
 
-static uint8_t *make_controlled_dxbc(uint32_t points, uint8_t location_mask,
+static uint8_t *make_controlled_dxbc(unsigned domain, uint32_t points, uint8_t location_mask,
                                      size_t *size) {
+    const unsigned coordinate_y = domain == 1 ? 0 : 1;
+    const unsigned coordinate_z = domain == 2 ? 2 : 0;
     const uint32_t words[] = {
         INSTRUCTION(147, 1) | (points << 11),
-        INSTRUCTION(149, 1) | (2u << 11),
+        INSTRUCTION(149, 1) | ((uint32_t)domain << 11),
         INSTRUCTION(106, 1) | (1u << 11),
         INSTRUCTION(95, 2), 0x0001c002u | (uint32_t)location_mask << 4,
         INSTRUCTION(95, 4), 0x002190f2, points, 0,
         INSTRUCTION(103, 4), 0x001020f2, 0, 1,
         INSTRUCTION(104, 2), 1,
-        INSTRUCTION(56, 7), 0x001000f2, 0, 0x0001c556,
+        INSTRUCTION(56, 7), 0x001000f2, 0, 0x0001c006u | ((uint32_t)coordinate_y * 0x55u << 4),
             0x00219e46, 1, 0,
         INSTRUCTION(50, 9), 0x001000f2, 0, 0x00219e46, 0, 0,
             0x0001c006, 0x00100e46, 0,
-        INSTRUCTION(50, 9), 0x001020f2, 0, 0x00219e46, 2, 0,
-            0x0001caa6, 0x00100e46, 0,
+        INSTRUCTION(50, 9), 0x001020f2, 0, 0x00219e46, points == 2 ? 1u : 2u, 0,
+            0x0001c006u | ((uint32_t)coordinate_z * 0x55u << 4), 0x00100e46, 0,
         INSTRUCTION(62, 1)
     };
     uint8_t bytes[1024] = {0};
@@ -78,7 +84,7 @@ static uint8_t *make_controlled_dxbc(uint32_t points, uint8_t location_mask,
     size_t offset = 48;
     for (unsigned role = 0; role < 3; ++role) {
         write_u32(bytes + 32 + 4 * role, (uint32_t)offset);
-        offset += write_signature(bytes + offset, role);
+        offset += write_signature(bytes + offset, role, domain);
         offset = (offset + 3) & ~(size_t)3;
     }
     write_u32(bytes + 44, (uint32_t)offset);
@@ -103,13 +109,13 @@ typedef struct {
     USILProgram program;
 } DomainFixture;
 
-static bool domain_fixture_init(DomainFixture *fixture, uint32_t points,
+static bool domain_fixture_init_shape(DomainFixture *fixture, unsigned domain, uint32_t points,
                                  uint8_t location_mask) {
     memset(fixture, 0, sizeof(*fixture));
     dxbc_document_init(&fixture->document);
     dxbc_stage_contract_init(&fixture->contract);
     size_t size = 0;
-    uint8_t *bytes = make_controlled_dxbc(points, location_mask, &size);
+    uint8_t *bytes = make_controlled_dxbc(domain, points, location_mask, &size);
     CHECK(bytes);
     DXBCDocumentDiagnostic document_diagnostic;
     DXBCStageContractDiagnostic contract_diagnostic;
@@ -123,6 +129,10 @@ static bool domain_fixture_init(DomainFixture *fixture, uint32_t points,
     CHECK(usil_translate_with_stage_contract(&fixture->program,
                                              &fixture->semantic, &fixture->contract));
     return true;
+}
+
+static bool domain_fixture_init(DomainFixture *fixture, uint32_t points, uint8_t location_mask) {
+    return domain_fixture_init_shape(fixture, 2, points, location_mask);
 }
 
 static void domain_fixture_dispose(DomainFixture *fixture) {
@@ -173,7 +183,7 @@ static bool observe_domain(void *context,
     if (observation->kind == HLSL_SOURCE_OBSERVATION_EXPRESSION &&
         facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL &&
         (facts->logical_value_id & (UINT64_C(1) << 63))) {
-        if (facts->logical_value_id & UINT64_C(0x400000000))
+        if (facts->logical_value_id & (UINT64_C(1) << 62))
             ledger->location = true;
         else
             ledger->points |= (uint8_t)(1u << ((facts->logical_value_id >> 32) & 3u));
@@ -286,13 +296,122 @@ static bool domain_authority_negatives(void) {
     domain_fixture_dispose(&fixture);
 
     CHECK(domain_fixture_init(&fixture, 4, 7));
-    CHECK(source_rejected(&fixture.program));
+    CHECK(hlsl_high_level_domain_interface_supported(&fixture.program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+    domain_fixture_dispose(&fixture);
+    return true;
+}
+
+/* Authored domain-specific ABI cases exercise natural coordinate widths and
+ * factor roles independently of interpolation structure and source spelling. */
+static bool other_domain_shapes(void) {
+    const struct { unsigned domain, points, mask; const char *attribute; } cases[] = {
+        {3, 4, 3, "quad"}, {1, 2, 1, "isoline"}, {2, 32, 7, "tri"}
+    };
+    for (unsigned row = 0; row < sizeof(cases) / sizeof(cases[0]); ++row) {
+        DomainFixture fixture;
+        CHECK(domain_fixture_init_shape(&fixture, cases[row].domain, cases[row].points, cases[row].mask));
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        HLSLSourceQualityResult quality;
+        HLSLExpressionSourceMap map;
+        options.source_quality = &quality;
+        options.expression_source_map = &map;
+        StringBuilder source; sb_init(&source);
+        CHECK(hlsl_emit_with_options(&fixture.program, &source, NULL, NULL, NULL, &options));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.counts.unknown_provenance &&
+              !quality.counts.residual_total && !quality.counts.incomplete_units);
+        CHECK(hlsl_expression_source_map_matches(&map, &fixture.program, source.buf));
+        char expected[96];
+        snprintf(expected, sizeof(expected), "[domain(\"%s\")]", cases[row].attribute);
+        CHECK(strstr(source.buf, expected));
+        snprintf(expected, sizeof(expected), "OutputPatch<appdata, %u>", cases[row].points);
+        CHECK(strstr(source.buf, expected));
+        if (cases[row].domain == 3) {
+            CHECK(strstr(source.buf, "float outer[4] : SV_TessFactor;"));
+            CHECK(strstr(source.buf, "float inner[2] : SV_InsideTessFactor;"));
+            CHECK(strstr(source.buf, "float2 coordinates : SV_DomainLocation"));
+        } else if (cases[row].domain == 1) {
+            CHECK(strstr(source.buf, "float outer[2] : SV_TessFactor;"));
+            CHECK(!strstr(source.buf, "SV_InsideTessFactor"));
+            CHECK(strstr(source.buf, "float2 coordinates : SV_DomainLocation"));
+        }
+        sb_free(&source);
+        /* A valid domain value cannot repair the wrong factor role, extent,
+         * or a use of an undeclared coordinate component. */
+        const uint32_t saved = fixture.program.patch_constants[0].system_value;
+        fixture.program.patch_constants[0].system_value = 999;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.patch_constants[0].system_value = saved;
+        fixture.program.signature_declarations[1].array_element_count = cases[row].points + 1;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.signature_declarations[1].array_element_count = cases[row].points;
+        if (cases[row].domain != 2) {
+            fixture.program.instructions[0].operands[1].swizzle[0] = 2;
+            CHECK(source_rejected(&fixture.program));
+        }
+        domain_fixture_dispose(&fixture);
+    }
+    return true;
+}
+
+/* The factors' retained ABI order comes from registers and semantic indices,
+ * including when the decoded record list itself uses another order. */
+static bool factor_group_order(void) {
+    for (unsigned domain = 2; domain <= 3; ++domain) {
+        DomainFixture fixture;
+        CHECK(domain_fixture_init_shape(&fixture, domain, domain == 2 ? 3 : 4, domain == 2 ? 7 : 3));
+        const unsigned outer = domain == 2 ? 3 : 4, inner = domain == 2 ? 1 : 2;
+        for (unsigned row = 0; row < outer + inner; ++row) {
+            DXBCSignatureElement *field = &fixture.program.patch_constants[row];
+            field->register_id = row < outer ? row + inner : row - outer;
+        }
+        bool inner_first;
+        CHECK(usil_signature_authority_is_valid(&fixture.program));
+        CHECK(hlsl_domain_factor_order(&fixture.program, &inner_first) && inner_first);
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        HLSLSourceQualityResult quality; HLSLExpressionSourceMap map;
+        options.source_quality = &quality; options.expression_source_map = &map;
+        StringBuilder source; sb_init(&source);
+        CHECK(hlsl_emit_with_options(&fixture.program, &source, NULL, NULL, NULL, &options));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+              hlsl_expression_source_map_matches(&map, &fixture.program, source.buf));
+        const char *outer_field = strstr(source.buf, "float outer["), *inner_field = strstr(source.buf, "float inner");
+        CHECK(inner_field && outer_field && inner_field < outer_field);
+        sb_free(&source);
+        /* Duplicate and split groups must fail rather than get sorted into an
+         * apparently valid source ABI. */
+        fixture.program.patch_constants[0].register_id = fixture.program.patch_constants[1].register_id;
+        CHECK(source_rejected(&fixture.program));
+        fixture.program.patch_constants[0].register_id = inner;
+        fixture.program.patch_constants[0].semantic_index = 1;
+        CHECK(source_rejected(&fixture.program));
+        domain_fixture_dispose(&fixture);
+    }
+    return true;
+}
+
+/* Point4 must not alias the domain coordinate logical value. */
+static bool separated_point_and_location_identity(void) {
+    DomainFixture fixture;
+    CHECK(domain_fixture_init(&fixture, 5, 7));
+    DXBCOperand *point = &fixture.program.instructions[0].operands[2];
+    point->register_index = 4; point->index_values[0] = 4;
+    HLSLEmitterContext context = {.program = &fixture.program, .high_level_interface = true,
+                                 .high_level_domain = true};
+    strcpy(context.high_level_input_names[0], "clipPosition");
+    ASTOperandProvenance point_origin, location_origin;
+    CHECK(hlsl_high_level_input_provenance(&context, point, 15, &point_origin));
+    CHECK(hlsl_high_level_input_provenance(&context, &fixture.program.instructions[0].operands[1],
+                                          15, &location_origin));
+    CHECK(point_origin.logical_value_id != location_origin.logical_value_id);
+    CHECK(point_origin.logical_value_id == ((UINT64_C(1) << 63) | (UINT64_C(4) << 32)));
+    CHECK(location_origin.logical_value_id == ((UINT64_C(1) << 63) | (UINT64_C(1) << 62)));
     domain_fixture_dispose(&fixture);
     return true;
 }
 
 int main(void) {
-    if (!natural_domain_source() || !domain_authority_negatives()) return 1;
+    if (!natural_domain_source() || !domain_authority_negatives() ||
+        !other_domain_shapes() || !factor_group_order() || !separated_point_and_location_identity()) return 1;
     puts("Domain source units passed");
     return 0;
 }

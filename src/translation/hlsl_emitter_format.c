@@ -1188,7 +1188,11 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
         const bool location = ctx->high_level_domain &&
             op->type == OPERAND_TYPE_DOMAIN_LOCATION;
         const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, op);
-        unsigned width = location ? 3 : 0;
+        HLSLDomainShape domain_shape = {0};
+        if (location && !hlsl_domain_shape(ctx->program->tessellation.domain, &domain_shape)) {
+            hlsl_builder_failed(ctx, output); sb_free(&idx); return false;
+        }
+        unsigned width = location ? domain_shape.coordinate_count : 0;
         if (element) for (unsigned component = 0; component < 4; ++component)
             if (element->mask & (1u << component)) ++width;
         if ((!element && !location) || !format_cb_swizzle(op, width, 0, write_mask, preserve_vector,
