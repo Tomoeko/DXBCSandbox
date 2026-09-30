@@ -304,7 +304,7 @@ static bool domain_authority_negatives(void) {
 /* Authored domain-specific ABI cases exercise natural coordinate widths and
  * factor roles independently of interpolation structure and source spelling. */
 static bool other_domain_shapes(void) {
-    const struct { unsigned domain, points, mask; const char *attribute; } cases[] = {
+    const struct { unsigned domain; uint8_t points, mask; const char *attribute; } cases[] = {
         {3, 4, 3, "quad"}, {1, 2, 1, "isoline"}, {2, 32, 7, "tri"}
     };
     for (unsigned row = 0; row < sizeof(cases) / sizeof(cases[0]); ++row) {
@@ -341,7 +341,7 @@ static bool other_domain_shapes(void) {
         fixture.program.patch_constants[0].system_value = 999;
         CHECK(source_rejected(&fixture.program));
         fixture.program.patch_constants[0].system_value = saved;
-        fixture.program.signature_declarations[1].array_element_count = cases[row].points + 1;
+        fixture.program.signature_declarations[1].array_element_count = (uint8_t)(cases[row].points + 1u);
         CHECK(source_rejected(&fixture.program));
         fixture.program.signature_declarations[1].array_element_count = cases[row].points;
         if (cases[row].domain != 2) {
