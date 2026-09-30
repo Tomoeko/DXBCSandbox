@@ -11,8 +11,9 @@
 /* A bounded source projection, not the Class72 declaration inverse. The
  * existing lossless decoder and USIL execution contract supply all metadata;
  * existing CFG/SSA supplies definition ownership. A private candidate route
- * admits one UINT4 texture or structured bits load/store expression with original metadata.
- * Signed/float domains, other memory families and control flow remain unavailable. */
+ * admits one UINT4 texture or structured bits expression, or one FLOAT4 UAV
+ * read/add/store with original metadata. Signed domains, other memory families
+ * and control flow remain unavailable. */
 /* This stage retains its own bound; generic V/F capacity grants no wider
  * compute admission or effect-planning authority. */
 enum { COMPUTE_SOURCE_INSTRUCTION_LIMIT = 64 };
@@ -138,8 +139,14 @@ static bool typed_resources_valid(HLSLEmitterContext *ctx, const HLSLComputeType
                 texture->stride != stride || texture->sample_count) return reject_stage(ctx);
             formats = texture->return_types;
         }
+        if ((resource->scalar_type != AST_SCALAR_UINT32 && resource->scalar_type != AST_SCALAR_FLOAT32) ||
+            (resource->scalar_type == AST_SCALAR_FLOAT32 &&
+             (resource->structured || !resource->writable || typed->resource_count != 1u || program->texture_count)))
+            return reject_stage(ctx);
+        const uint8_t format = resource->structured ? 0u :
+            (resource->scalar_type == AST_SCALAR_FLOAT32 ? 5u : 4u);
         for (unsigned component = 0; component < 4; ++component)
-            if (formats[component] != (resource->structured ? 0u : 4u)) return reject_stage(ctx);
+            if (formats[component] != format) return reject_stage(ctx);
     }
     return true;
 }
@@ -236,7 +243,7 @@ static bool static_indices(const DXBCOperand *operand, unsigned dimensions) {
     return true;
 }
 
-static bool instruction_valid(HLSLEmitterContext *ctx, int index, bool natural_projection) {
+static bool instruction_valid(HLSLEmitterContext *ctx, int index, bool natural_projection, bool float_add) {
     const USILProgram *program = ctx->program;
     const USILInstruction *instruction = &program->instructions[index];
     if (!usil_instruction_shape_valid(program, instruction) || instruction->saturate ||
@@ -267,7 +274,8 @@ static bool instruction_valid(HLSLEmitterContext *ctx, int index, bool natural_p
     if (instruction->opcode == USIL_OP_RET)
         return index == program->instruction_count - 1 ||
                reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
-    if (instruction->opcode != USIL_OP_MOV && !uint_operation(instruction->opcode))
+    if (instruction->opcode != USIL_OP_MOV && !uint_operation(instruction->opcode) &&
+        !(float_add && instruction->opcode == USIL_OP_ADD))
         return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_OPCODE);
     USILEffectFlags effects;
     if (!usil_instruction_effects(program, instruction, &effects) || effects != USIL_EFFECT_NONE)
@@ -414,7 +422,7 @@ static ASTExpr *source_expression(HLSLEmitterContext *ctx, int index, int operan
 
 /* Bounded typed memory expression projection. Registers are only SSA
  * evidence: the emitted source consists of resource elements, logical vector
- * addresses and uint4 values. A load is consumed exactly once and never moved
+ * addresses and typed values. A load is consumed exactly once and never moved
  * across another effect. Each source node retains its original owner. */
 typedef struct {
     HLSLEmitterContext *ctx;
@@ -434,8 +442,9 @@ static const HLSLComputeTypedResource *typed_binding(const HLSLComputeTypedSourc
     return NULL;
 }
 
-static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
+static bool typed_instruction_valid(HLSLEmitterContext *ctx, const HLSLComputeTypedSource *typed, int index) {
     const USILInstruction *instruction = &ctx->program->instructions[index];
+    const bool float_data = typed->resources[0].scalar_type == AST_SCALAR_FLOAT32;
     if (instruction->opcode == USIL_OP_LD_STRUCTURED || instruction->opcode == USIL_OP_STORE_STRUCTURED) {
         USILMemoryAccess memory;
         USILEffectFlags effects;
@@ -467,9 +476,13 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
     const bool uav_read = instruction->opcode == USIL_OP_LD_UAV_TYPED;
     if (instruction->opcode != USIL_OP_LD && !uav_read && instruction->opcode != USIL_OP_STORE_UAV_TYPED) {
         if (instruction->opcode != USIL_OP_MOV && !uint_operation(instruction->opcode) &&
-            instruction->opcode != USIL_OP_RET)
+            !(float_data && instruction->opcode == USIL_OP_ADD) && instruction->opcode != USIL_OP_RET)
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_OPCODE);
-        return instruction_valid(ctx, index, false);
+        if (instruction->opcode == USIL_OP_ADD &&
+            (!usil_instruction_shape_valid(ctx->program, instruction) ||
+             usil_operand_destination_lane_mask(&instruction->operands[0]) != 15u))
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+        return instruction_valid(ctx, index, false, float_data);
     }
     if (!usil_instruction_shape_valid(ctx->program, instruction) || instruction->operand_count != 3 ||
         instruction->saturate || instruction->precise_mask || instruction->has_texel_offset ||
@@ -485,7 +498,7 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
     for (unsigned component = 0; component < 4; ++component)
         if (instruction->resource_return_types[component] !=
-            (instruction->has_resource_return_types ? 4u : 0u))
+            (instruction->has_resource_return_types ? (float_data ? 5u : 4u) : 0u))
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
     USILEffectFlags effects;
     if (!usil_instruction_effects(ctx->program, instruction, &effects) ||
@@ -504,7 +517,7 @@ static bool typed_instruction_valid(HLSLEmitterContext *ctx, int index) {
         const DXBCOperand *resource = &instruction->operands[2];
         const uint8_t destination_lanes = usil_operand_destination_lane_mask(destination);
         if (destination->type != OPERAND_TYPE_TEMP || !static_indices(destination, 1) ||
-            !destination_lanes || (!uav_read && destination_lanes != 15u) || destination->swizzle_mode ||
+            !destination_lanes || ((!uav_read || float_data) && destination_lanes != 15u) || destination->swizzle_mode ||
             destination->has_abs || destination->has_neg || destination->min_precision ||
             destination->rel_op0 || destination->rel_op1 || destination->rel_op2 ||
             destination->extended_token_count || destination->extended_tokens ||
@@ -551,7 +564,7 @@ static ASTExpr *memory_origin(ComputeMemoryPlan *plan, ASTExpr *expression, int 
 }
 
 static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operand_index,
-                               uint8_t lanes, unsigned depth);
+                               uint8_t lanes, ASTScalarType scalar, unsigned depth);
 
 static bool memory_literal_lane(ComputeMemoryPlan *plan, int consumer, int operand_index,
     int lane, unsigned depth, uint32_t *bits, int *literal_owner, uint8_t *literal_lanes) {
@@ -605,24 +618,26 @@ static bool memory_load_projection(const DXBCOperand *resource, uint8_t lanes,
 }
 
 static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8_t lanes,
-                                   unsigned depth) {
+                                   ASTScalarType scalar, unsigned depth) {
     if (depth > COMPUTE_SOURCE_INSTRUCTION_LIMIT || ++plan->expanded_nodes > 512u) return NULL;
     const USILInstruction *instruction = &plan->ctx->program->instructions[definition];
     const unsigned width = component_count(lanes);
     plan->consumed[definition] |= lanes;
     if (instruction->opcode == USIL_OP_MOV)
-        return memory_operand(plan, definition, 1, lanes, depth + 1);
-    if (uint_operation(instruction->opcode)) {
-        if (width < 1u || width > 4u) return NULL;
-        ASTExpr *left = memory_operand(plan, definition, 1, lanes, depth + 1);
+        return memory_operand(plan, definition, 1, lanes, scalar, depth + 1);
+    if (uint_operation(instruction->opcode) || instruction->opcode == USIL_OP_ADD) {
+        if (width < 1u || width > 4u ||
+            (uint_operation(instruction->opcode) ? scalar != AST_SCALAR_UINT32 :
+                (scalar != AST_SCALAR_FLOAT32 || lanes != 15u))) return NULL;
+        ASTExpr *left = memory_operand(plan, definition, 1, lanes, scalar, depth + 1);
         const bool unary = instruction->opcode == USIL_OP_NOT;
-        ASTExpr *right = unary ? NULL : memory_operand(plan, definition, 2, lanes, depth + 1);
+        ASTExpr *right = unary ? NULL : memory_operand(plan, definition, 2, lanes, scalar, depth + 1);
         ASTExpr *expression = NULL;
         if (left && (unary || right))
             expression = unary ? ast_create_unary(instruction->opcode, left)
                                : ast_create_binary(instruction->opcode, left, right);
         if (!expression) { ast_free_expr(left); ast_free_expr(right); return NULL; }
-        return memory_origin(plan, expression, definition, lanes, AST_SCALAR_UINT32, width);
+        return memory_origin(plan, expression, definition, lanes, scalar, width);
     }
     if ((instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_STRUCTURED &&
          instruction->opcode != USIL_OP_LD_UAV_TYPED) ||
@@ -650,14 +665,14 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
             byte_offset >= 16u || (byte_offset & 3u)) return NULL;
         const DXBCOperand *resource = &instruction->operands[memory.binding_operand];
         if (!memory_load_projection(resource, lanes, byte_offset / 4u, projection, &project)) return NULL;
-        location = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
+        location = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, AST_SCALAR_UINT32, depth + 1);
         binding_operand = memory.binding_operand;
     } else if (instruction->opcode == USIL_OP_LD_UAV_TYPED) {
         USILMemoryAccess memory;
         if (!usil_instruction_memory_access(plan->ctx->program, instruction, &memory) ||
             !memory_load_projection(&instruction->operands[memory.binding_operand],
                 lanes, 0u, projection, &project)) return NULL;
-        ASTExpr *coordinates = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, depth + 1);
+        ASTExpr *coordinates = memory_operand(plan, definition, memory.address_operand, memory.address_lanes, AST_SCALAR_UINT32, depth + 1);
         ASTExpr *arguments[] = {coordinates};
         location = coordinates ? ast_create_call("int2", arguments, 1) : NULL;
         if (!location) { ast_free_expr(coordinates); return NULL; }
@@ -665,7 +680,7 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
         binding_operand = memory.binding_operand;
     } else {
         if (!memory_zero_lane(plan, definition, 1, 2, depth + 1, &literal_owner, &literal_lanes)) return NULL;
-        ASTExpr *coordinates = memory_operand(plan, definition, 1, 3u, depth + 1);
+        ASTExpr *coordinates = memory_operand(plan, definition, 1, 3u, AST_SCALAR_UINT32, depth + 1);
         const uint32_t zero = 0u;
         ASTExpr *lod = memory_origin(plan, ast_create_literal_bits(&zero, 1, AST_SCALAR_SINT32),
                                      literal_owner, literal_lanes, AST_SCALAR_SINT32, 1);
@@ -678,27 +693,27 @@ static ASTExpr *memory_definition(ComputeMemoryPlan *plan, int definition, uint8
     const DXBCOperand *resource = &instruction->operands[binding_operand];
     const HLSLComputeTypedResource *binding = typed_binding(plan->typed,
         instruction->opcode == USIL_OP_LD_UAV_TYPED, (uint32_t)resource->register_index);
-    if (!binding) { ast_free_expr(location); return NULL; }
+    if (!binding || binding->scalar_type != scalar) { ast_free_expr(location); return NULL; }
     char method[264];
     int size = snprintf(method, sizeof(method), "%s.Load", binding->name);
     if (size < 0 || (size_t)size >= sizeof(method)) { ast_free_expr(location); return NULL; }
     ASTExpr *load_arguments[] = {location};
     ASTExpr *load = ast_create_call(method, load_arguments, 1);
     if (!load) { ast_free_expr(location); return NULL; }
-    /* The declared value has four words. A typed read retains its UINT4 type;
+    /* The declared value has four words. A typed read retains its scalar type;
      * a structured bits view grants no unavailable original element type.
      * Any following selection retains this single load's instruction owner. */
-    load = memory_origin(plan, load, definition, lanes, AST_SCALAR_UINT32, 4);
+    load = memory_origin(plan, load, definition, lanes, scalar, 4);
     if (!load || !project) return load;
     ASTExpr *selection = ast_create_swizzle(load, projection, (int)width);
     if (!selection) { ast_free_expr(load); return NULL; }
-    selection = memory_origin(plan, selection, definition, lanes, AST_SCALAR_UINT32, width);
+    selection = memory_origin(plan, selection, definition, lanes, scalar, width);
     if (selection) selection->logical_origin.semantic_projection = true;
     return selection;
 }
 
 static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operand_index,
-                               uint8_t lanes, unsigned depth) {
+                               uint8_t lanes, ASTScalarType scalar, unsigned depth) {
     if (depth > COMPUTE_SOURCE_INSTRUCTION_LIMIT || ++plan->expanded_nodes > 512u) return NULL;
     const USILInstruction *instruction = &plan->ctx->program->instructions[consumer];
     const DXBCOperand *operand = &instruction->operands[operand_index];
@@ -715,8 +730,8 @@ static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operan
             bits[component++] = operand->imm_values[selected];
         }
         if (width == 4 && bits[0] == bits[1] && bits[1] == bits[2] && bits[2] == bits[3]) return NULL;
-        return memory_origin(plan, ast_create_literal_bits(bits, (int)width, AST_SCALAR_UINT32),
-                             consumer, lanes, AST_SCALAR_UINT32, width);
+        return memory_origin(plan, ast_create_literal_bits(bits, (int)width, scalar),
+                             consumer, lanes, scalar, width);
     }
     if (operand->type == OPERAND_TYPE_TEMP) {
         if (!static_indices(operand, 1)) return NULL;
@@ -741,8 +756,9 @@ static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operan
                 if (selections[component] <= previous) return NULL;
                 previous = selections[component];
             }
-            return memory_definition(plan, definition, selected_lanes, depth + 1);
+            return memory_definition(plan, definition, selected_lanes, scalar, depth + 1);
         }
+        if (scalar != AST_SCALAR_UINT32) return NULL;
         ASTExpr *arguments[4] = {0}; unsigned argument_count = 0;
         /* Compose distinct naturally ordered producers as vector arguments.
          * A resource read cannot recur through a second group or expansion. */
@@ -756,7 +772,7 @@ static ASTExpr *memory_operand(ComputeMemoryPlan *plan, int consumer, int operan
                 if (selections[end] != selections[end - 1] + 1) goto composition_failed;
                 producer_lanes |= (uint8_t)(1u << selections[end++]);
             }
-            arguments[argument_count] = memory_definition(plan, owner, producer_lanes, depth + 1);
+            arguments[argument_count] = memory_definition(plan, owner, producer_lanes, scalar, depth + 1);
             if (!arguments[argument_count]) goto composition_failed;
             ++argument_count;
             component = end;
@@ -769,7 +785,7 @@ composition_failed:
         return NULL;
     }
     const ComputeBuiltin *builtin = compute_builtin(operand->type);
-    if (!builtin || builtin->flag != USIL_COMPUTE_DISPATCH_THREAD_ID || !static_indices(operand, 0) ||
+    if (scalar != AST_SCALAR_UINT32 || !builtin || builtin->flag != USIL_COMPUTE_DISPATCH_THREAD_ID || !static_indices(operand, 0) ||
         (width != 1 && width != 2) || !(plan->ctx->program->compute.system_value_mask & builtin->flag)) return NULL;
     uint8_t selected_components[2] = {0, 0};
     unsigned component = 0;
@@ -821,7 +837,8 @@ static void emit_typed_declarations(HLSLEmitterContext *ctx, const HLSLComputeTy
         const HLSLComputeTypedResource *resource = &typed->resources[index];
         const char *type = resource->structured ? (resource->writable ? "RWStructuredBuffer" : "StructuredBuffer")
                                                 : (resource->writable ? "RWTexture2D" : "Texture2D");
-        sb_appendf(ctx->sb, "%s<uint4> %s;\n", type, resource->name);
+        const char *element = resource->scalar_type == AST_SCALAR_FLOAT32 ? "float4" : "uint4";
+        sb_appendf(ctx->sb, "%s<%s> %s;\n", type, element, resource->name);
         HLSLSourceQualityFacts fact;
         hlsl_source_quality_facts_init(&fact);
         fact.known = true;
@@ -926,6 +943,12 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
     if (uav_read && (program->texture_count || typed->resource_count != 1u || plan.load >= plan.store ||
         program->instructions[plan.store].opcode != USIL_OP_STORE_UAV_TYPED ||
         !same_typed_uav_address(ctx, plan.load, plan.store))) return reject_stage(ctx);
+    if (typed->resources[0].scalar_type == AST_SCALAR_FLOAT32) {
+        unsigned additions = 0;
+        for (int index = 0; index < program->instruction_count; ++index)
+            additions += program->instructions[index].opcode == USIL_OP_ADD;
+        if (!uav_read || additions != 1u) return reject_stage(ctx);
+    }
     if (plan.load >= 0) {
         for (int index = plan.load + 1; index < plan.store; ++index) {
             USILEffectFlags effects;
@@ -960,8 +983,8 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
         value_operand = memory.value_operand;
         address_lanes = memory.address_lanes;
     }
-    ASTExpr *coordinates = memory_operand(&plan, plan.store, address_operand, address_lanes, 0);
-    ASTExpr *value = memory_operand(&plan, plan.store, value_operand, 15u, 0);
+    ASTExpr *coordinates = memory_operand(&plan, plan.store, address_operand, address_lanes, AST_SCALAR_UINT32, 0);
+    ASTExpr *value = memory_operand(&plan, plan.store, value_operand, 15u, destination->scalar_type, 0);
     if (!resource || !coordinates || !value) {
         ast_free_expr(resource); ast_free_expr(coordinates); ast_free_expr(value);
         return reject_instruction(ctx, plan.store, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
@@ -975,6 +998,10 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
         return reject_instruction(ctx, plan.load, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     }
     for (int index = 0; index < plan.store; ++index) {
+        if (program->instructions[index].opcode == USIL_OP_ADD && plan.consumed[index] != 15u) {
+            ast_free_expr(resource); ast_free_expr(coordinates); ast_free_expr(value);
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+        }
         const uint8_t written = usil_operand_destination_lane_mask(&program->instructions[index].operands[0]);
         for (int lane = 0; lane < 4; ++lane) if ((written & (1u << lane)) && !(plan.consumed[index] & (1u << lane)) &&
             hlsl_definition_use_count(ctx, index, lane) != 0u) {
@@ -1128,7 +1155,7 @@ static bool emit_compute_stage(const USILProgram *program, StringBuilder *output
     if (!hlsl_source_quality_initialize(&ctx, options) || !source_program_valid(&ctx, typed)) goto cleanup;
     size_t barrier_count = 0;
     for (int index = 0; index < program->instruction_count; ++index) {
-        if (!(typed ? typed_instruction_valid(&ctx, index) : instruction_valid(&ctx, index, true))) goto cleanup;
+        if (!(typed ? typed_instruction_valid(&ctx, typed, index) : instruction_valid(&ctx, index, true, false))) goto cleanup;
         barrier_count += program->instructions[index].opcode == USIL_OP_SYNC;
     }
     if (barrier_count != program->compute.barrier_count) {

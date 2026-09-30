@@ -1324,8 +1324,158 @@ static bool check_partial_uav_candidate(void) {
     return true;
 }
 
+/* FLOAT data uses the current UAV declaration. Unsigned addresses remain a
+ * separate SSA domain, including the existing same-producer replication proof. */
+static void float_uav_words(uint32_t words[COUNT(uav_read_words)], const uint32_t bits[4]) {
+    memcpy(words, uav_read_words, sizeof(uav_read_words));
+    words[4] = UINT32_C(0x5555);
+    words[29] = INSTRUCTION(0, 10);
+    memcpy(words + 35, bits, 4 * sizeof(*bits));
+}
+
+static bool check_float_uav_candidate(void) {
+    const uint32_t literals[][4] = {
+        {UINT32_C(0x3e800000), UINT32_C(0x3f000000), UINT32_C(0x3f400000), UINT32_C(0x3f800000)},
+        {UINT32_C(0x00000000), UINT32_C(0x80000000), UINT32_C(0x7f800000), UINT32_C(0x7fc00013)},
+        {UINT32_C(0x00000001), UINT32_C(0xbf000000), UINT32_C(0x3eaaaaab), UINT32_C(0xff800000)}
+    };
+    for (size_t set = 0; set < COUNT(literals); ++set) {
+        for (unsigned address = 0; address < 3; ++address) {
+            Fixture fixture;
+            CHECK(uav_read_fixture(&fixture));
+            uint32_t words[COUNT(uav_read_words)];
+            float_uav_words(words, literals[set]);
+            size_t count = COUNT(words);
+            if (address == 1) {
+                words[14] = UINT32_C(0x001000f2);
+                words[16] = UINT32_C(0x00020546);
+                words[20] = words[21] = 2;
+                words[25] = UINT32_C(0x00100fc6);
+            } else if (address == 2) {
+                memmove(words + 13, words + 22, (COUNT(words) - 22) * sizeof(*words));
+                count -= 9;
+                words[16] = words[33] = UINT32_C(0x00020046);
+                memmove(words + 17, words + 18, (count - 18) * sizeof(*words)); --count;
+                /* Removing the load's register word shifts the store token. */
+                memmove(words + 33, words + 34, (count - 34) * sizeof(*words)); --count;
+                words[13] = INSTRUCTION(163, 6);
+                words[29] = INSTRUCTION(164, 6);
+            }
+            CHECK(typed_code(&fixture, words, count));
+            ComputeSourceCandidate candidate;
+            compute_source_candidate_init(&candidate);
+            CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+            CHECK(candidate.resource_count == 1 && candidate.variant_count == 8 && candidate.domain_complete &&
+                candidate.source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                candidate.resources[0].kind == COMPUTE_SOURCE_TEXTURE2D_FLOAT4 &&
+                candidate.resources[0].original_element_type_known && candidate.resources[0].witness_count == 8);
+            CHECK(strstr(candidate.source.buf, "RWTexture2D<float4> OutputTexels;") &&
+                !strstr(candidate.source.buf, "asuint") && !strstr(candidate.source.buf, ".xyzw") &&
+                !strstr(candidate.source.buf, ".xwww"));
+            for (size_t row = 0; row < candidate.variant_count; ++row) {
+                const ComputeSourceVariant *entry = &candidate.variants[row];
+                CHECK(entry->entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                    entry->expression_count == 3 && entry->memory_effect_count == 2);
+                const ASTExpr *value = entry->expressions[2];
+                CHECK(value->kind == AST_EXPR_BINARY && value->u.binary.op == USIL_OP_ADD &&
+                    value->logical_origin.complete && value->logical_origin.scalar_type == AST_SCALAR_FLOAT32 &&
+                    value->logical_origin.components == 4 && value->logical_origin.destination_lanes == 15);
+                const ASTExpr *load = value->u.binary.left, *literal = value->u.binary.right;
+                CHECK(load->kind == AST_EXPR_CALL && !strcmp(load->u.call.name, "OutputTexels.Load") &&
+                    load->logical_origin.complete && load->logical_origin.scalar_type == AST_SCALAR_FLOAT32 &&
+                    load->logical_origin.components == 4 && load->logical_origin.destination_lanes == 15 &&
+                    load->logical_origin.instruction_index == entry->memory_effects[0].instruction_index);
+                CHECK(literal->kind == AST_EXPR_LITERAL && literal->u.literal.scalar_type == AST_SCALAR_FLOAT32 &&
+                    literal->u.literal.components == 4 && !memcmp(literal->u.literal.val, literals[set], sizeof(literals[set])));
+                CHECK(load->u.call.args[0]->logical_origin.scalar_type == AST_SCALAR_SINT32);
+                if (address < 2)
+                    CHECK(entry->expressions[1]->logical_origin.complete &&
+                        entry->expressions[1]->logical_origin.scalar_type == AST_SCALAR_UINT32);
+            }
+            StringBuilder before, after;
+            sb_init(&before); sb_init(&after);
+            ast_format_expr(candidate.variants[0].expressions[2], &before);
+            memset(fixture.bytes, 0, sizeof(fixture.bytes));
+            ast_format_expr(candidate.variants[0].expressions[2], &after);
+            CHECK(sb_ok(&before) && sb_ok(&after) && before.len == after.len && !memcmp(before.buf, after.buf, before.len));
+            sb_free(&before); sb_free(&after);
+            compute_source_candidate_dispose(&candidate);
+        }
+    }
+    const struct { size_t word; uint32_t value; } negatives[] = {
+        {4, UINT32_C(0x4555)}, /* Mixed return tuple. */
+        {4, UINT32_C(0x3333)}, /* Signed resource. */
+        {29, INSTRUCTION(30, 10)}, /* UINT data cannot become FLOAT. */
+        {13, INSTRUCTION(0, 9)}, /* FLOAT address cannot become UINT. */
+        {29, INSTRUCTION(0, 10) | (UINT32_C(1) << 13)}, /* Saturation. */
+        {29, INSTRUCTION(0, 10) | (UINT32_C(15) << 19)}, /* Precision. */
+        {23, UINT32_C(0x00100032)}, /* Partial FLOAT read. */
+        {30, UINT32_C(0x00100032)}, /* Partial FLOAT addition. */
+        {40, UINT32_C(0x0011e032)}, /* Partial final store. */
+        {32, UINT32_C(0x001001b6)}, /* Reverse FLOAT read components. */
+        {44, UINT32_C(0x001001b6)}, /* Reverse final store components. */
+        {25, UINT32_C(0x00100416)}, /* Changed physical address. */
+        {1, INSTRUCTION(156, 4) | (3u << 11u) | (1u << 16u)} /* Coherence. */
+    };
+    for (size_t index = 0; index < COUNT(negatives); ++index) {
+        Fixture fixture;
+        CHECK(uav_read_fixture(&fixture));
+        uint32_t words[COUNT(uav_read_words)]; float_uav_words(words, literals[0]);
+        CHECK(typed_code(&fixture, words, COUNT(words)));
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        words[negatives[index].word] = negatives[index].value;
+        CHECK(typed_code(&fixture, words, COUNT(words)));
+        CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+        compute_source_candidate_dispose(&candidate);
+    }
+    for (unsigned order = 0; order < 2; ++order) {
+        Fixture fixture; CHECK(uav_read_fixture(&fixture));
+        uint32_t words[COUNT(uav_read_words)]; float_uav_words(words, literals[0]);
+        CHECK(typed_code(&fixture, words, COUNT(words)));
+        const uint8_t *float_code = fixture.variants[0][0].code;
+        CHECK(typed_code(&fixture, uav_read_words, COUNT(uav_read_words)));
+        const uint8_t *uint_code = fixture.variants[0][0].code;
+        for (size_t k = 0; k < 2; ++k) for (size_t v = 0; v < 4; ++v)
+            fixture.variants[k][v].code = order ? float_code : uint_code;
+        fixture.variants[0][0].code = order ? uint_code : float_code;
+        ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+        ComputeSourceDiagnostic diagnostic;
+        CHECK(compute_source_candidate_build(&fixture.object, &candidate, &diagnostic) == COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE);
+        CHECK(diagnostic.requested_variants == 8 && diagnostic.represented_variants == 1 &&
+            !candidate.domain_complete && !candidate.source.buf && !candidate.variants);
+        compute_source_candidate_dispose(&candidate);
+    }
+    Fixture fixture; CHECK(uav_read_fixture(&fixture));
+    uint32_t words[COUNT(uav_read_words)]; float_uav_words(words, literals[0]);
+    /* Commutativity does not grant a source operand-order rewrite. */
+    words[32] = UINT32_C(0x00004002);
+    memcpy(words + 33, literals[0], sizeof(literals[0]));
+    words[37] = UINT32_C(0x00100e46); words[38] = 1;
+    CHECK(typed_code(&fixture, words, COUNT(words)));
+    ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    const ASTExpr *value = candidate.variants[0].expressions[2];
+    CHECK(value->kind == AST_EXPR_BINARY && value->u.binary.op == USIL_OP_ADD &&
+        value->u.binary.left->kind == AST_EXPR_LITERAL && value->u.binary.right->kind == AST_EXPR_CALL);
+    /* A UINT address producer cannot become FLOAT data through a TEMP
+     * identity. A retained effect is independently required to have one use. */
+    float_uav_words(words, literals[0]);
+    words[14] = UINT32_C(0x001000f2); words[16] = UINT32_C(0x00020546);
+    words[20] = words[21] = 2; words[33] = 0;
+    CHECK(typed_code(&fixture, words, COUNT(words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    float_uav_words(words, literals[0]);
+    words[29] = INSTRUCTION(0, 7); words[34] = UINT32_C(0x00100e46); words[35] = 1;
+    memmove(words + 36, words + 39, (COUNT(words) - 39u) * sizeof(*words));
+    CHECK(typed_code(&fixture, words, COUNT(words) - 3u));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    compute_source_candidate_dispose(&candidate);
+    return true;
+}
+
 int main(void) {
-    return check_partial_uav_candidate() && check_replicated_uav_address_lanes() && check_same_uav_address_ownership() && check_uav_read_candidate() && check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_float_uav_candidate() && check_partial_uav_candidate() && check_replicated_uav_address_lanes() && check_same_uav_address_ownership() && check_uav_read_candidate() && check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }

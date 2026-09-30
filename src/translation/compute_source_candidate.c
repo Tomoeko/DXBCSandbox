@@ -152,13 +152,45 @@ static void hash_resource(CommonSha256Context *hash, const ComputeShaderResource
     hash_number(hash, (uint64_t)resource->texture_dimension);
 }
 
+/* The current entry's shared decoder owns the element type. A sibling
+ * declaration can join this inventory only after the same tuple is observed. */
+static bool resource_kind(const USILProgram *program, bool writable, bool structured,
+                          uint32_t binding, ComputeSourceResourceKind *kind) {
+    const uint8_t *formats = NULL;
+    if (writable) {
+        for (int index = 0; index < program->uav_count; ++index)
+            if (program->uavs[index].reg_idx >= 0 &&
+                (uint32_t)program->uavs[index].reg_idx == binding)
+                formats = program->uavs[index].return_types;
+    } else {
+        for (int index = 0; index < program->texture_count; ++index)
+            if (program->textures[index].reg_idx >= 0 &&
+                (uint32_t)program->textures[index].reg_idx == binding)
+                formats = program->textures[index].return_types;
+    }
+    if (!formats) return false;
+    const uint8_t format = formats[0];
+    for (unsigned lane = 1; lane < 4; ++lane)
+        if (formats[lane] != format) return false;
+    if (structured && !format) *kind = COMPUTE_SOURCE_STRUCTURED_UINT4_BITS;
+    else if (!structured && format == 4u) *kind = COMPUTE_SOURCE_TEXTURE2D_UINT4;
+    else if (!structured && format == 5u && writable && !program->texture_count)
+        *kind = COMPUTE_SOURCE_TEXTURE2D_FLOAT4;
+    else return false;
+    return true;
+}
+
 static ComputeSourceStatus resource_binding(const ComputeShaderObject *object,
-    const ComputeShaderResource *resource, bool writable, bool structured, ComputeSourceCandidate *candidate,
+    const USILProgram *program, const ComputeShaderResource *resource, bool writable, bool structured, ComputeSourceCandidate *candidate,
     HLSLComputeTypedResource *binding, uint32_t variant_row) {
     if (resource->generated_name.size || !borrowed_span(object, resource->generated_name.bytes, resource->generated_name.size) ||
         resource->bind_point < 0 || resource->bind_point >= (writable ? 8 : 128) ||
         resource->sampler_bind_point != -1 || resource->texture_dimension != (structured ? -1 : 2))
         return COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE;
+    ComputeSourceResourceKind kind;
+    if (!resource_kind(program, writable, structured, (uint32_t)resource->bind_point, &kind))
+        return COMPUTE_SOURCE_EMISSION_FAILED;
+    const ASTScalarType scalar = kind == COMPUTE_SOURCE_TEXTURE2D_FLOAT4 ? AST_SCALAR_FLOAT32 : AST_SCALAR_UINT32;
     char *name = NULL;
     ComputeSourceStatus status = copy_view(object, resource->name, MAX_NAME_BYTES,
                                            &name, COMPUTE_SOURCE_NAME_UNREPRESENTABLE);
@@ -175,13 +207,13 @@ static ComputeSourceStatus resource_binding(const ComputeShaderObject *object,
         if (same_name || same_binding) {
             free(name);
             if (!same_name || !same_binding ||
-                existing->kind != (structured ? COMPUTE_SOURCE_STRUCTURED_UINT4_BITS : COMPUTE_SOURCE_TEXTURE2D_UINT4))
+                existing->kind != kind)
                 return COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE;
             if (existing->witness_count >= candidate->variant_count ||
                 (existing->witness_count && existing->variant_witnesses[existing->witness_count - 1] >= variant_row))
                 return COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE;
             existing->variant_witnesses[existing->witness_count++] = variant_row;
-            *binding = (HLSLComputeTypedResource){existing->name, existing->binding_register, existing->writable, structured};
+            *binding = (HLSLComputeTypedResource){existing->name, existing->binding_register, existing->writable, structured, scalar};
             return COMPUTE_SOURCE_CANDIDATE_UNVERIFIED;
         }
     }
@@ -190,17 +222,17 @@ static ComputeSourceStatus resource_binding(const ComputeShaderObject *object,
     }
     ComputeSourceTypedResource *owned = &candidate->resources[candidate->resource_count++];
     *owned = (ComputeSourceTypedResource){.name = name, .binding_register = (uint32_t)resource->bind_point,
-        .writable = writable, .kind = structured ? COMPUTE_SOURCE_STRUCTURED_UINT4_BITS : COMPUTE_SOURCE_TEXTURE2D_UINT4,
+        .writable = writable, .kind = kind,
         .byte_stride = structured ? 16u : 0u, .original_element_type_known = !structured};
     owned->variant_witnesses = calloc(candidate->variant_count, sizeof(*owned->variant_witnesses));
     if (!owned->variant_witnesses) return COMPUTE_SOURCE_ALLOCATION_FAILED;
     owned->variant_witnesses[owned->witness_count++] = variant_row;
-    *binding = (HLSLComputeTypedResource){owned->name, owned->binding_register, owned->writable, structured};
+    *binding = (HLSLComputeTypedResource){owned->name, owned->binding_register, owned->writable, structured, scalar};
     return COMPUTE_SOURCE_CANDIDATE_UNVERIFIED;
 }
 
 static ComputeSourceStatus resource_inventory(const ComputeShaderObject *object,
-    const ComputeShaderKernelVariant *variant, ComputeSourceCandidate *candidate,
+    const ComputeShaderKernelVariant *variant, const USILProgram *program, ComputeSourceCandidate *candidate,
     HLSLComputeTypedResource bindings[COMPUTE_SOURCE_MAX_TYPED_RESOURCES], size_t *binding_count, uint32_t variant_row) {
     *binding_count = 0;
     if (variant->constant_buffer_variant_index_count || variant->constant_buffer_count ||
@@ -211,17 +243,17 @@ static ComputeSourceStatus resource_inventory(const ComputeShaderObject *object,
         (variant->texture_count && !variant->output_buffer_count))
         return COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE;
     if (variant->texture_count) {
-        ComputeSourceStatus status = resource_binding(object, &variant->textures[0], false, false, candidate,
+        ComputeSourceStatus status = resource_binding(object, program, &variant->textures[0], false, false, candidate,
                                                      &bindings[(*binding_count)++], variant_row);
         if (status != COMPUTE_SOURCE_CANDIDATE_UNVERIFIED) return status;
     }
     if (variant->input_buffer_count) {
-        ComputeSourceStatus status = resource_binding(object, &variant->input_buffers[0], false, true, candidate,
+        ComputeSourceStatus status = resource_binding(object, program, &variant->input_buffers[0], false, true, candidate,
                                                      &bindings[(*binding_count)++], variant_row);
         if (status != COMPUTE_SOURCE_CANDIDATE_UNVERIFIED) return status;
     }
     if (variant->output_buffer_count) {
-        ComputeSourceStatus status = resource_binding(object, &variant->output_buffers[0], true, variant->input_buffer_count != 0, candidate,
+        ComputeSourceStatus status = resource_binding(object, program, &variant->output_buffers[0], true, variant->input_buffer_count != 0, candidate,
                                                      &bindings[(*binding_count)++], variant_row);
         if (status != COMPUTE_SOURCE_CANDIDATE_UNVERIFIED) return status;
     }
@@ -251,9 +283,7 @@ static ComputeSourceStatus emit_variant(const ComputeShaderObject *object,
     const ComputeShaderKernelVariant *variant, ComputeSourceCandidate *candidate,
     ComputeSourceVariant *evidence, StringBuilder *entry, ComputeSourceDiagnostic *diagnostic) {
     HLSLComputeTypedResource bindings[COMPUTE_SOURCE_MAX_TYPED_RESOURCES];
-    size_t binding_count;
-    ComputeSourceStatus inventory_status = resource_inventory(object, variant, candidate, bindings, &binding_count, evidence->source_unit_id - 1u);
-    if (inventory_status != COMPUTE_SOURCE_CANDIDATE_UNVERIFIED) return inventory_status;
+    size_t binding_count = 0;
     if (variant->requirements < 0 || (uint64_t)variant->requirements != required_features)
         return COMPUTE_SOURCE_REQUIREMENTS_UNSUPPORTED;
     if (!variant->code_size || variant->code_size > MAX_CODE_BYTES ||
@@ -285,6 +315,16 @@ static ComputeSourceStatus emit_variant(const ComputeShaderObject *object,
         (size_t)program.texture_count != variant->texture_count + variant->input_buffer_count ||
         (size_t)program.uav_count != variant->output_buffer_count || program.icb_value_count ||
         program.indexable_temp_count || program.index_range_count) goto cleanup;
+    status = resource_inventory(object, variant, &program, candidate, bindings, &binding_count, evidence->source_unit_id - 1u);
+    if (status != COMPUTE_SOURCE_CANDIDATE_UNVERIFIED) {
+        if (status == COMPUTE_SOURCE_EMISSION_FAILED) {
+            hlsl_emit_diagnostic_init(&diagnostic->emission);
+            diagnostic->emission.status = HLSL_EMIT_STATUS_UNSUPPORTED;
+            diagnostic->emission.phase = HLSL_EMIT_PHASE_PROGRAM_VALIDATION;
+            diagnostic->emission.reason = HLSL_EMIT_REASON_UNSUPPORTED_STAGE;
+        }
+        goto cleanup;
+    }
     status = COMPUTE_SOURCE_BODY_UNSUPPORTED;
     if (program.instruction_count <= 0 || program.instruction_count > COMPUTE_SOURCE_MAX_INSTRUCTIONS)
         goto cleanup;
@@ -576,7 +616,8 @@ ComputeSourceStatus compute_source_candidate_build(const ComputeShaderObject *ob
         const bool structured = declaration->kind == COMPUTE_SOURCE_STRUCTURED_UINT4_BITS;
         const char *type = structured ? (declaration->writable ? "RWStructuredBuffer" : "StructuredBuffer")
                                       : (declaration->writable ? "RWTexture2D" : "Texture2D");
-        sb_appendf(&candidate.source, "%s<uint4> %s;\n", type, declaration->name);
+        const char *element = declaration->kind == COMPUTE_SOURCE_TEXTURE2D_FLOAT4 ? "float4" : "uint4";
+        sb_appendf(&candidate.source, "%s<%s> %s;\n", type, element, declaration->name);
         if (!declaration->witness_count) { status = COMPUTE_SOURCE_QUALITY_FAILED; goto cleanup; }
         for (size_t witness = 0; witness < declaration->witness_count; ++witness) {
             HLSLSourceQualityFacts fact;

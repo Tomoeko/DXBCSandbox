@@ -754,12 +754,26 @@ static bool append_compute_candidate_evidence(
     sb_append(output, ",\"resource_declarations\":[");
     for (size_t index = 0; index < candidate->resource_count; ++index) {
         const ComputeSourceTypedResource *resource = &candidate->resources[index];
+        const char *representation;
+        switch (resource->kind) {
+            case COMPUTE_SOURCE_TEXTURE2D_UINT4:
+                representation = "texture2d-uint4";
+                break;
+            case COMPUTE_SOURCE_STRUCTURED_UINT4_BITS:
+                representation = "structured-uint4-bits";
+                break;
+            case COMPUTE_SOURCE_TEXTURE2D_FLOAT4:
+                representation = "texture2d-float4";
+                break;
+            default:
+                return false;
+        }
         /* Candidate names have already passed the ASCII identifier guard. */
         sb_appendf(output, "%s{\"name\":\"%s\",\"binding_register\":%u,\"writable\":%s,"
             "\"representation\":\"%s\",\"byte_stride\":%u,\"original_element_type_known\":%s,"
             "\"variant_witnesses\":[", index ? "," : "", resource->name, resource->binding_register,
             resource->writable ? "true" : "false",
-            resource->kind == COMPUTE_SOURCE_STRUCTURED_UINT4_BITS ? "structured-uint4-bits" : "texture2d-uint4",
+            representation,
             resource->byte_stride, resource->original_element_type_known ? "true" : "false");
         for (size_t witness = 0; witness < resource->witness_count; ++witness)
             sb_appendf(output, "%s%u", witness ? "," : "", resource->variant_witnesses[witness]);

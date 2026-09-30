@@ -169,6 +169,10 @@ of its unsigned operation. Both access operands retain their original lane owner
 Partial identity-selected UAV reads use meaningful scalar/vector projections of
 the declared UINT4 value. Every loaded component must be consumed once; distinct
 SSA producers compose the complete stored value in its original order.
+A single `RWTexture2D<float4>` admits a full read, one full floating-point
+addition and a full final store at the same unsigned SSA address. The decoded
+resource format governs the data type; integer address operations stay unsigned.
+The addition retains its original operand order and raw constant bits.
 Coherent UAVs and multiple retained reads remain unsupported.
 A 16-byte structured load/store path uses an explicit `uint4` bit
 representation, preserving the actual index, byte window and memory-effect order. Release metadata does not retain the original
@@ -177,10 +181,11 @@ even when the unsigned entry bodies are `clean`. These memory paths require one
 complete final store and at most one retained read, preceding the store when
 present. Structured reads admit aligned, ascending
 word projections within the element and compose distinct SSA producers as natural
-scalar/vector constructor arguments. Typed texture declarations retain `uint4`;
+scalar/vector constructor arguments. Typed texture declarations retain the
+decoded `uint4` or `float4` representation;
 the separate read-only `Texture2D` path still requires a complete read.
-Wider strides, float arithmetic, other resources, control flow, shared memory
-and atomics remain unsupported.
+Wider strides, other floating-point operations, partial floating-point accesses,
+other resources, control flow, shared memory and atomics remain unsupported.
 Use `dxbc-sandbox extract INPUT --kind compute --all --compute-source-candidate
 --out recovered --format json` to export these candidates alongside the exact binary
 package. Each `_candidate.compute` has a separate evidence file. Unsupported

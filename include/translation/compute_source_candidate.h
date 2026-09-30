@@ -95,7 +95,8 @@ typedef struct {
  * it does not assert that the original declaration was uint4. */
 typedef enum {
     COMPUTE_SOURCE_TEXTURE2D_UINT4 = 0,
-    COMPUTE_SOURCE_STRUCTURED_UINT4_BITS
+    COMPUTE_SOURCE_STRUCTURED_UINT4_BITS,
+    COMPUTE_SOURCE_TEXTURE2D_FLOAT4
 } ComputeSourceResourceKind;
 
 typedef struct {
@@ -119,7 +120,7 @@ typedef struct {
     size_t local_keyword_count;
     size_t kernel_count;
     /* Strong declaration union: names, type and binding agree in every entry.
-     * UINT4 textures and explicit UINT4-bit structured representations remain
+     * UINT4/FLOAT4 textures and explicit UINT4-bit structured representations remain
      * distinct. Unknown original structured types keep whole source MIXED. */
     ComputeSourceTypedResource resources[COMPUTE_SOURCE_MAX_TYPED_RESOURCES];
     size_t resource_count;
@@ -145,7 +146,8 @@ void compute_source_candidate_dispose(ComputeSourceCandidate *candidate);
  * counts and the first precise unsupported coordinate. Initial source support
  * is one Windows64 D3D11 platform, exhaustive Boolean keyword domains, no
  * shared-memory declarations, and cs5 RET/SYNC-only bodies or one typed UINT4
- * Texture2D load/store, or one 16-byte structured load/store represented as
+ * Texture2D load/store, one full FLOAT4 same-UAV read/add/store, or one
+ * 16-byte structured load/store represented as
  * uint4 bits with bounded unsigned expressions. Structured candidates retain
  * an incomplete declaration-quality unit and no original-element-type claim. */
 ComputeSourceStatus compute_source_candidate_build(

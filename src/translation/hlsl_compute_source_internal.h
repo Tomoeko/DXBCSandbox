@@ -14,6 +14,7 @@ typedef struct {
     uint32_t binding_register;
     bool writable;
     bool structured; /* Explicit uint4-bit representation, original type unknown. */
+    ASTScalarType scalar_type; /* Current decoded declaration, never a sibling guess. */
 } HLSLComputeTypedResource;
 
 typedef struct {
