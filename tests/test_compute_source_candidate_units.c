@@ -2,6 +2,7 @@
 
 #include "translation/compute_source_candidate.h"
 #include "translation/hlsl_source_identifier.h"
+#include "translation/hlsl_emitter_internal.h"
 #include "dxbc/dxbc_hash.h"
 
 #include <stdio.h>
@@ -23,6 +24,8 @@ typedef struct {
     ComputeShaderStringView global[2][1];
     ComputeShaderStringView local[2][1];
     uint32_t groups[2][4][3];
+    ComputeShaderResource textures[2][4];
+    ComputeShaderResource outputs[2][4];
 } Fixture;
 
 static void write_u32(uint8_t *bytes, uint32_t value) {
@@ -148,7 +151,7 @@ static bool check_complete_candidate(void) {
     CHECK(strstr(candidate.source.buf, "#pragma kernel KernelFirst\n"));
     CHECK(strstr(candidate.source.buf, "#pragma multi_compile _ KEY_A\n"));
     CHECK(strstr(candidate.source.buf, "#pragma multi_compile_local _ KEY_B\n"));
-    CHECK(strstr(candidate.source.buf, "#pragma require compute\n"));
+    CHECK(!strstr(candidate.source.buf, "#pragma require"));
     CHECK(strstr(candidate.source.buf, "#if defined(KEY_A) && !defined(KEY_B)\n"));
     for (size_t index = 0; index < candidate.variant_count; ++index) {
         const ComputeSourceVariant *variant = &candidate.variants[index];
@@ -341,8 +344,191 @@ static bool check_barrier_candidates(void) {
     return true;
 }
 
+/* Controlled typed texture vocabulary in a synthetic container. These units
+ * establish decoder/emitter boundaries, not selected compiler equality. */
+static const uint32_t typed_words[] = {
+    0x0100086au, 0x04001858u, 0x00107000u, 0x00000000u, 0x00004444u, 0x0400189cu,
+    0x0011e000u, 0x00000000u, 0x00004444u, 0x0200005fu, 0x00020032u, 0x02000068u,
+    0x00000002u, 0x0400009bu, 0x00000004u, 0x00000004u, 0x00000001u, 0x08000036u,
+    0x001000c2u, 0x00000000u, 0x00004002u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x0900001eu, 0x00100032u, 0x00000000u, 0x00020046u, 0x00004002u,
+    0x00000001u, 0x00000002u, 0x00000000u, 0x00000000u, 0x8900002du, 0x800000c2u,
+    0x00111103u, 0x001000f2u, 0x00000001u, 0x00100e46u, 0x00000000u, 0x00107e46u,
+    0x00000000u, 0x0a00001eu, 0x001000f2u, 0x00000001u, 0x00100e46u, 0x00000001u,
+    0x00004002u, 0x00000001u, 0x00000002u, 0x00000003u, 0x00000004u, 0x070000a4u,
+    0x0011e0f2u, 0x00000000u, 0x00100546u, 0x00000000u, 0x00100e46u, 0x00000001u,
+    0x0100003eu,
+};
+
+static bool typed_code(Fixture *fixture, const uint32_t *words, size_t count) {
+    const size_t size = 52u + count * 4u;
+    CHECK(size <= sizeof(fixture->bytes) - fixture->used);
+    uint8_t *code = fixture->bytes + fixture->used;
+    memset(code, 0, size); memcpy(code, "DXBC", 4);
+    write_u32(code + 20, 1); write_u32(code + 24, (uint32_t)size);
+    write_u32(code + 28, 1); write_u32(code + 32, 36);
+    memcpy(code + 36, "SHEX", 4); write_u32(code + 40, (uint32_t)size - 44u);
+    write_u32(code + 44, 0x00050050u); write_u32(code + 48, (uint32_t)count + 2u);
+    for (size_t index = 0; index < count; ++index) write_u32(code + 52u + 4u * index, words[index]);
+    CHECK(dxbc_compute_hash(code, size, code + 4)); fixture->used += size;
+    for (size_t k = 0; k < 2; ++k) for (size_t v = 0; v < 4; ++v) {
+        fixture->variants[k][v].code = code; fixture->variants[k][v].code_size = size;
+    }
+    return true;
+}
+
+static bool typed_fixture(Fixture *fixture) {
+    CHECK(fixture_init(fixture, NULL, 0));
+    CHECK(typed_code(fixture, typed_words, COUNT(typed_words)));
+    const ComputeShaderStringView input = text(fixture, "InputTexels"), output = text(fixture, "OutputTexels");
+    for (size_t k = 0; k < 2; ++k) for (size_t v = 0; v < 4; ++v) {
+        fixture->groups[k][v][0] = fixture->groups[k][v][1] = 4;
+        fixture->textures[k][v] = (ComputeShaderResource){.name = input, .bind_point = 0, .sampler_bind_point = -1, .texture_dimension = 2};
+        fixture->outputs[k][v] = (ComputeShaderResource){.name = output, .bind_point = 0, .sampler_bind_point = -1, .texture_dimension = 2};
+        fixture->variants[k][v].textures = &fixture->textures[k][v]; fixture->variants[k][v].texture_count = 1;
+        fixture->variants[k][v].output_buffers = &fixture->outputs[k][v]; fixture->variants[k][v].output_buffer_count = 1;
+    }
+    return true;
+}
+
+static bool check_typed_candidate(void) {
+    Fixture fixture; CHECK(typed_fixture(&fixture));
+    const ComputeShaderStringView renamed = text(&fixture, "RenamedInput");
+    ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+    ComputeSourceDiagnostic diagnostic;
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(candidate.variant_count == 8 && candidate.resource_count == 2 && candidate.domain_complete);
+    CHECK(candidate.source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    CHECK(candidate.source_quality.counts.resource_declarations == 2);
+    CHECK(candidate.source_quality.counts.sibling_declarations == 2 &&
+          candidate.source_quality.counts.sibling_declaration_witnesses == 16);
+    for (size_t resource = 0; resource < 2; ++resource) {
+        CHECK(candidate.resources[resource].witness_count == 8);
+        for (size_t witness = 0; witness < 8; ++witness) CHECK(candidate.resources[resource].variant_witnesses[witness] == witness);
+    }
+    CHECK(candidate.source_quality.counts.ast_expressions && candidate.source_quality.counts.semantic_projections);
+    CHECK(!candidate.source_quality.counts.residual_total && !candidate.source_quality.counts.unknown_provenance);
+    CHECK(strstr(candidate.source.buf, "Texture2D<uint4> InputTexels;\n"));
+    CHECK(strstr(candidate.source.buf, "RWTexture2D<uint4> OutputTexels;\n"));
+    CHECK(strstr(candidate.source.buf, "InputTexels.Load(int3("));
+    CHECK(strstr(candidate.source.buf, "+ uint4(1u, 2u, 3u, 4u)"));
+    for (size_t row = 0; row < candidate.variant_count; ++row) {
+        CHECK(candidate.variants[row].expression_count == 3);
+        CHECK(candidate.variants[row].memory_effect_count == 2);
+        CHECK(candidate.variants[row].memory_effects[0].opcode == USIL_OP_LD &&
+              candidate.variants[row].memory_effects[1].opcode == USIL_OP_STORE_UAV_TYPED);
+        CHECK(candidate.variants[row].memory_effects[0].instruction_index < candidate.variants[row].memory_effects[1].instruction_index);
+        CHECK(candidate.variants[row].memory_effects[0].source_instruction_index < candidate.variants[row].memory_effects[1].source_instruction_index);
+        CHECK(candidate.variants[row].entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    }
+    ComputeShaderResource saved = fixture.outputs[0][0];
+    fixture.outputs[0][0].texture_dimension = -1;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][0] = saved;
+    fixture.outputs[0][0].bind_point = 1;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED)); fixture.outputs[0][0] = saved;
+    fixture.outputs[0][0].sampler_bind_point = 0;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][0] = saved;
+    fixture.outputs[0][0].generated_name = text(&fixture, "GeneratedDifferentName");
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][0] = saved;
+    fixture.outputs[0][1].name = text(&fixture, "DifferentOutput");
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][1] = saved;
+    fixture.outputs[0][0].name = (ComputeShaderStringView){fixture.bytes + sizeof(fixture.bytes), 1};
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_NAME_UNREPRESENTABLE)); fixture.outputs[0][0] = saved;
+    fixture.outputs[0][0].name = text(&fixture, "dispatchThreadId");
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_NAME_UNREPRESENTABLE)); fixture.outputs[0][0] = saved;
+    fixture.outputs[0][0].name = fixture.global[0][0];
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_NAME_UNREPRESENTABLE)); fixture.outputs[0][0] = saved;
+    fixture.outputs[0][0].name = fixture.textures[0][0].name;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][0] = saved;
+    fixture.variants[0][0].textures = NULL;
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.variants[0][0].textures = &fixture.textures[0][0];
+    /* Mutating modeled names changes the digest while the held span stays
+     * identical; roots and source names remain deeply owned. */
+    ComputeSourceCandidate first, second; compute_source_candidate_init(&first); compute_source_candidate_init(&second);
+    CHECK(compute_source_candidate_build(&fixture.object, &first, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    for (size_t k = 0; k < 2; ++k) for (size_t v = 0; v < 4; ++v) fixture.textures[k][v].name = renamed;
+    CHECK(compute_source_candidate_build(&fixture.object, &second, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(memcmp(first.modeled_input_sha256, second.modeled_input_sha256, 32));
+    CHECK(!memcmp(first.serialized_object_sha256, second.serialized_object_sha256, 32));
+    CHECK(strstr(first.source.buf, "InputTexels.Load") && strstr(second.source.buf, "RenamedInput.Load"));
+    memset(fixture.bytes, 0, sizeof(fixture.bytes));
+    StringBuilder retained; sb_init(&retained); ast_format_expr(first.variants[0].expressions[2], &retained);
+    CHECK(sb_ok(&retained) && strstr(retained.buf, "InputTexels.Load")); sb_free(&retained);
+    compute_source_candidate_dispose(&first); compute_source_candidate_dispose(&second); compute_source_candidate_dispose(&candidate);
+    return true;
+}
+
+static bool check_typed_effect_rejections(void) {
+    Fixture fixture; CHECK(typed_fixture(&fixture));
+    ComputeSourceCandidate candidate; compute_source_candidate_init(&candidate);
+    CHECK(compute_source_candidate_build(&fixture.object, &candidate, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    uint32_t changed[COUNT(typed_words) + 1];
+    memcpy(changed, typed_words, sizeof(typed_words)); changed[8] = 0x5555u; /* Float UAV. */
+    CHECK(typed_code(&fixture, changed, COUNT(typed_words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    memcpy(changed, typed_words, sizeof(typed_words)); changed[41] = 0x001071b6u; /* Reversed Load lanes. */
+    CHECK(typed_code(&fixture, changed, COUNT(typed_words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    memcpy(changed, typed_words, sizeof(typed_words)); changed[54] = 0x0011e032u; /* Partial store. */
+    CHECK(typed_code(&fixture, changed, COUNT(typed_words)));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* The same load cannot be emitted twice in an expression. */
+    memcpy(changed, typed_words, sizeof(typed_words)); changed[43] = INSTRUCTION(30, 7);
+    changed[48] = 0x00100e46u; changed[49] = 1u;
+    memmove(changed + 50, changed + 53, (COUNT(typed_words) - 53) * sizeof(uint32_t));
+    CHECK(typed_code(&fixture, changed, COUNT(typed_words) - 3));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    /* A retained device fence cannot become pure address computation. */
+    memcpy(changed, typed_words, sizeof(typed_words));
+    memmove(changed + 44, changed + 43, (COUNT(typed_words) - 43) * sizeof(uint32_t));
+    changed[43] = INSTRUCTION(190, 1) | (8u << 11u);
+    CHECK(typed_code(&fixture, changed, COUNT(typed_words) + 1));
+    CHECK(expect_failure(&fixture, &candidate, COMPUTE_SOURCE_EMISSION_FAILED));
+    compute_source_candidate_dispose(&candidate); return true;
+}
+
+static bool check_owned_quality_resolver(void) {
+    HLSLSourceQualityFacts facts;
+    hlsl_source_quality_facts_init(&facts);
+    ASTExpr *unknown = ast_create_emitter_operand("opaqueUnknown");
+    CHECK(unknown && !hlsl_source_quality_owned_expression_facts(NULL, 0, unknown, &facts));
+    ast_free_expr(unknown);
+    ASTOperandProvenance provenance;
+    ast_operand_provenance_init(&provenance);
+    provenance.complete = true; provenance.value_role = AST_OPERAND_VALUE_LOGICAL;
+    provenance.logical_value_id = 7; provenance.natural_components = provenance.result_components = 2;
+    provenance.instruction_index = 3; provenance.source_instruction_index = 9;
+    provenance.operand_index = 1; provenance.destination_lanes = 3;
+    ASTExpr *owned = ast_create_emitter_operand_with_provenance("knownLogicalValue", &provenance);
+    CHECK(owned && hlsl_source_quality_owned_expression_facts(NULL, 0, owned, &facts));
+    CHECK(facts.known && facts.value_kind == HLSL_SOURCE_VALUE_LOGICAL && facts.components == 2);
+    CHECK(facts.instruction_index == 3 && facts.source_instruction_index == 9);
+    owned->operand_provenance.complete = false;
+    hlsl_source_quality_facts_init(&facts);
+    CHECK(!hlsl_source_quality_owned_expression_facts(NULL, 0, owned, &facts));
+    ast_free_expr(owned);
+    provenance.value_role = AST_OPERAND_VALUE_UNKNOWN;
+    CHECK(ast_create_emitter_operand_with_provenance("untrusted", &provenance) == NULL);
+    const uint32_t one = 1, two = 2;
+    ASTExpr *left = ast_create_literal_bits(&one, 1, AST_SCALAR_UINT32);
+    ASTExpr *right = ast_create_literal_bits(&two, 1, AST_SCALAR_UINT32);
+    ASTExpr *operation = ast_create_binary(USIL_OP_IADD, left, right);
+    CHECK(operation);
+    const ASTExpr *roots[] = {operation};
+    const HLSLSourceQualityUnit unit = {.source_unit_id = 0, .kind = HLSL_SOURCE_UNIT_ENTRY_POINT,
+        .coverage_complete = true, .expressions = roots, .expression_count = 1};
+    const HLSLSourceQualityRequest request = {.stage = DXBC_PROGRAM_TYPE_COMPUTE,
+        .units = &unit, .unit_count = 1, .expected_unit_count = 1,
+        .expression_facts = hlsl_source_quality_owned_expression_facts};
+    HLSLSourceQualityResult result;
+    CHECK(hlsl_source_quality_analyze(&request, &result));
+    CHECK(result.classification != HLSL_SOURCE_QUALITY_CLEAN && result.counts.unknown_provenance == 1);
+    ast_free_expr(operation);
+    return true;
+}
+
 int main(void) {
-    return check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }

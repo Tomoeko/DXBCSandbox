@@ -457,7 +457,8 @@ bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *c
   const USILProgram *program = ctx->program;
   if (!program->texture_count && !program->sampler_count && !program->uav_count) return true;
   if (ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
-      program->program_type != DXBC_PROGRAM_TYPE_PIXEL || program->uav_count) return false;
+      (program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
+       program->program_type != DXBC_PROGRAM_TYPE_VERTEX) || program->uav_count) return false;
   for (int texture = 0; texture < program->texture_count; ++texture) {
     const USILTexture *resource = &program->textures[texture];
     const char *name = NULL;
@@ -471,7 +472,7 @@ bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *c
     bool used = false;
     for (int instruction = 0; instruction < program->instruction_count; ++instruction) {
       const USILInstruction *owner = &program->instructions[instruction];
-      if (owner->opcode == USIL_OP_SAMPLE && owner->operand_count == 4 &&
+      if (hlsl_texture_sample_opcode(owner->opcode) &&
           owner->operands[2].type == OPERAND_TYPE_RESOURCE &&
           owner->operands[2].register_index == resource->reg_idx) used = true;
     }
@@ -501,7 +502,7 @@ bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *c
     bool used = false;
     for (int instruction = 0; instruction < program->instruction_count; ++instruction) {
       const USILInstruction *owner = &program->instructions[instruction];
-      if (owner->opcode == USIL_OP_SAMPLE && owner->operand_count == 4 &&
+      if (hlsl_texture_sample_opcode(owner->opcode) &&
           owner->operands[3].type == OPERAND_TYPE_SAMPLER &&
           owner->operands[3].register_index == reg) used = true;
     }

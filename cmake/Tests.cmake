@@ -259,8 +259,13 @@ if(BUILD_TESTING)
         tests/test_hlsl_matrix_lift_units.c hlsl_matrix_lift_units)
     dxbc_add_core_test(test_hlsl_global_declarations_units
         tests/test_hlsl_global_declarations_units.c hlsl_global_declarations_units)
+    dxbc_add_core_test(test_hlsl_cbuffer_source_quality_units
+        tests/test_hlsl_cbuffer_source_quality_units.c hlsl_cbuffer_source_quality_units)
     dxbc_add_core_test(test_hlsl_texture_lift_units
         tests/test_hlsl_texture_lift_units.c hlsl_texture_lift_units)
+    dxbc_add_core_test(test_hlsl_geometry_source_units
+        tests/test_hlsl_geometry_source_units.c hlsl_geometry_source_units)
+    target_sources(test_hlsl_geometry_source_units PRIVATE tests/test_geometry_fixture.c)
     dxbc_add_core_test(test_hlsl_resource_quality_units
         tests/test_hlsl_resource_quality_units.c hlsl_resource_quality_units)
     dxbc_add_core_test(test_hlsl_natural_interface_units
@@ -544,7 +549,8 @@ if(BUILD_TESTING)
         add_test(NAME shaderlab_lift_capture_units COMMAND test_shaderlab_lift_capture_units)
 
         add_executable(test_shaderlab_lift_units
-            tests/test_shaderlab_lift_units.c tests/test_shaderlab_fixture.c)
+            tests/test_shaderlab_lift_units.c tests/test_shaderlab_fixture.c
+            tests/test_geometry_fixture.c)
         target_include_directories(test_shaderlab_lift_units PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_compile_definitions(test_shaderlab_lift_units PRIVATE

@@ -462,15 +462,23 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
         status = attempt(&context, &result->baseline, false, false, NULL);
     }
     result->baseline.status = status;
-    if (status != HLSL_LIFT_VERIFIED)
+    if (status != HLSL_LIFT_VERIFIED && status != HLSL_LIFT_EMISSION_REJECTED)
         return status;
-    result->accepted = &result->baseline;
+    const UnityShaderLabLiftArtifact *verified_baseline = NULL;
+    if (status == HLSL_LIFT_VERIFIED) {
+        verified_baseline = &result->baseline;
+        result->accepted = verified_baseline;
+    }
+    /* A typed stage may have a valid source form before the raw emitter does.
+     * In that case the candidate still needs its own complete source map,
+     * pinned authority, preprocessing and exact generated-domain evidence.
+     * Compiler, byte, provenance and authority failures never open this path. */
     if (limits->max_candidates == 0) {
         result->candidate.status = HLSL_LIFT_BUDGET_EXHAUSTED;
     } else {
         result->stats.candidates = 1;
         result->candidate.status =
-            attempt(&context, &result->candidate, true, false, &result->baseline);
+            attempt(&context, &result->candidate, true, false, verified_baseline);
     }
     if (result->candidate.status == HLSL_LIFT_VERIFIED) {
         result->accepted = &result->candidate;

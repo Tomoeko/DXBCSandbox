@@ -43,7 +43,11 @@ bool hlsl_compiler_matrix_vector_chain_matches(const USILProgram *program,
 const char *hlsl_matrix_lift_identifier(const struct HLSLEmitterContext *ctx,
                                        int buffer, int first_row, bool *row_major);
 /* Requires the existing SSA/use-def, projected cbuffer layout and high-level
- * interface plan. Failure leaves out_plan zeroed and owns no AST nodes. */
+ * interface plan. Admits the nested eight-operation graph, one full four-lane
+ * transform, or one three-lane transform projected from complete float4x4
+ * metadata. The latter requires a natural float3 input and constructs zero w;
+ * no missing float3x3 declaration shape is inferred. Failure leaves out_plan
+ * zeroed and owns no AST nodes. */
 bool hlsl_matrix_lift_prepare(struct HLSLEmitterContext *ctx, int start_instruction,
                               HLSLMatrixLiftPlan *out_plan);
 void hlsl_matrix_lift_plan_free(HLSLMatrixLiftPlan *plan);

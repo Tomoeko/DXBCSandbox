@@ -213,4 +213,8 @@ bool dxbc_stage_contract_validate_container(
 
 const char* dxbc_stage_contract_status_name(DXBCStageContractStatus status);
 
+/* Fixed input-array extent for the five D3D11 geometry primitive forms.
+ * Unsupported/reserved primitive values return zero. */
+uint32_t dxbc_geometry_input_vertex_count(DXBCInputPrimitive primitive);
+
 #endif /* DXBC_STAGE_CONTRACT_H */

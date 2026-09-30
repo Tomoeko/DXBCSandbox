@@ -1605,16 +1605,25 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
   }
 
   for (int i = 0; i < program->cbuffer_count; i++) {
-    const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[i];
+    HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[i];
     int reg = layout->reg;
     if (layout->omit_declaration) continue;
+    uint8_t shell_authority = 0;
+    const bool named_inventory =
+        hlsl_source_quality_named_cbuffer_supported(ctx, i, &shell_authority);
 
     bool use_packoffset = !layout->is_unity_builtin &&
                           layout->variable_count > 0 &&
                           !layout->is_globals;
     if (!layout->is_globals) {
+      const size_t begin = sb->len;
       sb_appendf(sb, "cbuffer %s : register(b%d) {\n",
                  layout->declaration_name, reg);
+      if (named_inventory && sb_ok(sb) && sb->len > begin) {
+        if (!hlsl_source_quality_cbuffer_syntax(ctx, i, HLSL_SOURCE_CBUFFER_BEGIN, -1,
+                                              shell_authority)) return;
+        layout->source_quality_begin_emitted = true;
+      }
     }
     if (layout->row_struct_storage) {
       sb_append(sb, "    struct {\n");
@@ -1695,6 +1704,7 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
     for (int k = 0; k < layout->variable_count; k++) {
         const TempVariable *var = &layout->variables[k];
         uint32_t target_byte_offset = var->byte_offset;
+        const size_t field_begin = sb->len;
 
         if (ctx->omit_unity_builtin_declarations && layout->is_globals) {
           const int global_alias =
@@ -1804,6 +1814,11 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
           }
         }
         current_byte_offset = target_byte_offset + var->byte_size;
+        if (named_inventory && sb_ok(sb) && sb->len > field_begin) {
+          if (!hlsl_source_quality_cbuffer_syntax(ctx, i, HLSL_SOURCE_CBUFFER_FIELD, k,
+                                                var->authority)) return;
+          ++layout->source_quality_fields_emitted;
+        }
         if (layout->compact_global_layout) {
           if (var->authority != 4 || !ctx->source_quality_analysis) {
             hlsl_source_quality_emission(ctx, 0, false, -1);
@@ -1874,7 +1889,13 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
       }
 
       if (!layout->is_globals) {
+        const size_t end_begin = sb->len;
         sb_append(sb, "};\n\n");
+        if (named_inventory && sb_ok(sb) && sb->len > end_begin) {
+          if (!hlsl_source_quality_cbuffer_syntax(ctx, i, HLSL_SOURCE_CBUFFER_END, -1,
+                                                shell_authority)) return;
+          layout->source_quality_end_emitted = true;
+        }
       } else {
         sb_append(sb, "\n");
       }

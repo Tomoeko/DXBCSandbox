@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Authored stride-16 analysis control only. Do not dispatch during capture.
+#pragma kernel FillUint4
+#pragma kernel CopyUint4
+#pragma kernel AddUint4
+#pragma only_renderers d3d11
+#pragma multi_compile __ OFFSET_TEXELS
+
+StructuredBuffer<uint4> _Source;
+RWStructuredBuffer<uint4> _Destination;
+
+#if defined(OFFSET_TEXELS)
+    #define GROUP_WIDTH 4
+#else
+    #define GROUP_WIDTH 8
+#endif
+
+[numthreads(GROUP_WIDTH, 1, 1)]
+void FillUint4(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint index = dispatchId.x;
+    #if defined(OFFSET_TEXELS)
+        index += 2u;
+    #endif
+    _Destination[index] = uint4(11u, 22u, 33u, 44u);
+}
+
+[numthreads(GROUP_WIDTH, 1, 1)]
+void CopyUint4(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint index = dispatchId.x;
+    #if defined(OFFSET_TEXELS)
+        index += 2u;
+    #endif
+    _Destination[index] = _Source[index];
+}
+
+[numthreads(GROUP_WIDTH, 1, 1)]
+void AddUint4(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint index = dispatchId.x;
+    #if defined(OFFSET_TEXELS)
+        index += 2u;
+    #endif
+    _Destination[index] = _Source[index] + uint4(1u, 2u, 3u, 4u);
+}

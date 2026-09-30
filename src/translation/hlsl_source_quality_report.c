@@ -38,7 +38,9 @@ bool hlsl_source_quality_append_json(const HLSLSourceQualityResult *result,
         {"sibling_declarations", counts->sibling_declarations},
         {"sibling_declaration_witnesses", counts->sibling_declaration_witnesses},
         {"resource_declarations", counts->resource_declarations},
-        {"residual_total", counts->residual_total}
+        {"residual_total", counts->residual_total},
+        {"cbuffer_declarations", counts->cbuffer_declarations},
+        {"cbuffer_fields", counts->cbuffer_fields}
     };
     for (size_t index = 0; index < sizeof(counters) / sizeof(counters[0]); ++index)
         sb_appendf(output, "%s\"%s\":%zu", index ? "," : "", counters[index].name,

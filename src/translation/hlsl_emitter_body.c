@@ -2395,6 +2395,13 @@ void emit_copy_back_outputs(HLSLEmitterContext* ctx, bool first_line_already_ind
 }
 
 void emit_return_block(HLSLEmitterContext* ctx) {
+  if (ctx->high_level_geometry) {
+    const size_t return_begin = ctx->sb->len;
+    sb_append(ctx->sb, "}\n");
+    hlsl_source_quality_emission(ctx, 0, false, ctx->program->instruction_count - 1);
+    ctx->high_level_return_block_emitted = sb_ok(ctx->sb) && ctx->sb->len > return_begin;
+    return;
+  }
   if (ctx->high_level_interface && !ctx->high_level_direct_return) {
     size_t return_begin = ctx->sb->len;
     sb_appendf(ctx->sb, "    return %s;\n}\n", ctx->high_level_output_variable);

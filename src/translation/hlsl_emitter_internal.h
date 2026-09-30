@@ -104,6 +104,9 @@ typedef struct {
     int use_alloc;
     DXBCCBufferProjection projection;
     DXBCCBufferProjectionStatus projection_status;
+    bool source_quality_begin_emitted;
+    int source_quality_fields_emitted;
+    bool source_quality_end_emitted;
 } HLSLCBufferLayout;
 
 typedef struct {
@@ -261,11 +264,13 @@ typedef struct HLSLEmitterContext {
     int source_quality_instruction;
     bool high_level_direct_return;
     bool high_level_interface;
+    bool high_level_geometry;
     /* Independent coverage of actual natural interface source spans. Names
      * and syntax eligibility are established from signatures before emission;
      * these masks are set only after the corresponding syntax was appended. */
     bool high_level_interface_prepared;
     bool source_quality_interface_required;
+    bool source_quality_cbuffer_required;
     uint32_t high_level_input_parameters_emitted;
     uint32_t high_level_output_fields_emitted;
     uint32_t high_level_output_statements_emitted;
@@ -273,12 +278,21 @@ typedef struct HLSLEmitterContext {
     bool high_level_result_local_emitted;
     bool high_level_entry_signature_emitted;
     bool high_level_return_block_emitted;
+    bool high_level_geometry_input_struct_emitted;
+    uint32_t high_level_geometry_input_fields_emitted;
+    bool high_level_geometry_attribute_emitted;
+    bool high_level_geometry_stream_parameter_emitted;
+    uint64_t high_level_geometry_statements_emitted;
     size_t high_level_statement_expression_begin;
     int high_level_statement_instruction;
     char high_level_input_names[HLSL_SM5_IO_REGISTER_COUNT][96];
     char high_level_output_names[HLSL_SM5_IO_REGISTER_COUNT][96];
     char high_level_output_type[96];
     char high_level_output_variable[96];
+    char high_level_geometry_input_type[96];
+    char high_level_geometry_input_variable[96];
+    char high_level_geometry_stream_variable[96];
+    const char *preferred_input_struct_name;
     const char *preferred_output_struct_name;
     const char *entry_point_name;
     const struct HLSLGlobalDeclarationUnion *global_declarations;
@@ -354,6 +368,10 @@ typedef struct HLSLEmitterContext {
     const char* readable_screen_pos_helper;
 } HLSLEmitterContext;
 
+/* Complete by-value origins only; no program/root inference. */
+bool hlsl_source_quality_owned_expression_facts(
+    void *context, uint32_t unit_id, const ASTExpr *expression,
+    HLSLSourceQualityFacts *facts);
 bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
                                             const ASTExpr *expression, int instruction);
 void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
@@ -377,6 +395,16 @@ void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, in
 bool hlsl_expression_effects_supported(const USILProgram *program,
                                         const USILInstruction *instruction);
 bool hlsl_high_level_struct_interface_supported(const USILProgram *program, HLSLEmitMode mode);
+/* Actual point[1]/stream0 straight-line geometry contract. Effects remain
+ * anchored at their decoded instruction sites and snapshot a persistent typed
+ * output tuple; this is candidate admission, never a compiler certificate. */
+bool hlsl_high_level_geometry_interface_supported(const USILProgram *program,
+                                                  HLSLEmitMode mode);
+bool hlsl_high_level_geometry_effect_supported(const HLSLEmitterContext *ctx,
+                                               int instruction);
+bool hlsl_emit_high_level_geometry_effect(HLSLEmitterContext *ctx, int instruction);
+const DXBCSignatureElement *hlsl_high_level_input_operand_signature(
+    const HLSLEmitterContext *ctx, const DXBCOperand *operand);
 const char *hlsl_high_level_output_name(const HLSLEmitterContext *ctx, int register_index);
 bool hlsl_append_high_level_output(HLSLEmitterContext *ctx, const DXBCOperand *destination);
 const DXBCSignatureElement *hlsl_high_level_input_signature(
@@ -445,6 +473,12 @@ extern const size_t g_builtins_count;
 // Top-level emission phases. Each phase owns one coherent HLSL section.
 void emit_comments_and_icb(HLSLEmitterContext* ctx);
 void emit_cbuffers(HLSLEmitterContext* ctx);
+bool hlsl_source_quality_cbuffer_inventory_supported(const HLSLEmitterContext *ctx);
+bool hlsl_source_quality_cbuffer_inventory_complete(const HLSLEmitterContext *ctx);
+bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
+    int layout_index, uint8_t *shell_authority);
+bool hlsl_source_quality_cbuffer_syntax(HLSLEmitterContext *ctx, int layout_index,
+    HLSLSourceQualityCBufferDeclarationKind kind, int field_index, uint8_t authority);
 void emit_cbuffer_helpers(HLSLEmitterContext* ctx);
 bool build_cbuffer_emission_layouts(HLSLEmitterContext* ctx);
 void free_cbuffer_emission_layouts(HLSLEmitterContext* ctx);
@@ -527,12 +561,15 @@ bool build_cbuffer_register_map(HLSLEmitterContext* ctx);
 bool build_sampler_name_map(HLSLEmitterContext* ctx);
 const USILTexture *hlsl_instruction_texture(const USILProgram *program,
     const USILInstruction *instruction, int resource_operand_index);
+bool hlsl_texture_sample_opcode(USILOpcode opcode);
 bool hlsl_texture_sample_supported(HLSLEmitterContext *ctx, int instruction);
 bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *ctx);
 bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *name);
-/* Always consumes the coordinate expression, including on failure. */
+/* Always consumes all supplied expressions, including on failure. Parameters
+ * are absent for Sample, one for level/bias, and two for gradients. */
 ASTExpr *hlsl_texture_sample_expression(HLSLEmitterContext *ctx, int instruction,
-                                       ASTExpr *coordinates);
+                                       ASTExpr *coordinates, ASTExpr *parameter,
+                                       ASTExpr *second_parameter);
 void free_sampler_name_map(HLSLEmitterContext* ctx);
 void get_sampler_usage(const USILProgram *program, int sampler_reg,
                        bool *uses_regular, bool *uses_comparison);

@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 10U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 12U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 64
 
 typedef enum {
@@ -28,7 +28,8 @@ typedef enum {
     HLSL_EXPRESSION_ORIGIN_CONTROL,
     HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL,
     HLSL_EXPRESSION_ORIGIN_FUNCTION,
-    HLSL_EXPRESSION_ORIGIN_UNITY_UV
+    HLSL_EXPRESSION_ORIGIN_UNITY_UV,
+    HLSL_EXPRESSION_ORIGIN_EFFECT
 } HLSLExpressionOriginKind;
 
 typedef struct {
@@ -54,6 +55,8 @@ typedef struct {
  * the call site and the instruction's operation in a shared helper definition.
  * UNITY_UV maps the call whose external definition belongs to a separately
  * retained compiler-expansion contract, so definition_begin/end stay zero.
+ * EFFECT owns an anchored geometry Append/RestartStrip statement with no
+ * destination lanes; effect instructions can never be marked dead.
  * This is provenance, never an independent correctness certificate. */
 typedef struct HLSLExpressionSourceMap {
     HLSLExpressionOrigin origins[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
@@ -87,7 +90,7 @@ typedef enum HLSLEmitMode {
      * with higher-level Unity/source constructs to improve readability. */
     HLSL_EMIT_MODE_READABLE = 1,
 
-    /* Verification-eligible candidate, never a certificate by itself. v10
+    /* Verification-eligible candidate, never a certificate by itself. v11
      * retains v1's at most 64 SM4/5 vertex/pixel instructions using full
      * float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP. It also
      * admits structured IF/ELSE/ENDIF with scalar input/temp bit conditions,
@@ -109,14 +112,20 @@ typedef enum HLSLEmitMode {
      * float4 domain. Straight-line material reads admit statically bound
      * metadata-proven float scalar/vector fields; arrays, matrices, dynamic
      * reads and unresolved/mixed fields reject. Closed metadata-backed single
-     * or nested float4 matrix graphs may become mul calls only when
+     * or nested float4 matrix graphs, and xyz projections from complete
+     * float4x4 declarations, may become mul calls only when
      * every internal SSA use and instruction/lane owner agrees. Dot products,
      * float unary intrinsics, and absolute/negative source modifiers preserve
-     * their exact source demand and arithmetic domain. Straight-line pixel
+     * their exact source demand and arithmetic domain. Straight-line
      * sampling admits statically bound metadata-backed float4 Texture2D and
-     * ordinary sampler pairs, preserving each Sample at its original site.
+     * ordinary sampler pairs, preserving each call at its original site.
+     * Sample/SampleBias require pixel stages; SampleLevel/SampleGrad admit
+     * vertex/pixel stages with owned explicit level/bias/gradient values.
      * Pixel derivatives likewise retain their sites; coarse/fine forms require SM5.
      * Other resource effects, sampling modes and precision controls reject.
+     * A separate parsed point[1] geometry route admits one typed stream0,
+     * persistent named output fields and anchored Append/RestartStrip effects.
+     * Loops, adjacency, multiple streams and instances remain outside it.
      * Straight-line single-use expressions are nested once; shared values have
      * typed deterministic names. Unsupported input fails instead of silently using
      * presentation recognizers. Reuses compiler inverse operand/MAD spelling;

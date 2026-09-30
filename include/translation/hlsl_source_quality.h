@@ -80,6 +80,13 @@ typedef enum {
     HLSL_SOURCE_RESOURCE_UAV
 } HLSLSourceQualityResourceKind;
 
+typedef enum {
+    HLSL_SOURCE_CBUFFER_NONE = 0,
+    HLSL_SOURCE_CBUFFER_BEGIN,
+    HLSL_SOURCE_CBUFFER_FIELD,
+    HLSL_SOURCE_CBUFFER_END
+} HLSLSourceQualityCBufferDeclarationKind;
+
 typedef struct {
     bool known;
     HLSLSourceQualityValueKind value_kind;
@@ -104,6 +111,16 @@ typedef struct {
     /* Actual typed resource declaration identity, independent of names. */
     HLSLSourceQualityResourceKind resource_declaration_kind;
     uint32_t resource_binding_register;
+    /* Actual named-cbuffer syntax. Field IDs index the retained declaration
+     * inventory; BEGIN/END use UINT32_MAX. The byte range comes from current
+     * or common serialized metadata, never from an identifier spelling.
+     * Authority is 1 for current-stage parameters, 2 for common parameters. */
+    HLSLSourceQualityCBufferDeclarationKind cbuffer_declaration_kind;
+    uint32_t cbuffer_binding_register;
+    uint32_t cbuffer_field_index;
+    uint32_t cbuffer_byte_offset;
+    uint32_t cbuffer_byte_size;
+    uint8_t cbuffer_declaration_authority;
 } HLSLSourceQualityFacts;
 
 void hlsl_source_quality_facts_init(HLSLSourceQualityFacts *facts);
@@ -215,6 +232,8 @@ typedef struct {
     size_t sibling_declaration_witnesses;
     size_t resource_declarations;
     size_t residual_total;
+    size_t cbuffer_declarations;
+    size_t cbuffer_fields;
 } HLSLSourceQualityCounters;
 
 typedef struct HLSLSourceQualityResult {

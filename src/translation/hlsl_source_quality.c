@@ -43,6 +43,8 @@ void hlsl_source_quality_facts_init(HLSLSourceQualityFacts *facts) {
     facts->declaration_field_index = UINT32_MAX;
     facts->declaration_witness_subprogram_index = UINT32_MAX;
     facts->resource_binding_register = UINT32_MAX;
+    facts->cbuffer_binding_register = UINT32_MAX;
+    facts->cbuffer_field_index = UINT32_MAX;
 }
 
 const char *hlsl_source_quality_class_name(HLSLSourceQualityClass classification) {
@@ -93,6 +95,28 @@ static bool facts_valid(const HLSLSourceQualityFacts *facts) {
          (facts->instruction_index != -1 || facts->logical_operation ||
           facts->resource_binding_register == UINT32_MAX)))
         return false;
+    if (facts->cbuffer_declaration_kind < HLSL_SOURCE_CBUFFER_NONE ||
+        facts->cbuffer_declaration_kind > HLSL_SOURCE_CBUFFER_END)
+        return false;
+    if (facts->cbuffer_declaration_kind != HLSL_SOURCE_CBUFFER_NONE) {
+        if (!facts->known || facts->instruction_index != -1 || facts->logical_operation ||
+            facts->artifacts || facts->resource_declaration_kind != HLSL_SOURCE_RESOURCE_NONE ||
+            facts->cbuffer_binding_register >= 15 || !facts->cbuffer_byte_size ||
+            facts->cbuffer_byte_size > 65536u || facts->cbuffer_byte_offset > 65536u ||
+            facts->cbuffer_byte_offset > UINT32_MAX - facts->cbuffer_byte_size ||
+            facts->cbuffer_byte_offset + facts->cbuffer_byte_size > 65536u ||
+            (facts->cbuffer_declaration_authority != 1 &&
+             facts->cbuffer_declaration_authority != 2))
+            return false;
+        if (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD) {
+            if (facts->cbuffer_field_index != facts->cbuffer_byte_offset / 16u ||
+                facts->cbuffer_byte_size > 16 ||
+                (facts->cbuffer_byte_size & 3u) || (facts->cbuffer_byte_offset & 15u))
+                return false;
+        } else if (facts->cbuffer_field_index != UINT32_MAX || facts->cbuffer_byte_offset ||
+                   (facts->cbuffer_byte_size & 15u))
+            return false;
+    }
     if (facts->instruction_index == -1 &&
         (facts->source_instruction_index != UINT32_MAX || facts->lanes))
         return false;
@@ -173,6 +197,10 @@ static bool observe(QualityAnalysis *analysis, HLSLSourceQualityObservationKind 
     }
     if (facts.resource_declaration_kind != HLSL_SOURCE_RESOURCE_NONE)
         ++counts->resource_declarations;
+    if (facts.cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_BEGIN)
+        ++counts->cbuffer_declarations;
+    if (facts.cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD)
+        ++counts->cbuffer_fields;
     HLSLSourceQualityObservation observation = {
         .stage = analysis->request->stage,
         .pass_index = analysis->request->pass_index,

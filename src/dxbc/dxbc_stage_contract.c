@@ -39,6 +39,18 @@ enum {
 
 #define NO_INSTRUCTION UINT32_MAX
 
+uint32_t dxbc_geometry_input_vertex_count(DXBCInputPrimitive primitive) {
+    switch (primitive) {
+        case DXBC_INPUT_PRIMITIVE_POINT: return 1u;
+        case DXBC_INPUT_PRIMITIVE_LINE: return 2u;
+        case DXBC_INPUT_PRIMITIVE_TRIANGLE: return 3u;
+        case DXBC_INPUT_PRIMITIVE_LINE_ADJACENCY: return 4u;
+        case DXBC_INPUT_PRIMITIVE_TRIANGLE_ADJACENCY: return 6u;
+        default: return 0u;
+    }
+}
+
+
 static bool instruction_token(const DXBCDocumentInstruction* instruction,
                               size_t index, uint32_t* out_token,
                               DXBCStageContractDiagnostic* diagnostic);

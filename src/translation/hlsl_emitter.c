@@ -994,6 +994,7 @@ static bool validate_geometry_program_for_hlsl(const USILProgram *program) {
 }
 
 static bool validate_program_for_hlsl(const USILProgram *program,
+                                      HLSLEmitMode mode,
                                       HLSLEmitDiagnostic *diagnostic) {
   if (!program || !has_terminated_text(program->shader_type_model,
                                        sizeof(program->shader_type_model)) ||
@@ -1066,7 +1067,8 @@ static bool validate_program_for_hlsl(const USILProgram *program,
         0, -1, -1);
     return false;
   }
-  if (!validate_geometry_program_for_hlsl(program)) {
+  if (!hlsl_high_level_geometry_interface_supported(program, mode) &&
+      !validate_geometry_program_for_hlsl(program)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                           HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
                           HLSL_EMIT_REASON_UNSUPPORTED_STAGE);
@@ -1399,11 +1401,12 @@ static unsigned source_quality_width(const DXBCOperand *destination) {
   return count;
 }
 
-static bool emitter_source_quality_expression_facts(
+bool hlsl_source_quality_owned_expression_facts(
     void *context, uint32_t unit_id, const ASTExpr *expression,
     HLSLSourceQualityFacts *facts) {
-  HLSLEmitterContext *ctx = context;
+  (void)context;
   (void)unit_id;
+  if (!expression || !facts) return false;
   if (expression->kind == AST_EXPR_EMITTER_OPERAND) {
     const ASTOperandProvenance *origin = &expression->operand_provenance;
     if (!origin->complete || origin->value_role == AST_OPERAND_VALUE_UNKNOWN) return false;
@@ -1448,6 +1451,16 @@ static bool emitter_source_quality_expression_facts(
       facts->artifacts = HLSL_SOURCE_ARTIFACT_STORAGE_BITCAST;
     return true;
   }
+  return false;
+}
+
+static bool emitter_source_quality_expression_facts(
+    void *context, uint32_t unit_id, const ASTExpr *expression,
+    HLSLSourceQualityFacts *facts) {
+  HLSLEmitterContext *ctx = context;
+  (void)unit_id;
+  if (hlsl_source_quality_owned_expression_facts(NULL, unit_id, expression, facts))
+    return true;
   if (expression->kind == AST_EXPR_SWIZZLE) {
     facts->known = true;
     facts->artifacts = HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT;
@@ -1534,7 +1547,7 @@ static bool source_quality_inventory_complete(const HLSLEmitterContext *ctx) {
       !hlsl_source_quality_interface_inventory_supported(ctx) ||
       !ctx->high_level_functions_prepared ||
       (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
-       program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
+       program->program_type != DXBC_PROGRAM_TYPE_PIXEL && !ctx->high_level_geometry) ||
       ctx->unity_uv_helper ||
       ctx->readable_screen_pos_helper || ctx->compiler_model.replacement_count ||
       ctx->use_uint_temps ||
@@ -1542,24 +1555,18 @@ static bool source_quality_inventory_complete(const HLSLEmitterContext *ctx) {
       !hlsl_source_quality_resource_inventory_complete(ctx) || program->uav_count ||
       program->icb_value_count || program->indexable_temp_count ||
       program->index_range_count || program->patch_constant_count ||
-      !ctx->cbuffer_layouts_built ||
-      ctx->cbuffer_layout_count != program->cbuffer_count)
+      !hlsl_source_quality_cbuffer_inventory_supported(ctx))
     return false;
   for (int group = 0; group < 2; ++group)
     if (ctx->float4_functions.use_count[group] >= 2)
       return false;
-  for (int buffer = 0; buffer < ctx->cbuffer_layout_count; ++buffer) {
-    const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[buffer];
-    if (!layout->compact_global_layout || layout->omit_declaration ||
-        layout->raw_storage || layout->row_struct_storage || layout->is_unity_builtin)
-      return false;
-  }
   return true;
 }
 
 bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete) {
   if (!ctx->source_quality_analysis) return true;
   ctx->source_quality_interface_required = complete && ctx->high_level_interface;
+  ctx->source_quality_cbuffer_required = complete && ctx->program->cbuffer_count > 0;
   if (hlsl_source_quality_analysis_begin_unit(ctx->source_quality_analysis, 0,
                                              HLSL_SOURCE_UNIT_ENTRY_POINT, complete))
     return true;
@@ -1617,8 +1624,11 @@ void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
   if (ctx->source_quality_analysis) {
     HLSLEmitStatus status = ctx->diagnostic ? ctx->diagnostic->status : HLSL_EMIT_STATUS_OK;
     if (status == HLSL_EMIT_STATUS_OK && !sb_ok(ctx->sb)) status = HLSL_EMIT_STATUS_OUTPUT_FAILED;
-    if (status == HLSL_EMIT_STATUS_OK && ctx->source_quality_interface_required &&
-        !hlsl_source_quality_interface_inventory_complete(ctx) &&
+    if (status == HLSL_EMIT_STATUS_OK &&
+        ((ctx->source_quality_interface_required &&
+          !hlsl_source_quality_interface_inventory_complete(ctx)) ||
+         (ctx->source_quality_cbuffer_required &&
+          !hlsl_source_quality_cbuffer_inventory_complete(ctx))) &&
         !hlsl_source_quality_analysis_mark_incomplete_unit(ctx->source_quality_analysis)) {
       hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                      HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
@@ -1837,12 +1847,11 @@ static bool hlsl_emit_with_options_impl(
   if (program->program_type == DXBC_PROGRAM_TYPE_COMPUTE) {
     return hlsl_emit_compute_stage(program, sb, names, options, diagnostic);
   }
-  if (!validate_program_for_hlsl(program, diagnostic)) {
+  HLSLEmitMode emit_mode = options ? options->mode : HLSL_EMIT_MODE_RECOMPILE;
+  if (!validate_program_for_hlsl(program, emit_mode, diagnostic)) {
     sb->failed = true;
     return false;
   }
-  HLSLEmitMode emit_mode = options ? options->mode
-                                   : HLSL_EMIT_MODE_RECOMPILE;
   if ((emit_mode != HLSL_EMIT_MODE_RECOMPILE &&
        emit_mode != HLSL_EMIT_MODE_READABLE &&
        emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) ||
@@ -1857,7 +1866,8 @@ static bool hlsl_emit_with_options_impl(
   if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
       (program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT || !program->has_stage_contract ||
        (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
-        program->program_type != DXBC_PROGRAM_TYPE_PIXEL))) {
+        program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
+        !hlsl_high_level_geometry_interface_supported(program, emit_mode)))) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_UNSUPPORTED,
                           HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
                           HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
@@ -1923,10 +1933,13 @@ static bool hlsl_emit_with_options_impl(
   ctx.indent = 4;
   ctx.high_level_direct_return = high_level_direct_return_supported(program, emit_mode) &&
       !(options && options->unity_uv_helper);
+  ctx.high_level_geometry = hlsl_high_level_geometry_interface_supported(program, emit_mode);
   ctx.high_level_interface = ctx.high_level_direct_return ||
+      ctx.high_level_geometry ||
       (hlsl_high_level_struct_interface_supported(program, emit_mode) &&
        !(options && options->unity_uv_helper));
   ctx.preferred_output_struct_name = output_struct;
+  ctx.preferred_input_struct_name = input_struct;
   ctx.entry_point_name = entry_point;
   ctx.global_declarations = options ? options->global_declarations : NULL;
   if (!hlsl_source_quality_initialize(&ctx, options)) {

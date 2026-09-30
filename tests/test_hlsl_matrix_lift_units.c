@@ -362,8 +362,115 @@ static bool check_single_matrix_negatives(void) {
     return true;
 }
 
+static void initialize_projection(MatrixFixture *fixture) {
+    initialize_single(fixture);
+    memcpy(fixture->input.semantic_name, "NORMAL", sizeof("NORMAL"));
+    fixture->input.mask = fixture->input.rw_mask = 7;
+    fixture->output.mask = 7;
+    for (int index = 0; index < 3; ++index) {
+        USILInstruction *instruction = &fixture->instructions[index];
+        instruction->operands[0].destination_mask = 0x70;
+        if (index == 2) instruction->operands[0].type = OPERAND_TYPE_OUTPUT;
+        const int matrix_operand = index ? 1 : 2;
+        instruction->operands[matrix_operand].swizzle[3] = 0;
+        if (index) instruction->operands[3].swizzle[3] = 0;
+    }
+    fixture->instructions[3] = (USILInstruction){.opcode = USIL_OP_RET,
+        .source_instruction_index = 103};
+    fixture->program.instruction_count = 4;
+}
+
+static bool check_projection_graph(void) {
+    MatrixFixture fixture;
+    initialize_projection(&fixture);
+    CHECK(analyze(&fixture));
+    HLSLMatrixLiftPlan plan;
+    CHECK(hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
+    CHECK(plan.end_instruction == 2 && plan.instruction_owners == UINT64_C(7));
+    CHECK(plan.result_components == 3 && plan.claimed_instruction_count == 3);
+    CHECK(!plan.world_expression && plan.expression->kind == AST_EXPR_SWIZZLE);
+    CHECK(plan.expression->logical_origin.complete &&
+          plan.expression->logical_origin.semantic_projection &&
+          plan.expression->logical_origin.components == 3 &&
+          plan.expression->logical_origin.destination_lanes == 7 &&
+          plan.expression->logical_origin.instruction_index == 2 &&
+          plan.expression->logical_origin.source_instruction_index == 102);
+    CHECK(plan.expression->u.swizzle.sub->logical_origin.complete &&
+          plan.expression->u.swizzle.sub->logical_origin.components == 4 &&
+          plan.expression->u.swizzle.sub->logical_origin.destination_lanes == 7);
+    CHECK(fixture.context.current_instruction_index == -1);
+    StringBuilder source;
+    sb_init(&source); ast_format_expr(plan.expression, &source);
+    CHECK(sb_ok(&source) && strstr(source.buf, "mul((ObjectTransform), float4((normal), 0.0f)).xyz"));
+    CHECK(!strstr(source.buf, "float3x3") && !strstr(source.buf, "get_cb") && !strstr(source.buf, "r0"));
+    sb_free(&source); hlsl_matrix_lift_plan_free(&plan);
+    fixture.matrices[0].row_major = true;
+    CHECK(hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
+    sb_init(&source); ast_format_expr(plan.expression, &source);
+    CHECK(sb_ok(&source) && strstr(source.buf, "mul(float4((normal), 0.0f), (ObjectTransform)).xyz"));
+    sb_free(&source); hlsl_matrix_lift_plan_free(&plan); release(&fixture);
+    return true;
+}
+
+static bool check_projection_negatives(void) {
+    for (int mutation = 0; mutation < 26; ++mutation) {
+        MatrixFixture fixture;
+        initialize_projection(&fixture);
+        CHECK(analyze(&fixture));
+        if (mutation == 0) fixture.instructions[1].precise_mask = 1;
+        if (mutation == 1) fixture.instructions[2].saturate = true;
+        if (mutation == 2) fixture.instructions[0].operands[1].has_abs = true;
+        if (mutation == 3) fixture.instructions[2].operands[1].has_neg = true;
+        if (mutation == 4) fixture.instructions[2].operands[2].min_precision = 1;
+        if (mutation == 5) fixture.instructions[2].operands[3].swizzle[0] = 1;
+        if (mutation == 6) fixture.instructions[2].operands[1].index_values[1] = 7;
+        if (mutation == 7) fixture.instructions[2].operands[0].destination_mask = 0x30;
+        if (mutation == 8) fixture.instructions[2].operands[1].extended_token_count = 1;
+        if (mutation == 9) fixture.instructions[0].operands[0].register_index = 1;
+        if (mutation == 10) fixture.instructions[0].operands[1].type = OPERAND_TYPE_TEMP;
+        if (mutation == 11) fixture.instructions[0].opcode = USIL_OP_ADD;
+        if (mutation == 12) fixture.matrices[0].matrix_array_size = 2;
+        if (mutation == 13) fixture.matrices[0].rows = 3;
+        if (mutation == 14) fixture.matrices[0].dim = 3;
+        if (mutation == 15) fixture.matrices[0].authority = 3;
+        if (mutation == 16) fixture.context.high_level_interface = false;
+        if (mutation == 17) ++fixture.context.use_def.definition_use_counts[0];
+        if (mutation == 18) fixture.instructions[1].operands[1].rel_offset0 = 7;
+        if (mutation == 19) fixture.context.cbuffer_layouts[0].raw_storage = true;
+        if (mutation == 20) fixture.instructions[1].resource_stride = 16;
+        if (mutation == 21) fixture.instructions[2].texel_offsets[0] = 1;
+        if (mutation == 22) fixture.instructions[0].geometry_stream_explicit = true;
+        if (mutation == 23) fixture.instructions[1].operands[1].swizzle[3] = 3;
+        if (mutation == 24) fixture.input.mask = 15;
+        if (mutation == 25) fixture.matrices[0].byte_size = 48;
+        HLSLMatrixLiftPlan plan;
+        memset(&plan, 0xff, sizeof(plan));
+        CHECK(!hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
+        CHECK(!plan.expression && !plan.world_expression && !plan.instruction_owners &&
+              !plan.result_components && !plan.claimed_instruction_count);
+        release(&fixture);
+    }
+    MatrixFixture fixture;
+    initialize_projection(&fixture);
+    fixture.instructions[3] = (USILInstruction){.opcode = USIL_OP_MOV, .operand_count = 2,
+        .source_instruction_index = 103};
+    fixture.instructions[3].operands[0] = destination(OPERAND_TYPE_TEMP, 1);
+    fixture.instructions[3].operands[0].destination_mask = 0x70;
+    fixture.instructions[3].operands[1] = register_operand(OPERAND_TYPE_TEMP, 0);
+    fixture.instructions[3].operands[1].swizzle[3] = 0;
+    fixture.instructions[4] = (USILInstruction){.opcode = USIL_OP_RET,
+        .source_instruction_index = 104};
+    fixture.program.instruction_count = 5;
+    CHECK(analyze(&fixture));
+    HLSLMatrixLiftPlan plan;
+    CHECK(!hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
+    release(&fixture);
+    return true;
+}
+
 int main(void) {
     return check_graph_and_metadata() && check_fail_closed_mutations() &&
            check_dataflow_ownership() && check_invalid_metadata_context() &&
-           check_single_matrix_graph() && check_single_matrix_negatives() ? 0 : 1;
+           check_single_matrix_graph() && check_single_matrix_negatives() &&
+           check_projection_graph() && check_projection_negatives() ? 0 : 1;
 }

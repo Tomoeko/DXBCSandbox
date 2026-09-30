@@ -101,6 +101,15 @@ and warm cache checks, toolchain drift, cancellation, budget and malformed-input
 tests. Source readability and byte-match coverage are reported independently.
 No stage/backend is admitted by changing a label or dropping an unavailable plane.
 
+A high-level candidate may establish independent generated-domain compiler
+evidence when ordinary source emission is unsupported. It still requires a
+complete instruction source map, pinned compiler/include/profile authority,
+valid preprocessing identity, complete pass/state/tier coverage, exact full
+containers and the existing reflected-binding checks. The raw emission failure
+remains in the report and never becomes a fallback. Compiler, byte, provenance,
+authority, cancellation and budget failures in the ordinary baseline stop this
+independent path. Acceptance does not enlarge the logical or native scope.
+
 The high-level source-quality ledger is independent of these certificates. Its
 stage-entry observations retain AST/provenance residuals, missing source units,
 and complete emission coverage. The extraction lift report renders these facts

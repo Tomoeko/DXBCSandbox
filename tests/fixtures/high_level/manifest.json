@@ -670,6 +670,307 @@
       "clean_reconstruction_status": "pending",
       "exact_recompilation_status": "pending",
       "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "sampling_modes.shader",
+      "source_sha256": "012ea7d451fff16c3550b2a3562cde4306e12ac19dfdee576c56c1857f98aedf",
+      "family": "sampling-modes",
+      "role": "typed-explicit-level-bias-gradient-positive-and-offset-precision-controls",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "SAMPLING_CHANGED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "SAMPLING_OFFSET",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "SAMPLING_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "sampling_modes_renamed.shader",
+      "source_sha256": "c2809c4fbfa153f424e74c63664c32a8a0e8057bd8d6d871de55a9bbd6a57a2a",
+      "family": "sampling-modes",
+      "role": "metadata-renamed-and-reordered-sampling-layout",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "SAMPLING_CHANGED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "SAMPLING_OFFSET",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "SAMPLING_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "geometry_straight_line.shader",
+      "source_sha256": "e63829abbb5b2884f5b7a37b215f0bc310900955541d981e0af7ea33e2051be5",
+      "family": "geometry",
+      "role": "point-input-one-stream-three-full-output-appends-and-strip-cut",
+      "stages": [
+        "vertex",
+        "geometry",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "GS_REVERSE_ORDER",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "typed_texture_uint4.compute",
+      "source_sha256": "c45d00d4e7c6dc9e5dfc3038d46de46bb6ad1c978958ddefc50059d62f85595e",
+      "family": "compute-typed-memory",
+      "role": "typed-uint4-texture-load-store-and-lane-add",
+      "stages": [
+        "compute"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OFFSET_TEXELS",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "typed_texture_float4.compute",
+      "source_sha256": "83aab190e34288c23ef59c490cbd0035b5b506c002f2181458a2a07db9e66fa9",
+      "family": "compute-typed-memory",
+      "role": "float4-format-control-outside-unsigned-source-boundary",
+      "stages": [
+        "compute"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OFFSET_TEXELS",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "structured_uint4.compute",
+      "source_sha256": "e07be411b6fd7bd5daa6df2910fd8956b2b4c4d979b0717553207670ee17cc3a",
+      "family": "compute-structured-memory",
+      "role": "uint4-stride16-structured-control",
+      "stages": [
+        "compute"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OFFSET_TEXELS",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "matrix_projections_reordered.shader",
+      "source_sha256": "a0efa16dea130457bae8b79d55435b54dbad0b6f76e1fc16e17ee47b9b5f98e4",
+      "family": "matrix-transform",
+      "role": "renamed-reordered-matrix-and-signature-three-projection-controls",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "MATRIX_VECTOR_FIRST",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ROW_MAJOR",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ARRAY",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_EXTERNAL_USE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "sampling_vertex_grad.shader",
+      "source_sha256": "34c860b99654960f3ef9d210a85e6d43aa8ce5e1f6d58176ec47c660357f67fa",
+      "family": "sampling-modes",
+      "role": "vertex-explicit-gradients-with-offset-and-precision-controls",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "SAMPLING_CHANGED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "SAMPLING_OFFSET",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "SAMPLING_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "geometry_arrays.shader",
+      "source_sha256": "1574ca8de44d90ffa5e182097a91acb02547799f0abf7307418e785e4263bcb3",
+      "family": "geometry",
+      "role": "static-primitive-arrays-and-output-order",
+      "stages": [
+        "vertex",
+        "fragment",
+        "geometry"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "GS_ARRAY_REVERSE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "captured_domain": {
+        "subshaders": 1,
+        "passes": 4,
+        "keyword_states": 2,
+        "graphics_stage_rows": 24
+      },
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "sampling_complete.shader",
+      "source_sha256": "27659bcad8738e7ca31a81cf05bc0397e37d4c316711c5864d8bea41f1050551",
+      "family": "sampling-modes",
+      "role": "complete-positive-level-bias-gradient-domain",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "SAMPLING_CHANGED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "captured_domain": {
+        "subshaders": 1,
+        "passes": 5,
+        "keyword_states": 2,
+        "graphics_stage_rows": 20
+      },
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
     }
   ]
 }

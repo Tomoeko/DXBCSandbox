@@ -79,12 +79,175 @@ static bool natural_signature_registers(const DXBCSignatureElement *signature, i
   return true;
 }
 
+/* Static vertex indices retain distinct value identity and are checked against
+ * the independently decoded input primitive/array extent. Dynamic indexing
+ * and primitive/system-value operands remain outside this route. */
+static const DXBCSignatureElement *geometry_input_signature(
+    const USILProgram *program, const DXBCOperand *operand) {
+  if (!program || !operand || operand->type != OPERAND_TYPE_INPUT ||
+      operand->register_index_dim != 2 || operand->register_index < 0 ||
+      (uint32_t)operand->register_index >= program->geometry.input_vertex_count ||
+      !operand->index_has_immediate[0] || !operand->index_has_immediate[1] ||
+      operand->index_representations[0] || operand->index_representations[1] ||
+      operand->index_value_exceeds_int[0] || operand->index_value_exceeds_int[1] ||
+      operand->index_values[0] != (uint32_t)operand->register_index ||
+      operand->index_values[0] >= program->geometry.input_vertex_count ||
+      operand->index_values[1] >= HLSL_SM5_IO_REGISTER_COUNT ||
+      operand->rel_offset0 != (int)operand->index_values[1] ||
+      operand->rel_op0 || operand->rel_op1 || operand->rel_op2) return NULL;
+  const DXBCSignatureElement *match = NULL;
+  for (int input = 0; input < program->input_count; ++input) {
+    const DXBCSignatureElement *element = &program->inputs[input];
+    if (element->register_id != operand->index_values[1]) continue;
+    if (match) return NULL;
+    match = element;
+  }
+  return match;
+}
+
+static bool geometry_effect_supported(const USILProgram *program,
+                                      const USILInstruction *instruction) {
+  USILGeometryEffectKind kind;
+  if (instruction->opcode == USIL_OP_GEOMETRY_APPEND)
+    kind = USIL_GEOMETRY_EFFECT_APPEND;
+  else if (instruction->opcode == USIL_OP_GEOMETRY_RESTART_STRIP)
+    kind = USIL_GEOMETRY_EFFECT_RESTART_STRIP;
+  else return false;
+  USILEffectFlags effects;
+  if (!usil_instruction_effects(program, instruction, &effects) ||
+      effects != USIL_EFFECT_GEOMETRY_OUTPUT || instruction->geometry_effect != kind ||
+      instruction->geometry_stream_id != 0 || instruction->saturate || instruction->precise_mask ||
+      instruction->geometry_stream_explicit != (program->geometry.declared_stream_mask == 1u))
+    return false;
+  if (!instruction->geometry_stream_explicit) return instruction->operand_count == 0;
+  if (instruction->operand_count != 1) return false;
+  const DXBCOperand *stream = &instruction->operands[0];
+  return stream->type == OPERAND_TYPE_STREAM && hlsl_lift_operand_is_plain(stream) &&
+      stream->register_index_dim == 1 && stream->register_index == 0 &&
+      stream->index_has_immediate[0] && stream->index_representations[0] == 0 &&
+      !stream->index_value_exceeds_int[0] && stream->index_values[0] == 0;
+}
+
+bool hlsl_high_level_geometry_interface_supported(const USILProgram *program, HLSLEmitMode mode) {
+  if (!program || mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
+      !program->has_stage_contract || !program->has_parsed_signature_authority ||
+      program->program_type != DXBC_PROGRAM_TYPE_GEOMETRY ||
+      !program->geometry.valid || !program->geometry.output_tuple_state_persists ||
+      !dxbc_geometry_input_vertex_count(program->geometry.input_primitive) ||
+      program->geometry.input_vertex_count !=
+          dxbc_geometry_input_vertex_count(program->geometry.input_primitive) ||
+      program->geometry.has_instance_count ||
+      program->geometry.instance_count != 1 || program->geometry.referenced_stream_mask != 1 ||
+      program->geometry.declared_stream_mask > 1 || !program->geometry.max_output_vertex_count ||
+      program->geometry.max_output_vertex_count > 1024 ||
+      (program->geometry.output_topology != DXBC_OUTPUT_TOPOLOGY_POINT_LIST &&
+       program->geometry.output_topology != DXBC_OUTPUT_TOPOLOGY_LINE_STRIP &&
+       program->geometry.output_topology != DXBC_OUTPUT_TOPOLOGY_TRIANGLE_STRIP) ||
+      program->input_count < 1 || program->output_count < 1 ||
+      program->instruction_count < 2 ||
+      program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+      program->instruction_alloc < program->instruction_count || !program->instructions ||
+      program->texture_count || program->sampler_count || program->uav_count ||
+      program->icb_value_count || program->indexable_temp_count || program->index_range_count ||
+      program->patch_constant_count || !usil_signature_authority_is_valid(program)) return false;
+  if (!memchr(program->shader_type_model, '\0', sizeof(program->shader_type_model)) ||
+      (program->shader_model_major != 4 && program->shader_model_major != 5) ||
+      (program->shader_model_major == 4 && program->shader_model_minor > 1) ||
+      (program->shader_model_major == 5 && program->shader_model_minor) ||
+      program->compute.valid || program->tessellation.valid) return false;
+  char model[32];
+  snprintf(model, sizeof(model), "gs_%u_%u", program->shader_model_major, program->shader_model_minor);
+  if (strcmp(program->shader_type_model, model) != 0) return false;
+  uint32_t inputs, outputs;
+  if (!natural_signature_registers(program->inputs, program->input_count, &inputs) ||
+      !natural_signature_registers(program->outputs, program->output_count, &outputs)) return false;
+  for (int input = 0; input < program->input_count; ++input)
+    if (program->inputs[input].stream_index) return false;
+  for (int output = 0; output < program->output_count; ++output)
+    if (program->outputs[output].stream_index) return false;
+  for (int declaration = 0; declaration < program->signature_declaration_count; ++declaration) {
+    DXBCOperandType type = program->signature_declarations[declaration].operand_type;
+    if (type != OPERAND_TYPE_INPUT && type != OPERAND_TYPE_OUTPUT) return false;
+  }
+  uint32_t initialized_outputs = 0;
+  size_t effects = 0;
+  uint32_t appends = 0;
+  for (int index = 0; index < program->instruction_count; ++index) {
+    const USILInstruction *instruction = &program->instructions[index];
+    if (instruction->saturate || instruction->precise_mask ||
+        !usil_instruction_shape_valid(program, instruction)) return false;
+    if (geometry_effect_supported(program, instruction)) {
+      ++effects;
+      if (instruction->opcode == USIL_OP_GEOMETRY_APPEND) {
+        if (initialized_outputs != outputs) return false;
+        ++appends;
+      }
+      continue;
+    }
+    if (instruction->geometry_effect != USIL_GEOMETRY_EFFECT_NONE) return false;
+    if (instruction->opcode == USIL_OP_RET) {
+      if (index + 1 != program->instruction_count) return false;
+      continue;
+    }
+    if (instruction->opcode == USIL_OP_NOP) continue;
+    if (instruction->opcode != USIL_OP_MOV && instruction->opcode != USIL_OP_ADD &&
+        instruction->opcode != USIL_OP_MUL && instruction->opcode != USIL_OP_MAD &&
+        instruction->opcode != USIL_OP_DIV && instruction->opcode != USIL_OP_MIN &&
+        instruction->opcode != USIL_OP_MAX) return false;
+    if (!hlsl_expression_effects_supported(program, instruction)) return false;
+    for (int operand = 0; operand < instruction->operand_count; ++operand) {
+      const DXBCOperand *value = &instruction->operands[operand];
+      USILOperandUseInfo use;
+      if (!usil_instruction_operand_use(program, instruction, operand, &use)) return false;
+      if (value->type == OPERAND_TYPE_INPUT && !geometry_input_signature(program, value))
+        return false;
+      if (value->type != OPERAND_TYPE_OUTPUT) continue;
+      if (use.use != USIL_OPERAND_USE_DESTINATION || !hlsl_lift_operand_is_plain(value)) return false;
+      const DXBCSignatureElement *field = NULL;
+      for (int output = 0; output < program->output_count; ++output)
+        if (program->outputs[output].register_id == (uint32_t)value->register_index)
+          field = &program->outputs[output];
+      if (!field || usil_operand_destination_lane_mask(value) != field->mask) return false;
+      initialized_outputs |= UINT32_C(1) << field->register_id;
+    }
+  }
+  /* Append and Cut retain the output tuple. Only an actual field write changes
+   * it; in particular, neither effect clears initialized_outputs above. */
+  return appends > 0 && appends <= program->geometry.max_output_vertex_count &&
+      effects == program->geometry.effect_count &&
+      program->instructions[program->instruction_count - 1].opcode == USIL_OP_RET;
+}
+
+bool hlsl_high_level_geometry_effect_supported(const HLSLEmitterContext *ctx, int instruction) {
+  return ctx && ctx->high_level_geometry && ctx->program && instruction >= 0 &&
+      instruction < ctx->program->instruction_count &&
+      geometry_effect_supported(ctx->program, &ctx->program->instructions[instruction]);
+}
+
+bool hlsl_emit_high_level_geometry_effect(HLSLEmitterContext *ctx, int instruction) {
+  if (!hlsl_high_level_geometry_effect_supported(ctx, instruction) ||
+      !ctx->high_level_interface_prepared || !ctx->high_level_geometry_stream_variable[0] ||
+      !ctx->high_level_output_variable[0]) return false;
+  const USILInstruction *owner = &ctx->program->instructions[instruction];
+  const size_t begin = ctx->sb->len;
+  sb_append_spaces(ctx->sb, ctx->indent);
+  if (owner->opcode == USIL_OP_GEOMETRY_APPEND)
+    sb_appendf(ctx->sb, "%s.Append(%s);\n", ctx->high_level_geometry_stream_variable,
+               ctx->high_level_output_variable);
+  else sb_appendf(ctx->sb, "%s.RestartStrip();\n", ctx->high_level_geometry_stream_variable);
+  hlsl_source_quality_emission(ctx, 0, true, instruction);
+  if (!sb_ok(ctx->sb) || ctx->sb->len <= begin) return false;
+  ctx->high_level_geometry_statements_emitted |= UINT64_C(1) << instruction;
+  return true;
+}
+
 bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext *ctx) {
   if (!ctx || !ctx->program || ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
       !ctx->high_level_interface || !ctx->high_level_interface_prepared || ctx->unity_uv_helper ||
       !ctx->program->has_stage_contract ||
       (ctx->program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
-       ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL)) return false;
+       ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
+       !ctx->high_level_geometry)) return false;
   const USILProgram *program = ctx->program;
   uint32_t inputs, outputs;
   if (!natural_signature_registers(program->inputs, program->input_count, &inputs) ||
@@ -93,8 +256,12 @@ bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext 
   for (int input = 0; input < program->input_count; ++input)
     if (!hlsl_high_level_input_name(ctx, (int)program->inputs[input].register_id)) return false;
   if (ctx->high_level_direct_return) return program->output_count == 1;
-  if (!ctx->high_level_output_type[0] || !ctx->high_level_output_variable[0] ||
-      !hlsl_high_level_struct_interface_supported(program, ctx->emit_mode)) return false;
+  if (!ctx->high_level_output_type[0] || !ctx->high_level_output_variable[0]) return false;
+  if (ctx->high_level_geometry) {
+    if (!hlsl_high_level_geometry_interface_supported(program, ctx->emit_mode) ||
+        !ctx->high_level_geometry_input_type[0] || !ctx->high_level_geometry_input_variable[0] ||
+        !ctx->high_level_geometry_stream_variable[0]) return false;
+  } else if (!hlsl_high_level_struct_interface_supported(program, ctx->emit_mode)) return false;
   for (int output = 0; output < program->output_count; ++output)
     if (!hlsl_high_level_output_name(ctx, (int)program->outputs[output].register_id)) return false;
   return true;
@@ -113,6 +280,20 @@ bool hlsl_source_quality_interface_inventory_complete(const HLSLEmitterContext *
   if (ctx->high_level_direct_return)
     return !ctx->high_level_output_struct_emitted && !ctx->high_level_result_local_emitted &&
            !ctx->high_level_output_fields_emitted;
+  if (ctx->high_level_geometry) {
+    uint64_t expected_statements = 0;
+    for (int instruction = 0; instruction < ctx->program->instruction_count; ++instruction) {
+      const USILInstruction *owner = &ctx->program->instructions[instruction];
+      if (owner->geometry_effect != USIL_GEOMETRY_EFFECT_NONE ||
+          (owner->operand_count && owner->operands[0].type == OPERAND_TYPE_OUTPUT))
+        expected_statements |= UINT64_C(1) << instruction;
+    }
+    if (!ctx->high_level_geometry_input_struct_emitted ||
+        ctx->high_level_geometry_input_fields_emitted != inputs ||
+        !ctx->high_level_geometry_attribute_emitted ||
+        !ctx->high_level_geometry_stream_parameter_emitted ||
+        ctx->high_level_geometry_statements_emitted != expected_statements) return false;
+  }
   return ctx->high_level_output_struct_emitted && ctx->high_level_result_local_emitted &&
          ctx->high_level_output_fields_emitted == outputs;
 }
@@ -140,6 +321,8 @@ void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, in
         element->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
         usil_operand_destination_lane_mask(&owner->operands[0]) != element->mask) continue;
     ctx->high_level_output_statements_emitted |= UINT32_C(1) << element->register_id;
+    if (ctx->high_level_geometry)
+      ctx->high_level_geometry_statements_emitted |= UINT64_C(1) << instruction;
     ctx->high_level_statement_instruction = -1;
     return;
   }
@@ -180,6 +363,18 @@ const DXBCSignatureElement *hlsl_high_level_input_signature(
   return match;
 }
 
+const DXBCSignatureElement *hlsl_high_level_input_operand_signature(
+    const HLSLEmitterContext *ctx, const DXBCOperand *operand) {
+  if (!ctx || !ctx->high_level_interface || !operand || operand->type != OPERAND_TYPE_INPUT)
+    return NULL;
+  if (ctx->high_level_geometry) return geometry_input_signature(ctx->program, operand);
+  if (operand->register_index_dim != 1 || !operand->index_has_immediate[0] ||
+      operand->index_representations[0] || operand->index_value_exceeds_int[0] ||
+      operand->index_values[0] != (uint32_t)operand->register_index ||
+      operand->rel_op0 || operand->rel_op1 || operand->rel_op2) return NULL;
+  return hlsl_high_level_input_signature(ctx, operand->register_index);
+}
+
 const char *hlsl_high_level_input_name(const HLSLEmitterContext *ctx, int register_index) {
   if (!hlsl_high_level_input_signature(ctx, register_index) ||
       !ctx->high_level_input_names[register_index][0]) return NULL;
@@ -208,7 +403,10 @@ bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *n
   for (unsigned output = 0; output < HLSL_SM5_IO_REGISTER_COUNT; ++output)
     if (strcmp(ctx->high_level_output_names[output], name) == 0) return false;
   if (strcmp(ctx->high_level_output_type, name) == 0 ||
-      strcmp(ctx->high_level_output_variable, name) == 0) return false;
+      strcmp(ctx->high_level_output_variable, name) == 0 ||
+      strcmp(ctx->high_level_geometry_input_type, name) == 0 ||
+      strcmp(ctx->high_level_geometry_input_variable, name) == 0 ||
+      strcmp(ctx->high_level_geometry_stream_variable, name) == 0) return false;
   for (int buffer = 0; buffer < ctx->cbuffer_layout_count; ++buffer) {
     const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[buffer];
     if (layout->declaration_name && strcmp(layout->declaration_name, name) == 0) return false;
@@ -265,6 +463,7 @@ bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
     char base[80];
     const char *semantic = dxbc_signature_semantic_name(element);
     const char *role = semantic_input_role(semantic);
+    if (ctx->high_level_geometry && element->system_value == 1) role = "clipPosition";
     if (!role) {
       if (!hlsl_format_checked(ctx, base, sizeof(base), "attribute%d", input)) return false;
     } else if (strcmp(semantic, "TEXCOORD") == 0 || element->semantic_index) {
@@ -275,6 +474,12 @@ bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
     }
     if (!allocate_interface_name(ctx, base, ctx->high_level_input_names[element->register_id])) goto unsupported;
   }
+  if (ctx->high_level_geometry &&
+      (!allocate_interface_name(ctx, ctx->preferred_input_struct_name,
+                                ctx->high_level_geometry_input_type) ||
+       !allocate_interface_name(ctx, "input", ctx->high_level_geometry_input_variable) ||
+       !allocate_interface_name(ctx, "stream", ctx->high_level_geometry_stream_variable)))
+    goto unsupported;
   if (!ctx->high_level_direct_return) {
     if (!allocate_interface_name(ctx, ctx->preferred_output_struct_name,
                                 ctx->high_level_output_type) ||
@@ -308,12 +513,14 @@ bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
   if (!ctx || !operand || !provenance || operand->type != OPERAND_TYPE_INPUT ||
       !demanded_lanes || (demanded_lanes & ~15u) ||
       !hlsl_lift_operand_is_plain(operand)) return false;
-  const DXBCSignatureElement *element = hlsl_high_level_input_signature(ctx, operand->register_index);
-  if (!element || !hlsl_high_level_input_name(ctx, operand->register_index)) return false;
+  const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, operand);
+  if (!element || !hlsl_high_level_input_name(ctx, (int)element->register_id)) return false;
   ast_operand_provenance_init(provenance);
   provenance->complete = true;
   provenance->value_role = AST_OPERAND_VALUE_LOGICAL;
-  provenance->logical_value_id = (UINT64_C(1) << 63) | (uint32_t)operand->register_index;
+  provenance->logical_value_id = (UINT64_C(1) << 63) | element->register_id;
+  if (ctx->high_level_geometry)
+    provenance->logical_value_id |= (uint64_t)operand->index_values[0] << 32u;
   provenance->natural_components = (uint8_t)signature_width(element);
   for (int component = 0; component < 4; ++component) {
     if (!(demanded_lanes & (1u << component))) continue;
@@ -423,6 +630,27 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
   const USILProgram* program = ctx->program;
   StringBuilder* sb = ctx->sb;
   if (ctx->high_level_interface) {
+    if (ctx->high_level_geometry) {
+      const size_t input_begin = sb->len;
+      sb_appendf(sb, "struct %s {\n", ctx->high_level_geometry_input_type);
+      for (int input = 0; input < program->input_count; ++input) {
+        const DXBCSignatureElement *element = &program->inputs[input];
+        const char *name = hlsl_high_level_input_name(ctx, (int)element->register_id);
+        const char *semantic = dxbc_signature_semantic_name(element);
+        if (!name) { sb->failed = true; return; }
+        sb_appendf(sb, "    %s %s : %s", get_type_str(element->component_type,
+            (int)signature_width(element)), name, semantic);
+        if (element->semantic_index || strcmp(semantic, "TEXCOORD") == 0)
+          sb_appendf(sb, "%u", element->semantic_index);
+        sb_append(sb, ";\n");
+        hlsl_source_quality_emission(ctx, 0, false, -1);
+        if (sb_ok(sb))
+          ctx->high_level_geometry_input_fields_emitted |= UINT32_C(1) << element->register_id;
+      }
+      sb_append(sb, "};\n\n");
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_geometry_input_struct_emitted = sb_ok(sb) && sb->len > input_begin;
+    }
     size_t struct_begin = sb->len;
     sb_appendf(sb, "struct %s {\n", ctx->high_level_output_type);
     for (int output = 0; output < program->output_count; ++output) {
@@ -558,6 +786,34 @@ void emit_entry_point_declarations(HLSLEmitterContext* ctx,
 
   if (ctx->high_level_interface) {
     size_t entry_begin = sb->len;
+    if (ctx->high_level_geometry) {
+      const char *stream = geometry_stream_type_name(program->geometry.output_topology);
+      if (!stream) { sb->failed = true; return; }
+      sb_appendf(sb, "[maxvertexcount(%u)]\n", program->geometry.max_output_vertex_count);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_geometry_attribute_emitted = sb_ok(sb);
+      const char *primitive = geometry_input_primitive_name(program->geometry.input_primitive);
+      if (!primitive) { sb->failed = true; return; }
+      sb_appendf(sb, "void %s(%s %s %s[%u]", entry_point, primitive,
+          ctx->high_level_geometry_input_type, ctx->high_level_geometry_input_variable,
+          program->geometry.input_vertex_count);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      if (sb_ok(sb)) {
+        for (int input = 0; input < program->input_count; ++input)
+          ctx->high_level_input_parameters_emitted |= UINT32_C(1) << program->inputs[input].register_id;
+      }
+      sb_appendf(sb, ", inout %s<%s> %s)", stream, ctx->high_level_output_type,
+          ctx->high_level_geometry_stream_variable);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_geometry_stream_parameter_emitted = sb_ok(sb);
+      sb_append(sb, " {\n");
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_entry_signature_emitted = sb_ok(sb) && sb->len > entry_begin;
+      sb_appendf(sb, "    %s %s;\n", ctx->high_level_output_type, ctx->high_level_output_variable);
+      hlsl_source_quality_emission(ctx, 0, false, -1);
+      ctx->high_level_result_local_emitted = sb_ok(sb);
+      return;
+    }
     const DXBCSignatureElement *output = &program->outputs[0];
     unsigned components = 0;
     for (unsigned lane = 0; lane < 4; ++lane)

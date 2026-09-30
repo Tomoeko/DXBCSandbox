@@ -5,6 +5,7 @@
 #include "dxbc/usbd.h"
 #include "dxbc/dxbc_hash.h"
 #include "test_shaderlab_fixture.h"
+#include "test_geometry_fixture.h"
 #include "test_unity_uv_fixture.h"
 
 #include <stdio.h>
@@ -52,17 +53,18 @@ typedef enum {
 
 typedef struct {
     CommonFileBytes bytes;
-    DXBCUSBDRecordView records[2];
+    DXBCUSBDRecordView records[3];
+    uint8_t *geometry_bytes;
     SerializedShader shader;
     SerializedSubShader subshader;
     SerializedPass passes[2];
-    SerializedSubProgram programs[2];
-    SerializedSubProgramIdentity identities[2];
+    SerializedSubProgram programs[3];
+    SerializedSubProgramIdentity identities[3];
     int platform;
     ShaderBlobArchive archive;
-    BlobEntry entries[2];
-    uint8_t *segments[2];
-    int lengths[2];
+    BlobEntry entries[3];
+    uint8_t *segments[3];
+    int lengths[3];
     UnityCompileProfile profile;
     UnityShaderLabLiftInput input;
 } Fixture;
@@ -141,9 +143,33 @@ static int fixture_init(Fixture *fixture) {
     return fixture_init_path(fixture, SHADERLAB_EXPRESSION_TEST_FIXTURE);
 }
 
+static int fixture_add_geometry(Fixture *fixture) {
+    size_t size = 0;
+    fixture->geometry_bytes = test_geometry_dxbc(false, true, &size);
+    CHECK(fixture->geometry_bytes && size <= INT32_MAX);
+    fixture->records[2].dxbc = fixture->geometry_bytes;
+    fixture->records[2].dxbc_size = size;
+    fixture->segments[2] = test_shaderlab_variant_blob(
+        fixture->geometry_bytes, size, 19, NULL, &size);
+    CHECK(fixture->segments[2] && size <= INT32_MAX);
+    fixture->lengths[2] = (int)size;
+    fixture->entries[2] = (BlobEntry){0, (int32_t)size, 2};
+    fixture->programs[2] = (SerializedSubProgram){
+        .blob_index = 2, .program_type = 19, .shader_requirements = 0xe3};
+    fixture->identities[2].hardware_tier_group = 3;
+    fixture->passes[0].subprogram_count[2] = 1;
+    fixture->passes[0].subprograms[2] = &fixture->programs[2];
+    fixture->passes[0].subprogram_identities[2] = &fixture->identities[2];
+    fixture->passes[0].program_mask |= 8;
+    fixture->passes[1] = fixture->passes[0];
+    fixture->archive.entry_count = fixture->archive.segment_count = 3;
+    return 0;
+}
+
 static void fixture_free(Fixture *fixture) {
-    for (int stage = 0; stage < 2; ++stage)
+    for (int stage = 0; stage < 3; ++stage)
         free(fixture->segments[stage]);
+    free(fixture->geometry_bytes);
     common_file_bytes_dispose(&fixture->bytes);
 }
 
@@ -207,13 +233,18 @@ static bool preprocess_service(void *opaque, const UnityCompilerShaderPreprocess
         snippet->has_contract = true;
         unity_compiler_snippet_contract_init(&snippet->contract);
         snippet->contract.language = 3;
-        snippet->contract.program_types_mask = 3;
+        snippet->contract.program_types_mask =
+            service->fixture->passes[0].subprogram_count[2] ? 19 : 3;
         snippet->contract.requirements = 0xe3;
-        for (int stage = 0; stage < 2; ++stage)
+        for (int stage = 0; stage <= 4; ++stage) {
+            if (stage == 2 || stage == 3 ||
+                (stage == 4 && !service->fixture->passes[0].subprogram_count[2]))
+                continue;
             for (int family = 0; family < 3; ++family)
                 if (!unity_compiler_snippet_contract_set_variant_combinations(
                         &snippet->contract, stage, (UnityKeywordVariantFamily)family, NULL, 0))
                     return false;
+        }
         if (!snippet->source)
             return false;
     }
@@ -240,7 +271,8 @@ static bool compile_service(void *opaque, const UnityCompilerSnippetCompileReque
                             UnityCompilerBinaryResponse *response) {
     Service *service = opaque;
     ++service->compiles;
-    if (request->platform != 4 || request->shader_type < 0 || request->shader_type > 1 ||
+    if (request->platform != 4 ||
+        (request->shader_type != 0 && request->shader_type != 1 && request->shader_type != 4) ||
         strcmp(request->source_directory, service->fixture->input.source_directory) ||
         strcmp(request->source_basename, service->fixture->input.source_basename))
         return false;
@@ -300,8 +332,8 @@ static bool compile_service(void *opaque, const UnityCompilerSnippetCompileReque
         response->data = (uint8_t *)sb_detach(&expansion);
         return true;
     }
-    const int stage =
-        failure == COMPILE_WRONG_BYTES ? 1 - request->shader_type : request->shader_type;
+    const int selected_stage = request->shader_type == 4 ? 2 : request->shader_type;
+    const int stage = failure == COMPILE_WRONG_BYTES ? (selected_stage == 0 ? 1 : 0) : selected_stage;
     const DXBCUSBDRecordView *record = &service->fixture->records[stage];
     response->size = failure == COMPILE_INVALID_BYTES ? 1 : record->dxbc_size;
     response->data = malloc(response->size);
@@ -492,6 +524,136 @@ static int test_unsupported_high_level_retains_baseline(void) {
     CHECK(unity_shaderlab_lift_candidate(result)->source_map.records == NULL);
     CHECK(strstr(unity_shaderlab_lift_baseline(result)->source.buf, "saturate("));
     unity_shaderlab_lift_result_free(result);
+    fixture_free(&fixture);
+    return 0;
+}
+
+static int test_independent_geometry_candidate(void) {
+    Fixture fixture;
+    CHECK(fixture_init(&fixture) == 0 && fixture_add_geometry(&fixture) == 0);
+    const HLSLLiftLimits limits = {1, 16, 1000};
+    for (int passes = 1; passes <= 2; ++passes) {
+        fixture.subshader.pass_count = passes;
+        Service service = {.fixture = &fixture, .now = 10, .cached = true};
+        UnityShaderLabLiftResult *result = NULL;
+        CHECK(run(&service, limits, &result) == HLSL_LIFT_VERIFIED);
+        const UnityShaderLabLiftArtifact *baseline = unity_shaderlab_lift_baseline(result);
+        const UnityShaderLabLiftArtifact *candidate = unity_shaderlab_lift_candidate(result);
+        CHECK(baseline->status == HLSL_LIFT_EMISSION_REJECTED &&
+              !baseline->preprocess_attempted && baseline->certified_pass_count == 0);
+        CHECK(candidate->status == HLSL_LIFT_VERIFIED &&
+              unity_shaderlab_lift_accepted(result) == candidate);
+        CHECK(candidate->certified_pass_count == (size_t)passes &&
+              shaderlab_expression_source_map_matches_source(&candidate->source_map,
+                                                              &candidate->source));
+        CHECK(strstr(candidate->source.buf, "TriangleStream<") &&
+              strstr(candidate->source.buf, ".Append(") &&
+              strstr(candidate->source.buf, ".RestartStrip()"));
+        CHECK(service.preprocesses == 1 && service.compiles == (size_t)passes * 3);
+        for (int pass = 0; pass < passes; ++pass)
+            CHECK(candidate->passes[pass].domain.matched_dxbc_count == 3);
+        HLSLLiftStats stats;
+        unity_shaderlab_lift_stats(result, &stats, NULL);
+        CHECK(stats.candidates == 1 && stats.accepted == 1 &&
+              stats.cache_hits == service.compiles);
+        char *json = unity_shaderlab_lift_format_json(result);
+        CHECK(json && strstr(json, "\"selection\":\"high-level\"") &&
+              strstr(json, "\"status\":\"emission-rejected\"") &&
+              strstr(json, "\"whole_source_quality\":\"unavailable\""));
+        free(json);
+        unity_shaderlab_lift_result_free(result);
+    }
+    fixture.subshader.pass_count = 1;
+    const struct {
+        Failure failure;
+        bool preprocessing;
+        HLSLLiftStatus expected;
+    } failures[] = {
+        {PREPROCESS_TRANSPORT, true, HLSL_LIFT_COMPILER_UNAVAILABLE},
+        {PREPROCESS_INCLUDE_AUTHORITY, true, HLSL_LIFT_COMPILER_UNAVAILABLE},
+        {PREPROCESS_REJECTED, true, HLSL_LIFT_COMPILER_REJECTED},
+        {PREPROCESS_MISSING_IDENTITY, true, HLSL_LIFT_PROVENANCE_MISMATCH},
+        {PREPROCESS_ZERO_IDENTITY, true, HLSL_LIFT_PROVENANCE_MISMATCH},
+        {PREPROCESS_EXTRA_SNIPPET, true, HLSL_LIFT_AUTHORITY_MISMATCH},
+        {COMPILE_TRANSPORT, false, HLSL_LIFT_COMPILER_UNAVAILABLE},
+        {COMPILE_INCLUDE_AUTHORITY, false, HLSL_LIFT_COMPILER_UNAVAILABLE},
+        {COMPILE_REJECTED, false, HLSL_LIFT_COMPILER_REJECTED},
+        {COMPILE_MISSING_IDENTITY, false, HLSL_LIFT_PROVENANCE_MISMATCH},
+        {COMPILE_ZERO_IDENTITY, false, HLSL_LIFT_PROVENANCE_MISMATCH},
+        {COMPILE_WRONG_BYTES, false, HLSL_LIFT_DXBC_MISMATCH},
+        {COMPILE_INVALID_BYTES, false, HLSL_LIFT_INVALID_DXBC},
+        {COMPILER_DRIFT, false, HLSL_LIFT_AUTHORITY_MISMATCH},
+        {ENVIRONMENT_DRIFT, false, HLSL_LIFT_AUTHORITY_MISMATCH},
+        {SOURCE_REVISION_DRIFT, false, HLSL_LIFT_AUTHORITY_MISMATCH},
+        {PROFILE_DRIFT, false, HLSL_LIFT_AUTHORITY_MISMATCH},
+        {LATE_PREPROCESS, true, HLSL_LIFT_BUDGET_EXHAUSTED},
+        {LATE_COMPILE, false, HLSL_LIFT_BUDGET_EXHAUSTED},
+        {CANCEL_PREPROCESS, true, HLSL_LIFT_CANCELLED},
+        {CANCEL_COMPILE, false, HLSL_LIFT_CANCELLED},
+        {CLOCK_FAILURE, false, HLSL_LIFT_CLOCK_UNAVAILABLE},
+    };
+    for (size_t index = 0; index < sizeof(failures) / sizeof(failures[0]); ++index) {
+        Service service = {.fixture = &fixture, .now = 10, .failure = failures[index].failure,
+                           .fail_preprocess = 1, .fail_compile = 3};
+        UnityShaderLabLiftResult *result = NULL;
+        const HLSLLiftStatus status = run(&service, limits, &result);
+        if (status != failures[index].expected)
+            fprintf(stderr, "independent failure %zu: %s expected %s\n", index,
+                    hlsl_lift_status_name(status), hlsl_lift_status_name(failures[index].expected));
+        CHECK(status == failures[index].expected && !unity_shaderlab_lift_accepted(result));
+        CHECK(unity_shaderlab_lift_baseline(result)->status == HLSL_LIFT_EMISSION_REJECTED);
+        CHECK(unity_shaderlab_lift_candidate(result)->status == status &&
+              !unity_shaderlab_lift_helper_baseline(result)->attempted);
+        CHECK(service.preprocesses == 1 && service.compiles ==
+              (failures[index].preprocessing ? 0 : 3));
+        unity_shaderlab_lift_result_free(result);
+        fixture.profile.build_platform = 19;
+    }
+    for (size_t maximum = 0; maximum < 3; ++maximum) {
+        Service service = {.fixture = &fixture, .now = 10};
+        UnityShaderLabLiftResult *result = NULL;
+        CHECK(run(&service, (HLSLLiftLimits){1, maximum, 1000}, &result) ==
+              HLSL_LIFT_BUDGET_EXHAUSTED);
+        CHECK(!unity_shaderlab_lift_accepted(result) && service.compiles == maximum);
+        unity_shaderlab_lift_result_free(result);
+    }
+    Service service = {.fixture = &fixture, .now = 10};
+    UnityShaderLabLiftResult *result = NULL;
+    CHECK(run(&service, (HLSLLiftLimits){0, 16, 1000}, &result) == HLSL_LIFT_BUDGET_EXHAUSTED);
+    CHECK(!unity_shaderlab_lift_accepted(result) &&
+          !unity_shaderlab_lift_candidate(result)->attempted && service.preprocesses == 0);
+    unity_shaderlab_lift_result_free(result);
+    fixture_free(&fixture);
+    return 0;
+}
+
+static int test_baseline_failures_stop_candidate_work(void) {
+    Fixture fixture;
+    CHECK(fixture_init(&fixture) == 0);
+    const struct { Failure failure; HLSLLiftStatus expected; } cases[] = {
+        {PREPROCESS_REJECTED, HLSL_LIFT_COMPILER_REJECTED},
+        {PREPROCESS_MISSING_IDENTITY, HLSL_LIFT_PROVENANCE_MISMATCH},
+        {PREPROCESS_INCLUDE_AUTHORITY, HLSL_LIFT_COMPILER_UNAVAILABLE},
+        {COMPILE_REJECTED, HLSL_LIFT_COMPILER_REJECTED},
+        {COMPILE_WRONG_BYTES, HLSL_LIFT_DXBC_MISMATCH},
+        {COMPILE_INVALID_BYTES, HLSL_LIFT_INVALID_DXBC},
+        {COMPILE_MISSING_IDENTITY, HLSL_LIFT_PROVENANCE_MISMATCH},
+        {COMPILER_DRIFT, HLSL_LIFT_AUTHORITY_MISMATCH},
+        {CANCEL_COMPILE, HLSL_LIFT_CANCELLED},
+        {LATE_COMPILE, HLSL_LIFT_BUDGET_EXHAUSTED},
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        Service service = {.fixture = &fixture, .now = 10, .failure = cases[index].failure,
+                           .fail_preprocess = 1, .fail_compile = 1};
+        UnityShaderLabLiftResult *result = NULL;
+        CHECK(run(&service, (HLSLLiftLimits){2, 16, 1000}, &result) == cases[index].expected);
+        CHECK(!unity_shaderlab_lift_accepted(result) &&
+              !unity_shaderlab_lift_candidate(result)->attempted &&
+              !unity_shaderlab_lift_helper_baseline(result)->attempted);
+        CHECK(unity_shaderlab_lift_baseline(result)->status == cases[index].expected &&
+              service.preprocesses == 1 && service.compiles <= 1);
+        unity_shaderlab_lift_result_free(result);
+    }
     fixture_free(&fixture);
     return 0;
 }
@@ -705,7 +867,8 @@ static int test_unity_uv_transaction(void) {
 
 int main(void) {
     if (test_verified_and_fallback() || test_admission_and_later_pass() ||
-        test_unsupported_high_level_retains_baseline() || test_unity_uv_transaction())
+        test_unsupported_high_level_retains_baseline() || test_independent_geometry_candidate() ||
+        test_baseline_failures_stop_candidate_work() || test_unity_uv_transaction())
         return 1;
     puts("ShaderLab lift admission, full-pass certification and rollback passed.");
     return 0;

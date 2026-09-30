@@ -199,8 +199,12 @@ bool hlsl_expression_effects_supported(const USILProgram *program,
     if (!program || !instruction ||
         !usil_instruction_effects(program, instruction, &effects)) return false;
     if (effects == USIL_EFFECT_NONE) return true;
+    if (instruction->opcode == USIL_OP_SAMPLE_L || instruction->opcode == USIL_OP_SAMPLE_D)
+        return (program->program_type == DXBC_PROGRAM_TYPE_PIXEL ||
+                program->program_type == DXBC_PROGRAM_TYPE_VERTEX) &&
+               effects == USIL_EFFECT_RESOURCE_READ;
     if (program->program_type != DXBC_PROGRAM_TYPE_PIXEL) return false;
-    if (instruction->opcode == USIL_OP_SAMPLE)
+    if (instruction->opcode == USIL_OP_SAMPLE || instruction->opcode == USIL_OP_SAMPLE_B)
         return effects == (USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_QUAD_CONTEXT);
     if (!float_derivative(instruction->opcode) || effects != USIL_EFFECT_QUAD_CONTEXT)
         return false;
@@ -257,7 +261,7 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
                              inst->opcode == USIL_OP_MUL;
     const bool vector_opcode = inst->opcode == USIL_OP_MAD || inst->opcode == USIL_OP_DIV ||
                                inst->opcode == USIL_OP_MIN || inst->opcode == USIL_OP_MAX;
-    const bool sample = !full_width && inst->opcode == USIL_OP_SAMPLE;
+    const bool sample = !full_width && hlsl_texture_sample_opcode(inst->opcode);
     if (!base_opcode && (full_width || (!vector_opcode && !float_intrinsic(inst->opcode) && !sample)))
         return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_OPCODE);
     if (!hlsl_expression_effects_supported(program, inst))
@@ -270,7 +274,8 @@ static bool float_instruction_supported(HLSLEmitterContext *ctx, int index, bool
         (full_width && usil_operand_destination_lane_mask(destination) != 15))
         return reject(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     for (int operand = 0; operand < inst->operand_count; ++operand) {
-        if (sample && operand >= 2) continue; /* Exact static bindings were validated above. */
+        if (sample && (operand == 2 || operand == 3))
+            continue; /* Extra level/bias/gradient operands retain ordinary value authority. */
         const DXBCOperand *value = &inst->operands[operand];
         DXBCOperand unmodified = *value;
         if (!full_width && operand) {
@@ -331,6 +336,13 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             continue;
         }
+        if (ctx->high_level_geometry &&
+            (inst->opcode == USIL_OP_GEOMETRY_APPEND ||
+             inst->opcode == USIL_OP_GEOMETRY_RESTART_STRIP)) {
+            if (!hlsl_high_level_geometry_effect_supported(ctx, index))
+                return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+            continue;
+        }
         if (matrix_plans && hlsl_matrix_lift_prepare(ctx, index, &matrix_plans[index])) {
             const int final = matrix_plans[index].end_instruction;
             const DXBCOperand *destination = &program->instructions[final].operands[0];
@@ -346,7 +358,7 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
         }
         if (!float_instruction_supported(ctx, index, full_width))
             return false;
-        if (inst->opcode == USIL_OP_SAMPLE || float_derivative(inst->opcode))
+        if (hlsl_texture_sample_opcode(inst->opcode) || float_derivative(inst->opcode))
             uses[index] = 2; /* Keep quad/resource operations at their original site. */
         const DXBCOperand *destination = &inst->operands[0];
         if (destination->type == OPERAND_TYPE_OUTPUT) {
@@ -594,6 +606,13 @@ ASTExpr *hlsl_float4_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *sou
         ASTExpr *vector = ast_create_call("float4", &value, 1);
         if (!vector)
             ast_free_expr(value);
+        /* The scalar's exact bits and this constructor's fixed numeric type
+         * prove a four-component broadcast. Retain its consuming instruction
+         * owner rather than leaving an opaque call inside a clean expression. */
+        if (vector && ctx && ctx->program && ctx->program->instructions &&
+            ctx->current_instruction_index >= 0 &&
+            ctx->current_instruction_index < ctx->program->instruction_count)
+            vector = logical_expression(ctx, vector, ctx->current_instruction_index, 15, 4);
         return vector;
     }
     StringBuilder source_text;
@@ -832,6 +851,30 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
     for (int index = 0; index < ctx->program->instruction_count; ++index)
         if (ctx->float4_functions.group[index] >= 0)
             uses[index] = 2; /* Keep each call result at its original instruction site. */
+    /* Method arguments are emitted in coordinate/LOD/gradient order. Distinct
+     * pure SSA values can have been computed in another order in DXBC. Preserve
+     * those evaluation sites with natural typed locals instead of moving their
+     * operation graphs into a differently ordered argument list. */
+    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+        const USILInstruction *sample = &ctx->program->instructions[index];
+        if (!hlsl_texture_sample_opcode(sample->opcode)) continue;
+        const int source_operands[] = {1, 4, 5};
+        int definitions[3], count = 0, previous = -1;
+        bool reordered = false;
+        for (size_t argument = 0; argument < 3; ++argument) {
+            const int operand = source_operands[argument];
+            if (operand >= sample->operand_count ||
+                sample->operands[operand].type != OPERAND_TYPE_TEMP) continue;
+            const int definition = vector_definition(ctx, index, operand);
+            if (definition < 0) goto cleanup;
+            definitions[count++] = definition;
+            if (previous > definition) reordered = true;
+            previous = definition;
+        }
+        if (reordered)
+            for (int argument = 0; argument < count; ++argument)
+                if (uses[definitions[argument]] < 2) uses[definitions[argument]] = 2;
+    }
     hlsl_expression_source_map_begin(ctx);
     HLSLExpressionSourceMap *map = ctx->expression_source_map;
     for (int index = 0; index < ctx->program->instruction_count; ++index) {
@@ -839,6 +882,19 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
         ctx->current_instruction_index = index;
         if (inst->opcode == USIL_OP_NOP || inst->opcode == USIL_OP_RET)
             continue;
+        if (ctx->high_level_geometry &&
+            (inst->opcode == USIL_OP_GEOMETRY_APPEND ||
+             inst->opcode == USIL_OP_GEOMETRY_RESTART_STRIP)) {
+            const size_t begin = ctx->sb->len;
+            if (!hlsl_emit_high_level_geometry_effect(ctx, index))
+                goto cleanup;
+            if (map) {
+                map->origins[index].kind = HLSL_EXPRESSION_ORIGIN_EFFECT;
+                map->origins[index].source_begin = begin;
+                map->origins[index].source_end = ctx->sb->len;
+            }
+            continue;
+        }
         HLSLMatrixLiftPlan *matrix = matrix_starts[index] >= 0
                                         ? &matrix_plans[matrix_starts[index]] : NULL;
         if (matrix && index != matrix->end_instruction) continue;
@@ -868,8 +924,14 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
             ASTExpr *left =
                 source_expression(ctx, index, 1, uses, pending, pending_owners, &owners,
                                   logical_widths);
-            if (inst->opcode == USIL_OP_SAMPLE) {
-                expression = hlsl_texture_sample_expression(ctx, index, left);
+            if (hlsl_texture_sample_opcode(inst->opcode)) {
+                ASTExpr *parameter = inst->operand_count < 5 ? NULL
+                    : source_expression(ctx, index, 4, uses, pending, pending_owners, &owners,
+                                        logical_widths);
+                ASTExpr *second_parameter = inst->operand_count < 6 ? NULL
+                    : source_expression(ctx, index, 5, uses, pending, pending_owners, &owners,
+                                        logical_widths);
+                expression = hlsl_texture_sample_expression(ctx, index, left, parameter, second_parameter);
             } else {
                 ASTExpr *right = inst->operand_count < 3 ? NULL
                     : source_expression(ctx, index, 2, uses, pending, pending_owners, &owners,
@@ -963,7 +1025,7 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                                 inst->opcode == USIL_OP_MUL || inst->opcode == USIL_OP_MAD ||
                                 inst->opcode == USIL_OP_DIV || inst->opcode == USIL_OP_MIN ||
                                 inst->opcode == USIL_OP_MAX || float_intrinsic(inst->opcode) ||
-                                inst->opcode == USIL_OP_SAMPLE;
+                                hlsl_texture_sample_opcode(inst->opcode);
         const uint8_t lanes = instruction_destination_lanes(program, inst);
         if (origin->destination_lanes != lanes)
             return false;
@@ -979,6 +1041,13 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
             break;
         case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
             if (!expression || !lanes)
+                return false;
+            break;
+        case HLSL_EXPRESSION_ORIGIN_EFFECT:
+            if (lanes || !hlsl_high_level_geometry_interface_supported(
+                    program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) ||
+                (inst->opcode != USIL_OP_GEOMETRY_APPEND &&
+                 inst->opcode != USIL_OP_GEOMETRY_RESTART_STRIP))
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_CONTROL:
@@ -1040,6 +1109,8 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
         return "function";
     case HLSL_EXPRESSION_ORIGIN_UNITY_UV:
         return HLSL_UNITY_UV_LIFT_ID;
+    case HLSL_EXPRESSION_ORIGIN_EFFECT:
+        return "effect";
     default:
         return "unmapped";
     }
@@ -1048,7 +1119,8 @@ const char *hlsl_expression_origin_kind_name(HLSLExpressionOriginKind kind) {
 bool hlsl_expression_origin_has_span(HLSLExpressionOriginKind kind) {
     return kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION || kind == HLSL_EXPRESSION_ORIGIN_RETURN ||
            kind == HLSL_EXPRESSION_ORIGIN_CONTROL || kind == HLSL_EXPRESSION_ORIGIN_LOOP_CONTROL ||
-           kind == HLSL_EXPRESSION_ORIGIN_FUNCTION || kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV;
+           kind == HLSL_EXPRESSION_ORIGIN_FUNCTION || kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV ||
+           kind == HLSL_EXPRESSION_ORIGIN_EFFECT;
 }
 
 bool hlsl_expression_origin_ranges_valid(const HLSLExpressionOrigin *origin, size_t source_length) {

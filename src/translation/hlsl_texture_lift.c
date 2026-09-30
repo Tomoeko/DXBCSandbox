@@ -6,16 +6,34 @@
 #include <stdio.h>
 #include <string.h>
 
-/* A first resource-aware expression boundary. Sampling remains at its original
- * instruction site and only straight-line pixel programs can use this route.
- * No comparison, explicit LOD/gradient, offset, integer format or result-lane
- * transport is inferred from this contract. */
+/* Sampling remains at its original instruction site. Implicit derivatives and
+ * bias require a pixel stage; explicit levels/gradients carry their own inputs.
+ * No comparison, offset, integer format or result-lane transport is inferred. */
+static const char *sample_method(USILOpcode opcode) {
+    switch (opcode) {
+    case USIL_OP_SAMPLE: return "Sample";
+    case USIL_OP_SAMPLE_L: return "SampleLevel";
+    case USIL_OP_SAMPLE_B: return "SampleBias";
+    case USIL_OP_SAMPLE_D: return "SampleGrad";
+    default: return NULL;
+    }
+}
+
+bool hlsl_texture_sample_opcode(USILOpcode opcode) {
+    return sample_method(opcode) != NULL;
+}
+
 static bool sample_binding(const HLSLEmitterContext *ctx, int index,
                             const char **texture_name, const char **sampler_name) {
     if (!ctx || !ctx->program || index < 0 || index >= ctx->program->instruction_count ||
-        ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL) return false;
+        (ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
+         ctx->program->program_type != DXBC_PROGRAM_TYPE_VERTEX)) return false;
     const USILInstruction *instruction = &ctx->program->instructions[index];
-    if (instruction->opcode != USIL_OP_SAMPLE || instruction->operand_count != 4 ||
+    const bool implicit = instruction->opcode == USIL_OP_SAMPLE || instruction->opcode == USIL_OP_SAMPLE_B;
+    const int operand_count = instruction->opcode == USIL_OP_SAMPLE ? 4 :
+                              instruction->opcode == USIL_OP_SAMPLE_D ? 6 : 5;
+    if (!sample_method(instruction->opcode) || instruction->operand_count != operand_count ||
+        (implicit && ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
         !usil_instruction_shape_valid(ctx->program, instruction) || instruction->saturate ||
         instruction->precise_mask || instruction->has_texel_offset ||
         usil_operand_destination_lane_mask(&instruction->operands[0]) != 15)
@@ -59,19 +77,32 @@ bool hlsl_texture_sample_supported(HLSLEmitterContext *ctx, int instruction) {
 }
 
 ASTExpr *hlsl_texture_sample_expression(HLSLEmitterContext *ctx, int index,
-                                       ASTExpr *coordinates) {
+                                       ASTExpr *coordinates, ASTExpr *parameter,
+                                       ASTExpr *second_parameter) {
     const char *texture_name = NULL, *sampler_name = NULL;
     if (!coordinates || !sample_binding(ctx, index, &texture_name, &sampler_name)) {
         ast_free_expr(coordinates);
-        return NULL;
-    }
-    char method[256];
-    const int length = snprintf(method, sizeof(method), "%s.Sample", texture_name);
-    if (length < 0 || (size_t)length >= sizeof(method)) {
-        ast_free_expr(coordinates);
+        ast_free_expr(parameter);
+        ast_free_expr(second_parameter);
         return NULL;
     }
     const USILInstruction *instruction = &ctx->program->instructions[index];
+    if ((instruction->operand_count >= 5) != (parameter != NULL) ||
+        (instruction->operand_count == 6) != (second_parameter != NULL)) {
+        ast_free_expr(coordinates);
+        ast_free_expr(parameter);
+        ast_free_expr(second_parameter);
+        return NULL;
+    }
+    char method[256];
+    const int length = snprintf(method, sizeof(method), "%s.%s", texture_name,
+                                sample_method(instruction->opcode));
+    if (length < 0 || (size_t)length >= sizeof(method)) {
+        ast_free_expr(coordinates);
+        ast_free_expr(parameter);
+        ast_free_expr(second_parameter);
+        return NULL;
+    }
     ASTOperandProvenance origin;
     ast_operand_provenance_init(&origin);
     origin.complete = true;
@@ -83,11 +114,14 @@ ASTExpr *hlsl_texture_sample_expression(HLSLEmitterContext *ctx, int index,
     origin.operand_index = 3;
     origin.destination_lanes = 15;
     ASTExpr *sampler = ast_create_emitter_operand_with_provenance(sampler_name, &origin);
-    ASTExpr *arguments[2] = {sampler, coordinates};
-    ASTExpr *expression = sampler ? ast_create_call(method, arguments, 2) : NULL;
+    ASTExpr *arguments[4] = {sampler, coordinates, parameter, second_parameter};
+    ASTExpr *expression = sampler ? ast_create_call(method, arguments,
+                                                    instruction->operand_count - 2) : NULL;
     if (!expression) {
         ast_free_expr(sampler);
         ast_free_expr(coordinates);
+        ast_free_expr(parameter);
+        ast_free_expr(second_parameter);
         return NULL;
     }
     ASTLogicalValueOrigin value;

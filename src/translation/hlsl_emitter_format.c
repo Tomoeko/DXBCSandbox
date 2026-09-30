@@ -1033,8 +1033,12 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
         }
         case OPERAND_TYPE_INPUT:
             if (ctx->high_level_interface) {
-                const char *name = hlsl_high_level_input_name(ctx, op->register_index);
+                const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, op);
+                const char *name = element ? hlsl_high_level_input_name(ctx, (int)element->register_id) : NULL;
                 if (!name) { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
+                else if (ctx->high_level_geometry)
+                    hlsl_builder_format_checked(ctx, &reg, "%s[%u].%s", ctx->high_level_geometry_input_variable,
+                                                op->index_values[0], name);
                 else hlsl_builder_copy_checked(ctx, &reg, name);
             } else if (ctx->is_geometry && op->register_index_dim == 2 &&
                 op->index_has_immediate[0] &&
@@ -1165,7 +1169,7 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
         swiz[0] = '\0';
     }
     if (ctx->high_level_interface && op->type == OPERAND_TYPE_INPUT) {
-        const DXBCSignatureElement *element = hlsl_high_level_input_signature(ctx, op->register_index);
+        const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, op);
         unsigned width = 0;
         if (element) for (unsigned component = 0; component < 4; ++component)
             if (element->mask & (1u << component)) ++width;

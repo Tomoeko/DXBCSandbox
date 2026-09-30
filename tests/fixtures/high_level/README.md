@@ -73,3 +73,46 @@ negative controls even when their physical arithmetic pattern is recognized.
 `matrix_vector4.shader` isolates a full four-component result so the same
 metadata and dataflow guards can be evaluated independently of three-component
 projection support.
+
+The sampling fixtures isolate fragment explicit-level, bias, and explicit-gradient
+sampling plus vertex explicit-level sampling. Their named scalar/vector constant
+buffer separates level, bias, and gradient parameters. Keyword controls alter
+coordinates and sampling parameters, introduce static texel offsets, or request
+precise color arithmetic. The renamed version also reorders the binding layout.
+Only retained DXBC and admitted metadata establish each emitted instruction form.
+
+`geometry_straight_line.shader` isolates point input, one triangle stream, three
+explicit full-field output appends, and a strip restart without authored loops
+or constant arrays. Its keyword control reverses the first two position offsets.
+Compilation may still transform assignments or combine stream operations; inspect
+the actual source ownership and contract before qualifying any reconstruction.
+
+`matrix_projections_reordered.shader` changes matrix names, constant-buffer
+locations, vertex parameter order, and output field order independently of the
+three-component arithmetic candidate. Its precision, orientation, arrays, and
+external-use controls remain part of the captured domain.
+
+The typed-memory compute fixtures isolate four unsigned or floating lanes in
+texture load/store operations; the structured control uses a sixteen-byte
+`uint4` element. Each kernel retains a separate fill, copy, or lane-wise add
+case and a coordinate/group-size keyword dimension. These are compilation and
+analysis references only. Capture does not dispatch them or establish source
+reconstruction, binding compatibility, or native behavior.
+
+`sampling_vertex_grad.shader` separately captures explicit-gradient sampling in
+the vertex stage, including coordinate, gradient, offset, and precision controls.
+Its domain is captured independently of the earlier sampling bundles.
+
+`geometry_arrays.shader` adds separate static line, triangle, line-adjacency, and
+triangle-adjacency input arrays. Each pass reads all input vertices, writes full
+position/color fields, and changes append order with one Boolean keyword. The
+captured domain contains four passes and twenty-four vertex/fragment/geometry
+stage rows. These captures qualify their actual primitive and array contracts;
+source generation and full linked-program compiler proof remain separate gates.
+
+`sampling_complete.shader` provides a separate benign complete domain for
+fragment level, bias, and gradient sampling plus vertex level and gradient
+sampling. Its five passes and coordinate/parameter keyword retain twenty
+vertex/fragment stage rows. The earlier offset and precision controls remain in
+their original captures. Standalone stage observations do not establish complete
+ShaderLab generated-domain acceptance, declaration authority, or native behavior.

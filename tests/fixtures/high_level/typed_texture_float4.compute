@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Authored evaluation input only. Do not dispatch as part of capture.
+#pragma kernel FillFloat4
+#pragma kernel CopyFloat4
+#pragma kernel AddFloat4
+#pragma only_renderers d3d11
+#pragma multi_compile __ OFFSET_TEXELS
+
+Texture2D<float4> _Source;
+RWTexture2D<float4> _Destination;
+
+#if defined(OFFSET_TEXELS)
+    #define GROUP_WIDTH 4
+#else
+    #define GROUP_WIDTH 8
+#endif
+
+[numthreads(GROUP_WIDTH, GROUP_WIDTH, 1)]
+void FillFloat4(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 coordinates = dispatchId.xy;
+    #if defined(OFFSET_TEXELS)
+        coordinates += uint2(1u, 2u);
+    #endif
+    _Destination[coordinates] = float4(11, 22, 33, 44);
+}
+
+[numthreads(GROUP_WIDTH, GROUP_WIDTH, 1)]
+void CopyFloat4(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 coordinates = dispatchId.xy;
+    #if defined(OFFSET_TEXELS)
+        coordinates += uint2(1u, 2u);
+    #endif
+    _Destination[coordinates] = _Source.Load(int3(coordinates, 0));
+}
+
+[numthreads(GROUP_WIDTH, GROUP_WIDTH, 1)]
+void AddFloat4(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 coordinates = dispatchId.xy;
+    #if defined(OFFSET_TEXELS)
+        coordinates += uint2(1u, 2u);
+    #endif
+    _Destination[coordinates] = _Source.Load(int3(coordinates, 0)) + float4(1, 2, 3, 4);
+}

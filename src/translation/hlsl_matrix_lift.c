@@ -115,21 +115,23 @@ static bool chain_dataflow_is_owned(const HLSLEmitterContext *ctx,
 }
 
 static bool set_result_origin(const HLSLEmitterContext *ctx, ASTExpr *expression,
-                              int instruction, uint64_t identity) {
+                              int instruction, uint64_t identity, uint8_t components,
+                              uint8_t lanes, bool projection) {
     ASTLogicalValueOrigin origin;
     ast_logical_value_origin_init(&origin);
     origin.complete = true;
     origin.scalar_type = AST_SCALAR_FLOAT32;
-    origin.components = 4;
+    origin.components = components;
     origin.logical_value_id = identity;
     origin.instruction_index = instruction;
     origin.source_instruction_index = ctx->program->instructions[instruction].source_instruction_index;
-    origin.destination_lanes = 15;
+    origin.destination_lanes = lanes;
+    origin.semantic_projection = projection;
     return ast_set_logical_value_origin(expression, &origin);
 }
 
 static ASTExpr *matrix_atom(const HLSLEmitterContext *ctx, const char *name, int buffer,
-                            int row, int instruction, int operand) {
+                            int row, int instruction, int operand, uint8_t lanes) {
     ASTOperandProvenance origin;
     ast_operand_provenance_init(&origin);
     origin.complete = true;
@@ -138,7 +140,7 @@ static ASTExpr *matrix_atom(const HLSLEmitterContext *ctx, const char *name, int
     origin.instruction_index = instruction;
     origin.source_instruction_index = ctx->program->instructions[instruction].source_instruction_index;
     origin.operand_index = operand;
-    origin.destination_lanes = 15;
+    origin.destination_lanes = lanes;
     return ast_create_emitter_operand_with_provenance(name, &origin);
 }
 
@@ -201,22 +203,22 @@ static bool prepare_nested_matrix(HLSLEmitterContext *ctx, int start,
     }
     const uint64_t world_identity = (UINT64_C(1) << 62) | (uint32_t)(start + 3);
     if (!set_result_origin(ctx, homogeneous, start + 3,
-                           (UINT64_C(1) << 61) | (uint32_t)(start + 3))) {
+                           (UINT64_C(1) << 61) | (uint32_t)(start + 3), 4, 15, false)) {
         ast_free_expr(homogeneous);
         return false;
     }
     ASTExpr *world = matrix_product(
         matrix_atom(ctx, world_name, chain.world_matrix_buffer, chain.world_matrix_first_row,
-                    start + 1, 1), homogeneous, world_row_major);
-    if (!world || !set_result_origin(ctx, world, start + 3, world_identity)) {
+                    start + 1, 1, 15), homogeneous, world_row_major);
+    if (!world || !set_result_origin(ctx, world, start + 3, world_identity, 4, 15, false)) {
         ast_free_expr(world);
         return false;
     }
     ASTExpr *clip = matrix_product(
         matrix_atom(ctx, clip_name, chain.clip_matrix_buffer, chain.clip_matrix_first_row,
-                    start + 5, 1), world, clip_row_major);
+                    start + 5, 1, 15), world, clip_row_major);
     if (!clip || !set_result_origin(ctx, clip, start + 7,
-                                   (UINT64_C(1) << 62) | (uint32_t)(start + 7))) {
+                                   (UINT64_C(1) << 62) | (uint32_t)(start + 7), 4, 15, false)) {
         ast_free_expr(clip);
         return false;
     }
@@ -246,12 +248,13 @@ static bool single_static_operand(const DXBCOperand *operand, unsigned dimension
 }
 
 static bool single_vector_source(const DXBCOperand *operand, DXBCOperandType type,
-                                  int reg, unsigned dimensions, int row) {
+                                  int reg, unsigned dimensions, int row, uint8_t width) {
     if (operand->type != type || operand->register_index != reg ||
         !single_static_operand(operand, dimensions) || operand->destination_mask ||
         (dimensions == 2 && operand->rel_offset0 != row)) return false;
     for (int lane = 0; lane < 4; ++lane)
-        if (usil_operand_source_component(operand, lane) != lane) return false;
+        if (usil_operand_source_component(operand, lane) !=
+            (width == 3 && lane == 3 ? 0 : lane)) return false;
     return true;
 }
 
@@ -263,28 +266,35 @@ static bool single_scalar_input(const DXBCOperand *operand, int reg, int compone
     return true;
 }
 
-/* The admitted compiler order is y, x, z, w. Do not commute rows or reassociate
- * accumulation; the full compiler container gate remains independent. */
+/* The admitted compiler order is y, x, z and optionally w. The xyz graph
+ * requires complete float4x4 metadata and a natural three-component input;
+ * it constructs a zero-w vector and projects only the captured xyz result.
+ * Do not commute rows or reassociate accumulation. The full compiler container
+ * gate remains independent, including for the unobserved fourth component. */
 static bool prepare_single_matrix(HLSLEmitterContext *ctx, int start,
                                    HLSLMatrixLiftPlan *out_plan) {
     if (!ctx || !ctx->program || !ctx->high_level_interface || !ctx->sb ||
-        start < 0 || start > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT - 4 ||
-        ctx->program->instruction_count < 4 || start > ctx->program->instruction_count - 4 ||
+        start < 0 || start > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT - 3 ||
+        ctx->program->instruction_count < 3 || start > ctx->program->instruction_count - 3 ||
         !ctx->program->instructions || !ctx->ssa.operand_ssa_vars ||
         !ctx->use_def.definition_use_counts ||
         ctx->ssa.instruction_count != ctx->program->instruction_count ||
         ctx->use_def.instruction_count != ctx->program->instruction_count) return false;
     const USILInstruction *chain = ctx->program->instructions + start;
     if (chain[0].operand_count != 3 || chain[0].opcode != USIL_OP_MUL) return false;
+    const uint8_t lanes = usil_operand_destination_lane_mask(&chain[0].operands[0]);
+    const uint8_t width = lanes == 15 ? 4 : lanes == 7 ? 3 : 0;
+    if (!width || start > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT - width ||
+        start > ctx->program->instruction_count - width) return false;
     const int accumulator = chain[0].operands[0].register_index;
     const int input = chain[0].operands[1].register_index;
     const int buffer = chain[0].operands[2].register_index;
     const int row_one = chain[0].operands[2].rel_offset0;
     if (accumulator < 0 || accumulator >= ctx->program->temp_count || input < 0 ||
-        buffer < 0 || row_one < 1 || row_one > INT_MAX - 2) return false;
+        buffer < 0 || row_one < 1 || row_one > INT_MAX - (width - 2)) return false;
     const int first_row = row_one - 1;
     const int components[4] = {1, 0, 2, 3};
-    for (int offset = 0; offset < 4; ++offset) {
+    for (int offset = 0; offset < width; ++offset) {
         const int index = start + offset;
         const USILInstruction *instruction = &chain[offset];
         if (instruction->opcode != (offset ? USIL_OP_MAD : USIL_OP_MUL) ||
@@ -310,24 +320,24 @@ static bool prepare_single_matrix(HLSLEmitterContext *ctx, int start,
             effects != USIL_EFFECT_NONE) return false;
         const DXBCOperand *destination = &instruction->operands[0];
         if (!single_static_operand(destination, 1) || destination->swizzle_mode ||
-            usil_operand_destination_lane_mask(destination) != 15 ||
-            destination->type != (offset == 3 ? OPERAND_TYPE_OUTPUT : OPERAND_TYPE_TEMP) ||
-            (offset != 3 && destination->register_index != accumulator) ||
-            (offset == 3 && destination->register_index >= HLSL_SM5_IO_REGISTER_COUNT)) return false;
+            usil_operand_destination_lane_mask(destination) != lanes ||
+            destination->type != (offset == width - 1 ? OPERAND_TYPE_OUTPUT : OPERAND_TYPE_TEMP) ||
+            (offset != width - 1 && destination->register_index != accumulator) ||
+            (offset == width - 1 && destination->register_index >= HLSL_SM5_IO_REGISTER_COUNT)) return false;
         const int input_operand = offset ? 2 : 1;
         const int matrix_operand = offset ? 1 : 2;
         if (!single_scalar_input(&instruction->operands[input_operand], input, components[offset]) ||
             !single_vector_source(&instruction->operands[matrix_operand],
                                   OPERAND_TYPE_CONSTANT_BUFFER, buffer, 2,
-                                  first_row + components[offset])) return false;
+                                  first_row + components[offset], width)) return false;
         if (!offset) continue;
         if (!single_vector_source(&instruction->operands[3], OPERAND_TYPE_TEMP,
-                                  accumulator, 1, 0)) return false;
-        for (int lane = 0; lane < 4; ++lane)
+                                  accumulator, 1, 0, width)) return false;
+        for (int lane = 0; lane < width; ++lane)
             if (hlsl_operand_definition(ctx, index, 3, lane) != index - 1) return false;
     }
-    for (int offset = 0; offset < 3; ++offset)
-        for (int lane = 0; lane < 4; ++lane)
+    for (int offset = 0; offset < width - 1; ++offset)
+        for (int lane = 0; lane < width; ++lane)
             if (hlsl_definition_use_count(ctx, start + offset, lane) != 1) return false;
     bool row_major;
     const char *matrix_name = hlsl_matrix_lift_identifier(ctx, buffer, first_row, &row_major);
@@ -336,29 +346,56 @@ static bool prepare_single_matrix(HLSLEmitterContext *ctx, int start,
     vector.swizzle_mode = 1;
     for (int lane = 0; lane < 4; ++lane) vector.swizzle[lane] = (uint8_t)lane;
     ASTOperandProvenance provenance;
-    if (!hlsl_high_level_input_provenance(ctx, &vector, 15, &provenance)) return false;
+    if (!hlsl_high_level_input_provenance(ctx, &vector, lanes, &provenance) ||
+        provenance.natural_components != width || provenance.result_components != width) return false;
     provenance.instruction_index = start;
     provenance.source_instruction_index = chain[0].source_instruction_index;
     provenance.operand_index = 1;
-    provenance.destination_lanes = 15;
+    provenance.destination_lanes = lanes;
     StringBuilder spelling;
     sb_init(&spelling);
     const int previous_instruction = ctx->current_instruction_index;
     ctx->current_instruction_index = start;
-    const bool formatted = format_operand_hlsl_sb(ctx, &vector, false, false, 0xf0, false, &spelling);
+    const bool formatted = format_operand_hlsl_sb(ctx, &vector, false, false, lanes << 4, false, &spelling);
     ctx->current_instruction_index = previous_instruction;
     ASTExpr *input_expression = formatted && sb_ok(&spelling)
         ? ast_create_emitter_operand_with_provenance(spelling.buf, &provenance) : NULL;
     sb_free(&spelling);
+    const int final = start + width - 1;
+    if (width == 3) {
+        const uint32_t zero_bits = 0;
+        ASTExpr *zero = ast_create_literal_bits(&zero_bits, 1, AST_SCALAR_FLOAT32);
+        ASTExpr *arguments[2] = {input_expression, zero};
+        ASTExpr *homogeneous = input_expression && zero ? ast_create_call("float4", arguments, 2) : NULL;
+        if (!homogeneous) {
+            ast_free_expr(input_expression); ast_free_expr(zero); return false;
+        }
+        if (!set_result_origin(ctx, homogeneous, final,
+                (UINT64_C(1) << 60) | (uint32_t)final, 4, lanes, false)) {
+            ast_free_expr(homogeneous); return false;
+        }
+        input_expression = homogeneous;
+    }
     ASTExpr *product = matrix_product(
-        matrix_atom(ctx, matrix_name, buffer, first_row, start + 1, 1), input_expression, row_major);
-    if (!product || !set_result_origin(ctx, product, start + 3,
-                                     (UINT64_C(1) << 62) | (uint32_t)(start + 3))) {
+        matrix_atom(ctx, matrix_name, buffer, first_row, start + 1, 1, lanes),
+        input_expression, row_major);
+    if (!product || !set_result_origin(ctx, product, final,
+            (UINT64_C(1) << (width == 3 ? 61 : 62)) | (uint32_t)final, 4, lanes, false)) {
         ast_free_expr(product); return false;
     }
-    *out_plan = (HLSLMatrixLiftPlan){.start_instruction = start, .end_instruction = start + 3,
-        .instruction_owners = UINT64_C(15) << start, .result_components = 4,
-        .claimed_instruction_count = 4, .expression = product};
+    ASTExpr *result = product;
+    if (width == 3) {
+        const int xyz[3] = {0, 1, 2};
+        result = ast_create_swizzle(product, xyz, 3);
+        if (!result) { ast_free_expr(product); return false; }
+        if (!set_result_origin(ctx, result, final,
+                (UINT64_C(1) << 62) | (uint32_t)final, 3, lanes, true)) {
+            ast_free_expr(result); return false;
+        }
+    }
+    *out_plan = (HLSLMatrixLiftPlan){.start_instruction = start, .end_instruction = final,
+        .instruction_owners = ((UINT64_C(1) << width) - 1u) << start,
+        .result_components = width, .claimed_instruction_count = width, .expression = result};
     return true;
 }
 

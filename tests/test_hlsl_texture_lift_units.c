@@ -24,6 +24,61 @@ static DXBCOperand operand(DXBCOperandType type, int reg, uint8_t lanes) {
     return value;
 }
 
+static int check_sample_argument_order(const USILProgram *base,
+                                      const SerializedProgramParameters *parameters,
+                                      HLSLEmitOptions *options,
+                                      HLSLSourceQualityResult *quality,
+                                      HLSLExpressionSourceMap *map) {
+    USILInstruction instructions[4] = {0};
+    instructions[0].opcode = USIL_OP_ADD;
+    instructions[0].operand_count = 3;
+    instructions[0].operands[0] = operand(OPERAND_TYPE_TEMP, 0, 1);
+    instructions[0].operands[1] = operand(OPERAND_TYPE_INPUT, 0, 0);
+    instructions[0].operands[1].swizzle_mode = 2;
+    instructions[0].operands[1].swizzle[0] = 2;
+    instructions[0].operands[2].type = OPERAND_TYPE_IMMEDIATE32;
+    instructions[0].operands[2].imm_value_count = 1;
+    instructions[0].operands[2].imm_values[0] = UINT32_C(0x3ec00000);
+    instructions[1].opcode = USIL_OP_MUL;
+    instructions[1].operand_count = 3;
+    instructions[1].operands[0] = operand(OPERAND_TYPE_TEMP, 1, 3);
+    instructions[1].operands[1] = operand(OPERAND_TYPE_INPUT, 0, 0);
+    instructions[1].operands[2].type = OPERAND_TYPE_IMMEDIATE32;
+    instructions[1].operands[2].imm_value_count = 1;
+    instructions[1].operands[2].imm_values[0] = UINT32_C(0x3fa00000);
+    instructions[2].opcode = USIL_OP_SAMPLE_L;
+    instructions[2].operand_count = 5;
+    instructions[2].operands[0] = operand(OPERAND_TYPE_OUTPUT, 0, 15);
+    instructions[2].operands[1] = operand(OPERAND_TYPE_TEMP, 1, 0);
+    instructions[2].operands[2] = operand(OPERAND_TYPE_RESOURCE, 0, 0);
+    instructions[2].operands[3] = operand(OPERAND_TYPE_SAMPLER, 0, 0);
+    instructions[2].operands[4] = operand(OPERAND_TYPE_TEMP, 0, 0);
+    instructions[2].operands[4].swizzle_mode = 2;
+    instructions[3].opcode = USIL_OP_RET;
+    for (unsigned index = 0; index < 4; ++index)
+        instructions[index].source_instruction_index = index + 9;
+    USILProgram program = *base;
+    program.instructions = instructions;
+    for (unsigned ordered = 0; ordered < 2; ++ordered) {
+        StringBuilder source;
+        sb_init(&source);
+        CHECK(hlsl_emit_with_options(&program, &source, parameters, NULL, NULL, options));
+        CHECK(quality->classification == HLSL_SOURCE_QUALITY_CLEAN &&
+              !quality->counts.register_storage && !quality->counts.lane_transport);
+        CHECK(hlsl_expression_source_map_matches(map, &program, source.buf));
+        const char *scalar = strstr(source.buf, "const float dxbc_value_i");
+        const char *coordinates = strstr(source.buf, "const float2 dxbc_value_i");
+        const char *sample = strstr(source.buf, ".SampleLevel(");
+        if (!ordered) CHECK(scalar && coordinates && sample && scalar < coordinates && coordinates < sample);
+        else CHECK(!scalar && !coordinates && sample);
+        sb_free(&source);
+        USILInstruction first = instructions[0];
+        instructions[0] = instructions[1];
+        instructions[1] = first;
+    }
+    return 0;
+}
+
 int main(void) {
     USILInstruction instructions[4] = {0};
     for (int index = 0; index < 2; ++index) {
@@ -106,6 +161,66 @@ int main(void) {
         sampler.mode = 0;
         binding.bind_type = SERIALIZED_RESOURCE_TEXTURE;
         program.program_type = DXBC_PROGRAM_TYPE_PIXEL;
+    }
+    const USILOpcode modes[] = {USIL_OP_SAMPLE_L, USIL_OP_SAMPLE_B, USIL_OP_SAMPLE_D};
+    const char *methods[] = {".SampleLevel(", ".SampleBias(", ".SampleGrad("};
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        for (unsigned stage = 0; stage < 2; ++stage) {
+            program.program_type = stage ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL;
+            strcpy(program.shader_type_model, stage ? "vs_5_0" : "ps_5_0");
+            strcpy(output.semantic_name, stage ? "SV_POSITION" : "SV_Target");
+            output.system_value = stage ? 1u : 64u;
+            for (int index = 0; index < 2; ++index) {
+                instructions[index].opcode = modes[mode];
+                instructions[index].operand_count = mode == 2 ? 6 : 5;
+                instructions[index].operands[4] = operand(OPERAND_TYPE_INPUT, 0, 0);
+                instructions[index].operands[5] = operand(OPERAND_TYPE_INPUT, 0, 0);
+                for (int lane = 0; lane < 4; ++lane) {
+                    instructions[index].operands[4].swizzle[lane] =
+                        mode == 2 ? (uint8_t)lane : 2u;
+                    instructions[index].operands[5].swizzle[lane] =
+                        (uint8_t)(2 + (lane % 2));
+                }
+            }
+            sb_init(&source);
+            if (stage && mode == 1) {
+                CHECK(!hlsl_emit_with_options(&program, &source, &parameters, NULL, NULL, &options));
+                CHECK(!map.complete);
+                sb_free(&source);
+                continue;
+            }
+            CHECK(hlsl_emit_with_options(&program, &source, &parameters, NULL, NULL, &options));
+            CHECK(hlsl_expression_source_map_matches(&map, &program, source.buf));
+            const char *sample = strstr(source.buf, methods[mode]);
+            CHECK(sample && strstr(sample + 1, methods[mode]));
+            CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+            CHECK(strstr(source.buf, mode == 2 ? "(texcoord0.xy), (texcoord0.zw)" : "texcoord0.z)"));
+            map.origins[0].kind = HLSL_EXPRESSION_ORIGIN_DEAD;
+            map.origins[0].source_begin = map.origins[0].source_end = 0;
+            CHECK(!hlsl_expression_source_map_matches(&map, &program, source.buf));
+            sb_free(&source);
+            for (int mutation = 0; mutation < 4; ++mutation) {
+                const USILInstruction saved = instructions[0];
+                if (mutation == 0) instructions[0].has_texel_offset = true;
+                if (mutation == 1) instructions[0].precise_mask = 1;
+                if (mutation == 2) instructions[0].operands[4].type = OPERAND_TYPE_OUTPUT;
+                if (mutation == 3) instructions[0].operand_count = 4;
+                sb_init(&source);
+                CHECK(!hlsl_emit_with_options(&program, &source, &parameters, NULL, NULL, &options));
+                CHECK(!map.complete);
+                sb_free(&source);
+                instructions[0] = saved;
+            }
+        }
+    }
+    program.program_type = DXBC_PROGRAM_TYPE_PIXEL;
+    strcpy(program.shader_type_model, "ps_5_0");
+    strcpy(output.semantic_name, "SV_Target");
+    output.system_value = 64u;
+    CHECK(check_sample_argument_order(&program, &parameters, &options, &quality, &map) == 0);
+    for (int index = 0; index < 2; ++index) {
+        instructions[index].opcode = USIL_OP_SAMPLE;
+        instructions[index].operand_count = 4;
     }
     binding.name = "texcoord0";
     sb_init(&source);

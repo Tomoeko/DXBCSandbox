@@ -15,6 +15,7 @@ enum {
     COMPUTE_SOURCE_MAX_KERNELS = 32,
     COMPUTE_SOURCE_MAX_VARIANTS = 4096,
     COMPUTE_SOURCE_MAX_INSTRUCTIONS = 64,
+    COMPUTE_SOURCE_MAX_TYPED_RESOURCES = 2,
     COMPUTE_SOURCE_MAX_BYTES = 8 * 1024 * 1024
 };
 
@@ -53,6 +54,14 @@ typedef struct {
 } ComputeSourceDiagnostic;
 
 typedef struct {
+    USILOpcode opcode;
+    uint32_t effect_flags; /* Exact USILEffectFlags from the shared validator. */
+    int instruction_index;
+    uint32_t source_instruction_index;
+    uint32_t binding_register;
+} ComputeSourceMemoryEffect;
+
+typedef struct {
     size_t platform_index;
     size_t kernel_index;
     size_t variant_index;
@@ -67,11 +76,26 @@ typedef struct {
     uint8_t dxbc_sha256[COMMON_SHA256_DIGEST_SIZE];
     uint8_t source_sha256[COMMON_SHA256_DIGEST_SIZE];
     HLSLSourceQualityResult entry_quality;
-    /* Owned effect/syntax ledger. RET/SYNC-only admission never flattens an
-     * AST expression into these events or borrows formatter state. */
+    /* Owned effect/syntax events; AST expressions are retained separately.
+     * No expression observation is flattened into an emission event. */
     HLSLSourceQualityFacts *emission_facts;
     size_t emission_fact_count;
+    /* Owned actual emitted AST roots, retaining by-value logical origins. */
+    ASTExpr **expressions;
+    size_t expression_count;
+    /* Original memory-effect order, independent of source presentation. */
+    ComputeSourceMemoryEffect memory_effects[2];
+    size_t memory_effect_count;
 } ComputeSourceVariant;
+
+typedef struct {
+    char *name;
+    uint32_t binding_register;
+    bool writable;
+    /* Owned original candidate-row IDs containing this exact declaration. */
+    uint32_t *variant_witnesses;
+    size_t witness_count;
+} ComputeSourceTypedResource;
 
 typedef struct {
     StringBuilder source;
@@ -81,6 +105,10 @@ typedef struct {
     size_t global_keyword_count;
     size_t local_keyword_count;
     size_t kernel_count;
+    /* Strong declaration union: names, type and binding agree in every entry.
+     * UINT4 Texture2D / RWTexture2D are the only admitted resource types. */
+    ComputeSourceTypedResource resources[COMPUTE_SOURCE_MAX_TYPED_RESOURCES];
+    size_t resource_count;
     uint8_t serialized_object_sha256[COMMON_SHA256_DIGEST_SIZE];
     /* Binds the canonical selected model as well as its serialized span.
      * Caller-owned decoded fields are not assumed immutable or proven equal
@@ -102,7 +130,8 @@ void compute_source_candidate_dispose(ComputeSourceCandidate *candidate);
  * leaves the initialized destination unchanged; diagnostics retain requested
  * counts and the first precise unsupported coordinate. Initial source support
  * is one Windows64 D3D11 platform, exhaustive Boolean keyword domains, no
- * resource/shared-memory declarations, and cs5 RET/SYNC-only bodies. */
+ * shared-memory declarations, and cs5 RET/SYNC-only bodies or one typed UINT4
+ * Texture2D load and one RWTexture2D store with bounded unsigned expressions. */
 ComputeSourceStatus compute_source_candidate_build(
     const ComputeShaderObject *object, ComputeSourceCandidate *candidate,
     ComputeSourceDiagnostic *diagnostic);

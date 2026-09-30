@@ -84,6 +84,9 @@ typedef struct {
 typedef struct UnityShaderLabLiftResult UnityShaderLabLiftResult;
 
 /* Verify the ordinary low-level baseline, then the ordinary expression candidate.
+ * If raw source emission is unsupported, the expression candidate may instead
+ * establish its own full generated-domain evidence. The failed baseline stays
+ * recorded and is never a fallback. Other baseline failures stop candidate work.
  * With a second candidate budget, an expression rejected by emission, compilation
  * or complete DXBC comparison can try the closed Unity UV family under its own
  * included low-level baseline. Missing evidence and authority failures cannot

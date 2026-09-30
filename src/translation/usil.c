@@ -993,17 +993,6 @@ static bool resource_declaration_list_valid(
     return true;
 }
 
-static uint32_t geometry_input_vertex_count(DXBCInputPrimitive primitive) {
-    switch (primitive) {
-        case DXBC_INPUT_PRIMITIVE_POINT: return 1u;
-        case DXBC_INPUT_PRIMITIVE_LINE: return 2u;
-        case DXBC_INPUT_PRIMITIVE_TRIANGLE: return 3u;
-        case DXBC_INPUT_PRIMITIVE_LINE_ADJACENCY: return 4u;
-        case DXBC_INPUT_PRIMITIVE_TRIANGLE_ADJACENCY: return 6u;
-        default: return 0u;
-    }
-}
-
 static bool initialize_stage_contract(
     USILProgram* program, const DXBCContainer* container,
     const DXBCStageContract* contract) {
@@ -1156,7 +1145,7 @@ static bool initialize_stage_contract(
     if (contract->program_type != DXBC_PROGRAM_TYPE_GEOMETRY) return true;
 
     const uint32_t vertex_count =
-        geometry_input_vertex_count(contract->input_primitive);
+        dxbc_geometry_input_vertex_count(contract->input_primitive);
     if (!contract->has_input_primitive || !contract->has_output_topology ||
         !contract->has_max_output_vertex_count || vertex_count == 0u ||
         contract->max_output_vertex_count == 0u ||

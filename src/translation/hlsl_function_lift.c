@@ -41,6 +41,8 @@ static bool prepare_functions(HLSLEmitterContext *ctx) {
     HLSLFloat4FunctionPlan *plan = &ctx->float4_functions;
     for (int i = 0; i < HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT; ++i)
         plan->group[i] = -1;
+    if (ctx->high_level_geometry)
+        return true; /* Geometry effects stay in the entry's ordered statement stream. */
     for (int i = 0; i < ctx->program->instruction_count; ++i)
         if (ctx->program->instructions[i].opcode == USIL_OP_IF ||
             ctx->program->instructions[i].opcode == USIL_OP_LOOP)

@@ -74,6 +74,7 @@ set(DXBC_SOURCES
     src/translation/hlsl_lift_transaction.c
     src/translation/hlsl_ast.c
     src/translation/hlsl_source_quality.c
+    src/translation/hlsl_cbuffer_source_quality.c
     src/translation/hlsl_source_quality_report.c
     src/translation/hlsl_matrix_lift.c
     src/translation/hlsl_global_declarations.c
