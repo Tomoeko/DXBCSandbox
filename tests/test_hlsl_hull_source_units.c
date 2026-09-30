@@ -773,10 +773,10 @@ static bool explicit_control_point_phase(void) {
 }
 
 static bool differing_control_point_counts(void) {
-    const uint32_t pairs[][2] = {{4, 3}, {32, 3}, {3, 1}, {32, 31}, {2, 1}};
+    const uint8_t pairs[][2] = {{4, 3}, {32, 3}, {3, 1}, {32, 31}, {2, 1}};
     for (size_t index = 0; index < sizeof(pairs) / sizeof(pairs[0]); ++index) {
         HullFixture fixture;
-        const uint32_t inputs = pairs[index][0], outputs = pairs[index][1];
+        const uint8_t inputs = pairs[index][0], outputs = pairs[index][1];
         CHECK(hull_fixture_init_counts(&fixture, inputs, outputs, 5));
         CHECK(fixture.contract.input_control_point_count == inputs);
         CHECK(fixture.contract.output_control_point_count == outputs);
