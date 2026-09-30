@@ -3,6 +3,7 @@
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_matrix_lift.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -29,7 +30,7 @@ static DXBCOperand register_operand(DXBCOperandType type, int reg) {
     value.index_has_immediate[0] = true;
     value.index_values[0] = (uint32_t)reg;
     value.swizzle_mode = 1;
-    for (int lane = 0; lane < 4; ++lane) value.swizzle[lane] = lane;
+    for (int lane = 0; lane < 4; ++lane) value.swizzle[lane] = (uint8_t)lane;
     return value;
 }
 
@@ -40,8 +41,10 @@ static DXBCOperand destination(DXBCOperandType type, int reg) {
 }
 
 static DXBCOperand scalar(DXBCOperandType type, int reg, int lane) {
+    assert(lane >= 0 && lane < 4);
     DXBCOperand value = register_operand(type, reg);
-    for (int component = 0; component < 4; ++component) value.swizzle[component] = lane;
+    for (int component = 0; component < 4; ++component)
+        value.swizzle[component] = (uint8_t)lane;
     return value;
 }
 

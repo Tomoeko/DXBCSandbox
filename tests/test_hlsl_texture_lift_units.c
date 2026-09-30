@@ -19,7 +19,8 @@ static DXBCOperand operand(DXBCOperandType type, int reg, uint8_t lanes) {
     value.index_values[0] = (uint32_t)reg;
     value.destination_mask = lanes << 4;
     value.swizzle_mode = 1;
-    for (int component = 0; component < 4; ++component) value.swizzle[component] = component;
+    for (int component = 0; component < 4; ++component)
+        value.swizzle[component] = (uint8_t)component;
     return value;
 }
 
