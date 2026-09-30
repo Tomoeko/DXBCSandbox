@@ -189,7 +189,7 @@ static bool hull_contract(const USILProgram *p, PatchPlan *plan) {
         if (!!(ranges & (UINT32_C(1) << phase)) != (f->count > 1) ||
             !!(instances & (UINT32_C(1) << phase)) != (f->count > 1)) return false;
         for (unsigned reg = 0; reg < plan->layout.row_count; ++reg) {
-            if (reg >= f->first_register && reg < f->first_register + f->count && plan->producer[reg] != (int)phase) return false;
+            if (reg >= f->first_register && reg < (unsigned)f->first_register + f->count && plan->producer[reg] != (int)phase) return false;
             if (plan->declared_reads[phase] & (UINT32_C(1) << reg)) {
                 const int producer = plan->producer[reg];
                 if (producer < 0 || producer >= (int)phase || p->tessellation.phases[producer].kind != DXBC_HULL_PHASE_FORK) return false;

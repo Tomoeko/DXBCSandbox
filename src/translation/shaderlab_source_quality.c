@@ -324,21 +324,21 @@ static void model_digest(const ShaderLabSourceQualityRequest *request,
         hash_number(&hash, program->has_hardware_tier);
         hash_number(&hash, (uint64_t)program->hardware_tier);
         hash_number(&hash, (uint64_t)program->global_keyword_count);
-        for (int index = 0; index < program->global_keyword_count; ++index)
-            hash_text(&hash, program->global_keywords[index]);
+        for (int keyword_index = 0; keyword_index < program->global_keyword_count; ++keyword_index)
+            hash_text(&hash, program->global_keywords[keyword_index]);
         hash_number(&hash, (uint64_t)program->local_keyword_count);
-        for (int index = 0; index < program->local_keyword_count; ++index)
-            hash_text(&hash, program->local_keywords[index]);
+        for (int keyword_index = 0; keyword_index < program->local_keyword_count; ++keyword_index)
+            hash_text(&hash, program->local_keywords[keyword_index]);
         const SerializedSubProgramIdentity *identity = &pass->subprogram_identities[entry->stage_index][entry->subprogram_index];
         hash_number(&hash, (uint64_t)identity->hardware_tier_group);
         hash_number(&hash, (uint64_t)identity->inner_subprogram_index);
         hash_number(&hash, identity->keyword_scopes_are_explicit);
         hash_number(&hash, (uint64_t)identity->global_keyword_index_count);
-        for (int index = 0; index < identity->global_keyword_index_count; ++index)
-            hash_number(&hash, (uint64_t)identity->global_keyword_indices[index]);
+        for (int keyword_index = 0; keyword_index < identity->global_keyword_index_count; ++keyword_index)
+            hash_number(&hash, (uint64_t)identity->global_keyword_indices[keyword_index]);
         hash_number(&hash, (uint64_t)identity->local_keyword_index_count);
-        for (int index = 0; index < identity->local_keyword_index_count; ++index)
-            hash_number(&hash, (uint64_t)identity->local_keyword_indices[index]);
+        for (int keyword_index = 0; keyword_index < identity->local_keyword_index_count; ++keyword_index)
+            hash_number(&hash, (uint64_t)identity->local_keyword_indices[keyword_index]);
     }
     common_sha256_final(&hash, inventory->modeled_input_digest);
 }

@@ -68,7 +68,11 @@ static bool init(Fixture *f,bool hull) {
     for(unsigned role=0;role<3;++role){u32(bytes+32+4*role,(uint32_t)off);off+=signature(bytes+off,role,hull);off=(off+3)&~(size_t)3;}
     u32(bytes+44,(uint32_t)off);memcpy(bytes+off,"SHEX",4);u32(bytes+off+4,(uint32_t)(count*4+8));
     u32(bytes+off+8,hull?0x00030050:0x00040050);u32(bytes+off+12,(uint32_t)(count+2));
-    for(size_t n=0;n<count;++n)u32(bytes+off+16+4*n,words[n]);off+=16+4*count;u32(bytes+24,(uint32_t)off);
+    for (size_t n = 0; n < count; ++n) {
+        u32(bytes + off + 16 + 4 * n, words[n]);
+    }
+    off += 16 + 4 * count;
+    u32(bytes + 24, (uint32_t)off);
     CHECK(dxbc_compute_hash(bytes,off,bytes+4));DXBCDocumentDiagnostic dd;DXBCStageContractDiagnostic sd;
     CHECK(dxbc_document_parse(&f->document,bytes,off,&dd));CHECK(dxbc_document_decode_semantic(&f->document,&f->semantic));
     CHECK(dxbc_stage_contract_decode(&f->document,&f->semantic,&f->contract,&sd));
