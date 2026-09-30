@@ -2,6 +2,7 @@
 
 #include "translation/usil.h"
 #include "dxbc/dxbc_decoder.h"
+#include "translation/usil_validation.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -258,7 +259,9 @@ static bool signature_input_builtin_mask_is_valid(DXBCOperandType type,
         case OPERAND_TYPE_INPUT_THREAD_ID:
         case OPERAND_TYPE_INPUT_THREAD_GROUP_ID:
         case OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP:
-            return mask == 0x07u;
+            /* FXC declares exactly the used xyz components of uint3 compute
+             * system values; preserve that mask instead of inventing lanes. */
+            return mask != 0u && (mask & ~0x07u) == 0u;
         case OPERAND_TYPE_INPUT_PRIMITIVE_ID:
         case OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID:
         case OPERAND_TYPE_FORK_INSTANCE_ID:
@@ -900,6 +903,17 @@ static bool map_dxbc_opcode(uint32_t opcode, USILOpcode* mapped) {
         case 19: *mapped = USIL_OP_GEOMETRY_APPEND; break;
         case 117: *mapped = USIL_OP_GEOMETRY_APPEND; break;
         case 118: *mapped = USIL_OP_GEOMETRY_RESTART_STRIP; break;
+        case 190: *mapped = USIL_OP_SYNC; break;
+        case 163: *mapped = USIL_OP_LD_UAV_TYPED; break;
+        case 164: *mapped = USIL_OP_STORE_UAV_TYPED; break;
+        case 165: *mapped = USIL_OP_LD_RAW; break;
+        case 166: *mapped = USIL_OP_STORE_RAW; break;
+        case 168: *mapped = USIL_OP_STORE_STRUCTURED; break;
+        case 171: *mapped = USIL_OP_ATOMIC_XOR; break;
+        case 173: *mapped = USIL_OP_ATOMIC_IADD; break;
+        case 178: *mapped = USIL_OP_IMM_ATOMIC_ALLOC; break;
+        case 179: *mapped = USIL_OP_IMM_ATOMIC_CONSUME; break;
+        case 185: *mapped = USIL_OP_IMM_ATOMIC_CMP_EXCH; break;
         default: return false;
     }
     return true;
@@ -1007,6 +1021,65 @@ static bool initialize_stage_contract(
     program->program_type = contract->program_type;
     program->shader_model_major = contract->shader_model_major;
     program->shader_model_minor = contract->shader_model_minor;
+    if (contract->program_type == DXBC_PROGRAM_TYPE_COMPUTE) {
+        if (!contract->has_thread_group_size ||
+            contract->thread_group_shared_memory_count > 8192u ||
+            contract->thread_group_shared_memory_count >
+                contract->thread_group_shared_memory_capacity ||
+            (contract->thread_group_shared_memory_count != 0u &&
+             !contract->thread_group_shared_memory) ||
+            contract->thread_group_shared_memory_bytes > 32768u ||
+            contract->memory_barrier_count > contract->memory_barrier_capacity ||
+            (contract->memory_barrier_count != 0u && !contract->memory_barriers))
+            return false;
+        const uint32_t maximum_threads = contract->shader_model_major == 4u ? 768u : 1024u;
+        uint64_t threads = 1u;
+        for (size_t axis = 0; axis < 3u; ++axis) {
+            const uint32_t limit = axis == 2u
+                ? (contract->shader_model_major == 4u ? 1u : 64u)
+                : maximum_threads;
+            if (contract->thread_group_size[axis] == 0u ||
+                contract->thread_group_size[axis] > limit) return false;
+            threads *= contract->thread_group_size[axis];
+        }
+        if (threads > maximum_threads) return false;
+        uint64_t shared_bytes = 0u;
+        for (size_t index = 0; index < contract->thread_group_shared_memory_count; ++index) {
+            const DXBCThreadGroupSharedMemoryContract* memory =
+                &contract->thread_group_shared_memory[index];
+            if (contract->shader_model_major != 5u || memory->register_id >= 8192u ||
+                memory->byte_count == 0u || (memory->byte_count & 3u) != 0u ||
+                (memory->structured &&
+                 (memory->byte_stride == 0u || (memory->byte_stride & 3u) != 0u ||
+                  memory->element_count == 0u ||
+                  (uint64_t)memory->byte_stride * memory->element_count != memory->byte_count)) ||
+                (!memory->structured && (memory->byte_stride != 0u || memory->element_count != 0u)))
+                return false;
+            shared_bytes += memory->byte_count;
+            for (size_t prior = 0; prior < index; ++prior)
+                if (contract->thread_group_shared_memory[prior].register_id == memory->register_id)
+                    return false;
+        }
+        if (shared_bytes > 32768u || shared_bytes != contract->thread_group_shared_memory_bytes)
+            return false;
+        program->compute.valid = true;
+        memcpy(program->compute.thread_group_size, contract->thread_group_size,
+               sizeof(program->compute.thread_group_size));
+        program->compute.declaration_source_instruction_index =
+            contract->thread_group_declaration_instruction_index;
+        program->compute.shared_memory_bytes = contract->thread_group_shared_memory_bytes;
+        program->compute.barrier_count = contract->memory_barrier_count;
+        if (contract->thread_group_shared_memory_count != 0u) {
+            const size_t bytes = contract->thread_group_shared_memory_count *
+                                 sizeof(*program->compute.shared_memory);
+            program->compute.shared_memory = mem_alloc(bytes);
+            if (!program->compute.shared_memory) return false;
+            memcpy(program->compute.shared_memory, contract->thread_group_shared_memory, bytes);
+            program->compute.shared_memory_count = contract->thread_group_shared_memory_count;
+            program->compute.shared_memory_capacity = contract->thread_group_shared_memory_count;
+        }
+        return true;
+    }
     if (contract->program_type == DXBC_PROGRAM_TYPE_HULL ||
         contract->program_type == DXBC_PROGRAM_TYPE_DOMAIN) {
         if (!contract->has_input_control_point_count ||
@@ -1110,6 +1183,83 @@ static bool initialize_stage_contract(
     program->geometry.effect_count = contract->geometry_effect_count;
     program->geometry.output_tuple_state_persists = true;
     return true;
+}
+
+static bool compute_declaration_matches(
+    const DXBCInstruction* source, uint32_t source_index,
+    const DXBCStageContract* contract, bool* seen_thread_group,
+    size_t* shared_memory_index) {
+    if (!contract || contract->program_type != DXBC_PROGRAM_TYPE_COMPUTE)
+        return false;
+    const uint32_t opcode = source->opcode;
+    const uint32_t expected_length = opcode == 160u ? 5u : 4u;
+    if (source->token != (expected_length << 24u | opcode)) return false;
+    if (opcode == 155u) {
+        if (*seen_thread_group || source->operand_count != 3 ||
+            source_index != contract->thread_group_declaration_instruction_index)
+            return false;
+        for (int axis = 0; axis < 3; ++axis) {
+            uint32_t dimension;
+            if (!declaration_scalar_u32(source, axis, &dimension) ||
+                dimension != contract->thread_group_size[axis]) return false;
+        }
+        *seen_thread_group = true;
+        return true;
+    }
+    if (*shared_memory_index >= contract->thread_group_shared_memory_count ||
+        source->operand_count != (opcode == 160u ? 3 : 2)) return false;
+    const DXBCThreadGroupSharedMemoryContract* memory =
+        &contract->thread_group_shared_memory[*shared_memory_index];
+    const DXBCOperand* binding = &source->operands[0];
+    uint32_t stride, count = 1u;
+    if (memory->instruction_index != source_index ||
+        memory->structured != (opcode == 160u) ||
+        binding->type != OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY ||
+        binding->register_index_dim != 1 || !binding->index_has_immediate[0] ||
+        binding->index_value_exceeds_int[0] || binding->register_index < 0 ||
+        binding->index_values[0] != memory->register_id ||
+        (uint32_t)binding->register_index != memory->register_id ||
+        binding->has_abs || binding->has_neg || binding->min_precision != 0u ||
+        binding->extended_token_count != 0u || binding->extended_tokens ||
+        binding->rel_op0 || binding->rel_op1 || binding->rel_op2 ||
+        !declaration_scalar_u32(source, 1, &stride) ||
+        (opcode == 160u && !declaration_scalar_u32(source, 2, &count)) ||
+        memory->byte_count != (uint64_t)stride * count ||
+        (opcode == 160u &&
+         (memory->byte_stride != stride || memory->element_count != count)) ||
+        (opcode == 159u && (memory->byte_stride != 0u || memory->element_count != 0u)))
+        return false;
+    ++*shared_memory_index;
+    return true;
+}
+
+static bool compute_barrier_matches(
+    const DXBCInstruction* source, uint32_t source_index,
+    const DXBCStageContract* contract, size_t* barrier_index,
+    USILInstruction* destination) {
+    if (source->opcode != 190u) return true;
+    if (!contract || contract->program_type != DXBC_PROGRAM_TYPE_COMPUTE ||
+        *barrier_index >= contract->memory_barrier_count ||
+        source->operand_count != 0 || source->saturate || source->precise_mask != 0u)
+        return false;
+    const DXBCMemoryBarrierContract* barrier = &contract->memory_barriers[*barrier_index];
+    if (barrier->instruction_index != source_index ||
+        source->token != (UINT32_C(0x01000000) | (uint32_t)barrier->flags << 11u | 190u) ||
+        (barrier->flags & ~0xfu) != 0u || (barrier->flags & 0xeu) == 0u ||
+        (barrier->flags & 0xcu) == 0xcu) return false;
+    destination->sync_flags = barrier->flags;
+    ++*barrier_index;
+    return true;
+}
+
+static uint8_t compute_system_value_flag(DXBCOperandType type) {
+    switch (type) {
+        case OPERAND_TYPE_INPUT_THREAD_ID: return USIL_COMPUTE_DISPATCH_THREAD_ID;
+        case OPERAND_TYPE_INPUT_THREAD_GROUP_ID: return USIL_COMPUTE_GROUP_ID;
+        case OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP: return USIL_COMPUTE_GROUP_THREAD_ID;
+        case OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED: return USIL_COMPUTE_GROUP_INDEX;
+        default: return 0u;
+    }
 }
 
 static bool geometry_effect_matches(
@@ -1327,6 +1477,9 @@ static bool usil_translate_internal(
     int max_temp_idx = -1;
     
     size_t geometry_effect_index = 0u;
+    size_t compute_shared_memory_index = 0u;
+    size_t compute_barrier_index = 0u;
+    bool seen_thread_group = false;
     size_t hull_phase_index = 0u;
     uint8_t active_signature_stream = 0u;
 
@@ -1375,6 +1528,14 @@ static bool usil_translate_internal(
          * label cannot turn executable code into metadata (or vice versa). */
         if (dxbc_opcode_is_declaration(src_inst->opcode)) {
             switch (src_inst->opcode) {
+            case 155: /* DCL_THREAD_GROUP */
+            case 159: /* DCL_TGSM_RAW */
+            case 160: /* DCL_TGSM_STRUCTURED */
+                if (!compute_declaration_matches(src_inst, (uint32_t)i,
+                                                   stage_contract, &seen_thread_group,
+                                                   &compute_shared_memory_index))
+                    goto declaration_fail;
+                break;
             case 53: /* CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER */
                 /* The decoder copies the exact DWORD payload into
                  * container->icb_values; the rows themselves carry no
@@ -1499,6 +1660,9 @@ static bool usil_translate_internal(
                         active_signature_stream)) {
                     goto declaration_fail;
                 }
+                if (program->compute.valid)
+                    program->compute.system_value_mask |=
+                        compute_system_value_flag(src_inst->operands[0].type);
                 break;
             case 105: /* DCL_INDEXABLE_TEMP */
                 if (src_inst->operand_count == 2) {
@@ -1550,8 +1714,8 @@ static bool usil_translate_internal(
                 }
                 break;
             default:
-                /* Function/interface linkage, compute thread-group and TGSM
-                 * declarations have no faithful USIL model yet. Never erase
+                /* Function/interface linkage declarations have no faithful
+                 * USIL model yet. Never erase
                  * them by treating them as inert metadata. */
                 LOG_ERROR("Cannot translate DXBC declaration opcode %u: no "
                           "faithful USIL representation",
@@ -1586,6 +1750,11 @@ declaration_fail:
         dest_inst->saturate = src_inst->saturate;
         dest_inst->condition_test = src_inst->condition_test;
         dest_inst->source_instruction_index = (uint32_t)i;
+        if (!compute_barrier_matches(src_inst, (uint32_t)i, stage_contract,
+                                      &compute_barrier_index, dest_inst)) {
+            LOG_ERROR("Compute barrier disagrees with raw DXBC contract at instruction %d", i);
+            goto fail;
+        }
         if (!geometry_effect_matches(src_inst, (size_t)i, stage_contract,
                                      &geometry_effect_index, dest_inst)) {
             LOG_ERROR("Geometry stream effect disagrees with raw DXBC contract "
@@ -1639,9 +1808,29 @@ declaration_fail:
             check_operand_temp_usage(&dest_inst->operands[k], &max_temp_idx);
         }
         
+        if (usil_opcode_has_memory_access(dest_inst->opcode) &&
+            (program->program_type == DXBC_PROGRAM_TYPE_COMPUTE ||
+             (dest_inst->opcode != USIL_OP_LD_STRUCTURED &&
+              dest_inst->opcode != USIL_OP_IMM_ATOMIC_IADD))) {
+            USILMemoryAccess access;
+            if ((src_inst->token & UINT32_C(0x00fff800)) != 0u ||
+                !usil_instruction_memory_access(program, dest_inst, &access)) {
+                for (int operand = 0; operand < dest_inst->operand_count; ++operand)
+                    free_usil_operand(&dest_inst->operands[operand]);
+                LOG_ERROR("Compute memory instruction lacks exact declaration/operand authority: opcode %u", src_inst->opcode);
+                goto fail;
+            }
+        }
         program->instruction_count++;
     }
 
+    if (program->compute.valid &&
+        (!seen_thread_group ||
+         compute_shared_memory_index != stage_contract->thread_group_shared_memory_count ||
+         compute_barrier_index != stage_contract->memory_barrier_count)) {
+        LOG_ERROR("Semantic projection omitted compute execution metadata");
+        goto fail;
+    }
     if (stage_contract &&
         stage_contract->program_type == DXBC_PROGRAM_TYPE_GEOMETRY &&
         geometry_effect_index != stage_contract->geometry_effect_count) {
@@ -1813,6 +2002,9 @@ void usil_free(USILProgram* program) {
     mem_free(program->tessellation.phases,
              program->tessellation.phase_capacity *
                  sizeof(*program->tessellation.phases));
+    mem_free(program->compute.shared_memory,
+             program->compute.shared_memory_capacity *
+                 sizeof(*program->compute.shared_memory));
     mem_free(program->icb_values,
              (size_t)program->icb_value_alloc * sizeof(*program->icb_values));
     memset(program, 0, sizeof(USILProgram));

@@ -160,9 +160,12 @@ const char *hlsl_emit_opcode_name(int opcode) {
       "deriv-rtx-coarse", "deriv-rty-coarse", "deriv-rtx-fine",
       "deriv-rty-fine", "iadd", "imul", "imad", "imax", "imin", "umax",
       "umin", "udiv", "ineg", "imm-atomic-iadd", "ldms", "sincos",
-      "ubfe", "geometry-append", "geometry-restart-strip"};
+      "ubfe", "geometry-append", "geometry-restart-strip", "sync",
+      "ld-uav-typed", "store-uav-typed", "ld-raw", "store-raw", "store-structured",
+      "atomic-xor", "atomic-iadd", "imm-atomic-alloc", "imm-atomic-consume",
+      "imm-atomic-cmp-exch"};
   _Static_assert(sizeof(names) / sizeof(names[0]) ==
-                     (size_t)USIL_OP_GEOMETRY_RESTART_STRIP + 1u,
+                     (size_t)USIL_OP_IMM_ATOMIC_CMP_EXCH + 1u,
                  "HLSL diagnostic opcode names must cover every USIL opcode");
   const size_t count = sizeof(names) / sizeof(names[0]);
   return opcode >= 0 && (size_t)opcode < count ? names[opcode] : "unknown";
@@ -1388,7 +1391,250 @@ static bool validate_program_for_hlsl(const USILProgram *program,
   return true;
 }
 
+static unsigned source_quality_width(const DXBCOperand *destination) {
+  unsigned count = 0;
+  unsigned mask = usil_operand_destination_lane_mask(destination);
+  for (unsigned lane = 0; lane < 4; ++lane)
+    if (mask & (1u << lane)) ++count;
+  return count;
+}
+
+static bool emitter_source_quality_expression_facts(
+    void *context, uint32_t unit_id, const ASTExpr *expression,
+    HLSLSourceQualityFacts *facts) {
+  HLSLEmitterContext *ctx = context;
+  (void)unit_id;
+  if (expression->kind == AST_EXPR_EMITTER_OPERAND) {
+    const ASTOperandProvenance *origin = &expression->operand_provenance;
+    if (!origin->complete || origin->value_role == AST_OPERAND_VALUE_UNKNOWN) return false;
+    facts->known = true;
+    facts->value_kind = origin->value_role == AST_OPERAND_VALUE_LOGICAL
+                            ? HLSL_SOURCE_VALUE_LOGICAL
+                            : origin->value_role == AST_OPERAND_VALUE_REGISTER
+                                  ? HLSL_SOURCE_VALUE_REGISTER : HLSL_SOURCE_VALUE_UNKNOWN;
+    facts->logical_value_id = origin->logical_value_id;
+    facts->components = origin->result_components;
+    facts->semantic_projection = origin->selection_role == AST_COMPONENT_SELECTION_SEMANTIC;
+    facts->real_bitcast = origin->bitcast_role == AST_OPERAND_BITCAST_PROGRAM;
+    facts->instruction_index = origin->instruction_index;
+    facts->source_instruction_index = origin->source_instruction_index;
+    facts->lanes = origin->destination_lanes;
+    if (origin->selection_role == AST_COMPONENT_SELECTION_TRANSPORT)
+      facts->artifacts |= HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT;
+    if (origin->bitcast_role == AST_OPERAND_BITCAST_STORAGE)
+      facts->artifacts |= HLSL_SOURCE_ARTIFACT_STORAGE_BITCAST;
+    if (origin->raw_buffer_reconstruction)
+      facts->artifacts |= HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION;
+    if (origin->synthetic_interface)
+      facts->artifacts |= HLSL_SOURCE_ARTIFACT_SYNTHETIC_INTERFACE;
+    return true;
+  }
+  const ASTLogicalValueOrigin *logical = &expression->logical_origin;
+  if (logical->complete) {
+    facts->known = true;
+    facts->value_kind = HLSL_SOURCE_VALUE_LOGICAL;
+    facts->logical_value_id = logical->logical_value_id;
+    facts->components = logical->components;
+    facts->instruction_index = logical->instruction_index;
+    facts->source_instruction_index = logical->source_instruction_index;
+    facts->lanes = logical->destination_lanes;
+    facts->semantic_projection = logical->semantic_projection;
+    facts->real_bitcast = logical->program_bitcast;
+    facts->logical_operation = expression->kind != AST_EXPR_VAR &&
+                               expression->kind != AST_EXPR_LITERAL;
+    if (expression->kind == AST_EXPR_SWIZZLE && !logical->semantic_projection)
+      facts->artifacts = HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT;
+    if (expression->kind == AST_EXPR_BITCAST && !logical->program_bitcast)
+      facts->artifacts = HLSL_SOURCE_ARTIFACT_STORAGE_BITCAST;
+    return true;
+  }
+  if (expression->kind == AST_EXPR_SWIZZLE) {
+    facts->known = true;
+    facts->artifacts = HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT;
+    return true;
+  }
+  int instruction = ctx->source_quality_instruction;
+  if (expression->kind == AST_EXPR_VAR)
+    instruction = expression->u.var.ssa_var;
+  else if (expression != ctx->source_quality_root ||
+           expression->kind == AST_EXPR_EMITTER_OPERAND)
+    return false;
+  if (instruction < 0 || instruction >= ctx->program->instruction_count ||
+      ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
+    return false;
+  const USILInstruction *owner = &ctx->program->instructions[instruction];
+  if (owner->operand_count < 1) return false;
+  facts->known = true;
+  facts->value_kind = HLSL_SOURCE_VALUE_LOGICAL;
+  facts->logical_value_id = (uint64_t)instruction;
+  facts->components = source_quality_width(&owner->operands[0]);
+  facts->instruction_index = instruction;
+  facts->source_instruction_index = owner->source_instruction_index;
+  facts->lanes = usil_operand_destination_lane_mask(&owner->operands[0]);
+  facts->logical_operation = expression->kind != AST_EXPR_VAR &&
+                             expression->kind != AST_EXPR_LITERAL;
+  return true;
+}
+
+static bool high_level_direct_return_supported(const USILProgram *program,
+                                                HLSLEmitMode mode) {
+  if (mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
+      program->output_count != 1 || program->instruction_count < 2 ||
+      program->instructions[program->instruction_count - 1].opcode != USIL_OP_RET)
+    return false;
+  const DXBCSignatureElement *output = &program->outputs[0];
+  if (output->component_type != 3 || output->register_id == UINT32_MAX ||
+      !output->mask || (output->mask & (output->mask + 1u)))
+    return false;
+  int output_write = -1;
+  int final_value_instruction = -1;
+  for (int instruction = 0; instruction + 1 < program->instruction_count; ++instruction) {
+    const USILInstruction *value = &program->instructions[instruction];
+    if (value->opcode == USIL_OP_NOP) continue;
+    final_value_instruction = instruction;
+    if (!hlsl_expression_effects_supported(program, value)) return false;
+    for (int operand = 0; operand < value->operand_count; ++operand) {
+      USILOperandUseInfo use;
+      if (!usil_instruction_operand_use(program, value, operand, &use)) return false;
+      if (value->operands[operand].type != OPERAND_TYPE_OUTPUT) continue;
+      if (use.use != USIL_OPERAND_USE_DESTINATION || output_write >= 0 ||
+          value->operands[operand].register_index != (int)output->register_id ||
+          usil_operand_destination_lane_mask(&value->operands[operand]) != output->mask)
+        return false;
+      output_write = instruction;
+    }
+  }
+  return output_write >= 0 && output_write == final_value_instruction;
+}
+
+bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
+                                            const ASTExpr *expression, int instruction) {
+  if (!ctx->source_quality_analysis) return true;
+  hlsl_source_quality_interface_expression_begin(ctx, instruction);
+  ctx->source_quality_root = expression;
+  ctx->source_quality_instruction = instruction;
+  bool accepted = hlsl_source_quality_analysis_expression(ctx->source_quality_analysis, expression);
+  ctx->source_quality_root = NULL;
+  if (!accepted)
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+  return accepted;
+}
+
+/* This inventory describes only the natural direct-entry straightline emitter,
+ * including signature-backed named result structures with one full write per
+ * field. Actual interface spans are checked independently before finalization.
+ * Every declaration/interface/statement in this bounded scope has an actual
+ * emission event and every expression is visited before its AST is freed.
+ * Other stages, includes, storage layouts and helpers retain explicit coverage
+ * gaps until their syntax and dependencies have their own audited units. */
+static bool source_quality_inventory_complete(const HLSLEmitterContext *ctx) {
+  const USILProgram *program = ctx->program;
+  if (ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
+      !hlsl_source_quality_interface_inventory_supported(ctx) ||
+      !ctx->high_level_functions_prepared ||
+      (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
+       program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
+      ctx->unity_uv_helper ||
+      ctx->readable_screen_pos_helper || ctx->compiler_model.replacement_count ||
+      ctx->use_uint_temps ||
+      ctx->indexed_face_basis.valid || ctx->surface_tangent_frame.valid ||
+      !hlsl_source_quality_resource_inventory_complete(ctx) || program->uav_count ||
+      program->icb_value_count || program->indexable_temp_count ||
+      program->index_range_count || program->patch_constant_count ||
+      !ctx->cbuffer_layouts_built ||
+      ctx->cbuffer_layout_count != program->cbuffer_count)
+    return false;
+  for (int group = 0; group < 2; ++group)
+    if (ctx->float4_functions.use_count[group] >= 2)
+      return false;
+  for (int buffer = 0; buffer < ctx->cbuffer_layout_count; ++buffer) {
+    const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[buffer];
+    if (!layout->compact_global_layout || layout->omit_declaration ||
+        layout->raw_storage || layout->row_struct_storage || layout->is_unity_builtin)
+      return false;
+  }
+  return true;
+}
+
+bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete) {
+  if (!ctx->source_quality_analysis) return true;
+  ctx->source_quality_interface_required = complete && ctx->high_level_interface;
+  if (hlsl_source_quality_analysis_begin_unit(ctx->source_quality_analysis, 0,
+                                             HLSL_SOURCE_UNIT_ENTRY_POINT, complete))
+    return true;
+  hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                 HLSL_EMIT_PHASE_CONTEXT_ALLOCATION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+  return false;
+}
+
+void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
+                                  bool logical_operation, int instruction) {
+  if (!ctx->source_quality_analysis) return;
+  HLSLSourceQualityFacts facts;
+  hlsl_source_quality_facts_init(&facts);
+  facts.known = true;
+  facts.artifacts = artifacts;
+  facts.logical_operation = logical_operation;
+  if (instruction >= 0 && instruction < ctx->program->instruction_count) {
+    const USILInstruction *owner = &ctx->program->instructions[instruction];
+    facts.instruction_index = instruction;
+    facts.source_instruction_index = owner->source_instruction_index;
+    if (owner->operand_count > 0) {
+      USILOperandUseInfo use;
+      if (usil_instruction_operand_use(ctx->program, owner, 0, &use) &&
+          use.use == USIL_OPERAND_USE_DESTINATION)
+        facts.lanes = usil_operand_destination_lane_mask(&owner->operands[0]);
+    }
+  }
+  if (!hlsl_source_quality_analysis_emission(ctx->source_quality_analysis, &facts))
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+  else
+    hlsl_source_quality_interface_statement_emitted(ctx, instruction);
+}
+
+bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptions *options) {
+  if (!options || !options->source_quality) return true;
+  const HLSLSourceQualityRequest quality_request = {
+      .stage = ctx->program->program_type,
+      .pass_index = options->source_quality_pass_index,
+      .entry_point_index = options->source_quality_entry_point_index,
+      .emission_status = HLSL_EMIT_STATUS_OK,
+      .expression_facts = emitter_source_quality_expression_facts,
+      .facts_context = ctx,
+      .observer = options->source_quality_observer,
+      .observer_context = options->source_quality_observer_context};
+  ctx->source_quality_analysis =
+      hlsl_source_quality_analysis_create(&quality_request, options->source_quality);
+  if (ctx->source_quality_analysis) return true;
+  hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                 HLSL_EMIT_PHASE_CONTEXT_ALLOCATION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+  return false;
+}
+
+void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
+  if (ctx->source_quality_analysis) {
+    HLSLEmitStatus status = ctx->diagnostic ? ctx->diagnostic->status : HLSL_EMIT_STATUS_OK;
+    if (status == HLSL_EMIT_STATUS_OK && !sb_ok(ctx->sb)) status = HLSL_EMIT_STATUS_OUTPUT_FAILED;
+    if (status == HLSL_EMIT_STATUS_OK && ctx->source_quality_interface_required &&
+        !hlsl_source_quality_interface_inventory_complete(ctx) &&
+        !hlsl_source_quality_analysis_mark_incomplete_unit(ctx->source_quality_analysis)) {
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+      status = HLSL_EMIT_STATUS_ANALYSIS_FAILED;
+    }
+    if (!hlsl_source_quality_analysis_finish(ctx->source_quality_analysis, status, 1) &&
+        status == HLSL_EMIT_STATUS_OK)
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    hlsl_source_quality_analysis_destroy(ctx->source_quality_analysis);
+  }
+  ctx->source_quality_analysis = NULL;
+}
+
 static void free_emitter_context(HLSLEmitterContext *ctx) {
+  hlsl_source_quality_finish_emission(ctx);
   free(ctx->cb_reg_map);
   free_sampler_name_map(ctx);
   free_cbuffer_emission_layouts(ctx);
@@ -1526,6 +1772,11 @@ static void mark_operand_ref(const DXBCOperand *op, bool *inputs_used,
 static bool hlsl_reserved_identifier_options_valid(
     const HLSLEmitOptions *options) {
   if (!options) return true;
+  if (options->global_declarations && options->mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
+    return false;
+  if ((options->source_quality_observer && !options->source_quality) ||
+      (options->source_quality_observer_context && !options->source_quality_observer))
+    return false;
   const bool has_pointer =
       options->reserved_preprocessor_identifiers != NULL;
   const bool has_count =
@@ -1554,7 +1805,7 @@ static bool hlsl_reserved_identifier_options_valid(
   return true;
 }
 
-bool hlsl_emit_with_options_diagnostic(
+static bool hlsl_emit_with_options_impl(
     const USILProgram *program, StringBuilder *sb,
     const SerializedProgramParameters *params,
     const SerializedProgramParameters *common_params,
@@ -1582,6 +1833,9 @@ bool hlsl_emit_with_options_diagnostic(
                           HLSL_EMIT_REASON_INVALID_ARGUMENT);
     sb->failed = true;
     return false;
+  }
+  if (program->program_type == DXBC_PROGRAM_TYPE_COMPUTE) {
+    return hlsl_emit_compute_stage(program, sb, names, options, diagnostic);
   }
   if (!validate_program_for_hlsl(program, diagnostic)) {
     sb->failed = true;
@@ -1667,9 +1921,36 @@ bool hlsl_emit_with_options_diagnostic(
   ctx.readable_screen_pos_add_idx = -1;
   ctx.readable_screen_pos_mov_idx = -1;
   ctx.indent = 4;
+  ctx.high_level_direct_return = high_level_direct_return_supported(program, emit_mode) &&
+      !(options && options->unity_uv_helper);
+  ctx.high_level_interface = ctx.high_level_direct_return ||
+      (hlsl_high_level_struct_interface_supported(program, emit_mode) &&
+       !(options && options->unity_uv_helper));
+  ctx.preferred_output_struct_name = output_struct;
+  ctx.entry_point_name = entry_point;
+  ctx.global_declarations = options ? options->global_declarations : NULL;
+  if (!hlsl_source_quality_initialize(&ctx, options)) {
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
+  if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE && program->output_count > 1 &&
+      (program->program_type == DXBC_PROGRAM_TYPE_VERTEX || program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
+      !ctx.high_level_interface) {
+    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_INTERFACE_EMISSION,
+                   HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
 
   if (program->program_type == DXBC_PROGRAM_TYPE_HULL ||
       program->program_type == DXBC_PROGRAM_TYPE_DOMAIN) {
+    if (!hlsl_source_quality_begin_entry(&ctx, false)) {
+      free_emitter_context(&ctx);
+      free(ctx_ptr);
+      return false;
+    }
     const bool maps_ready = build_sampler_name_map(&ctx);
     if (!maps_ready) {
       hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
@@ -1753,6 +2034,25 @@ bool hlsl_emit_with_options_diagnostic(
     free(ctx_ptr);
     return false;
   }
+  if (ctx.high_level_interface && !hlsl_prepare_high_level_interface(&ctx)) {
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
+  if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+      !hlsl_prepare_high_level_functions(&ctx)) {
+    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED,
+                   HLSL_EMIT_PHASE_STRUCTURAL_HELPER_EMISSION,
+                   HLSL_EMIT_REASON_LOWERING_FAILED);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
+  if (!hlsl_source_quality_begin_entry(&ctx, source_quality_inventory_complete(&ctx))) {
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
 
   bool inputs_used[HLSL_SM5_IO_REGISTER_COUNT] = {false};
   bool outputs_used[HLSL_SM5_IO_REGISTER_COUNT] = {false};
@@ -1774,6 +2074,8 @@ bool hlsl_emit_with_options_diagnostic(
           sb_append(sb, HLSL_UNITY_UV_INCLUDE_SOURCE);
   }
   emit_comments_and_icb(&ctx);
+  if (sb_ok(sb) && source_quality_inventory_complete(&ctx))
+    hlsl_source_quality_emission(&ctx, 0, false, -1);
   if (!sb_ok(sb)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_PROGRAM,
                           HLSL_EMIT_PHASE_ICB_EMISSION,
@@ -1791,7 +2093,8 @@ bool hlsl_emit_with_options_diagnostic(
   }
 
   // Emit Helper Functions for Constant Buffer indexing
-  emit_cbuffer_helpers(&ctx);
+  if (emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
+    emit_cbuffer_helpers(&ctx);
   if (!sb_ok(sb)) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_METADATA,
                           HLSL_EMIT_PHASE_CBUFFER_HELPER_EMISSION,
@@ -1886,6 +2189,38 @@ cleanup:
   }
   free(ctx_ptr);
 #undef ctx
+  return success;
+}
+
+bool hlsl_emit_with_options_diagnostic(
+    const USILProgram *program, StringBuilder *sb,
+    const SerializedProgramParameters *params,
+    const SerializedProgramParameters *common_params,
+    const HLSLEmitNames *names, const HLSLEmitOptions *options,
+    HLSLEmitDiagnostic *diagnostic) {
+  HLSLEmitDiagnostic local_diagnostic;
+  HLSLEmitDiagnostic *failure = diagnostic;
+  HLSLSourceQualityResult *quality = options ? options->source_quality : NULL;
+  if (quality) {
+    if (!failure) failure = &local_diagnostic;
+    memset(quality, 0, sizeof(*quality));
+    quality->stage = program ? program->program_type : DXBC_PROGRAM_TYPE_INVALID;
+    quality->pass_index = options->source_quality_pass_index;
+    quality->entry_point_index = options->source_quality_entry_point_index;
+    quality->classification = HLSL_SOURCE_QUALITY_FAILED;
+  }
+  bool success = hlsl_emit_with_options_impl(program, sb, params, common_params,
+                                             names, options, failure);
+  if (quality) {
+    quality->emission_status = failure->status;
+    if (!success) {
+      bool unsupported = failure->status == HLSL_EMIT_STATUS_UNSUPPORTED;
+      quality->classification = unsupported ? HLSL_SOURCE_QUALITY_UNSUPPORTED
+                                            : HLSL_SOURCE_QUALITY_FAILED;
+      quality->reasons |= unsupported ? HLSL_SOURCE_QUALITY_REASON_EMISSION_UNSUPPORTED
+                                      : HLSL_SOURCE_QUALITY_REASON_EMISSION_FAILED;
+    }
+  }
   return success;
 }
 

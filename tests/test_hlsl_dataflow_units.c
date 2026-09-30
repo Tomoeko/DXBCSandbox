@@ -1286,7 +1286,9 @@ static bool check_expression_emission(void) {
     sb_init(&source);
     CHECK(hlsl_emit_with_options_diagnostic(&program, &source, NULL, NULL, NULL, &options,
                                             &diagnostic));
-    CHECK(strstr(source.buf, "o0 = ((") && strstr(source.buf, " * ") && strstr(source.buf, " + "));
+    CHECK(strstr(source.buf, "return ((") && strstr(source.buf, " * ") && strstr(source.buf, " + "));
+    CHECK(strstr(source.buf, "float4 main(float4 texcoord0 : TEXCOORD0) : SV_Target"));
+    CHECK(!strstr(source.buf, "v0") && !strstr(source.buf, "o0") && !strstr(source.buf, "appdata"));
     CHECK(!strstr(source.buf, "float4 r") && !strstr(source.buf, "u_xlat_temp"));
     CHECK(source_map.complete && source_map.count == 4);
     for (size_t index = 0; index < source_map.count; ++index) {
@@ -1363,7 +1365,7 @@ static bool check_expression_emission(void) {
                                              &diagnostic));
     CHECK(diagnostic.reason == HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY);
     CHECK(!source_map.complete && source_map.count == 0);
-    const char *collisions[] = {"float4", "mad", "main", "appdata", "v0", "o0", "SV_Target"};
+    const char *collisions[] = {"float4", "mad", "main", "SV_Target"};
     for (size_t index = 0; index < sizeof(collisions) / sizeof(collisions[0]); ++index) {
         options.reserved_preprocessor_identifiers = &collisions[index];
         sb_free(&source);
@@ -1372,7 +1374,7 @@ static bool check_expression_emission(void) {
                                                  &diagnostic));
         CHECK(diagnostic.reason == HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY);
     }
-    const char *non_collisions[] = {"float", "dxbc_value_i", "v", "unused_keyword"};
+    const char *non_collisions[] = {"float", "dxbc_value_i", "v", "unused_keyword", "appdata", "v0", "o0"};
     options.reserved_preprocessor_identifiers = non_collisions;
     options.reserved_preprocessor_identifier_count =
         sizeof(non_collisions) / sizeof(non_collisions[0]);
@@ -1392,18 +1394,22 @@ static bool check_expression_emission(void) {
         if (mutation == 3)
             instructions[0].operands[1] = emission_reg(OPERAND_TYPE_TEMP, 1);
         if (mutation == 4)
-            instructions[0].operands[1].has_abs = true;
+            instructions[0].operands[1].min_precision = 1;
         if (mutation == 5)
             input.component_type = 1;
         if (mutation == 6) {
             instructions[0].opcode = USIL_OP_DERIV_RTX;
             instructions[0].operand_count = 2;
+            program.program_type = DXBC_PROGRAM_TYPE_VERTEX;
+            memcpy(program.shader_type_model, "vs_5_0", sizeof("vs_5_0"));
         }
         sb_free(&source);
         sb_init(&source);
         CHECK(!hlsl_emit_with_options(&program, &source, NULL, NULL, NULL, &options));
         instructions[0] = saved;
         input.component_type = 3;
+        program.program_type = DXBC_PROGRAM_TYPE_PIXEL;
+        memcpy(program.shader_type_model, "ps_5_0", sizeof("ps_5_0"));
     }
     /* MOV literals retain every raw word through expression emission. */
     USILInstruction saved_instructions[4];
@@ -1952,14 +1958,16 @@ static bool check_unity_uv_emission(void) {
     map.origins[0].definition_end = map.origins[0].source_begin;
     CHECK(!hlsl_expression_source_map_matches(&map, &program, candidate.buf));
     map = valid;
-    map.origins[0].kind = HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+    map.origins[0].kind = HLSL_EXPRESSION_ORIGIN_FUNCTION;
     CHECK(!hlsl_expression_source_map_matches(&map, &program, candidate.buf));
     sb_free(&candidate);
     /* A plain high-level request must not opt itself into a Unity include. */
     options.unity_uv_helper = HLSL_UNITY_UV_DISABLED;
     sb_init(&candidate);
-    CHECK(!hlsl_emit_with_options(&program, &candidate, NULL, NULL, NULL, &options));
-    CHECK(!map.complete && !strstr(candidate.buf, "UnityCG"));
+    CHECK(hlsl_emit_with_options(&program, &candidate, NULL, NULL, NULL, &options));
+    CHECK(map.complete && !strstr(candidate.buf, "UnityCG"));
+    CHECK(map.origins[0].kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION);
+    CHECK(hlsl_expression_source_map_matches(&map, &program, candidate.buf));
     sb_free(&candidate);
     options.unity_uv_helper = HLSL_UNITY_UV_INCLUDE;
     const char *collision = HLSL_UNITY_UV_FUNCTION;

@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Authored evaluation input. All group synchronization is uniform.
+// The host must provide one device/result element per dispatched thread.
+#pragma kernel GroupOnly
+#pragma kernel GroupSyncOnly
+#pragma kernel DeviceOnly
+#pragma kernel DeviceSyncOnly
+#pragma kernel AllOnly
+#pragma kernel AllSyncOnly
+#pragma kernel GroupAnchored
+#pragma kernel GroupSyncAnchored
+#pragma kernel DeviceAnchored
+#pragma kernel DeviceSyncAnchored
+#pragma kernel AllAnchored
+#pragma kernel AllSyncAnchored
+#pragma kernel OrderedBarriers
+#pragma multi_compile __ BARRIER_TILES
+#pragma multi_compile __ GLOBAL_COHERENCE
+
+#if defined(BARRIER_TILES)
+    #define BARRIER_THREADS_X 4
+    #define BARRIER_THREADS_Y 2
+#else
+    #define BARRIER_THREADS_X 8
+    #define BARRIER_THREADS_Y 1
+#endif
+
+#if defined(GLOBAL_COHERENCE)
+globallycoherent
+#endif
+RWStructuredBuffer<uint> _DeviceValues;
+RWStructuredBuffer<uint> _Results;
+groupshared uint sharedValues[8];
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void GroupOnly()
+{
+    GroupMemoryBarrier();
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void GroupSyncOnly()
+{
+    GroupMemoryBarrierWithGroupSync();
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void DeviceOnly()
+{
+    DeviceMemoryBarrier();
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void DeviceSyncOnly()
+{
+    DeviceMemoryBarrierWithGroupSync();
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void AllOnly()
+{
+    AllMemoryBarrier();
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void AllSyncOnly()
+{
+    AllMemoryBarrierWithGroupSync();
+}
+
+// Address each thread's own slot even without execution synchronization.
+// The 2D dispatch address is flattened using the captured row width.
+uint DeviceAddress(uint3 dispatchId)
+{
+    return dispatchId.x + dispatchId.y * BARRIER_THREADS_X;
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void GroupAnchored(uint3 dispatchId : SV_DispatchThreadID,
+                   uint groupIndex : SV_GroupIndex)
+{
+    sharedValues[groupIndex] = groupIndex + 17;
+    GroupMemoryBarrier();
+    _Results[DeviceAddress(dispatchId)] = sharedValues[groupIndex];
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void GroupSyncAnchored(uint3 dispatchId : SV_DispatchThreadID,
+                       uint groupIndex : SV_GroupIndex)
+{
+    sharedValues[groupIndex] = groupIndex + 17;
+    GroupMemoryBarrierWithGroupSync();
+    _Results[DeviceAddress(dispatchId)] = sharedValues[(groupIndex + 1) & 7];
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void DeviceAnchored(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint address = DeviceAddress(dispatchId);
+    _DeviceValues[address] = address + 17;
+    DeviceMemoryBarrier();
+    _Results[address] = _DeviceValues[address];
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void DeviceSyncAnchored(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint address = DeviceAddress(dispatchId);
+    _DeviceValues[address] = address + 17;
+    DeviceMemoryBarrierWithGroupSync();
+    _Results[address] = _DeviceValues[address];
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void AllAnchored(uint3 dispatchId : SV_DispatchThreadID,
+                 uint groupIndex : SV_GroupIndex)
+{
+    uint address = DeviceAddress(dispatchId);
+    sharedValues[groupIndex] = groupIndex + 17;
+    _DeviceValues[address] = address + 29;
+    AllMemoryBarrier();
+    _Results[address] = _DeviceValues[address] + sharedValues[groupIndex];
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void AllSyncAnchored(uint3 dispatchId : SV_DispatchThreadID,
+                     uint groupIndex : SV_GroupIndex)
+{
+    uint address = DeviceAddress(dispatchId);
+    sharedValues[groupIndex] = groupIndex + 17;
+    _DeviceValues[address] = address + 29;
+    AllMemoryBarrierWithGroupSync();
+    _Results[address] = _DeviceValues[address] + sharedValues[(groupIndex + 1) & 7];
+}
+
+[numthreads(BARRIER_THREADS_X, BARRIER_THREADS_Y, 1)]
+void OrderedBarriers()
+{
+    GroupMemoryBarrier();
+    GroupMemoryBarrierWithGroupSync();
+    DeviceMemoryBarrier();
+    DeviceMemoryBarrierWithGroupSync();
+    AllMemoryBarrier();
+    AllMemoryBarrierWithGroupSync();
+}

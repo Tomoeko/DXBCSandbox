@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Authored evaluation input. Dispatch exactly one group and bind at least
+// eight uint result elements. Atomic accesses avoid unsynchronized TGSM races;
+// their observed intermediate values may depend on thread execution order.
+#pragma kernel AtomicGroupFence
+#pragma multi_compile __ FENCE_TILES
+
+#if defined(FENCE_TILES)
+    #define FENCE_THREADS_X 4
+    #define FENCE_THREADS_Y 2
+#else
+    #define FENCE_THREADS_X 8
+    #define FENCE_THREADS_Y 1
+#endif
+
+RWStructuredBuffer<uint> _FenceResults;
+groupshared uint sharedCounter;
+
+[numthreads(FENCE_THREADS_X, FENCE_THREADS_Y, 1)]
+void AtomicGroupFence(uint groupIndex : SV_GroupIndex)
+{
+    if (groupIndex == 0)
+        sharedCounter = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint previous;
+    InterlockedAdd(sharedCounter, groupIndex + 1, previous);
+    GroupMemoryBarrier();
+
+    uint observed;
+    InterlockedCompareExchange(sharedCounter, 0, 0, observed);
+    _FenceResults[groupIndex] = observed + previous;
+}

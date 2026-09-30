@@ -7,6 +7,7 @@
 #include "dxbc/dxbc_parser.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_global_declarations.h"
 #include "translation/hlsl_unity_uv_lift.h"
 #include "translation/shaderlab_emitter_internal.h"
 #include "translation/usil.h"
@@ -555,6 +556,91 @@ static bool blob_entry_is_available(const BlobEntry *entries, int entry_count,
   return offset <= segment_length && length <= segment_length - offset;
 }
 
+/* Declaration witnesses come from the same archived player blobs used for the
+ * target. Runtime parameter authorities are never rewritten by this union. */
+static bool build_global_declarations(
+    const SerializedPass *pass, int stage, int current,
+    const SerializedProgramParameters *selected_parameters,
+    const BlobEntry *entries, int entry_count, uint8_t **segments,
+    const int *lengths, int segment_count, HLSLGlobalDeclarationUnion **output,
+    ShaderLabStageDiagnostic *diagnostic) {
+  *output = NULL;
+  HLSLGlobalDeclarationStatus status = hlsl_global_declarations_scope_status(
+      selected_parameters, &pass->common_parameters[stage]);
+  if (status == HLSL_GLOBAL_DECLARATIONS_NOT_APPLICABLE) return true;
+  if (status != HLSL_GLOBAL_DECLARATIONS_OK || stage >= 5 ||
+      pass->subprogram_count[stage] <= 0 || pass->subprogram_count[stage] > 4096) {
+    set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
+                   stage, current, -1);
+    return false;
+  }
+  const size_t capacity = (size_t)pass->subprogram_count[stage];
+  HLSLGlobalDeclarationWitness *witnesses = calloc(capacity, sizeof(*witnesses));
+  PlayerSubProgramMetadata *players = calloc(capacity, sizeof(*players));
+  SerializedProgramParameters *parameters = calloc(capacity, sizeof(*parameters));
+  if (!witnesses || !players || !parameters) {
+    free(witnesses); free(players); free(parameters);
+    set_diagnostic(diagnostic, SHADERLAB_STAGE_ALLOCATION_FAILED, stage, current, -1);
+    return false;
+  }
+  size_t count = 0;
+  bool success = false;
+  for (int index = 0; index < pass->subprogram_count[stage]; ++index) {
+    if (!hlsl_global_declarations_same_family(pass, stage, current, index)) continue;
+    const SerializedSubProgram *sub = &pass->subprograms[stage][index];
+    if (!blob_entry_is_available(entries, entry_count, segments, lengths,
+                                 segment_count, sub->blob_index)) {
+      set_diagnostic(diagnostic, SHADERLAB_STAGE_INVALID_BLOB, stage, current, index);
+      goto cleanup;
+    }
+    BlobEntry entry = entries[sub->blob_index];
+    ByteStream stream;
+    stream_init(&stream, segments[entry.segment] + (size_t)entry.offset,
+                (size_t)entry.length);
+    stream_set_endian(&stream, false);
+    /* Increment before parsing so partial allocations are also disposed. */
+    size_t slot = count++;
+    serialized_program_parameters_init(&parameters[slot]);
+    if (!subprogram_metadata_parse_variant(&stream, &players[slot])) {
+      set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_PARSE_FAILED, stage, current, index);
+      goto cleanup;
+    }
+    int parameter_index = pass->subprogram_param_blob_indices[stage]
+        ? pass->subprogram_param_blob_indices[stage][index] : -1;
+    if (parameter_index < -1 || (parameter_index >= 0 &&
+        !blob_entry_is_available(entries, entry_count, segments, lengths,
+                                 segment_count, parameter_index))) {
+      set_diagnostic(diagnostic, SHADERLAB_STAGE_INVALID_PARAMETER_BLOB, stage, current, index);
+      goto cleanup;
+    }
+    if (parameter_index >= 0) {
+      entry = entries[parameter_index];
+      stream_init(&stream, segments[entry.segment] + (size_t)entry.offset,
+                  (size_t)entry.length);
+      stream_set_endian(&stream, false);
+      if (!subprogram_metadata_parse_parameters(&stream, &parameters[slot])) {
+        set_diagnostic(diagnostic, SHADERLAB_STAGE_INVALID_PARAMETER_BLOB, stage, current, index);
+        goto cleanup;
+      }
+    }
+    witnesses[slot] = (HLSLGlobalDeclarationWitness){
+        index, &players[slot], parameter_index >= 0 ? &parameters[slot] : NULL};
+  }
+  HLSLGlobalDeclarationDiagnostic union_diagnostic;
+  status = hlsl_global_declarations_build(pass, stage, current, witnesses, count,
+                                         output, &union_diagnostic);
+  if (status == HLSL_GLOBAL_DECLARATIONS_OK) success = true;
+  else set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
+                       stage, current, union_diagnostic.conflicting_subprogram_index);
+cleanup:
+  for (size_t i = 0; i < count; ++i) {
+    subprogram_metadata_free_variant(&players[i]);
+    serialized_program_parameters_free(&parameters[i]);
+  }
+  free(witnesses); free(players); free(parameters);
+  return success;
+}
+
 static bool translate_stage_to_hlsl(
     const SerializedPass *pass, int stage_index, int subprogram_index,
     const BlobEntry *blob_entries, int entry_count, uint8_t **segments,
@@ -659,6 +745,7 @@ static bool translate_stage_to_hlsl(
   DXBCContainer semantic;
   bool semantic_decoded = false;
   bool success = false;
+  HLSLGlobalDeclarationUnion *global_declarations = NULL;
   dxbc_document_init(&document);
   dxbc_stage_contract_init(&contract);
   memset(&document_diagnostic, 0, sizeof(document_diagnostic));
@@ -727,13 +814,27 @@ static bool translate_stage_to_hlsl(
     goto cleanup;
   }
   HLSLEmitOptions emit_options = HLSL_EMIT_RECOMPILE_OPTIONS_INIT;
-  if (high_level) emit_options.mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+  if (high_level) {
+    emit_options.mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+    if (!build_global_declarations(pass, stage_index, subprogram_index,
+            selected_parameters, blob_entries, entry_count, segments,
+            segment_lengths, segment_count, &global_declarations, diagnostic)) {
+      usil_free(&usil);
+      goto cleanup;
+    }
+    emit_options.global_declarations = global_declarations;
+  }
   if (unity_uv_helpers && hlsl_unity_uv_lift_matches(&usil)) {
     emit_options.unity_uv_helper = HLSL_UNITY_UV_EXTERNAL_INCLUDE;
     if (unity_uv_used)
       *unity_uv_used = true;
   }
-  if (record) emit_options.expression_source_map = &record->instructions;
+  if (record) {
+    emit_options.expression_source_map = &record->instructions;
+    emit_options.source_quality = &record->source_quality;
+    emit_options.source_quality_pass_index = (uint32_t)record->pass_index;
+    emit_options.source_quality_entry_point_index = (uint32_t)subprogram_index;
+  }
   emit_options.omit_unity_builtin_declarations = true;
   emit_options.reserved_preprocessor_identifiers =
       reserved_preprocessor_identifiers;
@@ -753,12 +854,16 @@ static bool translate_stage_to_hlsl(
   } else {
     set_diagnostic(diagnostic, SHADERLAB_STAGE_OK, stage_index,
                    subprogram_index, -1);
-    if (record) common_sha256(raw_view.data, raw_view.size, record->target_digest);
+    if (record) {
+      common_sha256(raw_view.data, raw_view.size, record->target_digest);
+      record->has_source_quality = true;
+    }
     success = true;
   }
   usil_free(&usil);
 
 cleanup:
+  hlsl_global_declarations_free(global_declarations);
   if (semantic_decoded) dxbc_free(&semantic);
   dxbc_stage_contract_free(&contract);
   dxbc_document_free(&document);

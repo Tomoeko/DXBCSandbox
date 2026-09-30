@@ -88,6 +88,10 @@ if(BUILD_TESTING)
         unity_player_shader_caps_units)
     dxbc_add_core_test(test_compute_shader_object_units
         tests/test_compute_shader_object_units.c compute_shader_object_units)
+    dxbc_add_core_test(test_compute_usil_units
+        tests/test_compute_usil_units.c compute_usil_units)
+    dxbc_add_core_test(test_compute_source_candidate_units
+        tests/test_compute_source_candidate_units.c compute_source_candidate_units)
     dxbc_add_core_test(test_material_object_units
         tests/test_material_object_units.c material_object_units)
     target_compile_definitions(test_material_object_units PRIVATE
@@ -246,6 +250,25 @@ if(BUILD_TESTING)
         tests/test_hlsl_dataflow_units.c hlsl_dataflow_units)
     dxbc_add_core_test(test_hlsl_ast_units
         tests/test_hlsl_ast_units.c hlsl_ast_units)
+    dxbc_add_core_test(test_hlsl_vector_lift_units
+        tests/test_hlsl_vector_lift_units.c hlsl_vector_lift_units)
+    dxbc_add_core_test(test_hlsl_matrix_lift_units
+        tests/test_hlsl_matrix_lift_units.c hlsl_matrix_lift_units)
+    dxbc_add_core_test(test_hlsl_global_declarations_units
+        tests/test_hlsl_global_declarations_units.c hlsl_global_declarations_units)
+    dxbc_add_core_test(test_hlsl_texture_lift_units
+        tests/test_hlsl_texture_lift_units.c hlsl_texture_lift_units)
+    dxbc_add_core_test(test_hlsl_resource_quality_units
+        tests/test_hlsl_resource_quality_units.c hlsl_resource_quality_units)
+    dxbc_add_core_test(test_hlsl_natural_interface_units
+        tests/test_hlsl_natural_interface_units.c hlsl_natural_interface_units)
+    dxbc_add_core_test(test_hlsl_source_quality_units
+        tests/test_hlsl_source_quality_units.c hlsl_source_quality_units)
+    add_executable(hlsl_inventory_probe tests/probes/hlsl_inventory_probe.c)
+    target_link_libraries(hlsl_inventory_probe PRIVATE dxbc_core dxbc_build_options)
+    add_test(NAME hlsl_inventory_probe_help COMMAND hlsl_inventory_probe --help)
+    set_tests_properties(hlsl_inventory_probe_help PROPERTIES
+        PASS_REGULAR_EXPRESSION "SCHEMA_REGISTRY OUTPUT_JSONL INPUT")
     dxbc_add_core_test(test_compiler_model_units
         tests/test_compiler_model_units.c compiler_model_units)
     dxbc_add_core_test(test_cbuffer_projection_units
@@ -413,6 +436,12 @@ if(BUILD_TESTING)
     endif()
 
     if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
+        add_executable(high_level_fixture_probe tests/probes/high_level_fixture_probe.c)
+        target_link_libraries(high_level_fixture_probe PRIVATE
+            unity_compiler_support dxbc_build_options)
+        add_test(NAME high_level_fixture_probe_help COMMAND high_level_fixture_probe --help)
+        set_tests_properties(high_level_fixture_probe_help PROPERTIES
+            PASS_REGULAR_EXPRESSION "Authored reference sources are never read")
         dxbc_add_core_test(test_helpers_units
             tests/test_helpers_units.c standalone_project_discovery)
         target_compile_definitions(test_helpers_units PRIVATE

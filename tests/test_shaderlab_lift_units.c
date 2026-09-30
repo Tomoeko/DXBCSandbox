@@ -82,6 +82,7 @@ typedef struct {
     bool environment_drift;
     bool source_revision_drift;
     bool cached;
+    bool reject_ordinary_candidate;
 } Service;
 
 static int fixture_init_path(Fixture *fixture, const char *path) {
@@ -181,7 +182,8 @@ static bool preprocess_service(void *opaque, const UnityCompilerShaderPreprocess
         response->status.availability = UNITY_COMPILER_RESPONSE_INCLUDE_AUTHORITY_UNAVAILABLE;
         return true;
     }
-    response->status.compiler_success = failure != PREPROCESS_REJECTED;
+    response->status.compiler_success = failure != PREPROCESS_REJECTED &&
+        !(service->reject_ordinary_candidate && service->preprocesses == 2);
     response->status.from_cache = service->cached;
     response->has_request_identity = failure != PREPROCESS_MISSING_IDENTITY;
     /* Synthetic identities exercise transfer/admission only. Client tests and
@@ -359,8 +361,14 @@ static int test_verified_and_fallback(void) {
         CHECK(strstr(json, "\"selection\":\"high-level\""));
         CHECK(strstr(json, "\"scope\":\"generated-local-d3d11-program-domain\""));
         CHECK(strstr(json, "\"instructions\":[{"));
+        CHECK(strstr(json, "\"source_quality_scope\":\"emitted-stage-entry\""));
+        CHECK(strstr(json, "\"source_quality\":{\"scope\":\"observed-source-units\""));
+        CHECK(strstr(json, "\"whole_source_quality\":\"unavailable\""));
         CHECK(strstr(json, "\"recorded\":true,\"response_received\":true"));
-        CHECK(strstr(json, "\"lift\":{\"id\":\"float4-expressions\",\"version\":4}"));
+        char lift_identity[128];
+        snprintf(lift_identity, sizeof(lift_identity), "\"lift\":{\"id\":\"%s\",\"version\":%u}",
+                 HLSL_HIGH_LEVEL_LIFT_ID, HLSL_HIGH_LEVEL_LIFT_VERSION);
+        CHECK(strstr(json, lift_identity));
         CHECK(!strstr(json, fixture.shader.name) && !strstr(json, fixture.input.source_path));
         CHECK(!strstr(json, fixture.input.source_directory) &&
               !strstr(json, fixture.input.source_basename) &&
@@ -551,14 +559,15 @@ static int test_unity_uv_transaction(void) {
     for (int passes = 1; passes <= 2; ++passes) {
         fixture.subshader.pass_count = passes;
         Service service = {
-            .fixture = &fixture, .canonical_broker = broker, .now = 10, .cached = true};
+            .fixture = &fixture, .canonical_broker = broker, .now = 10, .cached = true,
+            .reject_ordinary_candidate = true};
         UnityShaderLabLiftResult *result = NULL;
         CHECK(run(&service, limits, &result) == HLSL_LIFT_VERIFIED);
         const UnityShaderLabLiftArtifact *baseline = unity_shaderlab_lift_baseline(result);
         const UnityShaderLabLiftArtifact *included = unity_shaderlab_lift_helper_baseline(result);
         const UnityShaderLabLiftArtifact *candidate = unity_shaderlab_lift_helper_candidate(result);
         CHECK(unity_shaderlab_lift_accepted(result) == candidate);
-        CHECK(unity_shaderlab_lift_candidate(result)->status == HLSL_LIFT_EMISSION_REJECTED);
+        CHECK(unity_shaderlab_lift_candidate(result)->status == HLSL_LIFT_COMPILER_REJECTED);
         CHECK(baseline->status == HLSL_LIFT_VERIFIED && included->status == HLSL_LIFT_VERIFIED);
         CHECK(candidate->status == HLSL_LIFT_VERIFIED && candidate->high_level &&
               candidate->unity_uv_helpers);
@@ -585,7 +594,7 @@ static int test_unity_uv_transaction(void) {
         size_t preprocesses;
         unity_shaderlab_lift_stats(result, &stats, &preprocesses);
         CHECK(stats.candidates == 2 && stats.accepted == 1 && stats.compiles == (size_t)passes * 8);
-        CHECK(stats.cache_hits == stats.compiles && preprocesses == 3);
+        CHECK(stats.cache_hits == stats.compiles && preprocesses == 4);
         char *json = unity_shaderlab_lift_format_json(result);
         CHECK(json && strstr(json, "\"selection\":\"high-level\""));
         CHECK(strstr(json, "\"unity_helper\":{\"id\":\"unity-packed-uv-adjust\""));
@@ -595,6 +604,35 @@ static int test_unity_uv_transaction(void) {
         unity_shaderlab_lift_result_free(result);
     }
     fixture.subshader.pass_count = 1;
+    /* A wider ordinary expression domain must not bypass helper authority or
+     * discard useful alternate spellings after a genuine byte rejection. */
+    const struct {
+        Failure failure;
+        HLSLLiftStatus expected;
+        bool helper;
+        bool invalidates;
+        size_t compiles;
+    } ordinary_cases[] = {
+        {NONE, HLSL_LIFT_VERIFIED, false, false, 4},
+        {COMPILE_WRONG_BYTES, HLSL_LIFT_VERIFIED, true, false, 9},
+        {COMPILE_MISSING_IDENTITY, HLSL_LIFT_PROVENANCE_MISMATCH, false, false, 3},
+        {COMPILE_TRANSPORT, HLSL_LIFT_COMPILER_UNAVAILABLE, false, false, 3},
+        {COMPILER_DRIFT, HLSL_LIFT_AUTHORITY_MISMATCH, false, true, 3},
+    };
+    for (size_t i = 0; i < sizeof(ordinary_cases) / sizeof(ordinary_cases[0]); ++i) {
+        Service service = {.fixture = &fixture, .canonical_broker = broker, .now = 10,
+                           .failure = ordinary_cases[i].failure, .fail_compile = 3};
+        UnityShaderLabLiftResult *result = NULL;
+        CHECK(run(&service, limits, &result) == ordinary_cases[i].expected);
+        CHECK(unity_shaderlab_lift_helper_candidate(result)->attempted == ordinary_cases[i].helper);
+        CHECK(service.compiles == ordinary_cases[i].compiles);
+        const UnityShaderLabLiftArtifact *accepted = unity_shaderlab_lift_accepted(result);
+        CHECK(accepted == (ordinary_cases[i].invalidates ? NULL :
+              ordinary_cases[i].helper ? unity_shaderlab_lift_helper_candidate(result) :
+              ordinary_cases[i].failure == NONE ? unity_shaderlab_lift_candidate(result) :
+                                                unity_shaderlab_lift_baseline(result)));
+        unity_shaderlab_lift_result_free(result);
+    }
     const struct {
         Failure failure;
         size_t compile, preprocess;
@@ -612,8 +650,8 @@ static int test_unity_uv_transaction(void) {
         {COMPILE_MISSING_IDENTITY, 6, 0, HLSL_LIFT_PROVENANCE_MISMATCH, false},
         {COMPILE_CACHE_MISS, 5, 0, HLSL_LIFT_COMPILER_UNAVAILABLE, false},
         {COMPILE_REJECTED, 5, 0, HLSL_LIFT_COMPILER_REJECTED, false},
-        {PREPROCESS_REJECTED, 0, 2, HLSL_LIFT_COMPILER_REJECTED, false},
-        {PREPROCESS_CONTROL_DRIFT, 0, 3, HLSL_LIFT_AUTHORITY_MISMATCH, false},
+        {PREPROCESS_REJECTED, 0, 3, HLSL_LIFT_COMPILER_REJECTED, false},
+        {PREPROCESS_CONTROL_DRIFT, 0, 4, HLSL_LIFT_AUTHORITY_MISMATCH, false},
         {COMPILER_DRIFT, 5, 0, HLSL_LIFT_AUTHORITY_MISMATCH, true},
         {ENVIRONMENT_DRIFT, 5, 0, HLSL_LIFT_AUTHORITY_MISMATCH, true},
         {SOURCE_REVISION_DRIFT, 6, 0, HLSL_LIFT_AUTHORITY_MISMATCH, true},
@@ -627,6 +665,7 @@ static int test_unity_uv_transaction(void) {
                            .canonical_broker = broker,
                            .now = 10,
                            .failure = cases[i].failure,
+                           .reject_ordinary_candidate = true,
                            .fail_compile = cases[i].compile,
                            .fail_preprocess = cases[i].preprocess};
         UnityShaderLabLiftResult *result = NULL;
@@ -643,7 +682,8 @@ static int test_unity_uv_transaction(void) {
         fixture.profile.build_platform = 19;
     }
     for (size_t maximum = 4; maximum <= 7; ++maximum) {
-        Service service = {.fixture = &fixture, .canonical_broker = broker, .now = 10};
+        Service service = {.fixture = &fixture, .canonical_broker = broker, .now = 10,
+                           .reject_ordinary_candidate = true};
         UnityShaderLabLiftResult *result = NULL;
         CHECK(run(&service, (HLSLLiftLimits){2, maximum, 1000}, &result) ==
               HLSL_LIFT_BUDGET_EXHAUSTED);
@@ -651,9 +691,10 @@ static int test_unity_uv_transaction(void) {
         CHECK(unity_shaderlab_lift_accepted(result) == unity_shaderlab_lift_baseline(result));
         unity_shaderlab_lift_result_free(result);
     }
-    Service service = {.fixture = &fixture, .canonical_broker = broker, .now = 10};
+    Service service = {.fixture = &fixture, .canonical_broker = broker, .now = 10,
+                       .reject_ordinary_candidate = true};
     UnityShaderLabLiftResult *result = NULL;
-    CHECK(run(&service, (HLSLLiftLimits){1, 32, 1000}, &result) == HLSL_LIFT_EMISSION_REJECTED);
+    CHECK(run(&service, (HLSLLiftLimits){1, 32, 1000}, &result) == HLSL_LIFT_COMPILER_REJECTED);
     CHECK(!unity_shaderlab_lift_helper_baseline(result)->attempted && service.compiles == 2);
     CHECK(unity_shaderlab_lift_accepted(result) == unity_shaderlab_lift_baseline(result));
     unity_shaderlab_lift_result_free(result);

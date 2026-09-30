@@ -1360,6 +1360,11 @@ static int test_high_level_shaderlab_candidate(int shape) {
     const ShaderLabExpressionSourceRecord *record = &map.records[i];
     CHECK(record->subshader_index == 0 && record->pass_index == 0);
     CHECK(record->stage_index == (int)i && record->subprogram_index == 0);
+    CHECK(record->has_source_quality);
+    CHECK(record->source_quality.pass_index == 0 && record->source_quality.entry_point_index == 0);
+    CHECK(record->source_quality.emission_status == HLSL_EMIT_STATUS_OK);
+    CHECK(record->source_quality.counts.inspected_units > 0);
+    CHECK(record->source_quality.stage == (i == 0 ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL));
     CHECK(record->blob_index == (int)i && record->hardware_tier_group == 3);
     CHECK(record->serialized_state == 0 &&
           record->instructions.count == fixtures[shape].instructions[i]);
@@ -1370,6 +1375,8 @@ static int test_high_level_shaderlab_candidate(int shape) {
       CHECK(origin->source_end <= high.len);
       CHECK(high.buf[origin->source_begin] == '(' ||
             high.buf[origin->source_begin] == ' ' ||
+            (origin->kind == HLSL_EXPRESSION_ORIGIN_RETURN &&
+             high.buf[origin->source_begin] == '}') ||
             origin->kind == HLSL_EXPRESSION_ORIGIN_FUNCTION ||
             origin->kind == HLSL_EXPRESSION_ORIGIN_UNITY_UV);
       if (origin->kind == HLSL_EXPRESSION_ORIGIN_RETURN)
@@ -1439,9 +1446,9 @@ static int test_high_level_shaderlab_candidate(int shape) {
   } else {
     CHECK(nested->source_begin > outer->source_begin);
     CHECK(nested->source_end < outer->source_end);
-    CHECK(outer->source_end - outer->source_begin == strlen("(((v1) * (v1.yzwx)) * (v1.zwxy))"));
+    CHECK(outer->source_end - outer->source_begin == strlen("(((texcoord0) * (texcoord0.yzwx)) * (texcoord0.zwxy))"));
     CHECK(memcmp(high.buf + outer->source_begin,
-                 "(((v1) * (v1.yzwx)) * (v1.zwxy))",
+                 "(((texcoord0) * (texcoord0.yzwx)) * (texcoord0.zwxy))",
                  outer->source_end - outer->source_begin) == 0);
   }
   for (int mutation = 0; mutation < 8; ++mutation) {
@@ -1466,7 +1473,7 @@ static int test_high_level_shaderlab_candidate(int shape) {
   }
   CHECK(diagnostic.status == SHADERLAB_CANDIDATE_OK);
   if (!conditional && !loop && !function && !unity_uv)
-    CHECK(strstr(high.buf, "o0 = (((v1) * (v1.yzwx)) * (v1.zwxy));") != NULL);
+    CHECK(strstr(high.buf, "return (((texcoord0) * (texcoord0.yzwx)) * (texcoord0.zwxy));") != NULL);
   CHECK(strstr(high.buf, "float4 r0") == NULL);
   CHECK(count_text(high.buf, "Single exact planned variant") == 2u);
   CHECK(unity_uv ? shaderlab_emit_unity_uv_candidate(&shader, entries, 2, segments, segment_lengths,
@@ -1619,6 +1626,25 @@ static int test_high_level_shaderlab_candidate(int shape) {
   shader.keyword_names.count = 1;
   shader.keyword_names.keywords = keywords;
   shader.keyword_flags = flags;
+  if (shape == 0 || shape == 3) {
+    /* Natural input names remove the old register-name collision. A collision
+     * with the generated role name is resolved before the source is emitted. */
+    sb_init(&repeated);
+    CHECK(emit_test_high_level_candidate(false, &shader, entries, 2, segments,
+        segment_lengths, 2, &repeated, &map, &diagnostic));
+    CHECK(shaderlab_expression_source_map_matches_source(&map, &repeated));
+    CHECK(strstr(repeated.buf, "float4 texcoord0 : TEXCOORD0") != NULL);
+    sb_free(&repeated);
+    keywords[0] = "texcoord0";
+    sb_init(&repeated);
+    CHECK(emit_test_high_level_candidate(false, &shader, entries, 2, segments,
+        segment_lengths, 2, &repeated, &map, &diagnostic));
+    CHECK(shaderlab_expression_source_map_matches_source(&map, &repeated));
+    CHECK(strstr(repeated.buf, "float4 texcoord0_1 : TEXCOORD0") != NULL);
+    sb_free(&repeated);
+    /* Stage entry points are fixed by the surrounding pragmas. */
+    keywords[0] = "frag";
+  }
   sb_init(&repeated);
   sb_append(&repeated, low.buf);
   CHECK(!emit_test_high_level_candidate(unity_uv, &shader, entries, 2, segments, segment_lengths, 2, &repeated, &map, &diagnostic));

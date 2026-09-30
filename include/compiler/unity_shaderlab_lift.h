@@ -84,8 +84,10 @@ typedef struct {
 typedef struct UnityShaderLabLiftResult UnityShaderLabLiftResult;
 
 /* Verify the ordinary low-level baseline, then the ordinary expression candidate.
- * With a second candidate budget, an emission-rejected expression attempt can
- * try the closed Unity UV family under its own included low-level baseline.
+ * With a second candidate budget, an expression rejected by emission, compilation
+ * or complete DXBC comparison can try the closed Unity UV family under its own
+ * included low-level baseline. Missing evidence and authority failures cannot
+ * start this alternate spelling.
  * Every emitted local D3D11 pass is checked across its full generated domain.
  * A helper pass additionally checks the actual expanded definitions for every
  * selected request, including stages whose bodies do not call the helper.

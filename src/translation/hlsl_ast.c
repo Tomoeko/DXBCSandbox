@@ -22,8 +22,25 @@ static char *ast_duplicate_string(const char *value) {
     return copy;
 }
 
+void ast_logical_value_origin_init(ASTLogicalValueOrigin *origin) {
+    if (!origin) return;
+    memset(origin, 0, sizeof(*origin));
+    origin->logical_value_id = UINT64_MAX;
+    origin->instruction_index = -1;
+    origin->source_instruction_index = UINT32_MAX;
+}
+
+static ASTExpr *ast_allocate_expr(void) {
+    ASTExpr *expression = calloc(1u, sizeof(*expression));
+    if (expression) {
+        ast_operand_provenance_init(&expression->operand_provenance);
+        ast_logical_value_origin_init(&expression->logical_origin);
+    }
+    return expression;
+}
+
 ASTExpr *ast_create_var(int ssa_var, int reg, int type, const char *name) {
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_VAR;
@@ -45,7 +62,7 @@ static bool scalar_type_valid(ASTScalarType type) {
 ASTExpr *ast_create_literal_bits(const uint32_t *bits, int components, ASTScalarType scalar_type) {
     if (!bits || components < 1 || components > 4 || !scalar_type_valid(scalar_type))
         return NULL;
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_LITERAL;
@@ -107,7 +124,7 @@ static const char *binary_operator(int opcode) {
 ASTExpr *ast_create_unary(int op, ASTExpr *sub) {
     if (!sub || !unary_operator(op))
         return NULL;
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_UNARY;
@@ -119,7 +136,7 @@ ASTExpr *ast_create_unary(int op, ASTExpr *sub) {
 ASTExpr *ast_create_binary(int op, ASTExpr *left, ASTExpr *right) {
     if (!left || !right || left == right || !binary_operator(op))
         return NULL;
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_BINARY;
@@ -133,7 +150,7 @@ ASTExpr *ast_create_ternary(ASTExpr *cond, ASTExpr *true_expr, ASTExpr *false_ex
     if (!cond || !true_expr || !false_expr || cond == true_expr || cond == false_expr ||
         true_expr == false_expr)
         return NULL;
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_TERNARY;
@@ -149,7 +166,7 @@ ASTExpr *ast_create_swizzle(ASTExpr *sub, const int *swizzle, int count) {
     for (int i = 0; i < count; ++i)
         if (swizzle[i] < 0 || swizzle[i] > 3)
             return NULL;
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_SWIZZLE;
@@ -172,7 +189,7 @@ ASTExpr *ast_create_call(const char *name, ASTExpr **args, int count) {
             if (args[i] == args[j])
                 return NULL;
     }
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_CALL;
@@ -197,7 +214,7 @@ ASTExpr *ast_create_call(const char *name, ASTExpr **args, int count) {
 ASTExpr *ast_create_cast(const char *type_name, ASTExpr *sub) {
     if (!type_name || !type_name[0] || !sub)
         return NULL;
-    ASTExpr *expr = malloc(sizeof(ASTExpr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_CAST;
@@ -213,7 +230,7 @@ ASTExpr *ast_create_cast(const char *type_name, ASTExpr *sub) {
 ASTExpr *ast_create_bitcast(ASTScalarType scalar_type, ASTExpr *sub) {
     if (!sub || !scalar_type_valid(scalar_type))
         return NULL;
-    ASTExpr *expr = malloc(sizeof(*expr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
     expr->kind = AST_EXPR_BITCAST;
@@ -222,14 +239,93 @@ ASTExpr *ast_create_bitcast(ASTScalarType scalar_type, ASTExpr *sub) {
     return expr;
 }
 
+void ast_operand_provenance_init(ASTOperandProvenance *provenance) {
+    if (!provenance)
+        return;
+    memset(provenance, 0, sizeof(*provenance));
+    provenance->logical_value_id = UINT64_MAX;
+    provenance->instruction_index = -1;
+    provenance->source_instruction_index = UINT32_MAX;
+    provenance->operand_index = -1;
+}
+
 ASTExpr *ast_create_emitter_operand(const char *expression) {
     if (!expression || !expression[0] || strpbrk(expression, ";{}#\r\n")) return NULL;
-    ASTExpr *expr = calloc(1u, sizeof(*expr));
+    ASTExpr *expr = ast_allocate_expr();
     if (!expr) return NULL;
     expr->kind = AST_EXPR_EMITTER_OPERAND;
     expr->u.emitter_operand = ast_duplicate_string(expression);
     if (!expr->u.emitter_operand) { free(expr); return NULL; }
     return expr;
+}
+
+ASTExpr *ast_create_emitter_operand_with_provenance(
+    const char *expression, const ASTOperandProvenance *provenance) {
+    if (!provenance || provenance->value_role < AST_OPERAND_VALUE_UNKNOWN ||
+        provenance->value_role > AST_OPERAND_VALUE_REGISTER ||
+        provenance->selection_role < AST_COMPONENT_SELECTION_NONE ||
+        provenance->selection_role > AST_COMPONENT_SELECTION_TRANSPORT ||
+        provenance->bitcast_role < AST_OPERAND_BITCAST_NONE ||
+        provenance->bitcast_role > AST_OPERAND_BITCAST_STORAGE ||
+        provenance->natural_components > 4 || provenance->result_components > 4 ||
+        ((provenance->natural_components == 0) != (provenance->result_components == 0)) ||
+        provenance->instruction_index < -1 || provenance->operand_index < -1 ||
+        (provenance->destination_lanes & ~15u) ||
+        (provenance->instruction_index < 0 &&
+         (provenance->source_instruction_index != UINT32_MAX ||
+          provenance->destination_lanes || provenance->operand_index >= 0)) ||
+        (provenance->instruction_index >= 0 &&
+         provenance->source_instruction_index == UINT32_MAX) ||
+        (provenance->complete && provenance->value_role == AST_OPERAND_VALUE_UNKNOWN) ||
+        (provenance->complete && provenance->value_role == AST_OPERAND_VALUE_LOGICAL &&
+         provenance->logical_value_id == UINT64_MAX))
+        return NULL;
+    if (provenance->selection_role == AST_COMPONENT_SELECTION_NONE &&
+        provenance->natural_components != provenance->result_components)
+        return NULL;
+    if (provenance->selection_role != AST_COMPONENT_SELECTION_NONE) {
+        if (!provenance->natural_components || !provenance->result_components ||
+            (provenance->selection_role == AST_COMPONENT_SELECTION_SEMANTIC &&
+             provenance->value_role != AST_OPERAND_VALUE_LOGICAL))
+            return NULL;
+        for (unsigned index = 0; index < provenance->result_components; ++index)
+            if (provenance->selected_components[index] >= provenance->natural_components)
+                return NULL;
+    }
+    ASTExpr *result = ast_create_emitter_operand(expression);
+    if (result)
+        result->operand_provenance = *provenance;
+    return result;
+}
+
+bool ast_set_logical_value_origin(ASTExpr *expression,
+                                  const ASTLogicalValueOrigin *origin) {
+    if (!expression || !origin || expression->kind < AST_EXPR_VAR ||
+        expression->kind >= AST_EXPR_EMITTER_OPERAND ||
+        !scalar_type_valid(origin->scalar_type) || origin->components > 4 ||
+        origin->instruction_index < -1 || (origin->destination_lanes & ~15u) ||
+        (origin->instruction_index < 0 &&
+         (origin->source_instruction_index != UINT32_MAX || origin->destination_lanes)) ||
+        (origin->instruction_index >= 0 &&
+         origin->source_instruction_index == UINT32_MAX) ||
+        (origin->complete && (!origin->components || origin->logical_value_id == UINT64_MAX)) ||
+        (origin->semantic_projection && expression->kind != AST_EXPR_SWIZZLE) ||
+        (origin->program_bitcast && expression->kind != AST_EXPR_BITCAST))
+        return false;
+    if (origin->complete) {
+        if (expression->kind == AST_EXPR_LITERAL &&
+            (origin->components != expression->u.literal.components ||
+             origin->scalar_type != expression->u.literal.scalar_type))
+            return false;
+        if (expression->kind == AST_EXPR_SWIZZLE &&
+            origin->components != expression->u.swizzle.swizzle_count)
+            return false;
+        if (expression->kind == AST_EXPR_BITCAST &&
+            origin->scalar_type != expression->u.bitcast.scalar_type)
+            return false;
+    }
+    expression->logical_origin = *origin;
+    return true;
 }
 
 void ast_free_expr(ASTExpr *expr) {

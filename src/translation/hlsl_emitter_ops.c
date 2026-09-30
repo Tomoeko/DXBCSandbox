@@ -932,6 +932,7 @@ void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst)
                                        right, sizeof(right))) {
             hlsl_format_checked(ctx, line_buf, sizeof(line_buf),
                                 "%s= asuint(%s);", left, right);
+            hlsl_source_quality_emission(ctx, HLSL_SOURCE_ARTIFACT_STORAGE_BITCAST, false, i);
           }
         }
       }
@@ -974,6 +975,11 @@ void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst)
       if (!is_custom) {
         sb_append(sb, line_buf);
         sb_append(sb, "\n");
+        if (line_buf[0] && inst_writes_to_dest(inst)) {
+          uint32_t artifacts = HLSL_SOURCE_ARTIFACT_INSTRUCTION_ASSIGNMENT;
+          if (wrap_swizzle) artifacts |= HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT;
+          hlsl_source_quality_emission(ctx, artifacts, false, i);
+        }
       }
       free_operand_expressions(operand_expressions);
     }
@@ -1018,6 +1024,8 @@ void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst)
           sb_appendf(sb, "u_xlat_temp_%c", mask_chars[component]);
         }
         sb_append(sb, ");\n");
+        hlsl_source_quality_emission(ctx, HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT |
+                                           HLSL_SOURCE_ARTIFACT_INSTRUCTION_ASSIGNMENT, false, i);
       } else {
         for (int c = 0; c < 4; c++) {
           if (inst->operands[0].destination_mask & (16 << c)) {
@@ -1038,6 +1046,8 @@ void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst)
             }
             sb_append_spaces(sb, ctx->indent);
             sb_appendf(sb, "%s = u_xlat_temp_%c;\n", comp_dest, "xyzw"[c]);
+            hlsl_source_quality_emission(ctx, HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT |
+                                               HLSL_SOURCE_ARTIFACT_INSTRUCTION_ASSIGNMENT, false, i);
           }
         }
       }
@@ -1072,6 +1082,8 @@ void hlsl_emit_instruction(HLSLEmitterContext* ctx, const USILInstruction* inst)
         }
       }
       sb_append(sb, ");\n");
+      hlsl_source_quality_emission(ctx, HLSL_SOURCE_ARTIFACT_LANE_TRANSPORT |
+                                         HLSL_SOURCE_ARTIFACT_INSTRUCTION_ASSIGNMENT, false, i);
     }
 
     for (int component = 0; component < 4; ++component) {

@@ -10,6 +10,7 @@
 #include "dxbc/usbd.h"
 #include "translation/hlsl_emitter.h"
 #include "translation/hlsl_lift_transaction.h"
+#include "translation/usil_validation.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -2142,7 +2143,7 @@ static void print_usage(const char* executable) {
             "result\n"
             "transactions: 64 candidates, 33 compiles, 30s acceptance deadline\n"
             "per exact baseline stage. In-flight compiler I/O has its own timeout.\n"
-            "--high-level also attempts the closed float4 expression candidate mode.\n"
+            "--high-level also attempts bounded float expression candidates.\n"
             "--report creates a new privacy-safe JSONL ledger; existing files\n"
             "are never overwritten.\n",
             executable);
@@ -2394,16 +2395,54 @@ static HLSLLiftStatus compile_live_lift_fixture_mode(void *context, const USILPr
         return HLSL_LIFT_INVALID_ARGUMENT;
     memcpy(instructions, program->instructions,
            (size_t)program->instruction_count * sizeof(*instructions));
+    bool mutated = false;
     for (int index = 0; index < program->instruction_count; ++index) {
         if (instructions[index].opcode == USIL_OP_MUL) {
             instructions[index].opcode = USIL_OP_ADD;
-            break;
-        }
-        if (instructions[index].opcode == USIL_OP_MOV) {
-            instructions[index].operands[1].swizzle[0] ^= 1u;
+            mutated = true;
             break;
         }
     }
+    if (!mutated) {
+        for (int index = 0; index < program->instruction_count; ++index) {
+            switch (instructions[index].opcode) {
+            case USIL_OP_DIV: case USIL_OP_MIN: case USIL_OP_MAX:
+                instructions[index].opcode = USIL_OP_ADD; break;
+            case USIL_OP_DP2: instructions[index].opcode = USIL_OP_DP3; break;
+            case USIL_OP_DP3: case USIL_OP_DP4:
+                instructions[index].opcode = USIL_OP_DP2; break;
+            case USIL_OP_RCP: case USIL_OP_RSQ: case USIL_OP_LOG:
+            case USIL_OP_EXP: case USIL_OP_FRC: case USIL_OP_ROUND_NE:
+            case USIL_OP_ROUND_NI: case USIL_OP_ROUND_PI: case USIL_OP_ROUND_Z:
+            case USIL_OP_DERIV_RTX: case USIL_OP_DERIV_RTY:
+            case USIL_OP_DERIV_RTX_COARSE: case USIL_OP_DERIV_RTY_COARSE:
+            case USIL_OP_DERIV_RTX_FINE: case USIL_OP_DERIV_RTY_FINE:
+                instructions[index].opcode = USIL_OP_SQRT; break;
+            case USIL_OP_SQRT: instructions[index].opcode = USIL_OP_RSQ; break;
+            default: continue;
+            }
+            mutated = true;
+            break;
+        }
+    }
+    if (!mutated) {
+        for (int index = 0; index < program->instruction_count; ++index) {
+            if (instructions[index].opcode != USIL_OP_MOV)
+                continue;
+            const uint8_t mask = usil_operand_destination_lane_mask(&instructions[index].operands[0]);
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!(mask & (1u << lane)))
+                    continue;
+                instructions[index].operands[1].swizzle[lane] ^= 1u;
+                mutated = true;
+                break;
+            }
+            if (mutated)
+                break;
+        }
+    }
+    if (!mutated)
+        return HLSL_LIFT_INVALID_ARGUMENT;
     USILProgram wrong = *program;
     wrong.instructions = instructions;
     return compile_lift_mode(&fixture->compiler, &wrong, remaining_ms, artifact, high_level);
@@ -2603,7 +2642,11 @@ static const struct {
         FIXTURE_PARTIAL,
         FIXTURE_BRANCH,
         FIXTURE_LOOP,
-        FIXTURE_FUNCTION
+        FIXTURE_FUNCTION,
+        FIXTURE_VECTOR,
+        FIXTURE_SCALAR,
+        FIXTURE_INTRINSIC,
+        FIXTURE_DERIVATIVE
     } kind;
 } k_expression_fixtures[] = {
     {"nested", "float4 product = value * value.wzyx; return product * value.zwxy;", FIXTURE_INLINE},
@@ -2641,7 +2684,42 @@ static const struct {
     {"shared-function",
      "float4 p=value * value.yzwx; float4 q=p * flags; "
      "float4 r=flags.zwxy * value.wzyx; float4 s=r * value; return q * s;",
-     FIXTURE_FUNCTION}};
+     FIXTURE_FUNCTION},
+    {"vector-shared", "float2 product=value.xy * value.zw; "
+                      "return float4(product + product.yx, product);", FIXTURE_VECTOR},
+    {"scalar-shared", "float product=value.x * value.y; "
+                      "return float4(product + product, product, value.z, value.w);", FIXTURE_SCALAR},
+    {"multiply-add", "float4 product=value * value.yzwx + value.zwxy; "
+                     "return product * value;", FIXTURE_INLINE},
+    {"divide", "float4 ratio=value / value.yzwx; return ratio * value.zwxy;", FIXTURE_INLINE},
+    {"minimum-maximum", "float4 bound=min(value, value.yzwx); "
+                        "return max(bound, value.zwxy);", FIXTURE_INLINE},
+    {"dot2", "return dot(value.xy, value.zw);", FIXTURE_INTRINSIC},
+    {"dot3", "return dot(value.xyz, value.yzw);", FIXTURE_INTRINSIC},
+    {"dot4", "return dot(value, value.yzwx);", FIXTURE_INTRINSIC},
+    {"dot-replicated2", "return dot(value.xx, value.yy);", FIXTURE_INTRINSIC},
+    {"dot-replicated3", "return dot(value.xxx, value.yyy);", FIXTURE_INTRINSIC},
+    {"dot-replicated4", "return dot(value.xxxx, value.yyyy);", FIXTURE_INTRINSIC},
+    {"dot-scalar-chain", "float product=dot(value.xyz,value.yzw); "
+                         "return dot(float3(product,product,product),value.xxx);", FIXTURE_INTRINSIC},
+    {"reciprocal", "return rcp(value);", FIXTURE_INTRINSIC},
+    {"reciprocal-root", "return rsqrt(value);", FIXTURE_INTRINSIC},
+    {"root", "return sqrt(value);", FIXTURE_INTRINSIC},
+    {"logarithm", "return log2(value);", FIXTURE_INTRINSIC},
+    {"exponential", "return exp2(value);", FIXTURE_INTRINSIC},
+    {"fraction", "return frac(value);", FIXTURE_INTRINSIC},
+    {"round-nearest", "return round(value);", FIXTURE_INTRINSIC},
+    {"round-down", "return floor(value);", FIXTURE_INTRINSIC},
+    {"round-up", "return ceil(value);", FIXTURE_INTRINSIC},
+    {"round-zero", "return trunc(value);", FIXTURE_INTRINSIC},
+    {"float-modifiers", "return -abs(value) * value.yzwx;", FIXTURE_INTRINSIC},
+    {"derivative-x", "return ddx(value);", FIXTURE_DERIVATIVE},
+    {"derivative-y", "return ddy(value);", FIXTURE_DERIVATIVE},
+    {"derivative-coarse-x", "return ddx_coarse(value);", FIXTURE_DERIVATIVE},
+    {"derivative-coarse-y", "return ddy_coarse(value);", FIXTURE_DERIVATIVE},
+    {"derivative-fine-x", "return ddx_fine(value);", FIXTURE_DERIVATIVE},
+    {"derivative-fine-y", "return ddy_fine(value);", FIXTURE_DERIVATIVE},
+    {"derivative-order", "return ddx(value) * ddy(value.yzwx);", FIXTURE_DERIVATIVE}};
 
 static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, int shape,
                                         FILE *report) {
@@ -2649,9 +2727,14 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
         (size_t)shape >= sizeof(k_expression_fixtures) / sizeof(k_expression_fixtures[0]))
         return false;
     const int kind = k_expression_fixtures[shape].kind;
-    const bool shared = kind != FIXTURE_INLINE, partial = kind == FIXTURE_PARTIAL;
+    const bool vector = kind == FIXTURE_VECTOR || kind == FIXTURE_SCALAR;
+    const bool intrinsic = kind == FIXTURE_INTRINSIC || kind == FIXTURE_DERIVATIVE;
+    const bool shared = kind != FIXTURE_INLINE && !vector && !intrinsic, partial = kind == FIXTURE_PARTIAL;
     const bool loop = kind == FIXTURE_LOOP, function = kind == FIXTURE_FUNCTION;
     const bool structured = kind == FIXTURE_BRANCH || loop;
+    /* Coarse/fine derivatives are SM5 instructions. Use the same explicit
+     * requirements for the authored target, baseline and every candidate. */
+    const uint64_t requirements = kind == FIXTURE_DERIVATIVE ? UINT64_C(0x13dfeb) : 0;
     bool succeeded = false;
     USILProgram program = {0};
     uint8_t *bytes = NULL;
@@ -2662,6 +2745,7 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     StringBuilder seed;
     sb_init(&seed);
     sb_append(&seed, "#pragma vertex main\n#pragma fragment main\n");
+    if (kind == FIXTURE_DERIVATIVE) sb_append(&seed, "#pragma target 5.0\n");
     sb_appendf(&seed, "float4 main(float4 value : %s%s) : %s {\n",
                stage == 0 ? "POSITION" : "TEXCOORD0",
                (structured || function) ? ", float4 flags : TEXCOORD1" : "",
@@ -2669,7 +2753,7 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
     sb_append(&seed, k_expression_fixtures[shape].body);
     sb_append(&seed, "\n}\n");
     SELF_CHECK(sb_ok(&seed));
-    bytes = unity_compiler_broker_compile(broker, seed.buf, "ExpressionFixture", stage, 4, 0, NULL,
+    bytes = unity_compiler_broker_compile(broker, seed.buf, "ExpressionFixture", stage, 4, requirements, NULL,
                                           0, NULL, 0, &byte_count, &error);
     SELF_CHECK(bytes);
     DXBCContainerView container;
@@ -2679,9 +2763,9 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
                            .bytecode_size = container.size};
     RecordResult reconstruction = record_result_init(true);
     reconstructed = reconstruct_stage_source(&target, &k_stages[stage], &reconstruction, &program);
-    SELF_CHECK(reconstructed && program.temp_count > 0);
-    GoldenFlags flags = {.shader_name = "ExpressionFixture"};
-    CompileJob job = {.stage = &k_stages[stage]};
+    SELF_CHECK(reconstructed && (intrinsic || program.temp_count > 0));
+    GoldenFlags flags = {.shader_name = "ExpressionFixture", .requirements = requirements};
+    CompileJob job = {.stage = &k_stages[stage], .requirements = requirements};
     LiveLiftFixture fixture = {.compiler = {.broker = broker, .flags = &flags, .job = &job}};
     HLSLLiftServices services = {.compile = compile_live_lift_fixture,
                                  .monotonic_ms = lift_monotonic_ms,
@@ -2694,23 +2778,62 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
         hlsl_lift_transaction_begin(&program, target.bytecode, target.bytecode_size, &services,
                                     &k_copy_limits, &transaction, &result);
     if (baseline_status != HLSL_LIFT_VERIFIED)
-        fprintf(stderr, "%s expression baseline: %s\n", k_stages[stage].name,
-                hlsl_lift_status_name(baseline_status));
+        fprintf(stderr, "%s %s expression baseline: %s (%s, instruction %u, token %u, "
+                        "expected 0x%llx, actual 0x%llx)\n", k_stages[stage].name,
+                k_expression_fixtures[shape].name, hlsl_lift_status_name(baseline_status),
+                dxbc_compare_status_name(result.comparison.status),
+                result.comparison.instruction_index, result.comparison.token_index,
+                (unsigned long long)result.comparison.expected_value,
+                (unsigned long long)result.comparison.actual_value);
     SELF_CHECK(baseline_status == HLSL_LIFT_VERIFIED);
-    if (!partial) {
+    {
         const char *baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
         flags.shader_name = "ExpressionFixtureChangedAuthority";
-        SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
-                   HLSL_LIFT_AUTHORITY_MISMATCH);
+        const HLSLLiftStatus changed_authority =
+            hlsl_lift_transaction_try_high_level(transaction, &result);
+        if (changed_authority != HLSL_LIFT_AUTHORITY_MISMATCH) {
+            RecordResult diagnostic = record_result_init(true);
+            HLSLEmitOptions candidate_options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+            char *candidate = emit_stage_with_options(&program, &k_stages[stage],
+                                                       &diagnostic, &candidate_options);
+            fprintf(stderr, "%s %s changed authority: %s; emission=%s (%s)\n",
+                    k_stages[stage].name, k_expression_fixtures[shape].name,
+                    hlsl_lift_status_name(changed_authority), diagnostic.emission, diagnostic.reason);
+            if (!candidate) {
+                StringBuilder detail;
+                HLSLEmitDiagnostic reason;
+                sb_init(&detail);
+                (void)hlsl_emit_with_options_diagnostic(&program, &detail, NULL, NULL,
+                    NULL, &candidate_options, &reason);
+                fprintf(stderr, "candidate phase=%d instruction=%d opcode=%d\n",
+                        (int)reason.phase, reason.instruction_index, (int)reason.opcode);
+                sb_free(&detail);
+            }
+            if (candidate && changed_authority == HLSL_LIFT_COMPILER_REJECTED) {
+                size_t diagnostic_size = 0;
+                char *diagnostic_error = NULL;
+                uint8_t *diagnostic_bytes = unity_compiler_broker_compile(broker, candidate,
+                    flags.shader_name, stage, 4, requirements, NULL, 0, NULL, 0,
+                    &diagnostic_size, &diagnostic_error);
+                if (diagnostic_error) fprintf(stderr, "%s\n", diagnostic_error);
+                free(diagnostic_bytes);
+                free(diagnostic_error);
+            }
+            free(candidate);
+        }
+        SELF_CHECK(changed_authority == HLSL_LIFT_AUTHORITY_MISMATCH);
         SELF_CHECK(!result.compared &&
                    hlsl_lift_transaction_artifact(transaction)->source == baseline_source);
         flags.shader_name = "ExpressionFixture";
     }
-    if (structured || function) {
+    if (structured || function || partial || vector || intrinsic) {
         const char *baseline_source = hlsl_lift_transaction_artifact(transaction)->source;
         fixture.corrupt_candidate = true;
-        SELF_CHECK(hlsl_lift_transaction_try_high_level(transaction, &result) ==
-                   HLSL_LIFT_DXBC_MISMATCH);
+        const HLSLLiftStatus corrupt_status = hlsl_lift_transaction_try_high_level(transaction, &result);
+        if (corrupt_status != HLSL_LIFT_DXBC_MISMATCH)
+            fprintf(stderr, "%s %s corrupt candidate: %s\n", k_stages[stage].name,
+                    k_expression_fixtures[shape].name, hlsl_lift_status_name(corrupt_status));
+        SELF_CHECK(corrupt_status == HLSL_LIFT_DXBC_MISMATCH);
         SELF_CHECK(hlsl_lift_transaction_artifact(transaction)->source == baseline_source &&
                    hlsl_lift_transaction_step_count(transaction) == 0);
         fixture.corrupt_candidate = false;
@@ -2722,22 +2845,35 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
         fixture.corrupt_source_map = false;
     }
     HLSLLiftStatus status = hlsl_lift_transaction_try_high_level(transaction, &result);
-    if (partial) {
-        SELF_CHECK(status == HLSL_LIFT_EMISSION_REJECTED);
-        SELF_CHECK(!hlsl_lift_transaction_is_high_level(transaction));
-        SELF_CHECK(strcmp(hlsl_lift_transaction_artifact(transaction)->source, reconstructed) == 0);
-        printf("%s: partial expression retained verified low-level fallback\n",
-               k_stages[stage].name);
-        succeeded = true;
-        goto cleanup;
-    }
     if (status != HLSL_LIFT_VERIFIED)
         fprintf(stderr, "%s %s expression: %s\n", k_stages[stage].name,
                 k_expression_fixtures[shape].name, hlsl_lift_status_name(status));
     SELF_CHECK(status == HLSL_LIFT_VERIFIED);
     const char *accepted = hlsl_lift_transaction_artifact(transaction)->source;
     SELF_CHECK(!strstr(accepted, "\n    float4 r") && !strstr(accepted, "u_xlat_temp"));
-    SELF_CHECK(shared == (strstr(accepted, "const float4 dxbc_value_") != NULL));
+    if (!partial && !vector && kind != FIXTURE_DERIVATIVE)
+        SELF_CHECK(shared == (strstr(accepted, "const float4 dxbc_value_") != NULL));
+    if (kind == FIXTURE_DERIVATIVE) {
+        const HLSLExpressionSourceMap *map =
+            hlsl_lift_transaction_artifact(transaction)->expression_source_map;
+        bool observed = false;
+        for (int index = 0; index < program.instruction_count; ++index) {
+            switch (program.instructions[index].opcode) {
+            case USIL_OP_DERIV_RTX: case USIL_OP_DERIV_RTY:
+            case USIL_OP_DERIV_RTX_COARSE: case USIL_OP_DERIV_RTY_COARSE:
+            case USIL_OP_DERIV_RTX_FINE: case USIL_OP_DERIV_RTY_FINE:
+                SELF_CHECK(map && map->origins[index].kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
+                           map->origins[index].source_begin < map->origins[index].source_end);
+                observed = true;
+                break;
+            default: break;
+            }
+        }
+        SELF_CHECK(observed);
+    }
+    if (vector)
+        SELF_CHECK(strstr(accepted, kind == FIXTURE_VECTOR ? "const float2 dxbc_value_" :
+                                                          "const float dxbc_value_"));
     if (structured || function) {
         if (function)
             SELF_CHECK(strstr(accepted, "float4 dxbc_mul_chain_right(") &&
@@ -2745,11 +2881,11 @@ static bool run_live_expression_fixture(UnityCompilerBroker *broker, int stage, 
         else
             SELF_CHECK(strstr(accepted, "float4 dxbc_merge_") &&
                        strstr(accepted, loop ? "[loop] for (uint" : "[branch] if ("));
-        char case_hash[65];
-        hash_hex(seed.buf, seed.len, case_hash);
-        report_lift(report, case_hash, 0, 0, &result, 2);
-        report_lift_steps(report, case_hash, 0, transaction);
     }
+    char case_hash[65];
+    hash_hex(seed.buf, seed.len, case_hash);
+    report_lift(report, case_hash, 0, 0, &result, 2);
+    report_lift_steps(report, case_hash, 0, transaction);
     printf("%s: decoded %s expression reproduced complete target DXBC\n", k_stages[stage].name,
            k_expression_fixtures[shape].name);
     succeeded = true;
@@ -2823,7 +2959,8 @@ int main(int argc, char** argv) {
         for (int shape = 0; passed && (size_t)shape < sizeof(k_expression_fixtures) /
                                                           sizeof(k_expression_fixtures[0]);
              ++shape)
-            for (int stage = 0; passed && stage < 2; ++stage)
+            for (int stage = k_expression_fixtures[shape].kind == FIXTURE_DERIVATIVE ? 1 : 0;
+                 passed && stage < 2; ++stage)
                 passed = run_live_expression_fixture(broker, stage, shape, report);
         if (report)
             fprintf(report, "{\"event\":\"end\",\"passed\":%s}\n", passed ? "true" : "false");

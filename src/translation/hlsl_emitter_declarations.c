@@ -3,6 +3,7 @@
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
 #include "io/parameter_layout.h"
+#include "translation/hlsl_global_declarations.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,7 +196,7 @@ static bool append_cbuffer_variable(HLSLCBufferLayout *layout,
 
 static bool append_serialized_cbuffer_source(
     HLSLCBufferLayout *layout, const SerializedProgramParameters *parameters,
-    const char *cb_name, uint8_t authority) {
+    const char *cb_name, uint8_t authority, bool retain_reflection_fields) {
   if (!parameters) return true;
   if (!cb_name || parameters->cb_count < 0 ||
       (parameters->cb_count > 0 && !parameters->constant_buffers)) {
@@ -255,7 +256,10 @@ static bool append_serialized_cbuffer_source(
        * Serialized metadata remains authoritative for a variable whose tail
        * was optimized away, so retain its complete declaration while the
        * projection intersects only bytes present in this DXBC declaration. */
-      if (decoded.byte_offset >= cbuffer_size) continue;
+      const uint32_t declaration_limit = retain_reflection_fields &&
+                                        layout->has_reflection_size_authority
+                                            ? layout->reflection_size_bytes : cbuffer_size;
+      if (decoded.byte_offset >= declaration_limit) continue;
 
       TempVariable candidate;
       memset(&candidate, 0, sizeof(candidate));
@@ -1270,6 +1274,14 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
   free_cbuffer_emission_layouts(ctx);
   ctx->cbuffer_layout_count = ctx->program->cbuffer_count;
   ctx->cbuffer_layouts_built = false;
+  if (ctx->global_declarations &&
+      hlsl_global_declarations_validate_target(ctx->global_declarations, ctx->program,
+          ctx->params, ctx->common_params) != HLSL_GLOBAL_DECLARATIONS_OK) {
+    fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
+        HLSL_EMIT_PHASE_CBUFFER_LAYOUT, HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY, -1, -1);
+    return false;
+  }
+  bool union_applied = false;
 
   for (int index = 0; index < ctx->program->cbuffer_count; ++index) {
     HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[index];
@@ -1289,20 +1301,57 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
                          strcmp(layout->declaration_name, "_Globals") == 0;
     layout->is_unity_builtin =
         is_unity_builtin_cbuffer(layout->declaration_name);
+    const bool compact_globals = ctx->emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+                                 layout->is_globals && layout->reg == 0;
 
     if (layout->serialized_name &&
         (!append_serialized_cbuffer_source(
              layout, ctx->params, layout->serialized_name,
-             CBUFFER_AUTHORITY_STAGE) ||
+             CBUFFER_AUTHORITY_STAGE, compact_globals) ||
          !append_serialized_cbuffer_source(
              layout, ctx->common_params, layout->serialized_name,
-             CBUFFER_AUTHORITY_COMMON))) {
+             CBUFFER_AUTHORITY_COMMON, compact_globals))) {
       fail_cbuffer_location(
           ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
           HLSL_EMIT_PHASE_CBUFFER_LAYOUT,
           HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY, index, -1);
       return false;
     }
+    if (ctx->global_declarations && compact_globals) {
+      if (!layout->has_reflection_size_authority || layout->reflection_size_bytes !=
+          hlsl_global_declarations_shell_size(ctx->global_declarations)) return false;
+      size_t field_count;
+      const HLSLGlobalDeclarationField *fields =
+          hlsl_global_declarations_fields(ctx->global_declarations, &field_count);
+      for (size_t field = 0; field < field_count; ++field) {
+        if (fields[field].current_authority) continue;
+        TempVariable candidate = {0};
+        candidate.name = fields[field].name;
+        candidate.type = fields[field].layout.scalar_type;
+        candidate.rows = fields[field].layout.rows;
+        candidate.dim = fields[field].layout.columns;
+        candidate.reg_offset = fields[field].layout.byte_offset / 16u;
+        candidate.byte_offset = fields[field].layout.byte_offset;
+        candidate.byte_size = fields[field].byte_size;
+        candidate.authority = 4; /* Same-pass sibling declaration only. */
+        if (!append_cbuffer_variable(layout, &candidate)) return false;
+      }
+      union_applied = true;
+    }
+    layout->compact_global_layout = compact_globals && layout->has_reflection_size_authority &&
+                                    layout->has_serialized_authority && layout->variable_count > 0;
+    uint32_t named_shell_end = 0;
+    for (int variable = 0; variable < layout->variable_count; ++variable) {
+      const TempVariable *value = &layout->variables[variable];
+      const uint64_t end = (uint64_t)value->byte_offset + value->byte_size;
+      if (value->type != 0 || value->is_matrix || value->matrix_array_size || value->rows != 1 ||
+          !value->dim || value->dim > 4 || (value->byte_offset & 15U) ||
+          value->byte_size != value->dim * 4U || end > layout->reflection_size_bytes)
+        layout->compact_global_layout = false;
+      if (end <= UINT32_MAX && end > named_shell_end) named_shell_end = (uint32_t)end;
+    }
+    if (((uint64_t)named_shell_end + 15U) / 16U * 16U != layout->reflection_size_bytes)
+      layout->compact_global_layout = false;
     if (ctx->emit_mode == HLSL_EMIT_MODE_READABLE &&
         layout->variable_count == 0 &&
         !append_readable_builtin_fallback(layout,
@@ -1454,7 +1503,7 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
         memset(layout->uses, 0,
                (size_t)layout->use_alloc * sizeof(*layout->uses));
       }
-    } else if (layout->projection.saw_access) {
+    } else if (layout->projection.saw_access && !layout->compact_global_layout) {
       int output = 0;
       for (int variable = 0; variable < layout->variable_count; ++variable) {
         if (!layout->uses[variable].referenced) continue;
@@ -1492,6 +1541,7 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
       }
     }
   }
+  if (ctx->global_declarations && !union_applied) return false;
   ctx->cbuffer_layouts_built = true;
   return true;
 }
@@ -1630,6 +1680,7 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
     }
     if (layout->raw_storage) {
       sb_appendf(sb, "    float4 cb%d_data[%d];\n", reg, layout->row_count);
+      hlsl_source_quality_emission(ctx, HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION, false, -1);
       const uint32_t active_size = (uint32_t)layout->row_count * 16U;
       if (layout->reflection_size_bytes > active_size) {
         sb_appendf(sb, "    float4 dxbc_reflection_tail_cb%d[%u];\n", reg,
@@ -1662,7 +1713,7 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
           }
         }
 
-        if (!use_packoffset) {
+        if (!use_packoffset && !layout->compact_global_layout) {
           if (target_byte_offset > current_byte_offset) {
             uint32_t diff = target_byte_offset - current_byte_offset;
             uint32_t pad_comps = diff / 4;
@@ -1695,7 +1746,15 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
 
         // Compute packoffset string
         char packoffset_str[32] = "";
-        if (use_packoffset) {
+        if (layout->compact_global_layout) {
+          if (!hlsl_format_checked(ctx, packoffset_str, sizeof(packoffset_str),
+                                   " : register(c%u)", target_byte_offset / 16U)) {
+            fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INTERNAL_INVARIANT,
+                                  HLSL_EMIT_PHASE_CBUFFER_EMISSION,
+                                  HLSL_EMIT_REASON_FIXED_BUFFER_OVERFLOW, i, k);
+            return;
+          }
+        } else if (use_packoffset) {
           uint32_t reg_num = target_byte_offset / 16;
           uint32_t comp = (target_byte_offset % 16) / 4;
           const char* comp_suffix[] = {"", ".y", ".z", ".w"};
@@ -1745,13 +1804,40 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
           }
         }
         current_byte_offset = target_byte_offset + var->byte_size;
+        if (layout->compact_global_layout) {
+          if (var->authority != 4 || !ctx->source_quality_analysis) {
+            hlsl_source_quality_emission(ctx, 0, false, -1);
+          } else {
+            size_t field_count;
+            const HLSLGlobalDeclarationField *fields =
+                hlsl_global_declarations_fields(ctx->global_declarations, &field_count);
+            for (size_t field = 0; field < field_count; ++field) {
+              if (strcmp(fields[field].name, var->name) != 0) continue;
+              for (size_t witness = 0; witness < fields[field].witness_count; ++witness) {
+                HLSLSourceQualityFacts facts;
+                hlsl_source_quality_facts_init(&facts);
+                facts.known = true;
+                facts.declaration_witness_record = true;
+                facts.declaration_witness_count = witness ? 0 : (uint32_t)fields[field].witness_count;
+                facts.declaration_field_index = (uint32_t)field;
+                facts.declaration_witness_subprogram_index = fields[field].witness_subprogram_indices[witness];
+                facts.declaration_variant_index = (uint32_t)
+                    hlsl_global_declarations_current_variant(ctx->global_declarations);
+                if (!hlsl_source_quality_analysis_emission(ctx->source_quality_analysis, &facts))
+                  hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                      HLSL_EMIT_PHASE_CBUFFER_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+              }
+              break;
+            }
+          }
+        }
     }
 
       /* Extend only the source/reflection shell. The executable access model
        * continues to use row_count from stripped DXBC. D3DCompiler retains
        * this unused tail in reflection while trimming it from dcl_constantbuffer. */
       uint32_t total_size_bytes = layout->reflection_size_bytes;
-      if (current_byte_offset < total_size_bytes) {
+      if (current_byte_offset < total_size_bytes && !layout->compact_global_layout) {
         if (use_packoffset) {
           uint32_t last_reg = (total_size_bytes / 16) - 1;
           if (current_byte_offset <= last_reg * 16) {

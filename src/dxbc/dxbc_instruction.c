@@ -129,6 +129,21 @@ static bool append_required_operand(ByteStream* stream, size_t instruction_end,
     return true;
 }
 
+static bool append_declaration_literal(ByteStream* stream, size_t instruction_end,
+                                        DXBCInstruction* instruction) {
+    uint32_t value;
+    if (instruction->operand_count >= DXBC_MAX_OPERANDS ||
+        !instruction_read_u32(stream, instruction_end, &value)) return false;
+    DXBCOperand* operand = &instruction->operands[instruction->operand_count++];
+    operand->type = OPERAND_TYPE_IMMEDIATE32;
+    operand->imm_value_count = 1;
+    operand->imm_values[0] = value;
+    operand->immediate_word_count = 1;
+    operand->immediate_words[0] = value;
+    format_instruction_text(operand->text, sizeof(operand->text), "%u", value);
+    return true;
+}
+
 static bool reserve_instructions(DXBCContainer* container, int required) {
     if (!container || required < 0 || container->instruction_count < 0 ||
         container->instruction_alloc < container->instruction_count ||
@@ -302,7 +317,7 @@ bool parse_shader_logic(ByteStream* stream, size_t next_pos, DXBCContainer* cont
         }
         
         inst->is_decl = dxbc_opcode_is_declaration(opcode);
-        if (!inst->is_decl) {
+        if (!inst->is_decl && opcode != 190u) {
             inst->precise_mask = (uint8_t)((token >> 19u) & 0x0fu);
         }
 
@@ -327,7 +342,7 @@ bool parse_shader_logic(ByteStream* stream, size_t next_pos, DXBCContainer* cont
                 return reject_instruction(inst);
         }
         
-        if (!inst->is_decl && (token & 0x2000) != 0) {
+        if (!inst->is_decl && opcode != 190u && (token & 0x2000) != 0) {
             inst->saturate = true;
         }
         
@@ -402,7 +417,34 @@ bool parse_shader_logic(ByteStream* stream, size_t next_pos, DXBCContainer* cont
         
         bool processed = false;
         
-        if (opcode == 53) { // DCL_IMMEDIATECONSTANTBUFFER
+        if (opcode == 155u) { /* DCL_THREAD_GROUP: three literal DWORDs. */
+            if ((token & UINT32_C(0x80fff800)) != 0u ||
+                !append_declaration_literal(stream, next_inst_pos, inst) ||
+                !append_declaration_literal(stream, next_inst_pos, inst) ||
+                !append_declaration_literal(stream, next_inst_pos, inst))
+                return reject_instruction(inst);
+            processed = true;
+        } else if (opcode == 159u || opcode == 160u) {
+            /* TGSM has a gN declaration operand followed by literal sizes,
+             * whose low bits must never be decoded as operand tokens. */
+            if ((token & UINT32_C(0x80fff800)) != 0u ||
+                !append_required_operand(stream, next_inst_pos,
+                                         DXBC_OPERAND_CONTEXT_DECLARATION,
+                                         opcode, inst))
+                return reject_instruction(inst);
+            int register_id;
+            if (!declaration_binding_register(
+                    inst, OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY, &register_id) ||
+                !append_declaration_literal(stream, next_inst_pos, inst) ||
+                (opcode == 160u &&
+                 !append_declaration_literal(stream, next_inst_pos, inst)))
+                return reject_instruction(inst);
+            processed = true;
+        } else if (opcode == 190u) { /* SYNC: control bits, no operands. */
+            if ((token & UINT32_C(0x80ff8000)) != 0u)
+                return reject_instruction(inst);
+            processed = true;
+        } else if (opcode == 53) { // DCL_IMMEDIATECONSTANTBUFFER
             size_t data_bytes = next_inst_pos - stream->position;
             if (data_bytes == 0 || data_bytes % (4 * sizeof(uint32_t)) != 0)
                 return reject_instruction(inst);

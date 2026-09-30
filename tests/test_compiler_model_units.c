@@ -939,6 +939,58 @@ static int verify_fresh_destination_order_is_mutation_safe(void) {
     return 0;
 }
 
+static int verify_full_width_extrema_input_order(void) {
+    const USILOpcode opcodes[] = {USIL_OP_MIN, USIL_OP_MAX};
+    for (size_t operation = 0; operation < sizeof(opcodes) / sizeof(opcodes[0]); ++operation) {
+        USILInstruction instructions[2] = {0};
+        init_instruction(&instructions[0], opcodes[operation], 3);
+        init_register_operand(&instructions[0].operands[0], OPERAND_TYPE_TEMP, 0);
+        instructions[0].operands[0].destination_mask = MASK_XYZW;
+        init_register_operand(&instructions[0].operands[1], OPERAND_TYPE_INPUT, 0);
+        init_register_operand(&instructions[0].operands[2], OPERAND_TYPE_INPUT, 0);
+        set_swizzle(&instructions[0].operands[1], 1, 2, 3, 0);
+        init_instruction(&instructions[1], USIL_OP_RET, 0);
+        USILProgram program;
+        init_program(&program, instructions, 2, 1);
+        CHECK(model_swaps_binary(&program, 0, true) == 0);
+        /* This inverse was measured on a plain full-width input pair. */
+        instructions[0].precise_mask = 1;
+        CHECK(model_swaps_binary(&program, 0, false) == 0);
+        instructions[0].precise_mask = 0;
+        instructions[0].operands[1].has_abs = true;
+        CHECK(model_swaps_binary(&program, 0, false) == 0);
+        instructions[0].operands[1].has_abs = false;
+        instructions[0].operands[0].destination_mask = MASK_X | MASK_Z;
+        CHECK(model_swaps_binary(&program, 0, false) == 0);
+    }
+    return 0;
+}
+
+static int verify_modified_input_product_order(void) {
+    USILInstruction instructions[2] = {0};
+    init_instruction(&instructions[0], USIL_OP_MUL, 3);
+    init_register_operand(&instructions[0].operands[0], OPERAND_TYPE_OUTPUT, 0);
+    instructions[0].operands[0].destination_mask = MASK_XYZW;
+    init_register_operand(&instructions[0].operands[1], OPERAND_TYPE_INPUT, 0);
+    init_register_operand(&instructions[0].operands[2], OPERAND_TYPE_INPUT, 0);
+    set_swizzle(&instructions[0].operands[1], 1, 2, 3, 0);
+    instructions[0].operands[2].has_abs = true;
+    instructions[0].operands[2].has_neg = true;
+    init_instruction(&instructions[1], USIL_OP_RET, 0);
+    USILProgram program;
+    init_program(&program, instructions, 2, 0);
+    CHECK(model_swaps_binary(&program, 0, true) == 0);
+    instructions[0].precise_mask = 1;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    instructions[0].precise_mask = 0;
+    instructions[0].saturate = true;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    instructions[0].saturate = false;
+    instructions[0].operands[0].destination_mask = MASK_X | MASK_Z;
+    CHECK(model_swaps_binary(&program, 0, false) == 0);
+    return 0;
+}
+
 int main(void) {
     CHECK(verify_tangent_frame_inverse_is_mutation_safe() == 0);
     CHECK(verify_screen_position_inverses_are_mutation_safe() == 0);
@@ -947,5 +999,7 @@ int main(void) {
     CHECK(verify_cross_product_order_inverse_is_mutation_safe() == 0);
     CHECK(verify_quadratic_sh_inverse_is_mutation_safe() == 0);
     CHECK(verify_fresh_destination_order_is_mutation_safe() == 0);
+    CHECK(verify_full_width_extrema_input_order() == 0);
+    CHECK(verify_modified_input_product_order() == 0);
     return 0;
 }

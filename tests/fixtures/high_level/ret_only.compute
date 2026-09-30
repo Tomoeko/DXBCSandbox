@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+#pragma kernel ReturnOnly
+#pragma kernel ReturnSystemValues
+#pragma multi_compile _ RETURN_VARIANT
+
+// This unused declaration probes compiler pruning independently of the
+// executable shared-memory contract. It is not inferred from captured DXBC.
+groupshared uint unusedSharedMemory[16];
+
+#if defined(RETURN_VARIANT)
+[numthreads(4, 2, 2)]
+#else
+[numthreads(8, 4, 1)]
+#endif
+void ReturnOnly()
+{
+    return;
+}
+
+#if defined(RETURN_VARIANT)
+[numthreads(4, 2, 2)]
+#else
+[numthreads(8, 4, 1)]
+#endif
+void ReturnSystemValues(uint3 dispatchThreadId : SV_DispatchThreadID,
+                        uint3 groupId : SV_GroupID,
+                        uint3 groupThreadId : SV_GroupThreadID,
+                        uint groupIndex : SV_GroupIndex)
+{
+    return;
+}

@@ -438,6 +438,96 @@ void free_structured_resource_layout(StructuredResourceLayout* layout) {
   memset(layout, 0, sizeof(*layout));
 }
 
+static bool resource_identifier_valid(const char *name) {
+  if (!name || !name[0]) return false;
+  for (size_t index = 0; name[index]; ++index) {
+    unsigned char value = (unsigned char)name[index];
+    if (index >= 255 || !((value >= 'A' && value <= 'Z') ||
+        (value >= 'a' && value <= 'z') || value == '_' ||
+        (index && value >= '0' && value <= '9'))) return false;
+  }
+  return true;
+}
+
+/* All dependencies here are emitted by this production path. Unused bindings,
+ * unknown names, includes and reconstructed byte buffers stay outside this
+ * first bounded texture inventory. No declaration spelling grants authority. */
+bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *ctx) {
+  if (!ctx || !ctx->program) return false;
+  const USILProgram *program = ctx->program;
+  if (!program->texture_count && !program->sampler_count && !program->uav_count) return true;
+  if (ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
+      program->program_type != DXBC_PROGRAM_TYPE_PIXEL || program->uav_count) return false;
+  for (int texture = 0; texture < program->texture_count; ++texture) {
+    const USILTexture *resource = &program->textures[texture];
+    const char *name = NULL;
+    if (strcmp(resource->dimension, "2d") != 0 || resource->stride || resource->sample_count ||
+        !resolve_srv_name_ctx(ctx, resource->reg_idx, SERIALIZED_RESOURCE_TEXTURE, &name) ||
+        !resource_identifier_valid(name) ||
+        (ctx->omit_unity_builtin_declarations && unity_builtin_texture_contract(name, resource)))
+      return false;
+    for (unsigned component = 0; component < 4; ++component)
+      if (resource->return_types[component] != 5) return false;
+    bool used = false;
+    for (int instruction = 0; instruction < program->instruction_count; ++instruction) {
+      const USILInstruction *owner = &program->instructions[instruction];
+      if (owner->opcode == USIL_OP_SAMPLE && owner->operand_count == 4 &&
+          owner->operands[2].type == OPERAND_TYPE_RESOURCE &&
+          owner->operands[2].register_index == resource->reg_idx) used = true;
+    }
+    if (!used) return false;
+    for (int previous = 0; previous < texture; ++previous) {
+      const char *prior_name = NULL;
+      if (!resolve_srv_name_ctx(ctx, program->textures[previous].reg_idx,
+            SERIALIZED_RESOURCE_TEXTURE, &prior_name) ||
+          (prior_name && strcmp(prior_name, name) == 0)) return false;
+    }
+    for (int sampler = 0; sampler < program->sampler_count; ++sampler) {
+      int reg = program->samplers[sampler].reg_idx;
+      if (reg < 0 || reg >= HLSL_SM5_SAMPLER_REGISTER_COUNT ||
+          (ctx->sampler_names[reg] && strcmp(ctx->sampler_names[reg], name) == 0)) return false;
+    }
+    if (ctx->entry_point_name && strcmp(ctx->entry_point_name, name) == 0) return false;
+    for (int buffer = 0; buffer < ctx->cbuffer_layout_count; ++buffer)
+      for (int variable = 0; variable < ctx->cbuffer_layouts[buffer].variable_count; ++variable)
+        if (strcmp(ctx->cbuffer_layouts[buffer].variables[variable].name, name) == 0) return false;
+  }
+  for (int sampler = 0; sampler < program->sampler_count; ++sampler) {
+    int reg = program->samplers[sampler].reg_idx;
+    const char *name = reg >= 0 && reg < HLSL_SM5_SAMPLER_REGISTER_COUNT
+        ? ctx->sampler_names[reg] : NULL;
+    if (program->samplers[sampler].mode || !resource_identifier_valid(name) ||
+        (ctx->omit_unity_builtin_declarations && unity_builtin_sampler_name(name))) return false;
+    bool used = false;
+    for (int instruction = 0; instruction < program->instruction_count; ++instruction) {
+      const USILInstruction *owner = &program->instructions[instruction];
+      if (owner->opcode == USIL_OP_SAMPLE && owner->operand_count == 4 &&
+          owner->operands[3].type == OPERAND_TYPE_SAMPLER &&
+          owner->operands[3].register_index == reg) used = true;
+    }
+    if (!used || (ctx->entry_point_name && strcmp(ctx->entry_point_name, name) == 0)) return false;
+    for (int buffer = 0; buffer < ctx->cbuffer_layout_count; ++buffer)
+      for (int variable = 0; variable < ctx->cbuffer_layouts[buffer].variable_count; ++variable)
+        if (strcmp(ctx->cbuffer_layouts[buffer].variables[variable].name, name) == 0) return false;
+  }
+  return true;
+}
+
+static void observe_resource_declaration(HLSLEmitterContext *ctx, const char *name,
+    HLSLSourceQualityResourceKind kind, uint32_t reg, uint32_t artifacts) {
+  if (!ctx->source_quality_analysis) return;
+  HLSLSourceQualityFacts facts;
+  hlsl_source_quality_facts_init(&facts);
+  facts.known = resource_identifier_valid(name);
+  facts.resource_declaration_kind = kind;
+  facts.resource_binding_register = reg;
+  facts.artifacts = artifacts;
+  if (!name) facts.artifacts |= HLSL_SOURCE_ARTIFACT_REGISTER_STORAGE;
+  if (!hlsl_source_quality_analysis_emission(ctx->source_quality_analysis, &facts))
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+        HLSL_EMIT_PHASE_RESOURCE_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+}
+
 void emit_resources(HLSLEmitterContext* ctx) {
   const USILProgram* program = ctx->program;
   StringBuilder* sb = ctx->sb;
@@ -548,6 +638,10 @@ void emit_resources(HLSLEmitterContext* ctx) {
     } else {
       sb_appendf(sb, "%s t%d : register(t%d);\n", tex_type, reg, reg);
     }
+    observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_TEXTURE, (uint32_t)reg,
+        strcmp(program->textures[i].dimension, "raw") == 0 ||
+        strcmp(program->textures[i].dimension, "structured") == 0
+            ? HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION : 0);
   }
   const char *emitted_sampler_names[HLSL_SM5_SAMPLER_REGISTER_COUNT] = {0};
   int emitted_sampler_count = 0;
@@ -627,6 +721,7 @@ void emit_resources(HLSLEmitterContext* ctx) {
                                    : "SamplerState";
     sb_appendf(sb, "%s %s : register(s%d);\n", sampler_type, name,
                reg);
+    observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_SAMPLER, (uint32_t)reg, 0);
   }
   for (int i = 0; i < program->uav_count; i++) {
     int reg = program->uavs[i].reg_idx;
@@ -688,6 +783,10 @@ void emit_resources(HLSLEmitterContext* ctx) {
                  program->uavs[i].globally_coherent ? "globallycoherent " : "",
                  uav_type, reg, reg);
     }
+    observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_UAV, (uint32_t)reg,
+        strcmp(program->uavs[i].dimension, "raw") == 0 ||
+        strcmp(program->uavs[i].dimension, "structured") == 0
+            ? HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION : 0);
   }
   if (program->texture_count > 0 || program->sampler_count > 0 ||
       program->uav_count > 0) {
@@ -705,4 +804,3 @@ void emit_resources(HLSLEmitterContext* ctx) {
     sb_append(sb, "}\n\n");
   }
 }
-

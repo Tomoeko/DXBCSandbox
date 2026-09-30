@@ -45,6 +45,21 @@ static bool prepare_functions(HLSLEmitterContext *ctx) {
         if (ctx->program->instructions[i].opcode == USIL_OP_IF ||
             ctx->program->instructions[i].opcode == USIL_OP_LOOP)
             return true; /* Structured values retain their existing planner. */
+    if (hlsl_float4_program_contract(ctx->program) != HLSL_EMIT_REASON_NONE)
+        return true; /* Width-aware expressions do not use float4 helpers. */
+    for (int i = 0; i < ctx->program->instruction_count; ++i) {
+        const USILInstruction *instruction = &ctx->program->instructions[i];
+        if (instruction->opcode != USIL_OP_MOV && instruction->opcode != USIL_OP_ADD &&
+            instruction->opcode != USIL_OP_MUL && instruction->opcode != USIL_OP_NOP &&
+            instruction->opcode != USIL_OP_RET)
+            return true;
+        if (instruction->operand_count &&
+            usil_operand_destination_lane_mask(&instruction->operands[0]) != 15)
+            return true;
+        for (int operand = 0; operand < instruction->operand_count; ++operand)
+            if (!hlsl_lift_operand_is_plain(&instruction->operands[operand]))
+                return true; /* The width-aware emitter preserves float modifiers. */
+    }
     unsigned uses[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT] = {0};
     if (!hlsl_float4_validate_expressions(ctx, uses))
         return false;
@@ -65,6 +80,15 @@ static bool prepare_functions(HLSLEmitterContext *ctx) {
     return true;
 }
 
+bool hlsl_prepare_high_level_functions(HLSLEmitterContext *ctx) {
+    if (ctx->high_level_functions_prepared)
+        return true;
+    if (!ctx->unity_uv_helper && !prepare_functions(ctx))
+        return false;
+    ctx->high_level_functions_prepared = true;
+    return true;
+}
+
 static ASTExpr *parameter(const char *name) {
     return ast_create_var(-1, -1, OPERAND_TYPE_TEMP, name);
 }
@@ -79,6 +103,10 @@ static bool emit_product(HLSLEmitterContext *ctx, int group, int operation, cons
         return false;
     }
     ctx->float4_functions.definition_begin[group][operation] = ctx->sb->len;
+    if (!hlsl_source_quality_observe_expression(ctx, expression, -1)) {
+        ast_free_expr(expression);
+        return false;
+    }
     ast_format_expr(expression, ctx->sb);
     ctx->float4_functions.definition_end[group][operation] = ctx->sb->len;
     ast_free_expr(expression);
@@ -88,7 +116,7 @@ static bool emit_product(HLSLEmitterContext *ctx, int group, int operation, cons
 bool emit_high_level_functions(HLSLEmitterContext *ctx) {
     if (ctx->unity_uv_helper)
         return true;
-    if (!prepare_functions(ctx))
+    if (!hlsl_prepare_high_level_functions(ctx))
         return false;
     for (int group = 0; group < 2; ++group) {
         if (ctx->float4_functions.use_count[group] < 2)

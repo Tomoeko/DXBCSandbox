@@ -100,3 +100,12 @@ previously certified cases, report fallback/unsupported outcomes, and pass cold
 and warm cache checks, toolchain drift, cancellation, budget and malformed-input
 tests. Source readability and byte-match coverage are reported independently.
 No stage/backend is admitted by changing a label or dropping an unavailable plane.
+
+The high-level source-quality ledger is independent of these certificates. Its
+stage-entry observations retain AST/provenance residuals, missing source units,
+and complete emission coverage. The extraction lift report renders these facts
+beside exact compiler results; it does not classify unobserved enclosing
+ShaderLab state or dependencies as clean. The bounded compute source candidate
+API likewise returns unverified source and owned per-kernel evidence. Controlled
+compiler equality does not supply the missing generic compute, import or native
+producers or enlarge the closed whole-shader scope above.

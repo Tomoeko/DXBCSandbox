@@ -65,7 +65,7 @@ static const char *find_texture_dimension(const USILProgram *program,
     return texture ? texture->dimension : NULL;
 }
 
-static const USILTexture *find_instruction_texture(
+const USILTexture *hlsl_instruction_texture(
     const USILProgram *program, const USILInstruction *instruction,
     int resource_operand_index) {
     if (!program || !instruction || resource_operand_index < 0 ||
@@ -296,7 +296,7 @@ void emit_texture_op(HLSLEmitterContext* ctx, const USILInstruction* inst,
           return;
         }
         const USILTexture *texture =
-            find_instruction_texture(program, inst, 2);
+            hlsl_instruction_texture(program, inst, 2);
         const char *dimension = texture ? texture->dimension : NULL;
         int uv_comps = sample_coordinate_count(dimension);
         int result_components =
@@ -374,7 +374,7 @@ void emit_texture_op(HLSLEmitterContext* ctx, const USILInstruction* inst,
           return;
         }
         const USILTexture *texture =
-            find_instruction_texture(program, inst, 2);
+            hlsl_instruction_texture(program, inst, 2);
         const char *dimension = texture ? texture->dimension : NULL;
         const int coordinate_components = load_coordinate_count(dimension);
         const int result_components =
@@ -410,7 +410,7 @@ void emit_texture_op(HLSLEmitterContext* ctx, const USILInstruction* inst,
           return;
         }
         const USILTexture *texture =
-            find_instruction_texture(program, inst, 2);
+            hlsl_instruction_texture(program, inst, 2);
         const char *dimension = texture ? texture->dimension : NULL;
         const int coordinate_components =
             multisample_coordinate_count(dimension);
@@ -659,7 +659,7 @@ void emit_texture_op(HLSLEmitterContext* ctx, const USILInstruction* inst,
           return;
         }
         const USILTexture *texture =
-            find_instruction_texture(program, inst, 1);
+            hlsl_instruction_texture(program, inst, 1);
         const char *resource_dimension = texture ? texture->dimension : NULL;
         const bool is_2dms =
             resource_dimension && strcmp(resource_dimension, "2dms") == 0;
@@ -768,7 +768,7 @@ void emit_texture_op(HLSLEmitterContext* ctx, const USILInstruction* inst,
           return;
         }
         const USILTexture *texture =
-            find_instruction_texture(program, inst, 2);
+            hlsl_instruction_texture(program, inst, 2);
         const char *dimension = texture ? texture->dimension : NULL;
         const int coordinate_components =
             multisample_coordinate_count(dimension);
@@ -802,4 +802,3 @@ void emit_texture_op(HLSLEmitterContext* ctx, const USILInstruction* inst,
         break;
     }
 }
-

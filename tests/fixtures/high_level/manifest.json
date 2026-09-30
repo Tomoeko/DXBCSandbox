@@ -1,0 +1,675 @@
+{
+  "schema": "dxbc-high-level-authored-fixtures",
+  "version": 1,
+  "source_role": "compilation-and-evaluation-only",
+  "reconstruction_input": "released-artifact-and-admitted-metadata",
+  "acceptance_scope": "initial-controlled-subset; complete mandatory stage matrix remains separately required",
+  "native_d3d11_status": "not-run",
+  "fixtures": [
+    {
+      "file": "single_color.shader",
+      "source_sha256": "4f07066bff09d6b25af83b34a678fca24ec3c38dbf1503d3bbad22678b49758f",
+      "family": "single-color",
+      "role": "baseline",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "COLOR_SCALE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "single_color_renamed.shader",
+      "source_sha256": "3e2f21f1774149d9e3596fb7f4d432e41603a4e01cb8991cf62175720c0d85e5",
+      "family": "single-color",
+      "role": "renamed-reordered",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "COLOR_SCALE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "single_color_changed.shader",
+      "source_sha256": "4ba1a098d18360935b3c9935722a2b4b32f955af4d8266277432a48e3b92de35",
+      "family": "single-color",
+      "role": "semantic-negative",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "triplanar.shader",
+      "source_sha256": "32655ba5439034b801bcb53aac9827521fe5dc2cd158f30ca6a2a8400e19ad07",
+      "family": "triplanar",
+      "role": "baseline",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OCCLUSION_DISABLED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "triplanar_renamed.shader",
+      "source_sha256": "617df48bcc1921c5244a797254a8ce84ee5782772cda9bc0e339ccf12c92ce0c",
+      "family": "triplanar",
+      "role": "renamed-reordered",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OCCLUSION_DISABLED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "triplanar_changed.shader",
+      "source_sha256": "2be8e6f80bf55df1399f915d182c6f5e7d6d7a357736fbae27b4cfa845597caa",
+      "family": "triplanar",
+      "role": "semantic-negative",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OCCLUSION_DISABLED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "value_widths.shader",
+      "source_sha256": "a896dd9ad960e2c76a1afd5ce9aef37021e8adf75a37ce714fc6c2acde2ecc75",
+      "family": "logical-values",
+      "role": "baseline",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "geometry_points.shader",
+      "source_sha256": "b7f17ea243f19727229ec2bbab05bebdad8c4d1bb5d15148c2c85118b331125b",
+      "family": "geometry-point-expansion",
+      "role": "baseline-and-stage-negative",
+      "stages": [
+        "vertex",
+        "geometry",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "REVERSE_EMISSION",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "geometry_primitives.shader",
+      "source_sha256": "050db309449c0d52c1ff3c4293888950321886f341214eb5c3702cea031d260d",
+      "family": "geometry-primitives",
+      "role": "baseline",
+      "stages": [
+        "vertex",
+        "geometry",
+        "fragment"
+      ],
+      "keyword_dimensions": [],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "geometry_streams.shader",
+      "source_sha256": "f81ed3ea0fb98c6b917974a6f5470b071eddcc2ce11e72bfde3161792e6a4a8e",
+      "family": "geometry-streams-instances",
+      "role": "baseline",
+      "stages": [
+        "vertex",
+        "geometry",
+        "fragment"
+      ],
+      "keyword_dimensions": [],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "tessellation_triangle.shader",
+      "source_sha256": "e94586d73b4806d2ed0b52240c2e9a420bf1ce8c7f86ed8e5ed9b52d3eaf3740",
+      "family": "tessellation-triangle",
+      "role": "baseline-and-stage-negative",
+      "stages": [
+        "vertex",
+        "hull",
+        "domain",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "REVERSE_TOPOLOGY",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "ADAPTIVE_FACTORS",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "tessellation_quad.shader",
+      "source_sha256": "4550ed9a38e5151ad2d6d936c6c5920dd8aa2683f33af37ad83cc91db161c1dc",
+      "family": "tessellation-quad",
+      "role": "baseline",
+      "stages": [
+        "vertex",
+        "hull",
+        "domain",
+        "fragment"
+      ],
+      "keyword_dimensions": [],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "tessellation_isoline.shader",
+      "source_sha256": "f827dfa1d94826f02cb66357d84e38310a188229236c32135dcd0b01004cdf05",
+      "family": "tessellation-isoline",
+      "role": "baseline",
+      "stages": [
+        "vertex",
+        "hull",
+        "domain",
+        "fragment"
+      ],
+      "keyword_dimensions": [],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "resource_kernels.compute",
+      "source_sha256": "10a127b6936ca2e4fcd5eb4db7c0cca2113de6b7d4c4fa69202bb2145853d166",
+      "family": "compute-resources",
+      "role": "baseline",
+      "stages": [
+        "compute"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OFFSET_VALUES",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "kernels": [
+        "Transform",
+        "ProcessTexture",
+        "Reduce",
+        "Count",
+        "AppendPositive",
+        "ConsumeValues",
+        "RawTransform",
+        "AtomicCompare",
+        "Counter"
+      ],
+      "host_inputs": [
+        "dispatch counts",
+        "bound resource bytes and sizes",
+        "append/consume counts",
+        "counter initial values"
+      ]
+    },
+    {
+      "file": "resource_kernels_changed.compute",
+      "source_sha256": "f112b3447693c6a84972efca32189d579c3b08c39a3c5f1d4d27e469f529df6a",
+      "family": "compute-resources",
+      "role": "dimensions-and-barrier-negative",
+      "stages": [
+        "compute"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "OFFSET_VALUES",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "kernels": [
+        "Transform",
+        "ProcessTexture",
+        "Reduce",
+        "Count",
+        "AppendPositive",
+        "ConsumeValues",
+        "RawTransform",
+        "AtomicCompare",
+        "Counter"
+      ],
+      "host_inputs": [
+        "dispatch counts",
+        "bound resource bytes and sizes",
+        "append/consume counts",
+        "counter initial values"
+      ],
+      "runtime_forbidden_kernels": [
+        "Reduce"
+      ]
+    },
+    {
+      "file": "ret_only.compute",
+      "source_sha256": "94a0dffb6eb38bddf450a90c9a818024efc80cbb41550cca0b0aa510095ecb01",
+      "family": "compute-empty-declarations",
+      "role": "compiler-pruning-control",
+      "stages": [
+        "compute"
+      ],
+      "kernels": [
+        "ReturnOnly",
+        "ReturnSystemValues"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "RETURN_VARIANT",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "captured_dispatch_groups": [
+        [
+          8,
+          4,
+          1
+        ],
+        [
+          4,
+          2,
+          2
+        ]
+      ],
+      "authored_unused_builtin_parameters": [
+        "SV_DispatchThreadID",
+        "SV_GroupID",
+        "SV_GroupThreadID",
+        "SV_GroupIndex"
+      ],
+      "authored_unused_group_shared_bytes": 64,
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "geometry_control_flow.shader",
+      "source_sha256": "a83e87e08a056aeadadcd25a5f6e7b35fba5804861e54ec9b27b7cd3071cd3ba",
+      "family": "geometry-conditional-loop-amplification",
+      "role": "baseline-and-emission-order-negative",
+      "stages": [
+        "vertex",
+        "geometry",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "REVERSE_WINDING",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending"
+    },
+    {
+      "file": "barrier_forms.compute",
+      "source_sha256": "d6dbe3e38e7cc48607ac292a281cce41c528a3ba2a537ef2fee5307d09ebceef",
+      "family": "compute-barrier-modes",
+      "role": "pure-and-anchored-memory-scope-controls",
+      "stages": [
+        "compute"
+      ],
+      "kernels": [
+        "GroupOnly",
+        "GroupSyncOnly",
+        "DeviceOnly",
+        "DeviceSyncOnly",
+        "AllOnly",
+        "AllSyncOnly",
+        "GroupAnchored",
+        "GroupSyncAnchored",
+        "DeviceAnchored",
+        "DeviceSyncAnchored",
+        "AllAnchored",
+        "AllSyncAnchored",
+        "OrderedBarriers"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "BARRIER_TILES",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "GLOBAL_COHERENCE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "dispatch_groups": [
+        [
+          8,
+          1,
+          1
+        ],
+        [
+          4,
+          2,
+          1
+        ]
+      ],
+      "native_dispatch_scope": "single group; device/result buffers contain at least8 uints; no dispatch performed",
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "barrier_group_atomic.compute",
+      "source_sha256": "a733ddc12355c726df12f71f74dfce36efdb8b794deccaae1f457534f645ef61",
+      "family": "compute-barrier",
+      "role": "atomic-group-fence-pruning-control",
+      "stages": [
+        "compute"
+      ],
+      "kernels": [
+        "AtomicGroupFence"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "FENCE_TILES",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "host_requirements": "dispatch exactly one group; bind at least eight uint result elements; intermediate atomic observations may vary with thread execution order",
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "matrix_transforms.shader",
+      "source_sha256": "2c4c7edad2b5039a71d7692bdb99648e3f2851c16d845fe3f284c3f7f1ccc39a",
+      "family": "matrix-transform",
+      "role": "generic-position-normal-with-orientation-layout-precision-and-external-use-controls",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "MATRIX_VECTOR_FIRST",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ROW_MAJOR",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ARRAY",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_EXTERNAL_USE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "matrix_transforms_explicit.shader",
+      "source_sha256": "8b8201771ab35ed0448b90e5b4c58f9384bf6db9d14aaf280a76bf8403812bea",
+      "family": "matrix-transform",
+      "role": "explicit-named-cbuffer-generic-matrix-controls",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "MATRIX_VECTOR_FIRST",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ROW_MAJOR",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ARRAY",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_EXTERNAL_USE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "matrix_square_projections.shader",
+      "source_sha256": "1923d3d2b6b9f2d46b47b28c949f84347964609bba929361628c9f8e47a485cc",
+      "family": "matrix-transform",
+      "role": "float4x4-metadata-with-three-component-projection-controls",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "MATRIX_VECTOR_FIRST",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ROW_MAJOR",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ARRAY",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_EXTERNAL_USE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "matrix_vector4.shader",
+      "source_sha256": "a779cb3c823f88766671b16b67f6d2ef02a48c7248ebaa48016186d13d7a197a",
+      "family": "matrix-transform",
+      "role": "full-four-component-single-matrix-with-dataflow-negatives",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "MATRIX_VECTOR_FIRST",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ROW_MAJOR",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_PRECISE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_ARRAY",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        {
+          "name": "MATRIX_EXTERNAL_USE",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    }
+  ]
+}

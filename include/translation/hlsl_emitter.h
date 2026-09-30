@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 4U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 10U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 64
 
 typedef enum {
@@ -87,7 +87,7 @@ typedef enum HLSLEmitMode {
      * with higher-level Unity/source constructs to improve readability. */
     HLSL_EMIT_MODE_READABLE = 1,
 
-    /* Verification-eligible candidate, never a certificate by itself. v4
+    /* Verification-eligible candidate, never a certificate by itself. v10
      * retains v1's at most 64 SM4/5 vertex/pixel instructions using full
      * float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP. It also
      * admits structured IF/ELSE/ENDIF with scalar input/temp bit conditions,
@@ -102,13 +102,29 @@ typedef enum HLSLEmitMode {
      * each call result remains named at its original site. No captures or
      * resource/ABI changes are allowed. Shared definitions and individual
      * call sites both retain instruction spans.
-     * No buffers/resources/effects/precision controls or partial definitions.
+     * Straight-line MOV/ADD/MUL/MAD/DIV/MIN/MAX also admits scalar and narrower float vectors
+     * and partial writes. A consumed vector must come from one dominating
+     * definition; its register lanes become compact logical components.
+     * Mixed-definition reads reject. This does not broaden the structured
+     * float4 domain. Straight-line material reads admit statically bound
+     * metadata-proven float scalar/vector fields; arrays, matrices, dynamic
+     * reads and unresolved/mixed fields reject. Closed metadata-backed single
+     * or nested float4 matrix graphs may become mul calls only when
+     * every internal SSA use and instruction/lane owner agrees. Dot products,
+     * float unary intrinsics, and absolute/negative source modifiers preserve
+     * their exact source demand and arithmetic domain. Straight-line pixel
+     * sampling admits statically bound metadata-backed float4 Texture2D and
+     * ordinary sampler pairs, preserving each Sample at its original site.
+     * Pixel derivatives likewise retain their sites; coarse/fine forms require SM5.
+     * Other resource effects, sampling modes and precision controls reject.
      * Straight-line single-use expressions are nested once; shared values have
      * typed deterministic names. Unsupported input fails instead of silently using
      * presentation recognizers. Reuses compiler inverse operand/MAD spelling;
      * this is not permission to reorder floating-point operations on its own.
      * Supply the complete reserved macro universe. Compile and compare under
-     * the original request before accepting; retain RECOMPILE as fallback. */
+     * the original request before accepting; retain RECOMPILE as fallback.
+     * Compute entry projection has a separate bounded unsigned/barrier contract;
+     * it does not grant generic compute compilation or certification authority. */
     HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE = 2
 } HLSLEmitMode;
 
@@ -117,6 +133,10 @@ typedef enum {
     HLSL_UNITY_UV_INCLUDE,
     HLSL_UNITY_UV_EXTERNAL_INCLUDE
 } HLSLUnityUvPolicy;
+
+struct HLSLSourceQualityResult;
+struct HLSLSourceQualityObservation;
+struct HLSLGlobalDeclarationUnion;
 
 typedef struct HLSLEmitOptions {
     HLSLEmitMode mode;
@@ -149,6 +169,22 @@ typedef struct HLSLEmitOptions {
      * compare the full container before accepting either form. EXTERNAL_INCLUDE
      * delegates the same prelude to the enclosing ShaderLab pass. Default off. */
     HLSLUnityUvPolicy unity_uv_helper;
+    /* Optional independent source-quality ledger. This is initialized even
+     * when emission fails; it never certifies compilation or byte equality.
+     * See hlsl_source_quality.h. Missing provenance cannot become clean. */
+    struct HLSLSourceQualityResult *source_quality;
+    uint32_t source_quality_pass_index;
+    uint32_t source_quality_entry_point_index;
+    /* Optional borrowed callback for each actual AST/emission/coverage record.
+     * Requires source_quality. Returning false rejects emission; callbacks must
+     * not mutate the emitter. The observation is valid only during the call. */
+    bool (*source_quality_observer)(void *context,
+        const struct HLSLSourceQualityObservation *observation);
+    void *source_quality_observer_context;
+    /* Declaration-only authority from keyword siblings of this pass/stage.
+     * Borrowed during emission. Original runtime parameters stay unchanged;
+     * imported fields cannot authorize otherwise unknown executable reads. */
+    const struct HLSLGlobalDeclarationUnion *global_declarations;
 } HLSLEmitOptions;
 
 /* Stable, allocation-free failure authority for HLSL emission.  Diagnostics
@@ -280,11 +316,11 @@ const char* hlsl_emit_metadata_kind_name(HLSLEmitMetadataKind kind);
 const char* hlsl_emit_opcode_name(int opcode);
 
 #define HLSL_EMIT_RECOMPILE_OPTIONS_INIT                                                           \
-    {HLSL_EMIT_MODE_RECOMPILE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED}
+    {HLSL_EMIT_MODE_RECOMPILE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED, NULL, 0, 0, NULL, NULL, NULL}
 #define HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT                                                          \
-    {HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED}
+    {HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED, NULL, 0, 0, NULL, NULL, NULL}
 #define HLSL_EMIT_READABLE_OPTIONS_INIT                                                            \
-    {HLSL_EMIT_MODE_READABLE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED}
+    {HLSL_EMIT_MODE_READABLE, NULL, false, NULL, 0, NULL, HLSL_UNITY_UV_DISABLED, NULL, 0, 0, NULL, NULL, NULL}
 
 // Translates a USIL program and appends recompilable HLSL to the string builder.
 // Semantic reconstruction is disabled. Returns true on success. Pass NULL for

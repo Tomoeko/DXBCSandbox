@@ -69,8 +69,13 @@ external headers. Macro-expanded include names and implicit Surface Shader
 generation currently return `include-authority-unavailable`.
 
 `unity_golden_verifier --high-level --report results.jsonl` tests an opt-in
-float4 expression lift for bounded vertex/fragment programs and structured
-conditionals, counted loops, and repeated pure multiplication helpers.
+float expression lift for bounded vertex/fragment programs. Straight-line
+expressions recover scalar and narrower vector values, partial writes, and
+static metadata-backed material fields. Supported graphs include dot products,
+floating-point intrinsics, pixel derivatives, source modifiers, metadata-backed matrix multiplication and
+ordinary Texture2D sampling. Sampling stays at its original instruction site;
+missing bindings and unsupported effects reject the candidate. Structured conditionals, counted loops,
+and repeated pure multiplication helpers retain their separate float4 domain.
 Each accepted candidate must reproduce its entire target DXBC container;
 unsupported candidates retain verified low-level output. Extraction's
 `--high-level` checks every local D3D11 pass/state/tier under the supplied
@@ -79,6 +84,23 @@ produce no Shader. A bounded packed-UV helper can use the selected Unity include
 after checking its actual definitions and exact DXBC for every selected variant.
 These checks do not certify import, external dependencies,
 player/runtime selection, or visual equivalence.
+
+Source quality is a separate semantic/provenance result. The optional
+`HLSLEmitOptions.source_quality` ledger records residual register machinery,
+semantic projections, missing coverage and emission failures. Complete audited
+entry points, helpers and includes with zero residuals are required for `clean`;
+compilation and exact bytecode alone do not satisfy that gate.
+Extraction's JSON lift report carries independent quality counters and reasons
+for each emitted stage entry. The enclosing ShaderLab's complete source quality
+remains unavailable until its state, routing and external dependencies are covered.
+
+Compute inspection retains group dimensions, shared-memory declarations, barrier
+flags and memory effects in the IR. A bounded HLSL entry-point projection supports
+unsigned straight-line values and typed thread/group arguments. Complete Unity
+`.compute` artifact reconstruction and compute certification remain in progress.
+A bounded `compute_source_candidate_build` API reconstructs complete resource-free
+RET/barrier kernel domains with their captured names, keywords and group dimensions.
+Its result is explicitly unverified; it supplies no generic Class72 certificate.
 
 The import, bundle, and finite-visual gate commands accept an explicit Editor
 path and use isolated projects. Their installed C# bridges live in

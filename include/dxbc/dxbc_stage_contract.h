@@ -105,6 +105,29 @@ typedef struct {
 } DXBCHullPhaseContract;
 
 typedef struct {
+    uint32_t instruction_index;
+    uint32_t register_id;
+    bool structured;
+    uint32_t byte_stride;
+    uint32_t element_count;
+    uint32_t byte_count;
+} DXBCThreadGroupSharedMemoryContract;
+
+/* These are the unshifted D3D11 sync control bits, retained as a typed
+ * instruction effect rather than arithmetic saturation/precision flags. */
+typedef enum {
+    DXBC_SYNC_THREADS_IN_GROUP = 1u << 0,
+    DXBC_SYNC_THREAD_GROUP_SHARED_MEMORY = 1u << 1,
+    DXBC_SYNC_UAV_MEMORY_GROUP = 1u << 2,
+    DXBC_SYNC_UAV_MEMORY_GLOBAL = 1u << 3
+} DXBCSyncFlags;
+
+typedef struct {
+    uint32_t instruction_index;
+    uint8_t flags;
+} DXBCMemoryBarrierContract;
+
+typedef struct {
     uint32_t version_token;
     DXBCProgramType program_type;
     uint8_t shader_model_major;
@@ -117,6 +140,10 @@ typedef struct {
     DXBCInputPrimitive input_primitive;
     bool has_output_topology;
     DXBCOutputTopology output_topology;
+    /* Topology declarations belong to the current dcl_stream section. The
+     * admitted geometry contract requires every section to agree on the
+     * common topology, while retaining each declaration's stream coverage. */
+    uint8_t output_topology_stream_mask;
     bool has_max_output_vertex_count;
     uint32_t max_output_vertex_count;
     bool has_geometry_instance_count;
@@ -148,10 +175,21 @@ typedef struct {
     DXBCHullPhaseContract* hull_phases;
     size_t hull_phase_count;
     size_t hull_phase_capacity;
+
+    bool has_thread_group_size;
+    uint32_t thread_group_size[3];
+    uint32_t thread_group_declaration_instruction_index;
+    uint32_t thread_group_shared_memory_bytes;
+    DXBCThreadGroupSharedMemoryContract* thread_group_shared_memory;
+    size_t thread_group_shared_memory_count;
+    size_t thread_group_shared_memory_capacity;
+    DXBCMemoryBarrierContract* memory_barriers;
+    size_t memory_barrier_count;
+    size_t memory_barrier_capacity;
 } DXBCStageContract;
 
 /* Initialize before first decode and free when finished.  Do not copy a live
- * contract by value: geometry_effects and hull_phases are owned storage. */
+ * contract by value: effect, phase, and shared-memory arrays are owned storage. */
 void dxbc_stage_contract_init(DXBCStageContract* contract);
 void dxbc_stage_contract_free(DXBCStageContract* contract);
 

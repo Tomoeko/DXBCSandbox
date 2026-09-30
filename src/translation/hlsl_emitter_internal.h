@@ -12,6 +12,7 @@
 #include "translation/hlsl_use_def.h"
 #include "translation/hlsl_ssa.h"
 #include "translation/hlsl_ast.h"
+#include "translation/hlsl_source_quality.h"
 #include "translation/hlsl_literal.h"
 #include "translation/hlsl_value_analysis.h"
 #include "translation/dxbc_cbuffer_projection.h"
@@ -67,6 +68,9 @@ typedef struct {
     const char* serialized_name;
     char* declaration_name;
     bool is_globals;
+    /* Named, row-aligned fields cover the captured implicit-global shell.
+     * Explicit constant bindings avoid anonymous padding declarations. */
+    bool compact_global_layout;
     bool is_unity_builtin;
     bool omit_declaration;
     bool raw_storage;
@@ -252,7 +256,34 @@ typedef struct HLSLEmitterContext {
     const char* const* reserved_preprocessor_identifiers;
     size_t reserved_preprocessor_identifier_count;
     HLSLExpressionSourceMap *expression_source_map;
+    HLSLSourceQualityAnalysis *source_quality_analysis;
+    const ASTExpr *source_quality_root;
+    int source_quality_instruction;
+    bool high_level_direct_return;
+    bool high_level_interface;
+    /* Independent coverage of actual natural interface source spans. Names
+     * and syntax eligibility are established from signatures before emission;
+     * these masks are set only after the corresponding syntax was appended. */
+    bool high_level_interface_prepared;
+    bool source_quality_interface_required;
+    uint32_t high_level_input_parameters_emitted;
+    uint32_t high_level_output_fields_emitted;
+    uint32_t high_level_output_statements_emitted;
+    bool high_level_output_struct_emitted;
+    bool high_level_result_local_emitted;
+    bool high_level_entry_signature_emitted;
+    bool high_level_return_block_emitted;
+    size_t high_level_statement_expression_begin;
+    int high_level_statement_instruction;
+    char high_level_input_names[HLSL_SM5_IO_REGISTER_COUNT][96];
+    char high_level_output_names[HLSL_SM5_IO_REGISTER_COUNT][96];
+    char high_level_output_type[96];
+    char high_level_output_variable[96];
+    const char *preferred_output_struct_name;
+    const char *entry_point_name;
+    const struct HLSLGlobalDeclarationUnion *global_declarations;
     bool unity_uv_helper;
+    bool high_level_functions_prepared;
     HLSLFloat4FunctionPlan float4_functions;
     int current_instruction_index;
     bool is_formatting_dest;
@@ -322,6 +353,37 @@ typedef struct HLSLEmitterContext {
     HLSLCompilerModelProgram compiler_model;
     const char* readable_screen_pos_helper;
 } HLSLEmitterContext;
+
+bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
+                                            const ASTExpr *expression, int instruction);
+void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
+                                  bool logical_operation, int instruction);
+/* Initialize after program/sb/diagnostic/context fields, then begin one unit
+ * before observing syntax. New stage routes must keep incomplete coverage
+ * until their complete emitted dependency inventory is represented. */
+bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptions *options);
+bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete);
+void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx);
+/* Bounded compute projection. Class72 source-artifact authority and complete
+ * resource/effect reconstruction remain separate from this entry emitter. */
+bool hlsl_emit_compute_stage(const USILProgram *program, StringBuilder *output,
+                             const HLSLEmitNames *names, const HLSLEmitOptions *options,
+                             HLSLEmitDiagnostic *diagnostic);
+bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx);
+bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext *ctx);
+bool hlsl_source_quality_interface_inventory_complete(const HLSLEmitterContext *ctx);
+void hlsl_source_quality_interface_expression_begin(HLSLEmitterContext *ctx, int instruction);
+void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, int instruction);
+bool hlsl_expression_effects_supported(const USILProgram *program,
+                                        const USILInstruction *instruction);
+bool hlsl_high_level_struct_interface_supported(const USILProgram *program, HLSLEmitMode mode);
+const char *hlsl_high_level_output_name(const HLSLEmitterContext *ctx, int register_index);
+bool hlsl_append_high_level_output(HLSLEmitterContext *ctx, const DXBCOperand *destination);
+const DXBCSignatureElement *hlsl_high_level_input_signature(
+    const HLSLEmitterContext *ctx, int register_index);
+const char *hlsl_high_level_input_name(const HLSLEmitterContext *ctx, int register_index);
+bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
+    const DXBCOperand *operand, uint8_t demanded_lanes, ASTOperandProvenance *provenance);
 
 /* First-failure-wins diagnostic helpers.  They never allocate and are safe to
  * call while unwinding an allocation failure. */
@@ -428,6 +490,7 @@ void emit_exact_structural_helpers(HLSLEmitterContext* ctx);
 void emit_instructions(HLSLEmitterContext* ctx);
 bool emit_high_level_expressions(HLSLEmitterContext* ctx);
 bool emit_high_level_functions(HLSLEmitterContext *ctx);
+bool hlsl_prepare_high_level_functions(HLSLEmitterContext *ctx);
 ASTExpr *hlsl_float4_function_call(HLSLEmitterContext *ctx, int instruction);
 bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
                                      unsigned uses[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT]);
@@ -462,6 +525,14 @@ bool hlsl_output_field_name(HLSLEmitterContext* ctx,
 bool RunAnalysisPasses(HLSLEmitterContext* ctx);
 bool build_cbuffer_register_map(HLSLEmitterContext* ctx);
 bool build_sampler_name_map(HLSLEmitterContext* ctx);
+const USILTexture *hlsl_instruction_texture(const USILProgram *program,
+    const USILInstruction *instruction, int resource_operand_index);
+bool hlsl_texture_sample_supported(HLSLEmitterContext *ctx, int instruction);
+bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *ctx);
+bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *name);
+/* Always consumes the coordinate expression, including on failure. */
+ASTExpr *hlsl_texture_sample_expression(HLSLEmitterContext *ctx, int instruction,
+                                       ASTExpr *coordinates);
 void free_sampler_name_map(HLSLEmitterContext* ctx);
 void get_sampler_usage(const USILProgram *program, int sampler_reg,
                        bool *uses_regular, bool *uses_comparison);

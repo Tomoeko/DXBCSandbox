@@ -26,6 +26,10 @@ enum {
     OP_DCL_HS_MAX_TESS_FACTOR = 152,
     OP_DCL_HS_FORK_PHASE_INSTANCE_COUNT = 153,
     OP_DCL_HS_JOIN_PHASE_INSTANCE_COUNT = 154,
+    OP_DCL_THREAD_GROUP = 155,
+    OP_DCL_TGSM_RAW = 159,
+    OP_DCL_TGSM_STRUCTURED = 160,
+    OP_SYNC = 190,
     OP_DCL_GS_INSTANCE_COUNT = 206,
     OP_DCL_RESOURCE_STRUCTURED = 162,
     OP_DCL_OUTPUT_TOPOLOGY = 92,
@@ -79,6 +83,12 @@ void dxbc_stage_contract_free(DXBCStageContract* contract) {
                  sizeof(*contract->geometry_effects));
     mem_free(contract->hull_phases,
              contract->hull_phase_capacity * sizeof(*contract->hull_phases));
+    mem_free(contract->thread_group_shared_memory,
+             contract->thread_group_shared_memory_capacity *
+                 sizeof(*contract->thread_group_shared_memory));
+    mem_free(contract->memory_barriers,
+             contract->memory_barrier_capacity *
+                 sizeof(*contract->memory_barriers));
     dxbc_stage_contract_init(contract);
 }
 
@@ -300,6 +310,7 @@ static bool append_phase(DXBCStageContract* contract,
 
 static bool decode_stream(const DXBCDocumentInstruction* instruction,
                           DXBCStageContract* contract,
+                          uint8_t* current_stream,
                           DXBCStageContractDiagnostic* diagnostic) {
     uint32_t control;
     uint32_t operand;
@@ -331,6 +342,7 @@ static bool decode_stream(const DXBCDocumentInstruction* instruction,
                     stream);
     }
     contract->declared_stream_mask |= bit;
+    *current_stream = (uint8_t)stream;
     return true;
 }
 
@@ -388,6 +400,139 @@ static bool decode_count_declaration(
     return true;
 }
 
+static bool reserve_execution_array(void** array, size_t* capacity,
+                                     size_t count, size_t element_size) {
+    if (count < *capacity) return true;
+    const size_t old_capacity = *capacity;
+    const size_t new_capacity = old_capacity == 0u ? 8u : old_capacity * 2u;
+    if (new_capacity <= old_capacity ||
+        new_capacity > SIZE_MAX / element_size) return false;
+    void* resized = mem_realloc(*array, old_capacity * element_size,
+                                new_capacity * element_size);
+    if (!resized) return false;
+    *array = resized;
+    *capacity = new_capacity;
+    return true;
+}
+
+static bool decode_thread_group(
+    const DXBCDocumentInstruction* instruction, DXBCStageContract* contract,
+    DXBCStageContractDiagnostic* diagnostic) {
+    uint32_t control;
+    uint32_t dimensions[3];
+    if (!declaration_header(instruction, 4u, &control, diagnostic)) return false;
+    if (control != 0u)
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_INVALID_DECLARATION_BITS,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, 0, control);
+    if (contract->has_thread_group_size)
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_DUPLICATE_DECLARATION,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, 1, 2);
+    const uint32_t maximum_threads = contract->shader_model_major == 4u ? 768u : 1024u;
+    const uint32_t maximum_z = contract->shader_model_major == 4u ? 1u : 64u;
+    uint64_t product = 1u;
+    for (size_t axis = 0; axis < 3u; ++axis) {
+        if (!instruction_token(instruction, axis + 1u, &dimensions[axis], diagnostic))
+            return false;
+        const uint32_t maximum = axis == 2u ? maximum_z : maximum_threads;
+        if (dimensions[axis] == 0u || dimensions[axis] > maximum)
+            return fail(diagnostic, DXBC_STAGE_CONTRACT_INVALID_DECLARATION_VALUE,
+                        instruction->chunk_index, instruction->instruction_index,
+                        instruction->opcode, maximum, dimensions[axis]);
+        product *= dimensions[axis];
+    }
+    if (product > maximum_threads)
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_INVALID_DECLARATION_VALUE,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, maximum_threads, product);
+    contract->has_thread_group_size = true;
+    memcpy(contract->thread_group_size, dimensions, sizeof(dimensions));
+    contract->thread_group_declaration_instruction_index = instruction->instruction_index;
+    return true;
+}
+
+static bool decode_shared_memory(
+    const DXBCDocumentInstruction* instruction, DXBCStageContract* contract,
+    DXBCStageContractDiagnostic* diagnostic) {
+    /* SM4 structured TGSM has additional per-thread allocation restrictions.
+     * It remains explicitly unsupported until those restrictions are modeled. */
+    if (contract->shader_model_major != 5u)
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_UNSUPPORTED_PROGRAM,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, 5, contract->shader_model_major);
+    const bool structured = instruction->opcode == OP_DCL_TGSM_STRUCTURED;
+    uint32_t control, operand, register_id, stride, count = 1u;
+    if (!declaration_header(instruction, structured ? 5u : 4u, &control, diagnostic) ||
+        !instruction_token(instruction, 1u, &operand, diagnostic) ||
+        !instruction_token(instruction, 2u, &register_id, diagnostic) ||
+        !instruction_token(instruction, 3u, &stride, diagnostic) ||
+        (structured && !instruction_token(instruction, 4u, &count, diagnostic)))
+        return false;
+    /* gN has zero components and one immediate32 index, without extensions. */
+    const uint32_t expected_operand = UINT32_C(0x0011f000);
+    if (control != 0u || operand != expected_operand)
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_INVALID_DECLARATION_BITS,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, control != 0u ? 0u : expected_operand,
+                    control != 0u ? control : operand);
+    const uint64_t byte_count = (uint64_t)stride * count;
+    if (register_id >= 8192u || stride == 0u || (stride & 3u) != 0u ||
+        count == 0u || byte_count > 32768u ||
+        byte_count + contract->thread_group_shared_memory_bytes > 32768u)
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_INVALID_DECLARATION_VALUE,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, 32768u, byte_count);
+    for (size_t index = 0; index < contract->thread_group_shared_memory_count; ++index)
+        if (contract->thread_group_shared_memory[index].register_id == register_id)
+            return fail(diagnostic, DXBC_STAGE_CONTRACT_DUPLICATE_DECLARATION,
+                        instruction->chunk_index, instruction->instruction_index,
+                        instruction->opcode, 0, register_id);
+    if (!reserve_execution_array((void**)&contract->thread_group_shared_memory,
+                                  &contract->thread_group_shared_memory_capacity,
+                                  contract->thread_group_shared_memory_count,
+                                  sizeof(*contract->thread_group_shared_memory)))
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_OUT_OF_MEMORY,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, 0, 0);
+    DXBCThreadGroupSharedMemoryContract* memory =
+        &contract->thread_group_shared_memory[contract->thread_group_shared_memory_count++];
+    memory->instruction_index = instruction->instruction_index;
+    memory->register_id = register_id;
+    memory->structured = structured;
+    memory->byte_stride = structured ? stride : 0u;
+    memory->element_count = structured ? count : 0u;
+    memory->byte_count = (uint32_t)byte_count;
+    contract->thread_group_shared_memory_bytes += memory->byte_count;
+    return true;
+}
+
+static bool decode_memory_barrier(
+    const DXBCDocumentInstruction* instruction, DXBCStageContract* contract,
+    DXBCStageContractDiagnostic* diagnostic) {
+    uint32_t flags;
+    if (!declaration_header(instruction, 1u, &flags, diagnostic)) return false;
+    const bool compute = contract->program_type == DXBC_PROGRAM_TYPE_COMPUTE;
+    if ((flags & ~UINT32_C(0xf)) != 0u ||
+        (compute ? ((flags & 0xeu) == 0u || (flags & 0xcu) == 0xcu)
+                 : flags != DXBC_SYNC_UAV_MEMORY_GLOBAL))
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_INVALID_DECLARATION_BITS,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, 0xeu, flags);
+    if (!reserve_execution_array((void**)&contract->memory_barriers,
+                                  &contract->memory_barrier_capacity,
+                                  contract->memory_barrier_count,
+                                  sizeof(*contract->memory_barriers)))
+        return fail(diagnostic, DXBC_STAGE_CONTRACT_OUT_OF_MEMORY,
+                    instruction->chunk_index, instruction->instruction_index,
+                    instruction->opcode, 0, 0);
+    DXBCMemoryBarrierContract* barrier =
+        &contract->memory_barriers[contract->memory_barrier_count++];
+    barrier->instruction_index = instruction->instruction_index;
+    barrier->flags = (uint8_t)flags;
+    return true;
+}
+
 static bool decode_version(const DXBCDocumentChunk* chunk,
                            DXBCStageContract* contract,
                            DXBCStageContractDiagnostic* diagnostic) {
@@ -431,12 +576,31 @@ static bool decode_instruction_contract(
     bool* seen_hs_decls, bool* seen_phase, bool* phase_has_executable,
     bool* seen_any_executable, int* hull_phase_order,
     bool* seen_control_point_phase,
+    uint8_t* current_geometry_stream,
     DXBCStageContractDiagnostic* diagnostic) {
     const uint32_t opcode = instruction->opcode;
     const bool is_hull = contract->program_type == DXBC_PROGRAM_TYPE_HULL;
     const bool is_domain = contract->program_type == DXBC_PROGRAM_TYPE_DOMAIN;
     const bool is_geometry =
         contract->program_type == DXBC_PROGRAM_TYPE_GEOMETRY;
+    const bool is_compute = contract->program_type == DXBC_PROGRAM_TYPE_COMPUTE;
+    if (opcode == OP_DCL_THREAD_GROUP || opcode == OP_DCL_TGSM_RAW ||
+        opcode == OP_DCL_TGSM_STRUCTURED) {
+        if (!is_compute) return stage_mismatch(instruction, diagnostic);
+        if (*seen_any_executable)
+            return fail(diagnostic, DXBC_STAGE_CONTRACT_DECLARATION_ORDER,
+                        instruction->chunk_index, instruction->instruction_index,
+                        opcode, 0, instruction->instruction_index);
+        return opcode == OP_DCL_THREAD_GROUP
+            ? decode_thread_group(instruction, contract, diagnostic)
+            : decode_shared_memory(instruction, contract, diagnostic);
+    }
+    if (opcode == OP_SYNC) {
+        if (!is_compute && contract->program_type != DXBC_PROGRAM_TYPE_PIXEL)
+            return stage_mismatch(instruction, diagnostic);
+        *seen_any_executable = true;
+        return decode_memory_barrier(instruction, contract, diagnostic);
+    }
 
     if (opcode == OP_HS_DECLS) {
         uint32_t control;
@@ -561,12 +725,20 @@ static bool decode_instruction_contract(
             return true;
         case OP_DCL_OUTPUT_TOPOLOGY:
             if (!is_geometry) return stage_mismatch(instruction, diagnostic);
+            bool stream_has_topology =
+                (contract->output_topology_stream_mask & (1u << *current_geometry_stream)) != 0;
             if (!decode_enum_declaration(
-                    instruction, &contract->has_output_topology, &value,
+                    instruction, &stream_has_topology, &value,
                     valid_output_topology, diagnostic)) {
                 return false;
             }
+            if (contract->has_output_topology && contract->output_topology != (DXBCOutputTopology)value)
+                return fail(diagnostic, DXBC_STAGE_CONTRACT_INVALID_DECLARATION_VALUE,
+                            instruction->chunk_index, instruction->instruction_index, opcode,
+                            contract->output_topology, value);
+            contract->has_output_topology = true;
             contract->output_topology = (DXBCOutputTopology)value;
+            contract->output_topology_stream_mask |= (uint8_t)(1u << *current_geometry_stream);
             return true;
         case OP_DCL_MAX_OUTPUT_VERTEX_COUNT:
             if (!is_geometry) return stage_mismatch(instruction, diagnostic);
@@ -576,7 +748,7 @@ static bool decode_instruction_contract(
                 &contract->max_output_vertex_count, diagnostic);
         case OP_DCL_STREAM:
             if (!is_geometry) return stage_mismatch(instruction, diagnostic);
-            return decode_stream(instruction, contract, diagnostic);
+            return decode_stream(instruction, contract, current_geometry_stream, diagnostic);
         case OP_DCL_GS_INSTANCE_COUNT:
             if (!is_geometry) return stage_mismatch(instruction, diagnostic);
             return decode_count_declaration(
@@ -731,6 +903,9 @@ static bool finish_contract(DXBCStageContract* contract, bool seen_hs_decls,
                             bool seen_phase,
                             DXBCStageContractDiagnostic* diagnostic) {
     switch (contract->program_type) {
+        case DXBC_PROGRAM_TYPE_COMPUTE:
+            return require_declaration(contract->has_thread_group_size,
+                                       OP_DCL_THREAD_GROUP, contract, diagnostic);
         case DXBC_PROGRAM_TYPE_GEOMETRY:
             if (!require_declaration(
                        contract->has_input_primitive,
@@ -745,6 +920,12 @@ static bool finish_contract(DXBCStageContract* contract, bool seen_hs_decls,
                        OP_DCL_MAX_OUTPUT_VERTEX_COUNT, contract, diagnostic)) {
                 return false;
             }
+            if ((contract->output_topology_stream_mask & contract->declared_stream_mask) !=
+                contract->declared_stream_mask)
+                return fail(diagnostic, DXBC_STAGE_CONTRACT_MISSING_DECLARATION,
+                            contract->executable_chunk_index, NO_INSTRUCTION,
+                            OP_DCL_OUTPUT_TOPOLOGY, contract->declared_stream_mask,
+                            contract->output_topology_stream_mask);
             for (size_t i = 0; i < contract->geometry_effect_count; ++i) {
                 const DXBCGeometryEffectContract* effect =
                     &contract->geometry_effects[i];
@@ -857,13 +1038,15 @@ static bool decode_document_internal(
     bool seen_any_executable = false;
     bool seen_control_point_phase = false;
     int hull_phase_order = 0;
+    uint8_t current_geometry_stream = 0;
     for (size_t i = first == SIZE_MAX ? 0u : first; i < end; ++i) {
         const DXBCDocumentInstruction* instruction =
             &document->instructions[i];
         if (!decode_instruction_contract(
                 instruction, contract, &seen_hs_decls, &seen_phase,
                 &phase_has_executable, &seen_any_executable,
-                &hull_phase_order, &seen_control_point_phase, diagnostic)) {
+                &hull_phase_order, &seen_control_point_phase,
+                &current_geometry_stream, diagnostic)) {
             return false;
         }
     }

@@ -477,9 +477,11 @@ HLSLLiftStatus unity_shaderlab_lift_run(const UnityShaderLabLiftInput *input,
         result->stats.accepted = 1;
     }
     status = result->candidate.status;
-    /* Ordinary emission failure can expose a supported helper family. Compiler,
-     * authority and budget failures are not reasons to start another attempt. */
-    if (status == HLSL_LIFT_EMISSION_REJECTED && limits->max_candidates >= 2) {
+    /* An ordinary spelling may not compile back to the target while a proven
+     * Unity helper does. Only source/byte rejections can start this alternate
+     * spelling; unavailable evidence, authority changes and limits cannot. */
+    if ((status == HLSL_LIFT_EMISSION_REJECTED || status == HLSL_LIFT_COMPILER_REJECTED ||
+         status == HLSL_LIFT_DXBC_MISMATCH) && limits->max_candidates >= 2) {
         status = work_status(&context);
         if (status != HLSL_LIFT_VERIFIED) {
             result->helper_baseline.status = status;

@@ -2,6 +2,8 @@
 
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
+#include "hlsl_matrix_lift.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1294,24 +1296,41 @@ static bool compiler_split_object_chain_matches(
                first_row + 3, identity4);
 }
 
-/* D3DCompiler does not recover Unity's two object-space expressions from a
- * flat register program.  If the clip expression uses float4(position.xyz,1)
- * while a later world expression uses position.w, flattening exposes their
- * common three-instruction prefix and CSE merges it.  The original source
- * shape, proved entirely by this graph, keeps the two matrix multiplies as
- * independent expressions and reproduces the serialized instruction stream. */
-static bool compiler_split_matrix_transform_matches(
+/* Shared physical graph for a homogeneous-position transform followed by a
+ * second matrix transform. Source type/orientation authority is separate. */
+bool hlsl_compiler_matrix_vector_chain_matches(
     const USILProgram *program, int clip_start,
-    HLSLCompilerSplitMatrixTransform *out_transform) {
+    HLSLMatrixVectorChain *out_chain) {
     static const int identity4[4] = {0, 1, 2, 3};
-    if (!program || !out_transform || clip_start < 0 ||
-        clip_start + 11 >= program->instruction_count) {
+    if (!program || !program->instructions || !out_chain || clip_start < 0 ||
+        program->instruction_count < 8 ||
+        clip_start > program->instruction_count - 8) {
         return false;
     }
     const USILInstruction *clip = program->instructions + clip_start;
+    for (int item = 0; item < 8; ++item) {
+        if (clip[item].operand_count < 1 || clip[item].operand_count > DXBC_MAX_OPERANDS) return false;
+        for (int operand = 0; operand < clip[item].operand_count; ++operand) {
+            const DXBCOperand *value = &clip[item].operands[operand];
+            if (value->extended_token_count || value->register_index < 0 ||
+                !value->index_has_immediate[0] || value->index_value_exceeds_int[0] ||
+                value->index_values[0] != (uint32_t)value->register_index)
+                return false;
+            if (value->type == OPERAND_TYPE_CONSTANT_BUFFER) {
+                if (value->register_index_dim != 2 || value->rel_offset0 < 0 ||
+                    !value->index_has_immediate[1] || value->index_value_exceeds_int[1] ||
+                    value->index_values[1] != (uint32_t)value->rel_offset0)
+                    return false;
+            } else if (value->register_index_dim != 1) {
+                return false;
+            }
+        }
+    }
     const int clip_temp = clip[0].operands[0].register_index;
     const int input_reg = clip[0].operands[1].register_index;
     const int object_buffer = clip[0].operands[2].register_index;
+    if (clip[0].operands[2].rel_offset0 < 1 ||
+        clip[0].operands[2].rel_offset0 > INT_MAX - 2) return false;
     const int object_first_row = clip[0].operands[2].rel_offset0 - 1;
     if (clip_temp < 0 || input_reg < 0 || object_buffer < 0 ||
         object_first_row < 0 ||
@@ -1323,6 +1342,8 @@ static bool compiler_split_matrix_transform_matches(
 
     const int clip_accumulator = clip[4].operands[0].register_index;
     const int clip_buffer = clip[4].operands[2].register_index;
+    if (clip[4].operands[2].rel_offset0 < 1 ||
+        clip[4].operands[2].rel_offset0 > INT_MAX - 2) return false;
     const int clip_first_row = clip[4].operands[2].rel_offset0 - 1;
     if (clip_accumulator < 0 || clip_accumulator == clip_temp ||
         clip_buffer < 0 || clip_first_row < 0 ||
@@ -1361,6 +1382,39 @@ static bool compiler_split_matrix_transform_matches(
             return false;
         }
     }
+    if (!compiler_temp_value_is_dead_in_linear_tail(
+            program, clip_start + 8, clip_temp, 0x0fu) ||
+        !compiler_temp_value_is_dead_in_linear_tail(
+            program, clip_start + 8, clip_accumulator, 0x0fu)) {
+        return false;
+    }
+    *out_chain = (HLSLMatrixVectorChain){
+        .start_instruction = clip_start,
+        .position_input_register = input_reg,
+        .world_temporary = clip_temp,
+        .clip_temporary = clip_accumulator,
+        .world_matrix_buffer = object_buffer,
+        .world_matrix_first_row = object_first_row,
+        .clip_matrix_buffer = clip_buffer,
+        .clip_matrix_first_row = clip_first_row};
+    return true;
+}
+
+/* D3DCompiler CSE merges the shared prefix if clip and a later world value
+ * are flattened. Keeping both matrix expressions independent reproduces this
+ * split graph; every expression and intervening liveness edge is checked. */
+static bool compiler_split_matrix_transform_matches(
+    const USILProgram *program, int clip_start,
+    HLSLCompilerSplitMatrixTransform *out_transform) {
+    HLSLMatrixVectorChain chain;
+    if (!out_transform ||
+        !hlsl_compiler_matrix_vector_chain_matches(program, clip_start, &chain))
+        return false;
+    const int input_reg = chain.position_input_register;
+    const int object_buffer = chain.world_matrix_buffer;
+    const int object_first_row = chain.world_matrix_first_row;
+    const int clip_buffer = chain.clip_matrix_buffer;
+    const int clip_first_row = chain.clip_matrix_first_row;
     if (object_buffer == clip_buffer &&
         object_first_row == clip_first_row) {
         return false;
@@ -1384,13 +1438,7 @@ static bool compiler_split_matrix_transform_matches(
         if (world_start >= 0) return false;
         world_start = candidate;
     }
-    if (world_start < 0 ||
-        !compiler_temp_value_is_dead_in_linear_tail(
-            program, clip_start + 8, clip_temp, 0x0fu) ||
-        !compiler_temp_value_is_dead_in_linear_tail(
-            program, clip_start + 8, clip_accumulator, 0x0fu)) {
-        return false;
-    }
+    if (world_start < 0) return false;
 
     *out_transform = (HLSLCompilerSplitMatrixTransform){
         .valid = true,
@@ -2035,29 +2083,9 @@ static bool claim_replacement(HLSLEmitterContext *ctx, int trigger,
  * must continue through the flat emitter. */
 static const char *compiler_column_major_float4x4_identifier(
     const HLSLEmitterContext *ctx, int buffer, int first_row) {
-    if (!ctx || buffer < 0 || first_row < 0) return NULL;
-    int offset = -1;
-    const char *name = resolve_cb_variable_ctx(
-        ctx, buffer, first_row, -1, &offset);
-    if (!name || offset != 0) return NULL;
-    for (int row = 1; row < 4; row++) {
-        int row_offset = -1;
-        const char *row_name = resolve_cb_variable_ctx(
-            ctx, buffer, first_row + row, -1, &row_offset);
-        if (!row_name || strcmp(row_name, name) != 0 ||
-            row_offset != row * 16) {
-            return NULL;
-        }
-    }
-    DecodedVariableLayout layout;
-    if (!resolve_variable_layout_ctx(ctx, name, &layout) ||
-        !layout.is_matrix || layout.rows != 4 || layout.columns != 4 ||
-        layout.scalar_type != 0 || layout.array_size != 0 ||
-        layout.byte_offset != (uint32_t)first_row * 16u ||
-        resolve_variable_is_row_major(ctx, name)) {
-        return NULL;
-    }
-    return name;
+    bool row_major = false;
+    const char *name = hlsl_matrix_lift_identifier(ctx, buffer, first_row, &row_major);
+    return row_major ? NULL : name;
 }
 
 static void register_split_matrix_transform_replacements(
@@ -2378,12 +2406,26 @@ static bool base_binary_order(const USILInstruction *inst,
         return is_non_canonical_add(&inst->operands[1],
                                     &inst->operands[2]);
     }
-    /* Controlled full/partial-lane fixtures require component ordering before
-     * the non-contiguous-lane fallback for products of one input register.
+    /* Controlled products and full-width extrema require component ordering
+     * before the non-contiguous-lane fallback for one input register.
      * This compiler inverse is an empirical candidate spelling, not a proof
      * that arbitrary FP operations commute. Full-container equality is still
      * required before accepting any reconstructed production result. */
     if (inst->opcode == USIL_OP_MUL &&
+        inst->operands[0].destination_mask == 0xf0 && !inst->precise_mask && !inst->saturate &&
+        inst->operands[1].type == OPERAND_TYPE_INPUT &&
+        inst->operands[2].type == OPERAND_TYPE_INPUT &&
+        inst->operands[1].register_index == inst->operands[2].register_index &&
+        !inst->operands[1].min_precision && !inst->operands[2].min_precision &&
+        !inst->operands[1].rel_op0 && !inst->operands[2].rel_op0 &&
+        !inst->operands[1].rel_op1 && !inst->operands[2].rel_op1 &&
+        !inst->operands[1].rel_op2 && !inst->operands[2].rel_op2 &&
+        ((inst->operands[1].has_abs || inst->operands[1].has_neg) !=
+         (inst->operands[2].has_abs || inst->operands[2].has_neg)))
+        return true;
+    if ((inst->opcode == USIL_OP_MUL ||
+         ((inst->opcode == USIL_OP_MIN || inst->opcode == USIL_OP_MAX) &&
+          inst->operands[0].destination_mask == 0xf0)) &&
         inst->operands[1].type == OPERAND_TYPE_INPUT &&
         inst->operands[2].type == OPERAND_TYPE_INPUT &&
         inst->operands[1].register_index == inst->operands[2].register_index &&

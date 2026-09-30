@@ -131,6 +131,11 @@ static void source_map(StringBuilder *out, const ShaderLabExpressionSourceMap *m
                    record->subprogram_index, record->blob_index, record->hardware_tier_group,
                    record->serialized_state);
         digest(out, "target_sha256", record->target_digest, true);
+        sb_append(out, ",\"source_quality_scope\":\"emitted-stage-entry\",\"source_quality\":");
+        if (record->has_source_quality)
+            hlsl_source_quality_append_json(&record->source_quality, out);
+        else
+            sb_append(out, "null");
         sb_append(out, ",\"instructions\":[");
         for (size_t j = 0; j < record->instructions.count; ++j) {
             const HLSLExpressionOrigin *origin = &record->instructions.origins[j];
@@ -252,6 +257,7 @@ char *unity_shaderlab_lift_format_json(const UnityShaderLabLiftResult *result) {
     sb_appendf(&out,
                "{\"schema\":\"dxbc-shaderlab-lift-v1\","
                "\"scope\":\"generated-local-d3d11-program-domain\","
+               "\"whole_source_quality\":\"unavailable\","
                "\"lift\":{\"id\":\"%s\",\"version\":%u},\"selection\":\"%s\","
                "\"authority\":{\"pinned\":%s,",
                HLSL_HIGH_LEVEL_LIFT_ID, HLSL_HIGH_LEVEL_LIFT_VERSION, selection,

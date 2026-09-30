@@ -3280,7 +3280,7 @@ static int verify_signature_declaration_contract(void) {
     intrinsic.kind = USIL_SIGNATURE_DECL_INPUT;
     intrinsic.operand_type = OPERAND_TYPE_INPUT_THREAD_ID;
     intrinsic.register_id = UINT32_MAX;
-    intrinsic.mask = 7u;
+    intrinsic.mask = 1u;
     intrinsic.source_instruction_index = 1u;
     memset(&program, 0, sizeof(program));
     program.program_type = DXBC_PROGRAM_TYPE_COMPUTE;
@@ -3289,6 +3289,14 @@ static int verify_signature_declaration_contract(void) {
     program.signature_declaration_alloc = 1;
     CHECK(usil_signature_authority_is_valid(&program));
     intrinsic.mask = 3u;
+    CHECK(usil_signature_authority_is_valid(&program));
+    intrinsic.mask = 7u;
+    CHECK(usil_signature_authority_is_valid(&program));
+    intrinsic.mask = 0u;
+    CHECK(!usil_signature_authority_is_valid(&program));
+    intrinsic.mask = 8u;
+    CHECK(!usil_signature_authority_is_valid(&program));
+    intrinsic.mask = 15u;
     CHECK(!usil_signature_authority_is_valid(&program));
     intrinsic.mask = 7u;
     program.program_type = DXBC_PROGRAM_TYPE_PIXEL;

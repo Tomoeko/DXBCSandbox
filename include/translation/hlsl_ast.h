@@ -23,6 +23,68 @@ typedef enum {
 typedef enum { AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32 } ASTScalarType;
 
 typedef enum {
+    AST_OPERAND_VALUE_UNKNOWN = 0,
+    AST_OPERAND_VALUE_LOGICAL,
+    AST_OPERAND_VALUE_REGISTER
+} ASTOperandValueRole;
+
+typedef enum {
+    AST_COMPONENT_SELECTION_NONE = 0,
+    AST_COMPONENT_SELECTION_SEMANTIC,
+    AST_COMPONENT_SELECTION_TRANSPORT
+} ASTComponentSelectionRole;
+
+typedef enum {
+    AST_OPERAND_BITCAST_NONE = 0,
+    AST_OPERAND_BITCAST_PROGRAM,
+    AST_OPERAND_BITCAST_STORAGE
+} ASTOperandBitcastRole;
+
+/* By-value authority for the validated operand formatter boundary. The producer
+ * must account for the entire spelling, including hidden helper/bitcast/lane
+ * operations. UNKNOWN never supplies source-quality authority. Natural/result
+ * widths are 1..4 for scalar/vector values, or both zero for aggregates. A
+ * semantic selection names components of a logical value; it is not permission
+ * to relabel a register shuffle. No pointers to transient operands are retained. */
+typedef struct {
+    bool complete;
+    ASTOperandValueRole value_role;
+    uint64_t logical_value_id;
+    uint8_t natural_components;
+    uint8_t result_components;
+    ASTComponentSelectionRole selection_role;
+    uint8_t selected_components[4];
+    ASTOperandBitcastRole bitcast_role;
+    bool raw_buffer_reconstruction;
+    bool synthetic_interface;
+    int instruction_index;
+    uint32_t source_instruction_index;
+    int operand_index;
+    uint8_t destination_lanes;
+} ASTOperandProvenance;
+
+void ast_operand_provenance_init(ASTOperandProvenance *provenance);
+
+/* Owned result facts for a recovered logical expression. The producer must
+ * derive type, width and instruction ownership from the logical-value plan;
+ * a source spelling, call name or register index is not authority. Children
+ * retain their own origins, including for inlined operations. The defaults
+ * carry no authority. Scalar/vector widths are limited to 1..4 here. */
+typedef struct {
+    bool complete;
+    ASTScalarType scalar_type;
+    uint8_t components;
+    uint64_t logical_value_id;
+    int instruction_index;
+    uint32_t source_instruction_index;
+    uint8_t destination_lanes;
+    bool semantic_projection;
+    bool program_bitcast;
+} ASTLogicalValueOrigin;
+
+void ast_logical_value_origin_init(ASTLogicalValueOrigin *origin);
+
+typedef enum {
     AST_STMT_BLOCK,
     AST_STMT_ASSIGN,
     AST_STMT_IF,
@@ -91,6 +153,9 @@ typedef struct {
 
 typedef struct ASTExpr {
     ASTExprKind kind;
+    /* Meaningful only for EMITTER_OPERAND; copied and owned with this node. */
+    ASTOperandProvenance operand_provenance;
+    ASTLogicalValueOrigin logical_origin;
     union {
         ASTVar var;
         ASTLiteral literal;
@@ -163,6 +228,12 @@ ASTExpr *ast_create_bitcast(ASTScalarType scalar_type, ASTExpr *sub);
  * AST. It owns a copy and always prints parentheses. Never pass source loaded
  * from a file or user text: this constructor is not an HLSL parser. */
 ASTExpr *ast_create_emitter_operand(const char *expression);
+ASTExpr *ast_create_emitter_operand_with_provenance(
+    const char *expression, const ASTOperandProvenance *provenance);
+/* Copies validated facts. Failure leaves the previous origin unchanged.
+ * EMITTER_OPERAND uses the fuller operand-provenance constructor instead. */
+bool ast_set_logical_value_origin(ASTExpr *expression,
+                                  const ASTLogicalValueOrigin *origin);
 void ast_free_expr(ASTExpr *expr);
 
 // AST Statement Constructors

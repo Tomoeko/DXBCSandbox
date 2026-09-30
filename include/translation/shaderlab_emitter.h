@@ -12,6 +12,7 @@
 #include "io/shader_blob_archive.h"
 #include "io/serialized_shader.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_source_quality.h"
 #include "translation/shaderlab_variant_plan.h"
 
 typedef enum {
@@ -180,6 +181,11 @@ typedef struct {
     size_t serialized_state;
     uint8_t target_digest[COMMON_SHA256_DIGEST_SIZE];
     HLSLExpressionSourceMap instructions;
+    /* Independent quality of this emitted stage entry and its observed
+     * declarations. This does not cover enclosing ShaderLab routing/state or
+     * certify byte equality. Absent observations are never implicit CLEAN. */
+    bool has_source_quality;
+    HLSLSourceQualityResult source_quality;
 } ShaderLabExpressionSourceRecord;
 
 typedef struct {

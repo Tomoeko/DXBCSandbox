@@ -100,7 +100,18 @@ typedef enum {
     USIL_OP_SINCOS,
     USIL_OP_UBFE,
     USIL_OP_GEOMETRY_APPEND,
-    USIL_OP_GEOMETRY_RESTART_STRIP
+    USIL_OP_GEOMETRY_RESTART_STRIP,
+    USIL_OP_SYNC,
+    USIL_OP_LD_UAV_TYPED,
+    USIL_OP_STORE_UAV_TYPED,
+    USIL_OP_LD_RAW,
+    USIL_OP_STORE_RAW,
+    USIL_OP_STORE_STRUCTURED,
+    USIL_OP_ATOMIC_XOR,
+    USIL_OP_ATOMIC_IADD,
+    USIL_OP_IMM_ATOMIC_ALLOC,
+    USIL_OP_IMM_ATOMIC_CONSUME,
+    USIL_OP_IMM_ATOMIC_CMP_EXCH
 } USILOpcode;
 
 typedef enum {
@@ -127,6 +138,7 @@ typedef struct {
     USILGeometryEffectKind geometry_effect;
     uint8_t geometry_stream_id;
     bool geometry_stream_explicit;
+    uint8_t sync_flags;
     DXBCOperand operands[DXBC_MAX_OPERANDS];
     int operand_count;
     /* Preserve the complete canonical DXBC diagnostic string.  The source
@@ -251,6 +263,25 @@ typedef struct {
     USILHullPhase *phases;
 } USILTessellationContract;
 
+typedef enum {
+    USIL_COMPUTE_DISPATCH_THREAD_ID = 1u << 0,
+    USIL_COMPUTE_GROUP_ID = 1u << 1,
+    USIL_COMPUTE_GROUP_THREAD_ID = 1u << 2,
+    USIL_COMPUTE_GROUP_INDEX = 1u << 3
+} USILComputeSystemValueFlags;
+
+typedef struct {
+    bool valid;
+    uint32_t thread_group_size[3];
+    uint32_t declaration_source_instruction_index;
+    uint8_t system_value_mask;
+    uint32_t shared_memory_bytes;
+    DXBCThreadGroupSharedMemoryContract* shared_memory;
+    size_t shared_memory_count;
+    size_t shared_memory_capacity;
+    size_t barrier_count;
+} USILComputeContract;
+
 typedef struct {
     char shader_type_model[32];
     
@@ -314,6 +345,7 @@ typedef struct {
     uint8_t shader_model_minor;
     USILGeometryContract geometry;
     USILTessellationContract tessellation;
+    USILComputeContract compute;
 } USILProgram;
 
 bool usil_translate(USILProgram* program, const DXBCContainer* container);

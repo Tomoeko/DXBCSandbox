@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Authored evaluation input. Dispatch dimensions and bindings are host inputs.
+#pragma kernel Transform
+#pragma kernel ProcessTexture
+#pragma kernel Reduce
+#pragma kernel Count
+#pragma kernel AppendPositive
+#pragma kernel ConsumeValues
+#pragma kernel RawTransform
+#pragma kernel AtomicCompare
+#pragma kernel Counter
+#pragma multi_compile __ OFFSET_VALUES
+
+struct Element
+{
+    float3 position;
+    float weight;
+};
+StructuredBuffer<Element> _Input;
+RWStructuredBuffer<Element> _Output;
+Texture2D<float4> _SourceTexture;
+RWTexture2D<float4> _DestinationTexture;
+RWStructuredBuffer<uint> _Counts;
+AppendStructuredBuffer<float> _Append;
+ConsumeStructuredBuffer<float> _Consume;
+RWByteAddressBuffer _RawBytes;
+RWStructuredBuffer<uint> _CounterBuffer;
+uint _ElementCount;
+uint2 _TextureSize;
+groupshared float partialSums[64];
+
+[numthreads(64, 1, 1)]
+void Transform(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= _ElementCount) return;
+    Element value = _Input[dispatchId.x];
+    value.position *= value.weight;
+    #if defined(OFFSET_VALUES)
+        value.position += float3(1, 2, 3);
+    #endif
+    _Output[dispatchId.x] = value;
+}
+
+[numthreads(8, 8, 1)]
+void ProcessTexture(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (any(dispatchId.xy >= _TextureSize)) return;
+    float4 color = _SourceTexture.Load(int3(dispatchId.xy, 0));
+    _DestinationTexture[dispatchId.xy] = float4(color.rgb * 0.5, color.a);
+}
+
+[numthreads(64, 1, 1)]
+void Reduce(uint3 dispatchId : SV_DispatchThreadID,
+            uint groupIndex : SV_GroupIndex, uint3 groupId : SV_GroupID)
+{
+    partialSums[groupIndex] = dispatchId.x < _ElementCount
+                          ? _Input[dispatchId.x].weight : 0;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 32; stride > 0; stride >>= 1)
+    {
+        if (groupIndex < stride)
+            partialSums[groupIndex] += partialSums[groupIndex + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (groupIndex == 0)
+    {
+        Element result;
+        result.position = float3(0, 0, 0);
+        result.weight = partialSums[0];
+        _Output[groupId.x] = result;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void Count(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x < _ElementCount && _Input[dispatchId.x].weight > 0)
+        InterlockedAdd(_Counts[0], 1);
+}
+
+[numthreads(64, 1, 1)]
+void AppendPositive(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x < _ElementCount)
+    {
+        float value = _Input[dispatchId.x].weight;
+        if (value > 0) _Append.Append(value);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ConsumeValues(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= _ElementCount) return;
+    Element result;
+    result.position = float3(0, 0, 0);
+    result.weight = _Consume.Consume();
+    _Output[dispatchId.x] = result;
+}
+
+[numthreads(64, 1, 1)]
+void RawTransform(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= _ElementCount) return;
+    uint offset = dispatchId.x * 16;
+    float3 position = asfloat(_RawBytes.Load3(offset));
+    float weight = asfloat(_RawBytes.Load(offset + 12));
+    _RawBytes.Store3(offset, asuint(position * weight));
+}
+
+[numthreads(64, 1, 1)]
+void AtomicCompare(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= _ElementCount) return;
+    uint previous;
+    InterlockedCompareExchange(_Counts[dispatchId.x], 0, dispatchId.x + 1, previous);
+    if (previous != 0)
+        InterlockedXor(_Counts[dispatchId.x], previous);
+}
+
+[numthreads(64, 1, 1)]
+void Counter(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= _ElementCount) return;
+    uint index = _CounterBuffer.IncrementCounter();
+    _CounterBuffer[index] = dispatchId.x;
+}

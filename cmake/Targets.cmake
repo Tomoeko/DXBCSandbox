@@ -56,6 +56,9 @@ set(DXBC_SOURCES
     src/translation/hlsl_emitter.c
     src/translation/hlsl_emitter_body.c
     src/translation/hlsl_emitter_declarations.c
+    src/translation/hlsl_emitter_compute.c
+    src/translation/hlsl_source_identifier.c
+    src/translation/compute_source_candidate.c
     src/translation/hlsl_emitter_interface.c
     src/translation/hlsl_emitter_tessellation.c
     src/translation/hlsl_emitter_resources.c
@@ -70,6 +73,11 @@ set(DXBC_SOURCES
     src/translation/hlsl_lift_control.c
     src/translation/hlsl_lift_transaction.c
     src/translation/hlsl_ast.c
+    src/translation/hlsl_source_quality.c
+    src/translation/hlsl_source_quality_report.c
+    src/translation/hlsl_matrix_lift.c
+    src/translation/hlsl_global_declarations.c
+    src/translation/hlsl_texture_lift.c
     src/translation/hlsl_function_lift.c
     src/translation/hlsl_unity_uv_lift.c
     src/translation/hlsl_expression_lift.c

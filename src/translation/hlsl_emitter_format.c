@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/usil_validation.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -1031,7 +1032,11 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
             break;
         }
         case OPERAND_TYPE_INPUT:
-            if (ctx->is_geometry && op->register_index_dim == 2 &&
+            if (ctx->high_level_interface) {
+                const char *name = hlsl_high_level_input_name(ctx, op->register_index);
+                if (!name) { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
+                else hlsl_builder_copy_checked(ctx, &reg, name);
+            } else if (ctx->is_geometry && op->register_index_dim == 2 &&
                 op->index_has_immediate[0] &&
                 op->index_has_immediate[1]) {
                 hlsl_builder_format_checked(
@@ -1044,7 +1049,13 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
             }
             break;
         case OPERAND_TYPE_OUTPUT:
-            hlsl_builder_format_checked(ctx, &reg, "o%d", op->register_index);
+            if (ctx->high_level_interface && !ctx->high_level_direct_return) {
+                const char *name = hlsl_high_level_output_name(ctx, op->register_index);
+                if (!name) { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
+                else hlsl_builder_format_checked(ctx, &reg, "%s.%s", ctx->high_level_output_variable, name);
+            } else {
+                hlsl_builder_format_checked(ctx, &reg, "o%d", op->register_index);
+            }
             break;
         case OPERAND_TYPE_OUTPUT_DEPTH:
             hlsl_builder_copy_checked(ctx, &reg, "oDepth");
@@ -1140,6 +1151,33 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
     }
     
     bool swizzle_formatted = false;
+    if (ctx->high_level_interface && !ctx->high_level_direct_return && op->type == OPERAND_TYPE_OUTPUT) {
+        const DXBCSignatureElement *element = NULL;
+        for (int output_index = 0; output_index < ctx->program->output_count; ++output_index)
+            if (ctx->program->outputs[output_index].register_id == (uint32_t)op->register_index)
+                element = &ctx->program->outputs[output_index];
+        if (!ctx->is_formatting_dest || !element || usil_operand_destination_lane_mask(op) != element->mask) {
+            hlsl_builder_failed(ctx, output);
+            sb_free(&idx); sb_free(&reg);
+            return false;
+        }
+        swizzle_formatted = true;
+        swiz[0] = '\0';
+    }
+    if (ctx->high_level_interface && op->type == OPERAND_TYPE_INPUT) {
+        const DXBCSignatureElement *element = hlsl_high_level_input_signature(ctx, op->register_index);
+        unsigned width = 0;
+        if (element) for (unsigned component = 0; component < 4; ++component)
+            if (element->mask & (1u << component)) ++width;
+        if (!element || !format_cb_swizzle(op, width, 0, write_mask, preserve_vector,
+                                           swiz, sizeof(swiz))) {
+            hlsl_builder_failed(ctx, output);
+            sb_free(&idx);
+            sb_free(&reg);
+            return false;
+        }
+        swizzle_formatted = true;
+    }
     
     if (op->type == OPERAND_TYPE_INPUT || op->type == OPERAND_TYPE_OUTPUT) {
         sb_clear(&idx);
@@ -1172,7 +1210,16 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
             // Extract the first accessed component for sub-register resolution
             // This tells the resolver which exact byte within the register is accessed
             int component_hint = -1; // -1 = unknown/register-level
-            if (op->swizzle_mode == 1) {
+            if (write_mask && !ctx->is_formatting_dest) {
+                /* A partial write need not consume the source's x lane. Resolve
+                 * the first demanded component, not an unrelated packed field. */
+                for (int lane = 0; lane < 4; ++lane) {
+                    if (write_mask & (16 << lane)) {
+                        component_hint = usil_operand_source_component(op, lane);
+                        break;
+                    }
+                }
+            } else if (op->swizzle_mode == 1) {
                 // Standard swizzle: first component
                 component_hint = op->swizzle[0];
             } else if (op->swizzle_mode == 2) {

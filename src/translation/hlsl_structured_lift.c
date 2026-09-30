@@ -495,6 +495,10 @@ static bool emit_counted_loop_begin(HLSLEmitterContext *ctx, StructuredPlan *pla
     sb_append_spaces(ctx->sb, ctx->indent);
     sb_appendf(ctx->sb, "[loop] for (uint dxbc_index_i%d = dxbc_initial_i%d; dxbc_index_i%d < ",
                loop->instruction, loop->initialization, loop->instruction);
+    if (!hlsl_source_quality_observe_expression(ctx, bits, loop->comparison)) {
+        ast_free_expr(bits);
+        return false;
+    }
     ast_format_expr(bits, ctx->sb);
     ast_free_expr(bits);
     sb_appendf(ctx->sb, "; ++dxbc_index_i%d) {\n", loop->instruction);
@@ -563,6 +567,10 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
             sb_append(ctx->sb, inst->condition_test == DXBC_INSTRUCTION_TEST_NONZERO
                                    ? "[branch] if ("
                                    : "[branch] if (!");
+            if (!hlsl_source_quality_observe_expression(ctx, bits, index)) {
+                ast_free_expr(bits);
+                goto cleanup;
+            }
             ast_format_expr(bits, ctx->sb);
             ast_free_expr(bits);
             sb_append(ctx->sb, ") {\n");
@@ -609,6 +617,10 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
             }
             sb_append(ctx->sb, " = ");
             begin = ctx->sb->len;
+            if (!hlsl_source_quality_observe_expression(ctx, expression, index)) {
+                ast_free_expr(expression);
+                goto cleanup;
+            }
             ast_format_expr(expression, ctx->sb);
             end = ctx->sb->len;
             ast_free_expr(expression);

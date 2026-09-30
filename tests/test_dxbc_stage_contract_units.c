@@ -253,6 +253,7 @@ static bool verify_geometry_contract(void) {
     CHECK(contract.program_type == DXBC_PROGRAM_TYPE_GEOMETRY);
     CHECK(contract.input_primitive == DXBC_INPUT_PRIMITIVE_TRIANGLE);
     CHECK(contract.output_topology == DXBC_OUTPUT_TOPOLOGY_TRIANGLE_STRIP);
+    CHECK(contract.output_topology_stream_mask == 1);
     CHECK(contract.max_output_vertex_count == 6);
     CHECK(contract.geometry_instance_count == 2);
     CHECK(contract.declared_stream_mask == 1);
@@ -277,6 +278,43 @@ static bool verify_geometry_contract(void) {
                                                   &diagnostic));
     CHECK(diagnostic.status == DXBC_STAGE_CONTRACT_CONTAINER_MISMATCH);
     dxbc_stage_contract_free(&contract);
+
+    const uint32_t multiple_streams[] = {
+        instruction1(93, DXBC_INPUT_PRIMITIVE_POINT),
+        instruction3(143, 0), UINT32_C(0x00110000), 0,
+        instruction1(92, DXBC_OUTPUT_TOPOLOGY_POINT_LIST),
+        instruction3(143, 0), UINT32_C(0x00110000), 1,
+        instruction1(92, DXBC_OUTPUT_TOPOLOGY_POINT_LIST),
+        instruction2(94, 0), 2,
+        instruction3(117, 0), UINT32_C(0x00110000), 0,
+        instruction3(117, 0), UINT32_C(0x00110000), 1,
+        instruction1(62, 0),
+    };
+    dxbc_stage_contract_init(&contract);
+    CHECK(decode_words(multiple_streams, sizeof(multiple_streams) / sizeof(multiple_streams[0]),
+                       UINT32_C(0x00020050), &contract, &diagnostic));
+    CHECK(contract.output_topology == DXBC_OUTPUT_TOPOLOGY_POINT_LIST);
+    CHECK(contract.output_topology_stream_mask == 3 && contract.declared_stream_mask == 3);
+    CHECK(contract.geometry_effect_count == 2 && contract.geometry_effects[1].stream_id == 1);
+    dxbc_stage_contract_free(&contract);
+    uint32_t changed_streams[sizeof(multiple_streams) / sizeof(multiple_streams[0])];
+    memcpy(changed_streams, multiple_streams, sizeof(changed_streams));
+    changed_streams[8] = instruction1(92, DXBC_OUTPUT_TOPOLOGY_LINE_STRIP);
+    CHECK(expect_contract_error(changed_streams, sizeof(changed_streams) / sizeof(changed_streams[0]),
+                                 UINT32_C(0x00020050), DXBC_STAGE_CONTRACT_INVALID_DECLARATION_VALUE));
+    changed_streams[8] = instruction1(106, 1); /* Stream 1 topology is now missing. */
+    CHECK(expect_contract_error(changed_streams, sizeof(changed_streams) / sizeof(changed_streams[0]),
+                                 UINT32_C(0x00020050), DXBC_STAGE_CONTRACT_MISSING_DECLARATION));
+    const uint32_t duplicate_topology[] = {
+        instruction1(93, DXBC_INPUT_PRIMITIVE_POINT),
+        instruction3(143, 0), UINT32_C(0x00110000), 0,
+        instruction1(92, DXBC_OUTPUT_TOPOLOGY_POINT_LIST),
+        instruction1(92, DXBC_OUTPUT_TOPOLOGY_POINT_LIST),
+        instruction2(94, 0), 2, instruction1(62, 0)
+    };
+    CHECK(expect_contract_error(duplicate_topology,
+                                 sizeof(duplicate_topology) / sizeof(duplicate_topology[0]),
+                                 UINT32_C(0x00020050), DXBC_STAGE_CONTRACT_DUPLICATE_DECLARATION));
 
     const uint32_t invalid_bits[] = {
         instruction1(93, DXBC_INPUT_PRIMITIVE_TRIANGLE),
