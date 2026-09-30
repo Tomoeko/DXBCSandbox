@@ -234,15 +234,18 @@ static bool packed_emit(USILProgram *program,bool accepted,unsigned width){
     sb_free(&source);return true;
 }
 static bool packed_positive(void){
-    for(unsigned width=2;width<=3;++width)for(unsigned stage=0;stage<2;++stage){
-        Fixture f;CHECK(packed_init(&f,stage==0,width));HLSLPatchLayout layout;
-        CHECK(hlsl_patch_layout(&f.program,&layout));CHECK(layout.row_count==4&&layout.signature_count==5);
-        CHECK(layout.lane_field[0][0]==0&&layout.lane_field[0][1]==2&&layout.lane_component[0][1]==0);
-        CHECK(packed_emit(&f.program,true,width));
-        /* PCSG record reordering does not alter field or producer ownership. */
-        DXBCSignatureElement swap=f.program.patch_constants[0];f.program.patch_constants[0]=f.program.patch_constants[4];f.program.patch_constants[4]=swap;
-        CHECK(packed_emit(&f.program,true,width));dispose(&f);
-    }return true;
+    for(unsigned width=2;width<=3;++width){
+        for(unsigned stage=0;stage<2;++stage){
+            Fixture f;CHECK(packed_init(&f,stage==0,width));HLSLPatchLayout layout;
+            CHECK(hlsl_patch_layout(&f.program,&layout));CHECK(layout.row_count==4&&layout.signature_count==5);
+            CHECK(layout.lane_field[0][0]==0&&layout.lane_field[0][1]==2&&layout.lane_component[0][1]==0);
+            CHECK(packed_emit(&f.program,true,width));
+            /* PCSG record reordering does not alter field or producer ownership. */
+            DXBCSignatureElement swap=f.program.patch_constants[0];f.program.patch_constants[0]=f.program.patch_constants[4];f.program.patch_constants[4]=swap;
+            CHECK(packed_emit(&f.program,true,width));dispose(&f);
+        }
+    }
+    return true;
 }
 static bool packed_vector_domain(void){
     uint32_t words[sizeof(domain_words)/4];memcpy(words,domain_words,sizeof(words));
