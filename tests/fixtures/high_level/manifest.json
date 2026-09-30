@@ -971,6 +971,88 @@
       "clean_reconstruction_status": "pending",
       "exact_recompilation_status": "pending",
       "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "long_arithmetic.shader",
+      "source_sha256": "c75428b6b0ebec05a1af05572f9a00196f84de7a36ce9e3df6b6acef55492074",
+      "family": "straight-line-arithmetic",
+      "role": "unrolled-vector-arithmetic-over64-operations",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "ARITHMETIC_CHANGED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "captured_domain": {
+        "subshaders": 1,
+        "passes": 1,
+        "keyword_states": 2,
+        "graphics_stage_rows": 4
+      },
+      "observed_fragment_shape": {
+        "instructions": 161,
+        "opcodes": {
+          "mul": 1,
+          "mad": 79,
+          "frc": 80,
+          "ret": 1
+        },
+        "precise_instructions": 0,
+        "constant_buffers": 0,
+        "resource_declarations": 0,
+        "loop_instructions": 0
+      },
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
+    },
+    {
+      "file": "long_arithmetic_renamed.shader",
+      "source_sha256": "907cf2c1cb355f797d16d1d2159154c7bb5081ff69de6971bd0cec2c8851f065",
+      "family": "straight-line-arithmetic",
+      "role": "renamed-unrolled-vector-arithmetic-over64-operations",
+      "stages": [
+        "vertex",
+        "fragment"
+      ],
+      "keyword_dimensions": [
+        {
+          "name": "ARITHMETIC_CHANGED",
+          "states": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      ],
+      "captured_domain": {
+        "subshaders": 1,
+        "passes": 1,
+        "keyword_states": 2,
+        "graphics_stage_rows": 4
+      },
+      "observed_fragment_shape": {
+        "instructions": 161,
+        "opcodes": {
+          "mul": 1,
+          "mad": 79,
+          "frc": 80,
+          "ret": 1
+        },
+        "precise_instructions": 0,
+        "constant_buffers": 0,
+        "resource_declarations": 0,
+        "loop_instructions": 0
+      },
+      "clean_reconstruction_status": "pending",
+      "exact_recompilation_status": "pending",
+      "native_d3d11_status": "not-run"
     }
   ]
 }

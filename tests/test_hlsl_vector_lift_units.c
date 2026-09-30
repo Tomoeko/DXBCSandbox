@@ -4,6 +4,7 @@
 #include "translation/hlsl_source_quality.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(condition) do { if (!(condition)) { \
@@ -643,8 +644,73 @@ static bool check_replicated_dot_arity(void) {
     return true;
 }
 
+/* A long logical expression must retain each distinct source owner across
+ * machine-word boundaries. These are source/map units, not compiler evidence. */
+static bool check_wide_instruction_ownership(void) {
+    const int counts[] = {66, 130, 194, HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT};
+    for (unsigned example = 0; example < sizeof(counts) / sizeof(counts[0]); ++example) {
+        const int count = counts[example];
+        USILInstruction *instructions = calloc((size_t)count + 1, sizeof(*instructions));
+        CHECK(instructions);
+        instructions[0] = (USILInstruction){.opcode = USIL_OP_MOV, .operand_count = 2};
+        instructions[0].operands[0] = operand(OPERAND_TYPE_TEMP, 0, 15);
+        instructions[0].operands[1] = operand(OPERAND_TYPE_INPUT, 0, 0);
+        for (int index = 1; index < count - 2; ++index) {
+            instructions[index].opcode = index & 1 ? USIL_OP_FRC : USIL_OP_MUL;
+            instructions[index].operand_count = index & 1 ? 2 : 3;
+            instructions[index].operands[0] = operand(OPERAND_TYPE_TEMP, 0, 15);
+            instructions[index].operands[1] = operand(OPERAND_TYPE_TEMP, 0, 0);
+            instructions[index].operands[2] = operand(OPERAND_TYPE_INPUT, 0, 0);
+        }
+        instructions[count - 2] = instructions[0];
+        instructions[count - 2].operands[0] = operand(OPERAND_TYPE_OUTPUT, 0, 15);
+        instructions[count - 2].operands[1] = operand(OPERAND_TYPE_TEMP, 0, 0);
+        instructions[count - 1].opcode = USIL_OP_RET;
+        for (int index = 0; index < count; ++index)
+            instructions[index].source_instruction_index = 17u + (uint32_t)index * 2u;
+        DXBCSignatureElement input = {.semantic_name = "TEXCOORD", .component_type = 3, .mask = 15, .rw_mask = 15};
+        DXBCSignatureElement output = {.semantic_name = "SV_Target", .component_type = 3, .system_value = 64, .mask = 15};
+        USILProgram value = program(instructions, count, &input, &output);
+        HLSLExpressionSourceMap map;
+        HLSLSourceQualityResult quality;
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        options.expression_source_map = &map; options.source_quality = &quality;
+        StringBuilder source; sb_init(&source);
+        CHECK(hlsl_emit_with_options(&value, &source, NULL, NULL, NULL, &options));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.counts.residual_total && !quality.counts.unknown_provenance);
+        CHECK(map.count == (size_t)count && hlsl_expression_source_map_matches(&map, &value, source.buf));
+        CHECK(strstr(source.buf, "const float4 dxbc_value_i") && !strstr(source.buf, "float4 r0"));
+        const char *line_begin = source.buf;
+        for (const char *character = source.buf; *character; ++character) {
+            if (*character != '\n') continue;
+            CHECK(character - line_begin < 512);
+            line_begin = character + 1;
+        }
+        for (int index = 0; index < count - 1; ++index) {
+            CHECK(map.origins[index].kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
+                  map.origins[index].source_end > map.origins[index].source_begin &&
+                  map.origins[index].source_instruction_index == instructions[index].source_instruction_index);
+        }
+        ++map.origins[count - 2].source_instruction_index;
+        CHECK(!hlsl_expression_source_map_matches(&map, &value, source.buf));
+        sb_free(&source);
+        /* A requested instruction beyond the declared bound is rejected before
+         * planning; it cannot disappear from the source map. */
+        if (count == HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT) {
+            instructions[count].opcode = USIL_OP_RET;
+            value.instruction_count = value.instruction_alloc = count + 1;
+            sb_init(&source);
+            CHECK(!hlsl_emit_with_options(&value, &source, NULL, NULL, NULL, &options));
+            CHECK(!map.complete && quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+            sb_free(&source);
+        }
+        free(instructions);
+    }
+    return true;
+}
+
 int main(void) {
-    return check_widths() && check_partial_lifetime_and_rejections() && check_material_authority() &&
+    return check_wide_instruction_ownership() && check_widths() && check_partial_lifetime_and_rejections() && check_material_authority() &&
            check_vector_operations() && check_float_intrinsics() && check_material_reflection_layout() &&
            check_packed_material_selection() && check_scalar_broadcast_and_projection() &&
            check_modifier_extension_authority() && check_derivative_sites() &&

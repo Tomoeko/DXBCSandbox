@@ -5,6 +5,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(condition) do { if (!(condition)) { \
@@ -148,7 +149,7 @@ static bool check_graph_and_metadata(void) {
     HLSLMatrixLiftPlan plan;
     CHECK(hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
     CHECK(plan.start_instruction == 0 && plan.end_instruction == 7);
-    CHECK(plan.instruction_owners == UINT64_C(255));
+    CHECK(plan.instruction_owners.words[0] == UINT64_C(255));
     CHECK(plan.expression->logical_origin.complete && plan.world_expression->logical_origin.complete);
     CHECK(plan.world_expression->logical_origin.instruction_index == 3);
     CHECK(plan.expression->logical_origin.instruction_index == 7);
@@ -160,7 +161,7 @@ static bool check_graph_and_metadata(void) {
     CHECK(!strstr(source.buf, "get_cb") && !strstr(source.buf, "transpose") && !strstr(source.buf, "r0"));
     sb_free(&source);
     hlsl_matrix_lift_plan_free(&plan);
-    CHECK(!plan.expression && !plan.world_expression && !plan.instruction_owners);
+    CHECK(!plan.expression && !plan.world_expression && hlsl_instruction_owners_empty(&plan.instruction_owners));
     /* Row-major storage represents a row vector multiplied by that matrix;
      * it cannot silently be relabeled as the column-major expression. */
     fixture.matrices[0].row_major = true;
@@ -202,7 +203,7 @@ static bool check_fail_closed_mutations(void) {
         HLSLMatrixLiftPlan plan;
         memset(&plan, 0xff, sizeof(plan));
         CHECK(!hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
-        CHECK(!plan.expression && !plan.world_expression && !plan.instruction_owners);
+        CHECK(!plan.expression && !plan.world_expression && hlsl_instruction_owners_empty(&plan.instruction_owners));
         release(&fixture);
     }
     return true;
@@ -289,7 +290,7 @@ static bool check_single_matrix_graph(void) {
     fixture.context.high_level_direct_return = false;
     HLSLMatrixLiftPlan plan;
     CHECK(hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
-    CHECK(plan.end_instruction == 3 && plan.instruction_owners == UINT64_C(15));
+    CHECK(plan.end_instruction == 3 && plan.instruction_owners.words[0] == UINT64_C(15));
     CHECK(plan.result_components == 4 && plan.claimed_instruction_count == 4);
     CHECK(!plan.world_expression && plan.expression->logical_origin.complete);
     CHECK(plan.expression->logical_origin.instruction_index == 3 &&
@@ -342,7 +343,7 @@ static bool check_single_matrix_negatives(void) {
         HLSLMatrixLiftPlan plan;
         memset(&plan, 0xff, sizeof(plan));
         CHECK(!hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
-        CHECK(!plan.expression && !plan.world_expression && !plan.instruction_owners &&
+        CHECK(!plan.expression && !plan.world_expression && hlsl_instruction_owners_empty(&plan.instruction_owners) &&
               !plan.result_components && !plan.claimed_instruction_count);
         release(&fixture);
     }
@@ -386,7 +387,7 @@ static bool check_projection_graph(void) {
     CHECK(analyze(&fixture));
     HLSLMatrixLiftPlan plan;
     CHECK(hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
-    CHECK(plan.end_instruction == 2 && plan.instruction_owners == UINT64_C(7));
+    CHECK(plan.end_instruction == 2 && plan.instruction_owners.words[0] == UINT64_C(7));
     CHECK(plan.result_components == 3 && plan.claimed_instruction_count == 3);
     CHECK(!plan.world_expression && plan.expression->kind == AST_EXPR_SWIZZLE);
     CHECK(plan.expression->logical_origin.complete &&
@@ -446,7 +447,7 @@ static bool check_projection_negatives(void) {
         HLSLMatrixLiftPlan plan;
         memset(&plan, 0xff, sizeof(plan));
         CHECK(!hlsl_matrix_lift_prepare(&fixture.context, 0, &plan));
-        CHECK(!plan.expression && !plan.world_expression && !plan.instruction_owners &&
+        CHECK(!plan.expression && !plan.world_expression && hlsl_instruction_owners_empty(&plan.instruction_owners) &&
               !plan.result_components && !plan.claimed_instruction_count);
         release(&fixture);
     }
@@ -468,8 +469,39 @@ static bool check_projection_negatives(void) {
     return true;
 }
 
+/* A real matrix graph can straddle any ownership word. Prefix NOPs have
+ * independent source identities and must not be claimed by the matrix AST. */
+static bool check_matrix_owner_word_boundaries(void) {
+    const int prefixes[] = {61, 125, 189};
+    for (unsigned example = 0; example < sizeof(prefixes) / sizeof(prefixes[0]); ++example) {
+        MatrixFixture fixture; initialize(&fixture);
+        const int prefix = prefixes[example], count = prefix + 9;
+        USILInstruction *instructions = calloc((size_t)count, sizeof(*instructions));
+        CHECK(instructions);
+        for (int index = 0; index < prefix; ++index) instructions[index].opcode = USIL_OP_NOP;
+        memcpy(instructions + prefix, fixture.instructions, 9 * sizeof(*instructions));
+        for (int index = 0; index < count; ++index) instructions[index].source_instruction_index = (uint32_t)index + 20u;
+        fixture.program.instructions = instructions;
+        fixture.program.instruction_count = fixture.program.instruction_alloc = count;
+        CHECK(analyze(&fixture));
+        HLSLMatrixLiftPlan plan;
+        CHECK(hlsl_matrix_lift_prepare(&fixture.context, prefix, &plan));
+        CHECK(plan.start_instruction == prefix && plan.end_instruction == prefix + 7 && plan.claimed_instruction_count == 8);
+        CHECK(plan.expression->logical_origin.instruction_index == prefix + 7 &&
+              plan.expression->logical_origin.source_instruction_index == instructions[prefix + 7].source_instruction_index);
+        for (int index = 0; index < HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT; ++index)
+            CHECK(hlsl_instruction_owners_contains(&plan.instruction_owners, index) == (index >= prefix && index < prefix + 8));
+        hlsl_matrix_lift_plan_free(&plan);
+        instructions[prefix + 5].precise_mask = 1;
+        CHECK(!hlsl_matrix_lift_prepare(&fixture.context, prefix, &plan));
+        CHECK(!plan.expression && hlsl_instruction_owners_empty(&plan.instruction_owners));
+        release(&fixture); free(instructions);
+    }
+    return true;
+}
+
 int main(void) {
-    return check_graph_and_metadata() && check_fail_closed_mutations() &&
+    return check_matrix_owner_word_boundaries() && check_graph_and_metadata() && check_fail_closed_mutations() &&
            check_dataflow_ownership() && check_invalid_metadata_context() &&
            check_single_matrix_graph() && check_single_matrix_negatives() &&
            check_projection_graph() && check_projection_negatives() ? 0 : 1;

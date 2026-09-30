@@ -13,7 +13,9 @@
  * existing CFG/SSA supplies definition ownership. A private candidate route
  * admits one typed UINT4 texture load/store expression with original metadata.
  * Signed/float domains, other memory families and control flow remain unavailable. */
-enum { COMPUTE_SOURCE_INSTRUCTION_LIMIT = HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT };
+/* This stage retains its own bound; generic V/F capacity grants no wider
+ * compute admission or effect-planning authority. */
+enum { COMPUTE_SOURCE_INSTRUCTION_LIMIT = 64 };
 
 typedef struct {
     DXBCOperandType type;

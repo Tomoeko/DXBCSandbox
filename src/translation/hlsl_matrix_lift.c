@@ -223,9 +223,14 @@ static bool prepare_nested_matrix(HLSLEmitterContext *ctx, int start,
         return false;
     }
     *out_plan = (HLSLMatrixLiftPlan){.start_instruction = start, .end_instruction = start + 7,
-        .instruction_owners = UINT64_C(255) << start,
         .result_components = 4, .claimed_instruction_count = 8, .expression = clip,
         .world_expression = world};
+    for (int owner = out_plan->start_instruction; owner <= out_plan->end_instruction; ++owner) {
+        if (!hlsl_instruction_owners_add(&out_plan->instruction_owners, owner)) {
+            hlsl_matrix_lift_plan_free(out_plan);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -394,8 +399,13 @@ static bool prepare_single_matrix(HLSLEmitterContext *ctx, int start,
         }
     }
     *out_plan = (HLSLMatrixLiftPlan){.start_instruction = start, .end_instruction = final,
-        .instruction_owners = ((UINT64_C(1) << width) - 1u) << start,
         .result_components = width, .claimed_instruction_count = width, .expression = result};
+    for (int owner = out_plan->start_instruction; owner <= out_plan->end_instruction; ++owner) {
+        if (!hlsl_instruction_owners_add(&out_plan->instruction_owners, owner)) {
+            hlsl_matrix_lift_plan_free(out_plan);
+            return false;
+        }
+    }
     return true;
 }
 

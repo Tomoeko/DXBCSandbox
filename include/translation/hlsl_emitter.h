@@ -16,8 +16,8 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 12U
-#define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 64
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 14U
+#define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
     HLSL_EXPRESSION_ORIGIN_UNMAPPED = 0,
@@ -90,12 +90,12 @@ typedef enum HLSLEmitMode {
      * with higher-level Unity/source constructs to improve readability. */
     HLSL_EMIT_MODE_READABLE = 1,
 
-    /* Verification-eligible candidate, never a certificate by itself. v11
-     * retains v1's at most 64 SM4/5 vertex/pixel instructions using full
+    /* Verification-eligible candidate, never a certificate by itself. v14
+     * admits at most 256 SM4/5 vertex/pixel instructions using full
      * float4 input/output/temp lanes, MOV/ADD/MUL and final RET/NOP. It also
      * admits structured IF/ELSE/ENDIF with scalar input/temp bit conditions,
      * proved single-entry joins, and explicit complete float4 phi assignments
-     * (at most 128 named values). Output writes must dominate the final RET.
+     * (at most 512 named values). Output writes must dominate the final RET.
      * A single counted loop also admits an unsigned immediate initialization,
      * UGE/BREAKC_NZ against immutable input bits, a unit IADD latch, and complete
      * float4 carried values. Control SSA must have no other uses. Nested loops,

@@ -116,3 +116,13 @@ sampling. Its five passes and coordinate/parameter keyword retain twenty
 vertex/fragment stage rows. The earlier offset and precision controls remain in
 their original captures. Standalone stage observations do not establish complete
 ShaderLab generated-domain acceptance, declaration authority, or native behavior.
+
+The two `long_arithmetic` fixtures retain eighty unrolled vector iterations with
+lane-specific constants, a changed-constant keyword, and an independently renamed
+interface. The separate controlled release contains eight vertex/fragment rows;
+each fragment retains 161 operations: one multiply, seventy-nine multiply-adds,
+eighty fractional-part operations, and a return. No loops, constant buffers,
+resources, or precision modifiers survive in this captured family. This tests
+instruction ownership above sixty-four operations. The authored references remain
+evaluation inputs; stage cleanliness, complete generated-domain equality, whole
+ShaderLab quality, and native execution require their own evidence.

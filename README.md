@@ -100,6 +100,9 @@ Source quality is a separate semantic/provenance result. The optional
 semantic projections, missing coverage and emission failures. Complete audited
 entry points, helpers and includes with zero residuals are required for `clean`;
 compilation and exact bytecode alone do not satisfy that gate.
+The generic expression planner admits up to 256 instructions, retaining source
+ownership across the complete graph. Geometry and compute keep their narrower
+stage bounds. Larger or unsupported graphs report an explicit analysis limit.
 Extraction's JSON lift report carries independent quality counters and reasons
 for each emitted stage entry. The enclosing ShaderLab's complete source quality
 remains unavailable until its state, routing and external dependencies are covered.

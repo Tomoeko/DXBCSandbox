@@ -12,6 +12,46 @@
  * There is no source parser, algebraic simplifier, or compiler oracle here. */
 enum { EXPRESSION_INSTRUCTION_LIMIT = HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT };
 
+enum { INLINE_EXPRESSION_DEPTH_LIMIT = 12, INLINE_EXPRESSION_NODE_LIMIT = 32 };
+
+/* Keep an owned logical value at its original evaluation site when inlining
+ * would hide it in a very deep expression. This changes no operation tree,
+ * type, order or effects; the existing compiler transaction still decides
+ * whether the additional typed local reproduces the target container. */
+static bool expression_exceeds_inline_limit(const ASTExpr *expression,
+                                            unsigned depth, unsigned *nodes) {
+    if (!expression || depth > INLINE_EXPRESSION_DEPTH_LIMIT ||
+        ++*nodes > INLINE_EXPRESSION_NODE_LIMIT) return true;
+    switch (expression->kind) {
+    case AST_EXPR_LITERAL:
+    case AST_EXPR_VAR:
+    case AST_EXPR_EMITTER_OPERAND:
+        return false;
+    case AST_EXPR_UNARY:
+        return expression_exceeds_inline_limit(expression->u.unary.sub, depth + 1, nodes);
+    case AST_EXPR_BINARY:
+        return expression_exceeds_inline_limit(expression->u.binary.left, depth + 1, nodes) ||
+               expression_exceeds_inline_limit(expression->u.binary.right, depth + 1, nodes);
+    case AST_EXPR_TERNARY:
+        return expression_exceeds_inline_limit(expression->u.ternary.cond, depth + 1, nodes) ||
+               expression_exceeds_inline_limit(expression->u.ternary.true_expr, depth + 1, nodes) ||
+               expression_exceeds_inline_limit(expression->u.ternary.false_expr, depth + 1, nodes);
+    case AST_EXPR_SWIZZLE:
+        return expression_exceeds_inline_limit(expression->u.swizzle.sub, depth + 1, nodes);
+    case AST_EXPR_CALL:
+        for (int argument = 0; argument < expression->u.call.arg_count; ++argument)
+            if (expression_exceeds_inline_limit(expression->u.call.args[argument], depth + 1, nodes))
+                return true;
+        return false;
+    case AST_EXPR_CAST:
+        return expression_exceeds_inline_limit(expression->u.cast.sub, depth + 1, nodes);
+    case AST_EXPR_BITCAST:
+        return expression_exceeds_inline_limit(expression->u.bitcast.sub, depth + 1, nodes);
+    default:
+        return true;
+    }
+}
+
 static bool reject(HLSLEmitterContext *ctx, int instruction, HLSLEmitReason reason) {
     hlsl_emit_fail_instruction(ctx, HLSL_EMIT_STATUS_UNSUPPORTED, reason, instruction, -1);
     return false;
@@ -492,8 +532,8 @@ static ASTExpr *vector_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *s
 }
 
 static ASTExpr *source_expression_unmodified(HLSLEmitterContext *ctx, int instruction, int operand,
-                                  const unsigned *uses, ASTExpr **pending, uint64_t *pending_owners,
-                                  uint64_t *owners, const DXBCOperand *source,
+                                  const unsigned *uses, ASTExpr **pending, HLSLInstructionOwners *pending_owners,
+                                  HLSLInstructionOwners *owners, const DXBCOperand *source,
                                   const uint8_t *logical_widths) {
     const uint8_t mask = source_lanes(ctx, instruction, operand);
     if (!mask) return NULL;
@@ -505,8 +545,8 @@ static ASTExpr *source_expression_unmodified(HLSLEmitterContext *ctx, int instru
         if (uses[definition] == 1) {
             value = pending[definition];
             pending[definition] = NULL;
-            *owners |= pending_owners[definition];
-            pending_owners[definition] = 0;
+            hlsl_instruction_owners_union(owners, &pending_owners[definition]);
+            hlsl_instruction_owners_clear(&pending_owners[definition]);
         } else {
             char name[48];
             if (!value_name(ctx, definition, name))
@@ -567,8 +607,8 @@ static ASTExpr *source_expression_unmodified(HLSLEmitterContext *ctx, int instru
 }
 
 static ASTExpr *source_expression(HLSLEmitterContext *ctx, int instruction, int operand,
-                                  const unsigned *uses, ASTExpr **pending, uint64_t *pending_owners,
-                                  uint64_t *owners, const uint8_t *logical_widths) {
+                                  const unsigned *uses, ASTExpr **pending, HLSLInstructionOwners *pending_owners,
+                                  HLSLInstructionOwners *owners, const uint8_t *logical_widths) {
     const DXBCOperand *original = &ctx->program->instructions[instruction].operands[operand];
     DXBCOperand unmodified = *original;
     unmodified.has_abs = unmodified.has_neg = false;
@@ -627,7 +667,7 @@ ASTExpr *hlsl_float4_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *sou
 typedef struct {
     HLSLExpressionSourceMap *map;
     ASTExpr **roots;
-    uint64_t owners;
+    HLSLInstructionOwners owners;
     bool function;
 } ExpressionSpanContext;
 
@@ -635,7 +675,7 @@ static bool record_expression_span(void *context, const ASTExpr *expression, siz
                                    size_t end) {
     ExpressionSpanContext *trace = context;
     for (size_t index = 0; index < trace->map->count; ++index) {
-        if (!(trace->owners & (UINT64_C(1) << index)) || trace->roots[index] != expression)
+        if (!hlsl_instruction_owners_contains(&trace->owners, (int)index) || trace->roots[index] != expression)
             continue;
         HLSLExpressionOrigin *origin = &trace->map->origins[index];
         if (origin->kind != HLSL_EXPRESSION_ORIGIN_UNMAPPED || begin >= end)
@@ -650,7 +690,7 @@ static bool record_expression_span(void *context, const ASTExpr *expression, siz
 
 static bool finish_expression_origins(ExpressionSpanContext *trace, bool dead) {
     for (int index = 0; index < EXPRESSION_INSTRUCTION_LIMIT; ++index) {
-        if (!(trace->owners & (UINT64_C(1) << index)))
+        if (!hlsl_instruction_owners_contains(&trace->owners, (int)index))
             continue;
         if (trace->map) {
             HLSLExpressionOrigin *origin = &trace->map->origins[index];
@@ -835,7 +875,7 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
     ASTExpr *pending[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     ASTExpr *roots[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     uint8_t logical_widths[EXPRESSION_INSTRUCTION_LIMIT] = {0};
-    uint64_t pending_owners[EXPRESSION_INSTRUCTION_LIMIT] = {0};
+    HLSLInstructionOwners pending_owners[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     HLSLMatrixLiftPlan matrix_plans[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     int matrix_starts[EXPRESSION_INSTRUCTION_LIMIT];
     for (int index = 0; index < EXPRESSION_INSTRUCTION_LIMIT; ++index)
@@ -901,7 +941,8 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
         if (index + 1 < ctx->program->instruction_count &&
             ctx->float4_functions.group[index + 1] >= 0)
             continue; /* The following call owns this single-use producer. */
-        uint64_t owners = UINT64_C(1) << index;
+        HLSLInstructionOwners owners = {0};
+        if (!hlsl_instruction_owners_add(&owners, index)) goto cleanup;
         const int group = ctx->float4_functions.group[index];
         ASTExpr *expression = NULL;
         if (matrix) {
@@ -912,7 +953,7 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
                 roots[claimed] = matrix->world_expression && claimed < matrix->start_instruction + 4
                                      ? matrix->world_expression : expression;
         } else if (group >= 0) {
-            owners |= UINT64_C(1) << (index - 1);
+            if (!hlsl_instruction_owners_add(&owners, index - 1)) goto cleanup;
             expression = hlsl_float4_function_call(ctx, index);
             roots[index - 1] = expression;
             for (int operation = 0; map && operation < 2; ++operation) {
@@ -952,6 +993,10 @@ bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
         ExpressionSpanContext trace = {
             .map = map, .roots = roots, .owners = owners, .function = group >= 0};
         const DXBCOperand *destination = &inst->operands[0];
+        unsigned inline_nodes = 0;
+        if (destination->type == OPERAND_TYPE_TEMP && uses[index] == 1 &&
+            expression_exceeds_inline_limit(expression, 1, &inline_nodes))
+            uses[index] = 2; /* Later consumers use this emitted logical value. */
         if (destination->type == OPERAND_TYPE_TEMP && uses[index] <= 1) {
             if (uses[index]) {
                 pending[index] = expression;

@@ -5,6 +5,7 @@
 
 #include "translation/hlsl_ast.h"
 #include "translation/usil.h"
+#include "hlsl_instruction_owners.h"
 
 struct HLSLEmitterContext;
 
@@ -26,7 +27,7 @@ typedef struct {
 typedef struct {
     int start_instruction;
     int end_instruction;
-    uint64_t instruction_owners;
+    HLSLInstructionOwners instruction_owners;
     uint8_t result_components;
     uint8_t claimed_instruction_count;
     /* Owns the entire tree. world_expression is borrowed from this tree.

@@ -145,7 +145,8 @@ bool hlsl_high_level_geometry_interface_supported(const USILProgram *program, HL
        program->geometry.output_topology != DXBC_OUTPUT_TOPOLOGY_TRIANGLE_STRIP) ||
       program->input_count < 1 || program->output_count < 1 ||
       program->instruction_count < 2 ||
-      program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+      /* Geometry statement coverage currently uses one 64-bit word. */
+      program->instruction_count > 64 ||
       program->instruction_alloc < program->instruction_count || !program->instructions ||
       program->texture_count || program->sampler_count || program->uav_count ||
       program->icb_value_count || program->indexable_temp_count || program->index_range_count ||
