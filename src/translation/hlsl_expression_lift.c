@@ -763,6 +763,72 @@ bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
     return validate_float_expressions(ctx, uses, true, NULL, NULL);
 }
 
+bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx) {
+    if (!ctx || !hlsl_packed_output_candidate(ctx->program) ||
+        !ctx->cfg.blocks || ctx->cfg.block_count != 2 ||
+        !ctx->cfg.instruction_block || !ctx->ssa.operand_ssa_vars) return false;
+    /* RET is a boundary and owns its own established CFG block. The complete
+     * pure arithmetic prefix falls through exactly once to that terminal. */
+    const int returned = ctx->program->instruction_count - 1;
+    const HLSLBasicBlock *body = &ctx->cfg.blocks[0], *tail = &ctx->cfg.blocks[1];
+    if (ctx->cfg.instruction_count != ctx->program->instruction_count ||
+        body->first_instruction != 0 || body->last_instruction != returned - 1 ||
+        body->has_ambiguous_flow || body->may_exit || body->successor_count != 1 ||
+        !body->successors || body->successors[0] != 1 || body->predecessor_count ||
+        tail->first_instruction != returned || tail->last_instruction != returned ||
+        tail->has_ambiguous_flow || !tail->may_exit || tail->successor_count ||
+        tail->predecessor_count != 1 || !tail->predecessors || tail->predecessors[0] != 0) return false;
+    for (int instruction = 0; instruction <= returned; ++instruction)
+        if (ctx->cfg.instruction_block[instruction] != (instruction == returned ? 1 : 0)) return false;
+    /* Preparation repeats this proof before interface names exist. Bind every
+     * actual source demand to the shared signature projection independently
+     * of name-dependent formatting in the normal instruction validator. */
+    for (int instruction = 0; instruction < returned; ++instruction) {
+        const USILInstruction *owner = &ctx->program->instructions[instruction];
+        for (int operand = 1; operand < owner->operand_count; ++operand) {
+            if (owner->operands[operand].type != OPERAND_TYPE_INPUT) continue;
+            USILOperandUseInfo use;
+            HLSLNaturalInputProjection projection;
+            if (!usil_instruction_operand_use(ctx->program, owner, operand, &use) ||
+                use.use != USIL_OPERAND_USE_SOURCE ||
+                !hlsl_natural_input_projection(ctx->program, &owner->operands[operand],
+                    use.source_lane_mask, &projection)) return false;
+        }
+    }
+    HLSLEmitterContext *scratch = malloc(sizeof(*scratch));
+    if (!scratch) return false;
+    *scratch = *ctx;
+    StringBuilder output;
+    sb_init(&output);
+    HLSLEmitDiagnostic diagnostic;
+    hlsl_emit_diagnostic_init(&diagnostic);
+    scratch->sb = &output;
+    scratch->diagnostic = &diagnostic;
+    /* Matrix proof consumes the same checked natural names as live emission.
+     * All arrays below belong to this by-value context copy; naming neither
+     * writes source nor changes any borrowed analysis/layout collection. */
+    memset(scratch->high_level_input_names, 0, sizeof(scratch->high_level_input_names));
+    memset(scratch->high_level_output_names, 0, sizeof(scratch->high_level_output_names));
+    memset(scratch->high_level_output_type, 0, sizeof(scratch->high_level_output_type));
+    memset(scratch->high_level_output_variable, 0, sizeof(scratch->high_level_output_variable));
+    scratch->high_level_interface = true;
+    scratch->high_level_direct_return = false;
+    scratch->high_level_packed_outputs = true;
+    scratch->high_level_packed_inputs = false;
+    unsigned uses[EXPRESSION_INSTRUCTION_LIMIT] = {0};
+    HLSLMatrixLiftPlan *matrices = calloc(EXPRESSION_INSTRUCTION_LIMIT, sizeof(*matrices));
+    const bool supported = matrices && hlsl_prepare_packed_output_preflight_names(scratch) &&
+        validate_float_expressions(scratch, uses, false, matrices, NULL);
+    if (matrices) {
+        for (int index = 0; index < EXPRESSION_INSTRUCTION_LIMIT; ++index)
+            hlsl_matrix_lift_plan_free(&matrices[index]);
+        free(matrices);
+    }
+    sb_free(&output);
+    free(scratch);
+    return supported;
+}
+
 /* Shared by the existing straight-line source builder and the new natural
  * arithmetic boundary. ABS precedes NEG; raw literal children stay intact.
  * These are FLOAT32 source operations, not extra destination writes. */

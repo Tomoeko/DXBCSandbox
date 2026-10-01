@@ -2012,11 +2012,18 @@ static void append_hlsl_diagnostic_json(
     sb_append_char(output, '}');
 }
 
+static bool candidate_failure_has_diagnostic(
+    const ShaderBatchRecordResult* result) {
+    return result &&
+        (result->failure == SHADER_BATCH_FAILURE_CANDIDATE_EMISSION ||
+         (result->failure == SHADER_BATCH_FAILURE_CANDIDATE_SELECTION &&
+          result->candidate_diagnostic.status != SHADERLAB_CANDIDATE_OK));
+}
+
 static void append_candidate_diagnostic_json(
     StringBuilder* output, const ShaderBatchRecordResult* result) {
     sb_append(output, ",\"emission_diagnostic\":");
-    if (!result ||
-        result->failure != SHADER_BATCH_FAILURE_CANDIDATE_EMISSION) {
+    if (!candidate_failure_has_diagnostic(result)) {
         sb_append(output, "null");
         return;
     }
@@ -2064,6 +2071,17 @@ static void append_candidate_diagnostic_json(
                                    diagnostic->stage.stage_tuple_status));
         sb_append(output, ",\"hlsl\":");
         append_hlsl_diagnostic_json(output, &diagnostic->stage);
+        if (diagnostic->stage.has_global_declaration_diagnostic) {
+            const HLSLGlobalDeclarationDiagnostic *declarations =
+                &diagnostic->stage.global_declaration;
+            sb_append(output, ",\"global_declarations\":{\"status\":");
+            sb_json_string(output, hlsl_global_declaration_status_name(declarations->status));
+            append_optional_index_json(output, "subprogram_index", declarations->subprogram_index);
+            append_optional_index_json(output, "conflicting_subprogram_index",
+                                       declarations->conflicting_subprogram_index);
+            append_optional_index_json(output, "field_index", declarations->field_index);
+            sb_append_char(output, '}');
+        }
     } else if (diagnostic->status ==
                SHADERLAB_CANDIDATE_PASS_TARGET_FAILED) {
         sb_append(output, ",\"target_status\":");
@@ -2091,8 +2109,7 @@ static void append_candidate_diagnostic_json(
 
 static void append_candidate_diagnostic_table(
     StringBuilder* output, const ShaderBatchRecordResult* result) {
-    if (!result ||
-        result->failure != SHADER_BATCH_FAILURE_CANDIDATE_EMISSION) {
+    if (!candidate_failure_has_diagnostic(result)) {
         return;
     }
     const ShaderLabCandidateDiagnostic* diagnostic =
@@ -2115,6 +2132,14 @@ static void append_candidate_diagnostic_table(
         if (diagnostic->stage.conflicting_subprogram_index >= 0)
             sb_appendf(output, " conflict=%d",
                        diagnostic->stage.conflicting_subprogram_index);
+        if (diagnostic->stage.has_global_declaration_diagnostic) {
+            const HLSLGlobalDeclarationDiagnostic *declarations =
+                &diagnostic->stage.global_declaration;
+            sb_appendf(output, " declarations=%s",
+                       hlsl_global_declaration_status_name(declarations->status));
+            if (declarations->field_index >= 0)
+                sb_appendf(output, " field=%d", declarations->field_index);
+        }
         if (diagnostic->stage.status ==
             SHADERLAB_STAGE_HLSL_EMISSION_FAILED) {
             const HLSLEmitDiagnostic* hlsl = &diagnostic->stage.hlsl;

@@ -194,7 +194,7 @@ static bool check_source_only_reports(const CliShaderLabLift *lift,
     catalog.records = records; catalog.record_count = 2;
     catalog.stats.shader_objects = catalog.stats.ready_shaders = 2;
     ShaderBatchRecordResult outputs[2] = {*publication, {0}};
-    outputs[0].output_path = (char *)"output/PortableCandidate.shader";
+    outputs[0].output_path = generated ? (char *)"output/PortableCandidate.shader" : NULL;
     outputs[1].status = SHADER_BATCH_FAILED;
     outputs[1].failure = SHADER_BATCH_FAILURE_CATALOG_NOT_READY;
     ShaderBatchResult batch = {.catalog_authority = &catalog, .records = outputs,
@@ -212,6 +212,12 @@ static bool check_source_only_reports(const CliShaderLabLift *lift,
     CHECK(strstr(report.buf, "\"published_local_domain_verified\":0") &&
           strstr(report.buf, "\"published_high_level_source\":false"));
     CHECK((strstr(report.buf, "\"published_high_level_source\":true") != NULL) == generated);
+    if (!generated) {
+        CHECK(strstr(report.buf, "\"emission_diagnostic\":{\"status\":\"stage-failed\"") &&
+              strstr(report.buf, "\"stage_index\":1,\"subprogram_index\":3") &&
+              strstr(report.buf, "\"hlsl\":{\"status\":") &&
+              count_text(report.buf, "\"emission_diagnostic\":null") == 1);
+    }
     CHECK(strstr(report.buf, "\"d3d11\":\"not-run\"") &&
           strstr(report.buf, "\"variant_selection\":\"not-run\""));
     CHECK(strstr(report.buf, "\"complete\":false") &&
@@ -227,6 +233,10 @@ static bool check_source_only_reports(const CliShaderLabLift *lift,
                                         "unavailable=1 not-run=1 published-generated=0 published-local-domain-verified=0"));
     CHECK(strstr(report.buf, "checks were not run") &&
           !strstr(report.buf, "complete local D3D11 program domains"));
+    if (!generated) {
+        CHECK(strstr(report.buf, ": stage-failed/") &&
+              strstr(report.buf, " stage=1 subprogram=3 hlsl="));
+    }
     outputs[0].published_shader_digest[0] ^= 1;
     sb_clear(&report);
     CHECK(render_extract_json(&catalog, selected, &batch, NULL, NULL,
@@ -403,14 +413,60 @@ static bool test_selected_row_failure(void) {
           !cli_shaderlab_lift_output_verified(lift, 0, &publication));
     publication.status = SHADER_BATCH_FAILED;
     publication.failure = SHADER_BATCH_FAILURE_CANDIDATE_SELECTION;
+    publication.candidate_diagnostic = diagnostic;
     publication.publication_authorized = false;
     CHECK(check_source_only_reports(lift, &publication, false));
+    /* A selector can fail without returning a diagnostic. Do not report the
+     * zero-initialized status as successful candidate emission. */
+    publication.candidate_diagnostic = (ShaderLabCandidateDiagnostic){0};
+    sb_clear(&json);
+    append_candidate_diagnostic_json(&json, &publication);
+    CHECK(!strcmp(json.buf, ",\"emission_diagnostic\":null"));
+    sb_clear(&json);
+    append_candidate_diagnostic_table(&json, &publication);
+    CHECK(!json.len);
     sb_append(&source, "caller-owned destination");
     CHECK(!batch_options.select_candidate(batch_options.candidate_context, &input, &source, &diagnostic));
     CHECK(!strcmp(source.buf, "caller-owned destination"));
     CHECK(append_record(lift, 0, &json) && strstr(json.buf, "\"generated\":false"));
     fixture_dispose(&fixture); cli_shaderlab_lift_free(lift);
     sb_free(&low); sb_free(&source); sb_free(&json);
+    return true;
+}
+
+static bool test_global_declaration_failure_reports(void) {
+    Fixture fixture; CHECK(fixture_init(&fixture));
+    SerializedVariable field = {"_Enabled", {0, 2, 0, 1, 0, 0}};
+    SerializedConstantBuffer buffer = {.name = "$Globals", .size = 64,
+        .role = SERIALIZED_CBUFFER_NAMED, .var_count = 1, .variables = &field};
+    SerializedResourceParam binding = {.name = "$Globals",
+        .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER};
+    fixture.pass.common_parameters[1] = (SerializedProgramParameters){
+        .cb_count = 1, .constant_buffers = &buffer, .res_count = 1, .resources = &binding};
+    const CliShaderLabLiftOptions options = {.enabled = true};
+    CliShaderLabLift *lift = cli_shaderlab_lift_create(&options, 1); CHECK(lift);
+    ShaderBatchOptions batch_options; shader_batch_options_default(&batch_options);
+    cli_shaderlab_lift_attach(lift, &batch_options);
+    ShaderBatchCandidateInput input = candidate_input(&fixture, 0);
+    StringBuilder source, report; sb_init(&source); sb_init(&report);
+    ShaderLabCandidateDiagnostic diagnostic;
+    CHECK(!batch_options.select_candidate(batch_options.candidate_context, &input, &source, &diagnostic));
+    CHECK(!source.len && diagnostic.status == SHADERLAB_CANDIDATE_STAGE_FAILED &&
+          diagnostic.stage.stage_index == 1 && diagnostic.stage.subprogram_index == 0 &&
+          diagnostic.stage.has_global_declaration_diagnostic &&
+          diagnostic.stage.global_declaration.status == HLSL_GLOBAL_DECLARATIONS_FIELD_CONFLICT &&
+          diagnostic.stage.global_declaration.field_index == -1);
+    const ShaderBatchRecordResult failed = {.status = SHADER_BATCH_FAILED,
+        .failure = SHADER_BATCH_FAILURE_CANDIDATE_SELECTION, .candidate_diagnostic = diagnostic};
+    append_candidate_diagnostic_json(&report, &failed);
+    CHECK(strstr(report.buf, "\"global_declarations\":{\"status\":\"field-conflict\"") &&
+          strstr(report.buf, "\"field_index\":null}") && strstr(report.buf, "\"hlsl\":null"));
+    sb_clear(&report);
+    append_candidate_diagnostic_table(&report, &failed);
+    CHECK(strstr(report.buf, " stage=1 subprogram=0") &&
+          strstr(report.buf, " declarations=field-conflict") && !strstr(report.buf, " field="));
+    fixture_dispose(&fixture); cli_shaderlab_lift_free(lift);
+    sb_free(&source); sb_free(&report);
     return true;
 }
 
@@ -459,7 +515,8 @@ static bool test_argument_boundaries(void) {
 
 int main(void) {
     if (!test_argument_boundaries() || !test_source_only_generation() ||
-        !test_selected_row_failure() || !test_inventory_scope_is_optional()) return 1;
+        !test_selected_row_failure() || !test_global_declaration_failure_reports() ||
+        !test_inventory_scope_is_optional()) return 1;
     puts("Profile-free ShaderLab candidates retain complete source rows and unverified evidence.");
     return 0;
 }

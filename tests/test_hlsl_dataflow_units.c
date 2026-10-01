@@ -3,6 +3,7 @@
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_copy_lift.h"
 #include "translation/hlsl_lift_transaction.h"
+#include "translation/hlsl_matrix_lift.h"
 #include "dxbc/dxbc_hash.h"
 #include "dxbc/dxbc_document.h"
 #include "dxbc/dxbc_stage_contract.h"
@@ -5991,6 +5992,822 @@ static bool check_unity_uv_emission(void) {
     return true;
 }
 
+typedef struct {
+    NaturalIfFixture decoded;
+    int xy_field, zw_field, xy_writer, zw_writer;
+    const SerializedProgramParameters *parameters, *common_parameters;
+} PackedOutputFixture;
+
+/* The independent output rows share a register, but their RW masks describe
+ * the complementary unwritten lanes. All authority comes from the normal
+ * document/signature/declaration/USIL decoder chain above. */
+static bool packed_output_fixture_layout(PackedOutputFixture *fixture, unsigned arithmetic,
+    bool reversed, bool union_declaration, unsigned boundary, unsigned cbuffer) {
+    memset(fixture, 0, sizeof(*fixture));
+    dxbc_document_init(&fixture->decoded.document);
+    dxbc_stage_contract_init(&fixture->decoded.contract);
+    CHECK(arithmetic < 4 && boundary < 3 && cbuffer < 3 && (!boundary || cbuffer != 2));
+    uint32_t words[96]; size_t count = 0;
+#define PACKED_WORD(value) do { CHECK(count < sizeof(words) / sizeof(words[0])); words[count++] = (value); } while (0)
+#define PACKED_INST(opcode, length) ((uint32_t)(opcode) | (uint32_t)(length) << 24u)
+    PACKED_WORD(PACKED_INST(106, 1) | UINT32_C(1) << 11u);
+    for (unsigned input = 0; input < 3; ++input) {
+        PACKED_WORD(PACKED_INST(95, 3));
+        PACKED_WORD(UINT32_C(0x00101002) | (input ? UINT32_C(3) : UINT32_C(15)) << 4u);
+        PACKED_WORD(input);
+    }
+    PACKED_WORD(PACKED_INST(103, 4)); PACKED_WORD(UINT32_C(0x001020f2)); PACKED_WORD(0); PACKED_WORD(1);
+    for (unsigned row = 0; row < (union_declaration ? 1u : 2u); ++row) {
+        const uint8_t mask = union_declaration ? 15 : ((row != 0) == reversed ? 3 : 12);
+        PACKED_WORD(PACKED_INST(101, 3));
+        PACKED_WORD(UINT32_C(0x00102002) | (uint32_t)mask << 4u); PACKED_WORD(1);
+    }
+    if (cbuffer) {
+        PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(0); PACKED_WORD(cbuffer == 2 ? 4 : 1);
+    }
+    if (cbuffer == 2) {
+        PACKED_WORD(PACKED_INST(104, 2)); PACKED_WORD(1);
+        const uint8_t components[4] = {1, 0, 2, 3};
+        for (unsigned row = 0; row < 4; ++row) {
+            const uint8_t selection[4] = {components[row], components[row], components[row], components[row]};
+            PACKED_WORD(PACKED_INST(row ? 50 : 56, row ? 10 : 8));
+            PACKED_WORD(row == 3 ? UINT32_C(0x001020f2) : UINT32_C(0x001000f2)); PACKED_WORD(0);
+            if (row) {
+                PACKED_WORD(UINT32_C(0x00208e46)); PACKED_WORD(0); PACKED_WORD(components[row]);
+                PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, selection)); PACKED_WORD(0);
+                PACKED_WORD(UINT32_C(0x00100e46)); PACKED_WORD(0);
+            } else {
+                PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, selection)); PACKED_WORD(0);
+                PACKED_WORD(UINT32_C(0x00208e46)); PACKED_WORD(0); PACKED_WORD(components[row]);
+            }
+        }
+    } else {
+        PACKED_WORD(PACKED_INST(54, 5)); PACKED_WORD(boundary == 1 ? UINT32_C(0x00102072) : UINT32_C(0x001020f2)); PACKED_WORD(0);
+        PACKED_WORD(UINT32_C(0x00101e46)); PACKED_WORD(0);
+    }
+    if (boundary == 1) {
+        PACKED_WORD(PACKED_INST(54, 5)); PACKED_WORD(UINT32_C(0x00102082)); PACKED_WORD(0);
+        PACKED_WORD(UINT32_C(0x0010103a)); PACKED_WORD(0);
+    }
+    const USILOpcode xy[] = {USIL_OP_MUL, USIL_OP_ADD, USIL_OP_MAD, USIL_OP_MOV};
+    const USILOpcode zw[] = {USIL_OP_ADD, USIL_OP_MUL, USIL_OP_MUL, USIL_OP_MAD};
+    for (unsigned write = 0; write < 2; ++write) {
+        if (boundary == 2) {
+            PACKED_WORD(PACKED_INST(56, 7)); PACKED_WORD(UINT32_C(0x001020f2)); PACKED_WORD(1);
+            PACKED_WORD(UINT32_C(0x00101e46)); PACKED_WORD(0);
+            PACKED_WORD(UINT32_C(0x00004001)); PACKED_WORD(UINT32_C(0x3ec00000));
+            break;
+        }
+        const bool is_xy = (write != 0) == reversed;
+        const uint8_t mask = is_xy ? 3 : 12;
+        const uint8_t selection[4] = {0, is_xy ? 1 : 0, 0, is_xy ? 0 : 1};
+        const USILOpcode opcode = is_xy ? xy[arithmetic] : zw[arithmetic];
+        const uint32_t raw_opcode = opcode == USIL_OP_MOV ? 54 : natural_arithmetic_raw_opcode(opcode);
+        const bool cbuffer_source = cbuffer == 1 && is_xy;
+        const unsigned length = (opcode == USIL_OP_MOV ? 5u : opcode == USIL_OP_MAD ? 9u : 7u) + (cbuffer_source ? 1u : 0u);
+        PACKED_WORD(PACKED_INST(raw_opcode, length));
+        PACKED_WORD(UINT32_C(0x00102002) | (uint32_t)mask << 4u); PACKED_WORD(1);
+        if (cbuffer_source) {
+            PACKED_WORD(UINT32_C(0x00208046)); PACKED_WORD(0); PACKED_WORD(0);
+        } else {
+            PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, selection)); PACKED_WORD(is_xy ? 1 : 2);
+        }
+        if (opcode != USIL_OP_MOV) {
+            PACKED_WORD(UINT32_C(0x00004001));
+            PACKED_WORD(opcode == USIL_OP_MUL ? UINT32_C(0x3ec00000) : UINT32_C(0x3e800000));
+        }
+        if (opcode == USIL_OP_MAD) {
+            PACKED_WORD(UINT32_C(0x00004001)); PACKED_WORD(UINT32_C(0x3f000000));
+        }
+        if (is_xy) fixture->xy_writer = (int)write + (cbuffer == 2 ? 4 : 1) + (boundary == 1 ? 1 : 0);
+        else fixture->zw_writer = (int)write + (cbuffer == 2 ? 4 : 1) + (boundary == 1 ? 1 : 0);
+    }
+    PACKED_WORD(PACKED_INST(62, 1));
+#undef PACKED_INST
+#undef PACKED_WORD
+    DXBCSignatureElement inputs[3] = {
+        {.semantic_name = "POSITION", .component_type = 3, .mask = 15, .rw_mask = 15},
+        {.semantic_name = "VALUE", .register_id = 1, .component_type = 3, .mask = 3, .rw_mask = 3},
+        {.semantic_name = "DIRECTION", .register_id = 2, .component_type = 3, .mask = 3, .rw_mask = 3}};
+    DXBCSignatureElement outputs[3] = {
+        {.semantic_name = "SV_POSITION", .component_type = 3, .system_value = 1, .mask = 15},
+        {.semantic_name = "TEXCOORD", .register_id = 1, .component_type = 3},
+        {.semantic_name = "TEXCOORD", .register_id = 1, .component_type = 3}};
+    fixture->xy_field = reversed ? 2 : 1; fixture->zw_field = reversed ? 1 : 2;
+    outputs[fixture->xy_field].mask = 3; outputs[fixture->xy_field].rw_mask = 12;
+    outputs[fixture->zw_field].mask = 12; outputs[fixture->zw_field].rw_mask = 3;
+    outputs[fixture->zw_field].semantic_index = 1;
+    CHECK(natural_if_fixture_decode_words(&fixture->decoded, UINT32_C(0x00010050), words, count,
+        inputs, 3, outputs, 3));
+    USILProgram *program = &fixture->decoded.program;
+    CHECK(program->program_type == DXBC_PROGRAM_TYPE_VERTEX && program->instruction_count ==
+        (cbuffer == 2 ? 7 : boundary == 1 ? 5 : boundary == 2 ? 3 : 4) &&
+        program->temp_count == (cbuffer == 2 ? 1 : 0) && program->signature_declaration_count == (union_declaration ? 5 : 6) &&
+        program->instructions[0].source_instruction_index == (uint32_t)(program->signature_declaration_count + (cbuffer == 2 ? 3 : cbuffer ? 2 : 1)) &&
+        usil_signature_authority_is_valid(program));
+    CHECK(program->cbuffer_count == (cbuffer ? 1 : 0));
+    if (cbuffer) CHECK(program->cbuffers[0].reg_idx == 0 && program->cbuffers[0].size == (cbuffer == 2 ? 4 : 1) && !program->cbuffers[0].dynamic_indexed);
+    return true;
+}
+
+static bool packed_output_fixture(PackedOutputFixture *fixture, unsigned arithmetic,
+    bool reversed, bool union_declaration) {
+    return packed_output_fixture_layout(fixture, arithmetic, reversed, union_declaration, 0, false);
+}
+
+typedef struct {
+    USILProgram *program;
+    StringBuilder *source;
+    HLSLExpressionSourceMap *map;
+    size_t observations, first_config, first_header, last_header, reject_at, mutate_at, source_offset;
+    unsigned mutation;
+    int field, writer, xy_writer, zw_writer;
+    const HLSLEmitNames *names;
+    char *mutable_entry_name;
+    SerializedProgramParameters *mutable_parameters;
+    char *mutable_field_name;
+    uint8_t writers_seen;
+    size_t cbuffer_events;
+    uint8_t cbuffer_authority;
+    uint32_t cbuffer_field_bytes;
+    bool wrong_owner, mutated;
+} PackedOutputObservations;
+
+static bool observe_packed_output(void *context, const HLSLSourceQualityObservation *observation) {
+    PackedOutputObservations *ledger = context;
+    ++ledger->observations;
+    if (ledger->reject_at == ledger->observations) return false;
+    const HLSLSourceQualityFacts *facts = &observation->facts;
+    if (observation->stage != DXBC_PROGRAM_TYPE_VERTEX || observation->pass_index != 3 ||
+        observation->entry_point_index != 4 || observation->source_unit_id != 0) ledger->wrong_owner = true;
+    if (facts->cbuffer_declaration_kind != HLSL_SOURCE_CBUFFER_NONE) {
+        ++ledger->cbuffer_events;
+        if (observation->kind != HLSL_SOURCE_OBSERVATION_EMISSION || !facts->known || facts->instruction_index != -1 ||
+            facts->source_instruction_index != UINT32_MAX || facts->cbuffer_binding_register != 0 ||
+            (ledger->cbuffer_authority && ledger->cbuffer_authority != facts->cbuffer_declaration_authority))
+            ledger->wrong_owner = true;
+        ledger->cbuffer_authority = facts->cbuffer_declaration_authority;
+        if (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD) {
+            if (facts->cbuffer_field_index || facts->cbuffer_byte_offset) ledger->wrong_owner = true;
+            ledger->cbuffer_field_bytes = facts->cbuffer_byte_size;
+        }
+    }
+    if (observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION && facts->instruction_index < 0 &&
+        ledger->source && ledger->source->buf) {
+        if (!ledger->first_config && strstr(ledger->source->buf, "// Model:") && !strstr(ledger->source->buf, "float"))
+            ledger->first_config = ledger->observations;
+        if (!ledger->first_header && strstr(ledger->source->buf, "float")) ledger->first_header = ledger->observations;
+        const size_t suffix = sizeof(" output;\n") - 1u;
+        if (ledger->source->len >= suffix && !strcmp(ledger->source->buf + ledger->source->len - suffix, " output;\n"))
+            ledger->last_header = ledger->observations;
+    }
+    if (facts->instruction_index >= 0) {
+        if (facts->instruction_index >= ledger->program->instruction_count || facts->source_instruction_index !=
+            ledger->program->instructions[facts->instruction_index].source_instruction_index) ledger->wrong_owner = true;
+        else if ((observation->ast_kind == AST_EXPR_BINARY || observation->ast_kind == AST_EXPR_CALL) &&
+            facts->known && facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL &&
+            (facts->instruction_index == ledger->xy_writer || facts->instruction_index == ledger->zw_writer) &&
+            facts->lanes == usil_operand_destination_lane_mask(
+                &ledger->program->instructions[facts->instruction_index].operands[0])) {
+            if (facts->components != 2 || facts->logical_value_id != (uint64_t)(unsigned)facts->instruction_index)
+                ledger->wrong_owner = true;
+            ledger->writers_seen |= (uint8_t)(1u << (unsigned)facts->instruction_index);
+        }
+    }
+    if (!ledger->mutation || ledger->observations != ledger->mutate_at) return true;
+    USILProgram *program = ledger->program;
+    switch (ledger->mutation) {
+    case 1:
+        memset(program->outputs[ledger->field].semantic_name, 0, sizeof(program->outputs[ledger->field].semantic_name));
+        memcpy(program->outputs[ledger->field].semantic_name, "COORDVALUE", sizeof("COORDVALUE"));
+        program->outputs[ledger->field].semantic_name_length = sizeof("COORDVALUE") - 1u;
+        break;
+    case 2:
+        program->instructions[ledger->writer].operands[2].imm_values[0] = UINT32_C(0x3f400000);
+        program->instructions[ledger->writer].operands[2].immediate_words[0] = UINT32_C(0x3f400000);
+        break;
+    case 3: {
+        const USILInstruction old = program->instructions[1];
+        const uint32_t first_raw = old.source_instruction_index, second_raw = program->instructions[2].source_instruction_index;
+        program->instructions[1] = program->instructions[2]; program->instructions[2] = old;
+        program->instructions[1].source_instruction_index = first_raw; program->instructions[2].source_instruction_index = second_raw;
+        break;
+    }
+    case 4:
+        if (!ledger->source || ledger->source_offset >= ledger->source->len) return false;
+        ledger->source->buf[ledger->source_offset] ^= 1;
+        break;
+    case 5:
+        if (!ledger->source) return false;
+        sb_append(ledger->source, "static const float injectedValue = 1.0f;\n");
+        if (!sb_ok(ledger->source)) return false;
+        break;
+    case 6: {
+        if (!ledger->source) return false;
+        char *type = strstr(ledger->source->buf, "float");
+        if (!type) return false;
+        *type ^= 1;
+        break;
+    }
+    case 7:
+        if (!ledger->map || ledger->map->count < 3) return false;
+        ++ledger->map->origins[2].source_end;
+        break;
+    case 8: {
+        DXBCOperand *source = &program->instructions[ledger->writer].operands[1];
+        source->register_index = source->register_index == 1 ? 2 : 1;
+        source->index_values[0] = (uint32_t)source->register_index;
+        break;
+    }
+    case 9:
+        if (!ledger->mutable_entry_name || !ledger->mutable_entry_name[0]) return false;
+        ledger->mutable_entry_name[0] = ledger->mutable_entry_name[0] == 'e' ? 'E' : 'e';
+        break;
+    case 10:
+        if (!ledger->mutable_field_name) return false;
+        memcpy(ledger->mutable_field_name, "_AdjustedScale", sizeof("_AdjustedScale"));
+        break;
+    case 11:
+        if (!ledger->mutable_parameters || ledger->mutable_parameters->cb_count != 1 ||
+            ledger->mutable_parameters->constant_buffers[0].var_count != 1) return false;
+        ledger->mutable_parameters->constant_buffers[0].variables[0].layout[3] = 4;
+        break;
+    }
+    ledger->mutated = true;
+    return true;
+}
+
+static bool packed_output_emit(PackedOutputFixture *fixture, StringBuilder *source,
+    HLSLExpressionSourceMap *map, HLSLSourceQualityResult *quality, PackedOutputObservations *observer,
+    HLSLEmitDiagnostic *diagnostic) {
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    options.expression_source_map = map; options.source_quality = quality;
+    options.source_quality_pass_index = 3; options.source_quality_entry_point_index = 4;
+    if (observer) {
+        observer->program = &fixture->decoded.program; observer->source = source; observer->map = map;
+        observer->xy_writer = fixture->xy_writer; observer->zw_writer = fixture->zw_writer;
+        options.source_quality_observer = observe_packed_output; options.source_quality_observer_context = observer;
+    }
+    return hlsl_emit_with_options_diagnostic(&fixture->decoded.program, source, fixture->parameters, fixture->common_parameters,
+        observer ? observer->names : NULL, &options, diagnostic);
+}
+
+static bool packed_output_clean(const HLSLSourceQualityResult *quality) {
+    CHECK(quality->classification == HLSL_SOURCE_QUALITY_CLEAN && !quality->reasons &&
+        quality->counts.inspected_units == 1 && !quality->counts.incomplete_units &&
+        !quality->counts.residual_total && !quality->counts.unknown_provenance);
+    return true;
+}
+
+static bool packed_output_prepare_context(PackedOutputFixture *fixture, HLSLEmitterContext *ctx,
+    StringBuilder *scratch, HLSLEmitDiagnostic *diagnostic) {
+    CHECK(analyze(ctx, &fixture->decoded.program)); sb_init(scratch); hlsl_emit_diagnostic_init(diagnostic);
+    ctx->emit_mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE; ctx->sb = scratch; ctx->diagnostic = diagnostic;
+    ctx->entry_point_name = "main"; ctx->preferred_input_struct_name = "appdata"; ctx->preferred_output_struct_name = "v2f";
+    ctx->params = fixture->parameters; ctx->common_params = fixture->common_parameters;
+    if (ctx->program->cbuffer_count) CHECK(build_cbuffer_register_map(ctx) && build_cbuffer_emission_layouts(ctx));
+    const bool candidate = hlsl_packed_output_candidate(ctx->program);
+    const bool preflight = candidate && hlsl_packed_output_preflight(ctx);
+    if (!candidate || !preflight) fprintf(stderr,
+        "Packed output private setup: candidate=%d preflight=%d blocks=%d instructions=%d outputs=%d declarations=%d flags=%u status=%s reason=%s\n",
+        candidate, preflight, ctx->cfg.block_count, ctx->program->instruction_count, ctx->program->output_count,
+        ctx->program->signature_declaration_count, ctx->program->global_flags, hlsl_emit_status_name(diagnostic->status),
+        hlsl_emit_reason_name(diagnostic->reason));
+    CHECK(candidate && preflight);
+    ctx->high_level_packed_outputs = true; ctx->high_level_interface = true;
+    CHECK(hlsl_prepare_high_level_interface(ctx));
+    return true;
+}
+
+static bool packed_output_owned_roots(PackedOutputFixture *fixture, ASTExpr *roots[2], char names[2][96]) {
+    HLSLEmitterContext ctx; StringBuilder scratch; HLSLEmitDiagnostic diagnostic;
+    CHECK(packed_output_prepare_context(fixture, &ctx, &scratch, &diagnostic));
+    const int writers[2] = {fixture->xy_writer, fixture->zw_writer};
+    const int fields[2] = {fixture->xy_field, fixture->zw_field};
+    for (unsigned item = 0; item < 2; ++item) {
+        const int index = writers[item]; const USILInstruction *instruction = &ctx.program->instructions[index];
+        const uint8_t mask = item ? 12 : 3;
+        const DXBCInstruction *raw = NULL;
+        for (int token = 0; token < fixture->decoded.semantic.instruction_count; ++token) {
+            const DXBCInstruction *candidate = &fixture->decoded.semantic.instructions[token];
+            if (candidate->has_raw_instruction_index && candidate->raw_instruction_index == instruction->source_instruction_index) {
+                CHECK(!raw); raw = candidate;
+            }
+        }
+        CHECK(raw && raw->operand_count == instruction->operand_count && raw->opcode ==
+            (instruction->opcode == USIL_OP_MOV ? 54u : natural_arithmetic_raw_opcode(instruction->opcode)) &&
+            usil_instruction_shape_valid(ctx.program, instruction));
+        HLSLNaturalOutputProjection projection;
+        CHECK(hlsl_high_level_output_projection(ctx.program, &instruction->operands[0], &projection) &&
+            projection.field_index == fields[item] && projection.register_index == 1 && projection.field_mask == mask &&
+            projection.natural_components == 2 && projection.packed);
+        const char *name = hlsl_high_level_output_field_name(&ctx, fields[item]);
+        CHECK(name && *name && strlen(name) < sizeof(names[item])); strcpy(names[item], name);
+        ctx.current_instruction_index = index;
+        ASTExpr *left = hlsl_natural_source_atom(&ctx, index, 1, mask);
+        ASTExpr *right = instruction->operand_count > 2 ? hlsl_natural_source_atom(&ctx, index, 2, mask) : NULL;
+        ASTExpr *third = instruction->operand_count > 3 ? hlsl_natural_source_atom(&ctx, index, 3, mask) : NULL;
+        CHECK(left && left->kind == AST_EXPR_EMITTER_OPERAND && left->operand_provenance.complete &&
+            left->operand_provenance.instruction_index == index && left->operand_provenance.operand_index == 1 &&
+            left->operand_provenance.source_instruction_index == instruction->source_instruction_index &&
+            left->operand_provenance.destination_lanes == mask && left->operand_provenance.natural_components == 2 &&
+            left->operand_provenance.result_components == 2 && left->operand_provenance.selected_components[0] == 0 &&
+            left->operand_provenance.selected_components[1] == 1);
+        ASTExpr *literals[2] = {right, third};
+        for (int literal = 0; literal < instruction->operand_count - 2; ++literal) {
+            const DXBCOperand *owner = &instruction->operands[literal + 2];
+            CHECK(owner->type == OPERAND_TYPE_IMMEDIATE32 && owner->imm_value_count == 1 &&
+                owner->immediate_word_count == 1 && owner->immediate_words[0] == owner->imm_values[0] &&
+                literals[literal] && literals[literal]->kind == AST_EXPR_LITERAL &&
+                literals[literal]->u.literal.scalar_type == AST_SCALAR_FLOAT32 && literals[literal]->u.literal.components == 2 &&
+                literals[literal]->u.literal.val[0] == owner->imm_values[0] && literals[literal]->u.literal.val[1] == owner->imm_values[0]);
+        }
+        roots[item] = hlsl_natural_float_operation(&ctx, index, left, right, third);
+        CHECK(roots[item]);
+        if (instruction->opcode == USIL_OP_MOV) CHECK(roots[item] == left);
+        else if (instruction->opcode == USIL_OP_MAD) CHECK(roots[item]->kind == AST_EXPR_BINARY &&
+            roots[item]->u.binary.op == USIL_OP_ADD && roots[item]->u.binary.right == third &&
+            roots[item]->u.binary.left->kind == AST_EXPR_BINARY && roots[item]->u.binary.left->u.binary.op == USIL_OP_MUL &&
+            roots[item]->u.binary.left->u.binary.left == left && roots[item]->u.binary.left->u.binary.right == right);
+        else CHECK(roots[item]->kind == AST_EXPR_BINARY && roots[item]->u.binary.op == (int)instruction->opcode &&
+            roots[item]->u.binary.left == left && roots[item]->u.binary.right == right);
+        if (instruction->opcode != USIL_OP_MOV) CHECK(roots[item]->logical_origin.complete &&
+            roots[item]->logical_origin.scalar_type == AST_SCALAR_FLOAT32 && roots[item]->logical_origin.components == 2 &&
+            roots[item]->logical_origin.logical_value_id == (uint64_t)(unsigned)index &&
+            roots[item]->logical_origin.instruction_index == index && roots[item]->logical_origin.source_instruction_index ==
+            instruction->source_instruction_index && roots[item]->logical_origin.destination_lanes == mask);
+    }
+    CHECK(strcmp(names[0], names[1])); free_cbuffer_emission_layouts(&ctx); free(ctx.cb_reg_map);
+    dispose(&ctx); sb_free(&scratch);
+    return true;
+}
+
+static bool check_packed_output_positive(unsigned arithmetic, bool reversed, bool union_declaration) {
+    PackedOutputFixture fixture; CHECK(packed_output_fixture(&fixture, arithmetic, reversed, union_declaration));
+    ASTExpr *roots[2] = {0}; char names[2][96]; CHECK(packed_output_owned_roots(&fixture, roots, names));
+    StringBuilder baseline, repeated, owned_text; sb_init(&baseline); sb_init(&repeated); sb_init(&owned_text);
+    HLSLExpressionSourceMap map, repeated_map; HLSLSourceQualityResult quality, repeated_quality; HLSLEmitDiagnostic diagnostic;
+    PackedOutputObservations observer = {0};
+    const bool emitted = packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic);
+    if (!emitted) fprintf(stderr, "Packed output arithmetic=%u reversed=%d union=%d status=%s phase=%d reason=%s instruction=%d\n",
+        arithmetic, reversed, union_declaration, hlsl_emit_status_name(diagnostic.status), (int)diagnostic.phase,
+        hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index);
+    CHECK(emitted && packed_output_clean(&quality) && !observer.wrong_owner && observer.observations > 2 &&
+        map.complete && map.count == 4 && hlsl_expression_source_map_matches(&map, &fixture.decoded.program, baseline.buf));
+    uint8_t arithmetic_writers = 0;
+    for (unsigned index = 1; index < 3; ++index)
+        if (fixture.decoded.program.instructions[index].opcode != USIL_OP_MOV) arithmetic_writers |= (uint8_t)(1u << index);
+    CHECK(observer.writers_seen == arithmetic_writers);
+    CHECK(strstr(baseline.buf, " : TEXCOORD0;") && strstr(baseline.buf, " : TEXCOORD1;") &&
+        strstr(baseline.buf, " : SV_POSITION;") && !strstr(baseline.buf, "u_xlat") && !strstr(baseline.buf, "float4 r1"));
+    for (unsigned item = 0; item < 2; ++item) {
+        const int writer = item ? fixture.zw_writer : fixture.xy_writer;
+        char declaration[128], assignment[128];
+        snprintf(declaration, sizeof(declaration), "float2 %.95s : TEXCOORD%u;", names[item], item);
+        snprintf(assignment, sizeof(assignment), "output.%.95s = ", names[item]);
+        CHECK(strstr(baseline.buf, declaration) && strstr(baseline.buf, assignment));
+        const HLSLExpressionOrigin *origin = &map.origins[writer];
+        CHECK(origin->instruction_index == writer && origin->source_instruction_index ==
+            fixture.decoded.program.instructions[writer].source_instruction_index && origin->destination_lanes == (item ? 12 : 3) &&
+            origin->source_begin < origin->source_end && origin->source_end <= baseline.len);
+        StringBuilder expression; sb_init(&expression); ast_format_expr(roots[item], &expression);
+        CHECK(sb_ok(&expression) && expression.len);
+        const char *printed = strstr(baseline.buf + origin->source_begin, expression.buf);
+        CHECK(printed && printed + expression.len <= baseline.buf + origin->source_end); sb_free(&expression);
+        char physical[128]; snprintf(physical, sizeof(physical), "output.%.95s.", names[item]); CHECK(!strstr(baseline.buf, physical));
+    }
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        sb_free(&repeated); sb_init(&repeated);
+        CHECK(packed_output_emit(&fixture, &repeated, outputs & 1u ? &repeated_map : NULL,
+            outputs & 2u ? &repeated_quality : NULL, NULL, &diagnostic) && repeated.len == baseline.len &&
+            !memcmp(repeated.buf, baseline.buf, baseline.len));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &repeated_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &repeated_quality));
+    }
+    const size_t points[] = {1, observer.observations / 2u, observer.observations};
+    for (unsigned point = 0; point < sizeof(points) / sizeof(*points); ++point) {
+        PackedOutputObservations veto = {.reject_at = points[point]}; sb_free(&repeated); sb_init(&repeated);
+        CHECK(!packed_output_emit(&fixture, &repeated, &repeated_map, &repeated_quality, &veto, &diagnostic) &&
+            veto.observations == points[point] && !repeated_map.complete && !repeated_map.count &&
+            repeated_quality.classification == HLSL_SOURCE_QUALITY_FAILED && !repeated.len &&
+            (!repeated.buf || !repeated.buf[0]));
+    }
+    sb_free(&repeated); sb_init(&repeated);
+    CHECK(packed_output_emit(&fixture, &repeated, &repeated_map, &repeated_quality, NULL, &diagnostic) &&
+        repeated.len == baseline.len && !memcmp(repeated.buf, baseline.buf, baseline.len) &&
+        natural_if_maps_equal(&map, &repeated_map) && hlsl_source_quality_results_equal(&quality, &repeated_quality));
+    for (unsigned item = 0; item < 2; ++item) { ast_format_expr(roots[item], &owned_text); sb_append(&owned_text, "\n"); }
+    CHECK(sb_ok(&owned_text) && owned_text.len); const size_t owned_size = owned_text.len;
+    char *owned_bytes = malloc(owned_size + 1u); CHECK(owned_bytes); memcpy(owned_bytes, owned_text.buf, owned_size + 1u);
+    natural_if_fixture_dispose(&fixture.decoded); sb_free(&owned_text); sb_init(&owned_text);
+    for (unsigned item = 0; item < 2; ++item) { ast_format_expr(roots[item], &owned_text); sb_append(&owned_text, "\n"); }
+    CHECK(sb_ok(&owned_text) && owned_text.len == owned_size && !memcmp(owned_bytes, owned_text.buf, owned_size + 1u));
+    free(owned_bytes); ast_free_expr(roots[0]); ast_free_expr(roots[1]);
+    sb_free(&owned_text); sb_free(&baseline); sb_free(&repeated); return true;
+}
+
+static bool check_packed_output_rejections(void) {
+    PackedOutputFixture fixture; CHECK(packed_output_fixture(&fixture, 0, false, false));
+    USILProgram *program = &fixture.decoded.program;
+    USILInstruction instructions[4]; DXBCSignatureElement outputs[3]; USILSignatureDeclaration declarations[6];
+    memcpy(instructions, program->instructions, sizeof(instructions)); memcpy(outputs, program->outputs, sizeof(outputs));
+    CHECK(program->signature_declaration_count == 6); memcpy(declarations, program->signature_declarations, sizeof(declarations));
+    for (unsigned mutation = 0; mutation < 17; ++mutation) {
+        DXBCOperand relative = {0}; uint32_t extension = UINT32_C(0x41);
+        switch (mutation) {
+        case 0: program->outputs[2].mask = 6; program->outputs[2].rw_mask = 9; break; /* overlap and hole */
+        case 1: program->outputs[2].mask = 8; program->outputs[2].rw_mask = 7; break;
+        case 2: program->outputs[1].rw_mask = 8; break;
+        case 3: program->outputs[1].component_type = 1; break;
+        case 4: program->outputs[2].system_value = 1; break;
+        case 5: program->instructions[1].operands[0].destination_mask = 16; break; /* only X */
+        case 6: program->instructions[2].operands[0] = program->instructions[1].operands[0]; break;
+        case 7: program->instructions[2].opcode = USIL_OP_NOP; program->instructions[2].operand_count = 0; break;
+        case 8: {
+            DXBCOperand *destination = &program->instructions[1].operands[0];
+            relative = program->instructions[0].operands[1]; relative.swizzle_mode = 2;
+            memset(relative.swizzle, 0, sizeof(relative.swizzle)); relative.raw_token = UINT32_C(0x0010100a);
+            destination->index_representations[0] = 2;
+            destination->index_has_immediate[0] = false; destination->rel_op0 = &relative;
+            destination->raw_token = (destination->raw_token & ~(UINT32_C(7) << 22u)) | UINT32_C(2) << 22u;
+            break;
+        }
+        case 9: {
+            DXBCOperand *source = &program->instructions[1].operands[1]; source->has_neg = true;
+            source->raw_token |= UINT32_C(0x80000000); source->extended_tokens = &extension; source->extended_token_count = 1;
+            break;
+        }
+        case 10: program->instructions[2].operands[1].type = OPERAND_TYPE_OUTPUT;
+            program->instructions[2].operands[1].register_index = 1;
+            program->instructions[2].operands[1].index_values[0] = 1;
+            program->instructions[2].operands[1].raw_token = natural_if_source_token(OPERAND_TYPE_OUTPUT,
+                program->instructions[2].operands[1].swizzle); break;
+        case 11: program->instructions[0].operands[0].destination_mask = 112; break; /* split POSITION not assembled */
+        case 12: program->instructions[1].operands[0].destination_mask = 240; break; /* one write crosses both fields */
+        case 13: program->outputs[2].semantic_index = 0; break;
+        case 14: program->signature_declarations[5].mask = 8; break;
+        case 15: program->instructions[1].precise_mask = 1; break;
+        case 16: program->instructions[2].operands[1].min_precision = 1; break;
+        }
+        HLSLEmitDiagnostic diagnostic; const bool rejected = natural_if_rejected(program, &diagnostic);
+        /* Borrowed relative/extension storage is removed before decoder cleanup
+         * on both the expected and unexpectedly admitted paths. */
+        memcpy(program->instructions, instructions, sizeof(instructions)); memcpy(program->outputs, outputs, sizeof(outputs));
+        memcpy(program->signature_declarations, declarations, sizeof(declarations));
+        if (!rejected) fprintf(stderr, "Packed output unexpectedly admitted mutation=%u\n", mutation);
+        CHECK(rejected);
+    }
+    CHECK(usil_signature_authority_is_valid(program)); natural_if_fixture_dispose(&fixture.decoded);
+    for (unsigned boundary = 1; boundary < 3; ++boundary) {
+        CHECK(packed_output_fixture_layout(&fixture, 0, false, false, boundary, false) &&
+            usil_signature_authority_is_valid(&fixture.decoded.program));
+        CHECK(natural_if_rejected(&fixture.decoded.program, NULL)); natural_if_fixture_dispose(&fixture.decoded);
+    }
+    return true;
+}
+
+static bool check_packed_output_callbacks(void) {
+    PackedOutputFixture fixture; CHECK(packed_output_fixture(&fixture, 0, false, false));
+    USILProgram *program = &fixture.decoded.program; const char prefix[] = "// caller prefix\n";
+    char entry_name[] = "entryName"; const HLSLEmitNames names = {.entry_point = entry_name};
+    StringBuilder baseline, changed; sb_init(&baseline); sb_init(&changed); sb_append(&baseline, prefix);
+    HLSLExpressionSourceMap map, changed_map; HLSLSourceQualityResult quality, changed_quality; HLSLEmitDiagnostic diagnostic;
+    PackedOutputObservations observer = {.names = &names};
+    CHECK(packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic) && packed_output_clean(&quality) &&
+        observer.first_config && observer.first_header > observer.first_config && observer.last_header > observer.first_header &&
+        observer.observations > observer.last_header);
+    USILInstruction instructions[4]; DXBCSignatureElement outputs[3];
+    memcpy(instructions, program->instructions, sizeof(instructions)); memcpy(outputs, program->outputs, sizeof(outputs));
+    const struct {unsigned mutation; size_t point, offset;} attacks[] = {
+        {1, 1, 0}, {2, observer.observations / 2u, 0}, {3, observer.observations, 0},
+        {8, observer.observations, 0}, {9, observer.observations, 0},
+        {6, observer.first_header, 0}, {5, observer.last_header, 0},
+        {5, observer.first_config, 0}, {4, observer.first_config, sizeof(prefix)},
+        {4, 1, 0}, {4, observer.observations, 0},
+        {4, observer.observations, map.origins[fixture.xy_writer].source_begin}, {7, observer.observations, 0}};
+    for (unsigned attack = 0; attack < sizeof(attacks) / sizeof(*attacks); ++attack) {
+        PackedOutputObservations drift = {.mutation = attacks[attack].mutation, .mutate_at = attacks[attack].point,
+            .source_offset = attacks[attack].offset, .field = fixture.zw_field, .writer = fixture.xy_writer,
+            .names = &names, .mutable_entry_name = entry_name};
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        const bool rejected = !packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic);
+        if (!rejected) fprintf(stderr, "Packed output callback falsely accepted attack=%u action=%u point=%zu\n",
+            attack, drift.mutation, drift.mutate_at);
+        CHECK(rejected && drift.mutated && !changed_map.complete && !changed_map.count &&
+            changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && changed.len == sizeof(prefix) - 1u &&
+            changed.buf && !strcmp(changed.buf, prefix));
+        if (drift.mutation == 1 || drift.mutation == 2 || drift.mutation == 3 || drift.mutation == 8 || drift.mutation == 9) {
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            PackedOutputObservations fresh = {.names = &names};
+            CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                packed_output_clean(&changed_quality) && hlsl_expression_source_map_matches(&changed_map, program, changed.buf) &&
+                (changed.len != baseline.len || memcmp(changed.buf, baseline.buf, baseline.len)));
+        } else CHECK(!memcmp(program->instructions, instructions, sizeof(instructions)) &&
+            !memcmp(program->outputs, outputs, sizeof(outputs)));
+        memcpy(program->instructions, instructions, sizeof(instructions)); memcpy(program->outputs, outputs, sizeof(outputs));
+        memcpy(entry_name, "entryName", sizeof(entry_name));
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        PackedOutputObservations restored = {.names = &names};
+        CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &restored, &diagnostic) &&
+            changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) &&
+            natural_if_maps_equal(&map, &changed_map) && hlsl_source_quality_results_equal(&quality, &changed_quality));
+    }
+    sb_free(&baseline); sb_free(&changed); natural_if_fixture_dispose(&fixture.decoded); return true;
+}
+
+typedef struct {
+    char buffer_names[2][32], field_names[2][32];
+    SerializedVariable fields[2];
+    SerializedConstantBuffer buffers[2];
+    SerializedResourceParam bindings[2];
+    SerializedProgramParameters parameters[2];
+} PackedOutputCBufferMetadata;
+
+static void packed_output_cbuffer_metadata(PackedOutputCBufferMetadata *metadata) {
+    memset(metadata, 0, sizeof(*metadata));
+    for (unsigned source = 0; source < 2; ++source) {
+        memcpy(metadata->buffer_names[source], "PackedInputs", sizeof("PackedInputs"));
+        memcpy(metadata->field_names[source], "_Scale", sizeof("_Scale"));
+        metadata->fields[source] = (SerializedVariable){metadata->field_names[source], {0, 0, 0, 2, 0, 0}};
+        metadata->buffers[source] = (SerializedConstantBuffer){.name = metadata->buffer_names[source],
+            .role = SERIALIZED_CBUFFER_NAMED, .size = 16, .variables = &metadata->fields[source], .var_count = 1};
+        metadata->bindings[source] = (SerializedResourceParam){.name = metadata->buffer_names[source],
+            .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER};
+        metadata->parameters[source] = (SerializedProgramParameters){.constant_buffers = &metadata->buffers[source],
+            .cb_count = 1, .resources = &metadata->bindings[source], .res_count = 1};
+    }
+}
+
+static bool check_packed_output_cbuffer(void) {
+    PackedOutputFixture fixture; CHECK(packed_output_fixture_layout(&fixture, 0, false, false, 0, true));
+    PackedOutputCBufferMetadata metadata; packed_output_cbuffer_metadata(&metadata);
+    fixture.parameters = &metadata.parameters[0];
+    ASTExpr *roots[2] = {0}; char names[2][96]; CHECK(packed_output_owned_roots(&fixture, roots, names));
+    const ASTExpr *read = roots[0]->u.binary.left;
+    CHECK(read->kind == AST_EXPR_EMITTER_OPERAND && read->operand_provenance.complete &&
+        read->operand_provenance.value_role == AST_OPERAND_VALUE_LOGICAL &&
+        read->operand_provenance.logical_value_id == (UINT64_C(1) << 32) &&
+        read->operand_provenance.natural_components == 2 && read->operand_provenance.result_components == 2 &&
+        read->operand_provenance.instruction_index == fixture.xy_writer && read->operand_provenance.operand_index == 1 &&
+        read->operand_provenance.source_instruction_index == fixture.decoded.program.instructions[fixture.xy_writer].source_instruction_index &&
+        read->operand_provenance.destination_lanes == 3);
+    StringBuilder held, retained; sb_init(&held); sb_init(&retained); ast_format_expr(roots[0], &held);
+    CHECK(sb_ok(&held) && strstr(held.buf, "_Scale"));
+    const char prefix[] = "// caller prefix\n";
+    StringBuilder baseline, changed; sb_init(&baseline); sb_init(&changed);
+    HLSLExpressionSourceMap map, changed_map; HLSLSourceQualityResult quality, changed_quality; HLSLEmitDiagnostic diagnostic;
+    for (unsigned authority = 0; authority < 2; ++authority) {
+        fixture.parameters = authority ? NULL : &metadata.parameters[0];
+        fixture.common_parameters = authority ? &metadata.parameters[1] : NULL;
+        sb_free(&baseline); sb_init(&baseline); sb_append(&baseline, prefix);
+        PackedOutputObservations observer = {0};
+        const bool emitted = packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic);
+        if (!emitted) fprintf(stderr, "Packed CB authority=%u status=%s phase=%s reason=%s\n", authority,
+            hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase), hlsl_emit_reason_name(diagnostic.reason));
+        CHECK(emitted && packed_output_clean(&quality) && !observer.wrong_owner && observer.cbuffer_events == 3 &&
+            observer.cbuffer_authority == authority + 1u && observer.cbuffer_field_bytes == 8 &&
+            quality.counts.cbuffer_declarations == 1 && quality.counts.cbuffer_fields == 1 &&
+            strstr(baseline.buf, "cbuffer PackedInputs : register(b0)") &&
+            strstr(baseline.buf, "float2 _Scale : packoffset(c0)") &&
+            map.complete && hlsl_expression_source_map_matches(&map, &fixture.decoded.program, baseline.buf));
+        for (unsigned outputs = 0; outputs < 4; ++outputs) {
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(packed_output_emit(&fixture, &changed, outputs & 1u ? &changed_map : NULL,
+                outputs & 2u ? &changed_quality : NULL, NULL, &diagnostic) &&
+                changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len));
+            if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &changed_map));
+            if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &changed_quality));
+        }
+        const size_t points[2] = {1, observer.observations};
+        for (unsigned change = 0; change < 2; ++change) for (unsigned point = 0; point < 2; ++point) {
+            PackedOutputObservations drift = {.mutation = change ? 11 : 10, .mutate_at = points[point],
+                .mutable_parameters = &metadata.parameters[authority], .mutable_field_name = metadata.field_names[authority]};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+                drift.mutated && !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && changed.len == sizeof(prefix) - 1u &&
+                changed.buf && !strcmp(changed.buf, prefix));
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+                packed_output_clean(&changed_quality) && hlsl_expression_source_map_matches(&changed_map, &fixture.decoded.program, changed.buf) &&
+                (changed.len != baseline.len || memcmp(changed.buf, baseline.buf, baseline.len)));
+            memset(metadata.field_names[authority], 0, sizeof(metadata.field_names[authority]));
+            memcpy(metadata.field_names[authority], "_Scale", sizeof("_Scale")); metadata.fields[authority].layout[3] = 2;
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+                changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) &&
+                natural_if_maps_equal(&map, &changed_map) && hlsl_source_quality_results_equal(&quality, &changed_quality));
+        }
+    }
+    /* The selected current model remains intact. The same-name common model
+     * is dormant read authority, but still belongs to this emission lease. */
+    fixture.parameters = &metadata.parameters[0]; fixture.common_parameters = &metadata.parameters[1];
+    sb_free(&baseline); sb_init(&baseline); sb_append(&baseline, prefix);
+    PackedOutputObservations observer = {0}; CHECK(packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic));
+    PackedOutputObservations common_drift = {.mutation = 10, .mutate_at = observer.observations,
+        .mutable_field_name = metadata.field_names[1]};
+    sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+    CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &common_drift, &diagnostic) && common_drift.mutated &&
+        !changed_map.complete && !changed_map.count && changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED &&
+        changed.len == sizeof(prefix) - 1u && changed.buf && !strcmp(changed.buf, prefix));
+    memset(metadata.field_names[1], 0, sizeof(metadata.field_names[1])); memcpy(metadata.field_names[1], "_Scale", sizeof("_Scale"));
+    sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+    CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+        changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) && natural_if_maps_equal(&map, &changed_map) &&
+        hlsl_source_quality_results_equal(&quality, &changed_quality));
+    for (unsigned failure = 0; failure < 2; ++failure) {
+        fixture.parameters = failure ? &metadata.parameters[0] : NULL;
+        fixture.common_parameters = failure ? &metadata.parameters[1] : NULL;
+        if (failure) metadata.buffers[1].size = 32;
+        sb_free(&changed); sb_init(&changed);
+        CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+            diagnostic.status != HLSL_EMIT_STATUS_OK && !changed_map.complete && !changed_map.count &&
+            changed_quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        metadata.buffers[1].size = 16;
+    }
+    natural_if_fixture_dispose(&fixture.decoded); memset(&metadata, 0, sizeof(metadata));
+    ast_format_expr(roots[0], &retained);
+    CHECK(sb_ok(&retained) && retained.len == held.len && !memcmp(retained.buf, held.buf, held.len));
+    ast_free_expr(roots[0]); ast_free_expr(roots[1]); sb_free(&held); sb_free(&retained); sb_free(&baseline); sb_free(&changed);
+    return true;
+}
+
+static bool packed_output_owned_matrix(PackedOutputFixture *fixture, ASTExpr **owned) {
+    HLSLEmitterContext ctx; StringBuilder scratch; HLSLEmitDiagnostic diagnostic;
+    CHECK(packed_output_prepare_context(fixture, &ctx, &scratch, &diagnostic));
+    HLSLMatrixLiftPlan plan;
+    CHECK(hlsl_matrix_lift_prepare(&ctx, 0, &plan) && plan.start_instruction == 0 && plan.end_instruction == 3 &&
+        plan.claimed_instruction_count == 4 && plan.result_components == 4 && !plan.world_expression &&
+        plan.instruction_owners.words[0] == UINT64_C(15));
+    const USILProgram *program = ctx.program;
+    const uint8_t components[4] = {1, 0, 2, 3};
+    for (int instruction = 0; instruction < 4; ++instruction) {
+        const USILInstruction *owner = &program->instructions[instruction];
+        CHECK(owner->source_instruction_index < (uint32_t)fixture->decoded.semantic.instruction_count);
+        const DXBCInstruction *raw = &fixture->decoded.semantic.instructions[owner->source_instruction_index];
+        const int input_slot = instruction ? 2 : 1, matrix_slot = instruction ? 1 : 2;
+        CHECK(raw->has_raw_instruction_index && raw->raw_instruction_index == owner->source_instruction_index &&
+            raw->opcode == (instruction ? 50u : 56u) && raw->operand_count == (instruction ? 4 : 3) &&
+            owner->operands[matrix_slot].type == OPERAND_TYPE_CONSTANT_BUFFER &&
+            owner->operands[matrix_slot].rel_offset0 == components[instruction] &&
+            owner->operands[input_slot].type == OPERAND_TYPE_INPUT && owner->operands[input_slot].register_index == 0 &&
+            usil_operand_destination_lane_mask(&owner->operands[0]) == 15 &&
+            owner->operands[0].type == (instruction == 3 ? OPERAND_TYPE_OUTPUT : OPERAND_TYPE_TEMP));
+        for (int lane = 0; lane < 4; ++lane) {
+            CHECK(usil_operand_source_component(&owner->operands[input_slot], lane) == components[instruction]);
+            if (instruction) CHECK(hlsl_operand_definition(&ctx, instruction, 3, lane) == instruction - 1);
+            if (instruction < 3) CHECK(hlsl_definition_use_count(&ctx, instruction, lane) == 1);
+        }
+    }
+    ASTExpr *root = plan.expression;
+    CHECK(root && root->kind == AST_EXPR_CALL && !strcmp(root->u.call.name, "mul") && root->u.call.arg_count == 2 &&
+        root->logical_origin.complete && root->logical_origin.scalar_type == AST_SCALAR_FLOAT32 &&
+        root->logical_origin.components == 4 && root->logical_origin.destination_lanes == 15 &&
+        root->logical_origin.logical_value_id == ((UINT64_C(1) << 62) | UINT64_C(3)) &&
+        root->logical_origin.instruction_index == 3 &&
+        root->logical_origin.source_instruction_index == program->instructions[3].source_instruction_index);
+    const ASTExpr *matrix = root->u.call.args[0], *input = root->u.call.args[1];
+    CHECK(matrix != input && matrix->kind == AST_EXPR_EMITTER_OPERAND && matrix->operand_provenance.complete &&
+        matrix->operand_provenance.logical_value_id == (UINT64_C(1) << 32) &&
+        matrix->operand_provenance.instruction_index == 1 && matrix->operand_provenance.operand_index == 1 &&
+        matrix->operand_provenance.source_instruction_index == program->instructions[1].source_instruction_index &&
+        matrix->operand_provenance.destination_lanes == 15 && input->kind == AST_EXPR_EMITTER_OPERAND &&
+        input->operand_provenance.complete && input->operand_provenance.instruction_index == 0 &&
+        input->operand_provenance.source_instruction_index == program->instructions[0].source_instruction_index &&
+        input->operand_provenance.operand_index == 1 && input->operand_provenance.natural_components == 4 &&
+        input->operand_provenance.result_components == 4 && input->operand_provenance.destination_lanes == 15);
+    for (int lane = 0; lane < 4; ++lane) CHECK(input->operand_provenance.selected_components[lane] == lane);
+    *owned = root; plan.expression = NULL; hlsl_matrix_lift_plan_free(&plan);
+    free_cbuffer_emission_layouts(&ctx); free(ctx.cb_reg_map); dispose(&ctx); sb_free(&scratch);
+    return true;
+}
+
+static bool packed_output_matrix_quality(const HLSLSourceQualityResult *quality) {
+    /* The matrix expression and interface have actual owners, but the existing
+     * named-CB syntax receipt admits only scalar/vector fields. A matrix
+     * declaration therefore retains its separate incomplete-source obligation. */
+    CHECK(quality->classification == HLSL_SOURCE_QUALITY_MIXED &&
+        quality->reasons == HLSL_SOURCE_QUALITY_REASON_INCOMPLETE_SOURCE &&
+        quality->counts.inspected_units == 1 && quality->counts.incomplete_units == 1 &&
+        !quality->counts.residual_total && !quality->counts.unknown_provenance &&
+        !quality->counts.cbuffer_declarations && !quality->counts.cbuffer_fields &&
+        quality->has_first_issue && quality->first_issue.reasons == HLSL_SOURCE_QUALITY_REASON_INCOMPLETE_SOURCE &&
+        quality->first_issue.facts.instruction_index == -1 &&
+        quality->first_issue.facts.source_instruction_index == UINT32_MAX);
+    return true;
+}
+
+static bool check_packed_output_matrix_cbuffer(void) {
+    PackedOutputFixture fixture; CHECK(packed_output_fixture_layout(&fixture, 0, false, false, 0, 2));
+    PackedOutputCBufferMetadata metadata; packed_output_cbuffer_metadata(&metadata);
+    for (unsigned authority = 0; authority < 2; ++authority) {
+        memset(metadata.field_names[authority], 0, sizeof(metadata.field_names[authority]));
+        memcpy(metadata.field_names[authority], "ObjectTransform", sizeof("ObjectTransform"));
+        metadata.fields[authority] = (SerializedVariable){metadata.field_names[authority], {0, 4, 4, 1, 0, 0}};
+        metadata.buffers[authority].size = 64; metadata.parameters[authority].is_binary = true;
+    }
+    fixture.parameters = &metadata.parameters[0];
+    ASTExpr *matrix = NULL, *roots[2] = {0}; char names[2][96];
+    CHECK(packed_output_owned_matrix(&fixture, &matrix) && packed_output_owned_roots(&fixture, roots, names));
+    StringBuilder held, retained; sb_init(&held); sb_init(&retained); ast_format_expr(matrix, &held);
+    CHECK(sb_ok(&held) && strstr(held.buf, "mul((ObjectTransform), (position))") && !strstr(held.buf, "get_cb"));
+    const char prefix[] = "// caller prefix\n";
+    StringBuilder baseline, changed; sb_init(&baseline); sb_init(&changed);
+    HLSLExpressionSourceMap map, changed_map; HLSLSourceQualityResult quality, changed_quality; HLSLEmitDiagnostic diagnostic;
+    sb_append(&baseline, prefix); PackedOutputObservations observer = {0};
+    const bool emitted = packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic);
+    if (!emitted) fprintf(stderr, "Packed matrix status=%s phase=%s reason=%s instruction=%d\n",
+        hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase),
+        hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index);
+    if (emitted && (quality.classification != HLSL_SOURCE_QUALITY_MIXED ||
+        quality.reasons != HLSL_SOURCE_QUALITY_REASON_INCOMPLETE_SOURCE)) fprintf(stderr,
+        "Packed matrix quality=%s reasons=%u units=%zu incomplete=%zu residual=%zu unknown=%zu first_kind=%d first_owner=%d first_raw=%u first_artifacts=%u first_reasons=%u bytes=%zu\n",
+        hlsl_source_quality_class_name(quality.classification), quality.reasons, quality.counts.inspected_units,
+        quality.counts.incomplete_units, quality.counts.residual_total, quality.counts.unknown_provenance,
+        quality.has_first_issue ? (int)quality.first_issue.kind : -1,
+        quality.has_first_issue ? quality.first_issue.facts.instruction_index : -1,
+        quality.has_first_issue ? quality.first_issue.facts.source_instruction_index : UINT32_MAX,
+        quality.has_first_issue ? quality.first_issue.facts.artifacts : 0,
+        quality.has_first_issue ? quality.first_issue.reasons : 0, baseline.len);
+    CHECK(emitted && packed_output_matrix_quality(&quality) && !observer.wrong_owner && observer.writers_seen == UINT8_C(48) &&
+        !observer.cbuffer_events && !observer.cbuffer_authority && !observer.cbuffer_field_bytes &&
+        strstr(baseline.buf, "cbuffer PackedInputs : register(b0)") && strstr(baseline.buf, "float4x4 ObjectTransform") &&
+        strstr(baseline.buf, held.buf) && map.complete && map.count == (size_t)fixture.decoded.program.instruction_count &&
+        hlsl_expression_source_map_matches(&map, &fixture.decoded.program, baseline.buf));
+    for (int instruction = 0; instruction < 4; ++instruction) CHECK(map.origins[instruction].instruction_index == instruction &&
+        map.origins[instruction].source_instruction_index == fixture.decoded.program.instructions[instruction].source_instruction_index &&
+        map.origins[instruction].destination_lanes == 15 && map.origins[instruction].source_begin >= sizeof(prefix) - 1u &&
+        map.origins[instruction].source_end <= baseline.len && map.origins[instruction].source_begin < map.origins[instruction].source_end);
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(packed_output_emit(&fixture, &changed, outputs & 1u ? &changed_map : NULL,
+            outputs & 2u ? &changed_quality : NULL, NULL, &diagnostic) &&
+            changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &changed_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &changed_quality));
+    }
+    /* Matrix read authority can come from common metadata; its independent
+     * model and callback lease cannot substitute an incomplete current field. */
+    fixture.parameters = NULL; fixture.common_parameters = &metadata.parameters[1];
+    sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+    PackedOutputObservations common = {0};
+    CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &common, &diagnostic) &&
+        packed_output_matrix_quality(&changed_quality) && !common.wrong_owner && !common.cbuffer_events &&
+        changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) && natural_if_maps_equal(&map, &changed_map));
+    const HLSLSourceQualityResult common_quality = changed_quality;
+    for (unsigned authority = 0; authority < 2; ++authority) for (unsigned point = 0; point < 2; ++point) {
+        fixture.parameters = authority ? NULL : &metadata.parameters[0];
+        fixture.common_parameters = authority ? &metadata.parameters[1] : NULL;
+        const size_t at = point ? (authority ? common.observations : observer.observations) : 1;
+        PackedOutputObservations drift = {.mutation = 10, .mutate_at = at, .mutable_field_name = metadata.field_names[authority]};
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic) && drift.mutated &&
+            changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && !changed_map.complete && !changed_map.count &&
+            changed.len == sizeof(prefix) - 1u && changed.buf && !strcmp(changed.buf, prefix));
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+            packed_output_matrix_quality(&changed_quality) && strstr(changed.buf, "_AdjustedScale") &&
+            !strstr(changed.buf, "ObjectTransform") &&
+            hlsl_expression_source_map_matches(&changed_map, &fixture.decoded.program, changed.buf));
+        memset(metadata.field_names[authority], 0, sizeof(metadata.field_names[authority]));
+        memcpy(metadata.field_names[authority], "ObjectTransform", sizeof("ObjectTransform"));
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+            changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) && natural_if_maps_equal(&map, &changed_map) &&
+            hlsl_source_quality_results_equal(authority ? &common_quality : &quality, &changed_quality));
+    }
+    for (unsigned failure = 0; failure < 4; ++failure) {
+        fixture.parameters = failure ? &metadata.parameters[0] : NULL;
+        fixture.common_parameters = failure == 2 || failure == 3 ? &metadata.parameters[1] : NULL;
+        if (failure == 1 || failure == 3) metadata.fields[0].layout[1] = 3;
+        if (failure == 2) metadata.buffers[1].size = 80;
+        sb_free(&changed); sb_init(&changed);
+        CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+            diagnostic.status != HLSL_EMIT_STATUS_OK && !changed_map.complete && !changed_map.count &&
+            changed_quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        metadata.fields[0].layout[1] = 4; metadata.buffers[1].size = 64;
+    }
+    fixture.parameters = &metadata.parameters[0]; fixture.common_parameters = NULL;
+    sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+    CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+        changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) && natural_if_maps_equal(&map, &changed_map) &&
+        hlsl_source_quality_results_equal(&quality, &changed_quality));
+    natural_if_fixture_dispose(&fixture.decoded); memset(&metadata, 0, sizeof(metadata));
+    ast_format_expr(matrix, &retained);
+    CHECK(sb_ok(&retained) && retained.len == held.len && !memcmp(retained.buf, held.buf, held.len));
+    ast_free_expr(matrix); ast_free_expr(roots[0]); ast_free_expr(roots[1]);
+    sb_free(&held); sb_free(&retained); sb_free(&baseline); sb_free(&changed);
+    return true;
+}
+
+static bool check_packed_output_emission(void) {
+    for (unsigned arithmetic = 0; arithmetic < 4; ++arithmetic)
+        CHECK(check_packed_output_positive(arithmetic, arithmetic == 1, false));
+    CHECK(check_packed_output_positive(0, true, true));
+    CHECK(check_packed_output_rejections() && check_packed_output_callbacks() && check_packed_output_cbuffer() &&
+        check_packed_output_matrix_cbuffer()); return true;
+}
+
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
@@ -6000,7 +6817,7 @@ int main(void) {
         !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
         !check_expression_emission() || !check_conditional_emission() ||
-        !check_natural_conditional_emission() ||
+        !check_natural_conditional_emission() || !check_packed_output_emission() ||
         !check_counted_loop_emission() || !check_function_emission() || !check_unity_uv_emission())
         return 1;
     puts("HLSL dataflow contracts passed");

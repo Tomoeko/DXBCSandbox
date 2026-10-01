@@ -2,6 +2,7 @@
 
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_emitted_matrix_uses_internal.h"
+#include "translation/hlsl_global_declarations.h"
 #include "common/sha256.h"
 #include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
@@ -11,6 +12,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static bool hlsl_emit_with_options_impl(
+    const USILProgram *program, StringBuilder *sb,
+    const SerializedProgramParameters *params,
+    const SerializedProgramParameters *common_params,
+    const HLSLEmitNames *names, const HLSLEmitOptions *options,
+    HLSLMatrixUseCapture *matrix_capture, HLSLStageCoverage *stage_coverage,
+    HLSLEmitDiagnostic *diagnostic, bool packed_replay);
 
 static void hlsl_emit_metadata_location_init(
     HLSLEmitMetadataLocation *location) {
@@ -1626,6 +1635,236 @@ static bool source_builder_storage_valid(const StringBuilder *source) {
       : !source->len && !source->capacity);
 }
 
+enum { PACKED_OUTPUT_LEASE_LIMIT = 256, PACKED_OUTPUT_BYTE_LIMIT = 1024 * 1024 };
+
+typedef struct {
+  const void *original;
+  void *owned;
+  size_t size;
+} PackedOutputLease;
+
+/* Parent objects precede every pointed collection. A changed pointer or count
+ * rejects before typed replay follows that collection. Rendered source and
+ * maps come from a callback-free invocation of this same complete emitter. */
+typedef struct HLSLPackedOutputGuard {
+  PackedOutputLease leases[PACKED_OUTPUT_LEASE_LIMIT];
+  size_t lease_count, owned_bytes, prefix_length;
+  uint8_t model_digest[32];
+  SerializedProgramParameters current, common;
+  StringBuilder expected;
+  HLSLExpressionSourceMap expected_map, actual_map, callback_map;
+  HLSLExpressionSourceMap *caller_map;
+  const HLSLGlobalDeclarationUnion *globals;
+  const HLSLGlobalDeclarationField *global_fields;
+  size_t global_field_count;
+  uint32_t global_shell_size;
+  int global_current_variant;
+  bool ready;
+} HLSLPackedOutputGuard;
+
+static bool packed_output_lease(HLSLPackedOutputGuard *guard, const void *source, size_t size) {
+  if (!size) return true;
+  if (!source || guard->lease_count == (size_t)PACKED_OUTPUT_LEASE_LIMIT ||
+      size > (size_t)PACKED_OUTPUT_BYTE_LIMIT - guard->owned_bytes) return false;
+  void *owned = malloc(size);
+  if (!owned) return false;
+  memcpy(owned, source, size);
+  guard->leases[guard->lease_count++] = (PackedOutputLease){source, owned, size};
+  guard->owned_bytes += size;
+  return true;
+}
+
+static bool packed_output_string_lease(HLSLPackedOutputGuard *guard, const char *text) {
+  if (!text) return true;
+  size_t length = 0;
+  while (length < 256 && text[length]) ++length;
+  return length < 256 && packed_output_lease(guard, text, length + 1);
+}
+
+static bool packed_output_parameters_lease(HLSLPackedOutputGuard *guard,
+    const SerializedProgramParameters *parameters, SerializedProgramParameters *owned) {
+  if (!parameters) return true;
+  if (parameters->cb_count < 0 || parameters->cb_count > 8 ||
+      parameters->res_count < 0 || parameters->res_count > 128 ||
+      !packed_output_lease(guard, parameters, sizeof(*parameters)) ||
+      !packed_output_lease(guard, parameters->constant_buffers,
+          (size_t)parameters->cb_count * sizeof(*parameters->constant_buffers)) ||
+      !packed_output_lease(guard, parameters->resources,
+          (size_t)parameters->res_count * sizeof(*parameters->resources))) return false;
+  for (int buffer = 0; buffer < parameters->cb_count; ++buffer) {
+    const SerializedConstantBuffer *cbuffer = &parameters->constant_buffers[buffer];
+    if (cbuffer->var_count < 0 || cbuffer->var_count > 128 ||
+        cbuffer->struct_count < 0 || cbuffer->struct_count > 16 ||
+        !packed_output_string_lease(guard, cbuffer->name) ||
+        !packed_output_lease(guard, cbuffer->variables,
+            (size_t)cbuffer->var_count * sizeof(*cbuffer->variables)) ||
+        !packed_output_lease(guard, cbuffer->struct_params,
+            (size_t)cbuffer->struct_count * sizeof(*cbuffer->struct_params))) return false;
+    for (int variable = 0; variable < cbuffer->var_count; ++variable)
+      if (!packed_output_string_lease(guard, cbuffer->variables[variable].name)) return false;
+    for (int structure = 0; structure < cbuffer->struct_count; ++structure) {
+      const SerializedStructParam *entry = &cbuffer->struct_params[structure];
+      if (entry->member_count < 0 || entry->member_count > 128 ||
+          !packed_output_string_lease(guard, entry->name) ||
+          !packed_output_lease(guard, entry->members,
+              (size_t)entry->member_count * sizeof(*entry->members))) return false;
+      for (int member = 0; member < entry->member_count; ++member)
+        if (!packed_output_string_lease(guard, entry->members[member].name)) return false;
+    }
+  }
+  for (int resource = 0; resource < parameters->res_count; ++resource)
+    if (!packed_output_string_lease(guard, parameters->resources[resource].name)) return false;
+  return serialized_program_parameters_copy(owned, parameters);
+}
+
+static bool packed_output_maps_equal(const HLSLExpressionSourceMap *left,
+    const HLSLExpressionSourceMap *right) {
+  if (!left || !right || left->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+      left->count != right->count || left->complete != right->complete) return false;
+  for (size_t origin = 0; origin < left->count; ++origin)
+    if (!hlsl_expression_origins_equal(&left->origins[origin], &right->origins[origin])) return false;
+  return true;
+}
+
+static bool packed_output_model_matches(const HLSLEmitterContext *ctx) {
+  const HLSLPackedOutputGuard *guard = ctx->packed_output_guard;
+  if (!guard || !guard->ready) return false;
+  for (size_t lease = 0; lease < guard->lease_count; ++lease)
+    if (memcmp(guard->leases[lease].original, guard->leases[lease].owned,
+        guard->leases[lease].size)) return false;
+  uint8_t current[32];
+  if (!hlsl_packed_output_owned_contract_digest(ctx->program, current) ||
+      memcmp(current, guard->model_digest, sizeof(current)) ||
+      (ctx->params && !serialized_program_parameters_equal(ctx->params, &guard->current)) ||
+      (ctx->common_params && !serialized_program_parameters_equal(ctx->common_params, &guard->common))) return false;
+  if (guard->globals) {
+    size_t count = 0;
+    if (hlsl_global_declarations_fields(guard->globals, &count) != guard->global_fields ||
+        count != guard->global_field_count ||
+        hlsl_global_declarations_shell_size(guard->globals) != guard->global_shell_size ||
+        hlsl_global_declarations_current_variant(guard->globals) != guard->global_current_variant) return false;
+  }
+  return true;
+}
+
+static bool packed_output_source_matches(const HLSLEmitterContext *ctx, bool complete) {
+  const HLSLPackedOutputGuard *guard = ctx->packed_output_guard;
+  return guard && source_builder_storage_valid(ctx->sb) &&
+      ctx->sb->len >= guard->prefix_length && ctx->sb->len <= guard->expected.len &&
+      (!complete || ctx->sb->len == guard->expected.len) &&
+      (!ctx->sb->len || !memcmp(ctx->sb->buf, guard->expected.buf, ctx->sb->len));
+}
+
+static void packed_output_guard_dispose(HLSLEmitterContext *ctx) {
+  HLSLPackedOutputGuard *guard = ctx->packed_output_guard;
+  if (!guard) return;
+  ctx->expression_source_map = guard->caller_map;
+  for (size_t lease = 0; lease < guard->lease_count; ++lease) free(guard->leases[lease].owned);
+  serialized_program_parameters_free(&guard->current);
+  serialized_program_parameters_free(&guard->common);
+  sb_free(&guard->expected);
+  free(guard);
+  ctx->packed_output_guard = NULL;
+}
+
+static void packed_output_guard_rollback(HLSLEmitterContext *ctx) {
+  HLSLPackedOutputGuard *guard = ctx->packed_output_guard;
+  if (!guard) return;
+  if (ctx->expression_source_map) memset(ctx->expression_source_map, 0, sizeof(*ctx->expression_source_map));
+  /* The initial prefix is owned independently of all observer mutations. */
+  sb_clear(ctx->sb);
+  ctx->sb->failed = false;
+  sb_append_len(ctx->sb, guard->expected.buf, guard->prefix_length);
+  ctx->sb->failed = true;
+}
+
+static bool packed_output_guard_prepare(HLSLEmitterContext *ctx, size_t prefix_length,
+    const HLSLEmitNames *names, const HLSLEmitOptions *options) {
+  if (!source_builder_storage_valid(ctx->sb) || ctx->sb->len != prefix_length ||
+      prefix_length > (size_t)PACKED_OUTPUT_BYTE_LIMIT) return false;
+  HLSLPackedOutputGuard *guard = calloc(1, sizeof(*guard));
+  if (!guard) return false;
+  guard->caller_map = ctx->expression_source_map;
+  guard->prefix_length = prefix_length;
+  sb_init(&guard->expected);
+  sb_append_len(&guard->expected, ctx->sb->buf, prefix_length);
+  ctx->packed_output_guard = guard;
+  const USILProgram *program = ctx->program;
+  if (!sb_ok(&guard->expected) ||
+      !packed_output_lease(guard, program, sizeof(*program)) ||
+      !packed_output_lease(guard, program->instructions,
+          (size_t)program->instruction_count * sizeof(*program->instructions)) ||
+      !packed_output_lease(guard, program->inputs, (size_t)program->input_count * sizeof(*program->inputs)) ||
+      !packed_output_lease(guard, program->outputs, (size_t)program->output_count * sizeof(*program->outputs)) ||
+      !packed_output_lease(guard, program->signature_declarations,
+          (size_t)program->signature_declaration_count * sizeof(*program->signature_declarations)) ||
+      !packed_output_lease(guard, program->cbuffers, (size_t)program->cbuffer_count * sizeof(*program->cbuffers)) ||
+      !packed_output_parameters_lease(guard, ctx->params, &guard->current) ||
+      !packed_output_parameters_lease(guard, ctx->common_params, &guard->common) ||
+      !packed_output_lease(guard, names, names ? sizeof(*names) : 0) ||
+      !packed_output_string_lease(guard, ctx->entry_point_name) ||
+      !packed_output_string_lease(guard, ctx->preferred_input_struct_name) ||
+      !packed_output_string_lease(guard, ctx->preferred_output_struct_name) ||
+      !packed_output_lease(guard, options, options ? sizeof(*options) : 0)) goto fail;
+  if (ctx->reserved_preprocessor_identifier_count > 128 ||
+      !packed_output_lease(guard, ctx->reserved_preprocessor_identifiers,
+          ctx->reserved_preprocessor_identifier_count * sizeof(*ctx->reserved_preprocessor_identifiers))) goto fail;
+  for (size_t index = 0; index < ctx->reserved_preprocessor_identifier_count; ++index)
+    if (!packed_output_string_lease(guard, ctx->reserved_preprocessor_identifiers[index])) goto fail;
+  for (int role = 0; role < 2; ++role) {
+    const DXBCSignatureElement *elements = role ? program->outputs : program->inputs;
+    const int count = role ? program->output_count : program->input_count;
+    for (int field = 0; field < count; ++field)
+      if (!packed_output_string_lease(guard, elements[field].semantic_name_extended)) goto fail;
+  }
+  guard->globals = ctx->global_declarations;
+  if (guard->globals) {
+    guard->global_fields = hlsl_global_declarations_fields(guard->globals, &guard->global_field_count);
+    guard->global_shell_size = hlsl_global_declarations_shell_size(guard->globals);
+    guard->global_current_variant = hlsl_global_declarations_current_variant(guard->globals);
+    if (guard->global_field_count > 128 || !packed_output_lease(guard, guard->global_fields,
+        guard->global_field_count * sizeof(*guard->global_fields))) goto fail;
+    for (size_t field = 0; field < guard->global_field_count; ++field) {
+      const HLSLGlobalDeclarationField *entry = &guard->global_fields[field];
+      if (entry->witness_count > 128 || !packed_output_string_lease(guard, entry->name) ||
+          !packed_output_lease(guard, entry->witness_subprogram_indices,
+              entry->witness_count * sizeof(*entry->witness_subprogram_indices))) goto fail;
+    }
+  }
+  if (!hlsl_packed_output_owned_contract_digest(program, guard->model_digest)) goto fail;
+  HLSLEmitOptions replay = options ? *options : (HLSLEmitOptions){0};
+  replay.source_quality = NULL;
+  replay.source_quality_observer = NULL;
+  replay.source_quality_observer_context = NULL;
+  replay.expression_source_map = &guard->expected_map;
+  HLSLEmitDiagnostic diagnostic;
+  if (!hlsl_emit_with_options_impl(program, &guard->expected, ctx->params, ctx->common_params,
+      names, &replay, NULL, NULL, &diagnostic, true) ||
+      guard->expected.len > (size_t)PACKED_OUTPUT_BYTE_LIMIT) goto fail;
+  guard->ready = true;
+  if (!packed_output_model_matches(ctx)) goto fail;
+  if (!ctx->expression_source_map) ctx->expression_source_map = &guard->actual_map;
+  return true;
+fail:
+  packed_output_guard_dispose(ctx);
+  return false;
+}
+
+static bool packed_output_quality_observer(HLSLEmitterContext *ctx,
+    const HLSLSourceQualityObservation *observation) {
+  HLSLPackedOutputGuard *guard = ctx->packed_output_guard;
+  if (!guard || !guard->ready || !packed_output_model_matches(ctx) ||
+      !packed_output_source_matches(ctx, false) || !ctx->expression_source_map) return false;
+  const size_t length = ctx->sb->len;
+  guard->callback_map = *ctx->expression_source_map;
+  const bool observed = hlsl_stage_coverage_observation(ctx, observation) &&
+      (!ctx->source_quality_forward_observer ||
+       ctx->source_quality_forward_observer(ctx->source_quality_forward_observer_context, observation));
+  return observed && packed_output_model_matches(ctx) && ctx->sb->len == length &&
+      packed_output_source_matches(ctx, false) &&
+      packed_output_maps_equal(ctx->expression_source_map, &guard->callback_map);
+}
+
 void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
                                   bool logical_operation, int instruction) {
   if (!ctx->source_quality_analysis) return;
@@ -1678,6 +1917,7 @@ void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
 
 static bool owned_stage_quality_observer(void *context, const HLSLSourceQualityObservation *observation) {
   HLSLEmitterContext *ctx = context;
+  if (ctx->high_level_packed_outputs) return packed_output_quality_observer(ctx, observation);
   return hlsl_stage_coverage_observation(ctx, observation) &&
       (!ctx->source_quality_forward_observer ||
        ctx->source_quality_forward_observer(ctx->source_quality_forward_observer_context, observation));
@@ -1694,8 +1934,10 @@ bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptio
       .emission_status = HLSL_EMIT_STATUS_OK,
       .expression_facts = emitter_source_quality_expression_facts,
       .facts_context = ctx,
-      .observer = ctx->stage_coverage || ctx->matrix_use_capture ? owned_stage_quality_observer : options->source_quality_observer,
-      .observer_context = ctx->stage_coverage || ctx->matrix_use_capture ? ctx : options->source_quality_observer_context};
+      .observer = ctx->stage_coverage || ctx->matrix_use_capture || ctx->high_level_packed_outputs
+          ? owned_stage_quality_observer : options->source_quality_observer,
+      .observer_context = ctx->stage_coverage || ctx->matrix_use_capture || ctx->high_level_packed_outputs
+          ? ctx : options->source_quality_observer_context};
   ctx->source_quality_analysis =
       hlsl_source_quality_analysis_create(&quality_request, options->source_quality);
   if (ctx->source_quality_analysis) return true;
@@ -1735,6 +1977,16 @@ void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
 
 static void free_emitter_context(HLSLEmitterContext *ctx) {
   hlsl_source_quality_finish_emission(ctx);
+  if (ctx->packed_output_guard) {
+    if (sb_ok(ctx->sb) && (!packed_output_model_matches(ctx) ||
+        !packed_output_source_matches(ctx, true) ||
+        !packed_output_maps_equal(ctx->expression_source_map, &ctx->packed_output_guard->expected_map) ||
+        !hlsl_expression_source_map_matches(ctx->expression_source_map, ctx->program, ctx->sb->buf)))
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    if (!sb_ok(ctx->sb)) packed_output_guard_rollback(ctx);
+    packed_output_guard_dispose(ctx);
+  }
   if (ctx->natural_structured_owners_guarded && !sb_ok(ctx->sb) && ctx->expression_source_map)
     memset(ctx->expression_source_map, 0, sizeof(*ctx->expression_source_map));
   if (ctx->natural_structured_owners_guarded && sb_ok(ctx->sb) &&
@@ -1920,7 +2172,8 @@ static bool hlsl_emit_with_options_impl(
     const SerializedProgramParameters *params,
     const SerializedProgramParameters *common_params,
     const HLSLEmitNames *names, const HLSLEmitOptions *options,
-    HLSLMatrixUseCapture *matrix_capture, HLSLStageCoverage *stage_coverage, HLSLEmitDiagnostic *diagnostic) {
+    HLSLMatrixUseCapture *matrix_capture, HLSLStageCoverage *stage_coverage,
+    HLSLEmitDiagnostic *diagnostic, bool packed_replay) {
   hlsl_emit_diagnostic_init(diagnostic);
   if (options && options->expression_source_map)
     memset(options->expression_source_map, 0, sizeof(*options->expression_source_map));
@@ -2053,6 +2306,8 @@ static bool hlsl_emit_with_options_impl(
       ctx.high_level_geometry || ctx.high_level_domain ||
       (hlsl_high_level_struct_interface_supported(program, emit_mode) &&
        !(options && options->unity_uv_helper));
+  ctx.high_level_packed_outputs = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+      !ctx.unity_uv_helper && hlsl_packed_output_candidate(program);
   ctx.preferred_output_struct_name = output_struct;
   ctx.preferred_input_struct_name = input_struct;
   ctx.entry_point_name = entry_point;
@@ -2065,7 +2320,7 @@ static bool hlsl_emit_with_options_impl(
   const bool defer_multi_output_interface = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
       !ctx.high_level_interface && !ctx.unity_uv_helper && program->output_count > 1 &&
       (program->program_type == DXBC_PROGRAM_TYPE_VERTEX || program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
-      hlsl_natural_structured_candidate(program);
+      (ctx.high_level_packed_outputs || hlsl_natural_structured_candidate(program));
   if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE && program->output_count > 1 &&
       (program->program_type == DXBC_PROGRAM_TYPE_VERTEX || program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
       !ctx.high_level_interface && !defer_multi_output_interface) {
@@ -2185,7 +2440,9 @@ static bool hlsl_emit_with_options_impl(
    * the established direct-return and full-width interfaces retain their path. */
   const bool natural_structured = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
       !ctx.unity_uv_helper && hlsl_natural_structured_preflight(&ctx);
-  if (defer_multi_output_interface && !natural_structured) {
+  const bool packed_output = ctx.high_level_packed_outputs && hlsl_packed_output_preflight(&ctx);
+  if ((ctx.high_level_packed_outputs && !packed_output) ||
+      (defer_multi_output_interface && !natural_structured && !packed_output)) {
     hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_INTERFACE_EMISSION,
                    HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     free_emitter_context(&ctx);
@@ -2196,7 +2453,7 @@ static bool hlsl_emit_with_options_impl(
       !ctx.high_level_interface && !ctx.unity_uv_helper && program->output_count >= 1 &&
       program->output_count <= HLSL_SM5_IO_REGISTER_COUNT &&
       (program->program_type == DXBC_PROGRAM_TYPE_VERTEX || program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
-      natural_structured) {
+      (natural_structured || packed_output)) {
     ctx.high_level_interface = true;
   }
   if (ctx.high_level_interface && !hlsl_prepare_high_level_interface(&ctx)) {
@@ -2225,6 +2482,14 @@ static bool hlsl_emit_with_options_impl(
     ctx.natural_structured_append_prefix_length = source_start;
     common_sha256(sb->buf, source_start, ctx.natural_structured_append_prefix_digest);
     ctx.natural_structured_owners_guarded = true;
+  }
+  if (packed_output && !packed_replay &&
+      !packed_output_guard_prepare(&ctx, source_start, names, options)) {
+    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
   }
   if (!hlsl_source_quality_begin_entry(&ctx, hlsl_source_quality_inventory_supported(&ctx))) {
     free_emitter_context(&ctx);
@@ -2410,7 +2675,7 @@ static bool emit_with_diagnostic_and_capture(
     quality->classification = HLSL_SOURCE_QUALITY_FAILED;
   }
   bool success = hlsl_emit_with_options_impl(program, sb, params, common_params,
-                                             names, options, matrix_capture, stage_coverage, failure);
+                                             names, options, matrix_capture, stage_coverage, failure, false);
   if (quality) {
     quality->emission_status = failure->status;
     if (!success) {

@@ -35,6 +35,7 @@ typedef struct {
     uint8_t component_mask;
     uint32_t raw_instruction, original_bits;
     USILOpcode opcode;
+    uint8_t demanded_lanes, destination_lanes;
     bool valid;
 } ProbeDecodedLiteral;
 
@@ -458,11 +459,96 @@ static bool print_domain_operand(const DXBCOperand *operand, int instruction,
     return complete;
 }
 
+/* This experiment recognizes the actual parsed fixture interface. Output RW
+ * masks encode never-written components, unlike input RW masks. No shader text
+ * or source-field spelling is used to infer a packed lane owner. */
+static bool packed_output_vertex_shape(const USILProgram *program,
+                                       int *packed_register) {
+    if (!program || !packed_register ||
+        program->program_type != DXBC_PROGRAM_TYPE_VERTEX ||
+        !program->has_stage_contract || !program->has_parsed_signature_authority ||
+        program->input_count < 0 || program->input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
+        program->input_alloc < program->input_count ||
+        (program->input_alloc != 0) != (program->inputs != NULL) ||
+        program->output_count != 3 || program->output_alloc < 3 || !program->outputs ||
+        program->patch_constant_count ||
+        program->signature_declaration_count < 0 ||
+        program->signature_declaration_count > PROBE_DOMAIN_DECLARATION_LIMIT ||
+        program->signature_declaration_alloc < program->signature_declaration_count ||
+        (program->signature_declaration_alloc != 0) !=
+            (program->signature_declarations != NULL) ||
+        !usil_signature_authority_is_valid(program)) return false;
+    const DXBCSignatureElement *position = NULL, *xy = NULL, *zw = NULL;
+    for (int index = 0; index < program->output_count; ++index) {
+        const DXBCSignatureElement *field = &program->outputs[index];
+        if (!linked_inline_signature(field) || field->component_type != 3 ||
+            field->stream_index || field->min_precision ||
+            field->rw_mask != (uint8_t)(15u & ~(unsigned)field->mask)) return false;
+        if (field->system_value == 1 && field->semantic_index == 0 &&
+            field->mask == 15 && !position) position = field;
+        else if (!field->system_value && !strcmp(field->semantic_name, "TEXCOORD") &&
+                 field->semantic_index == 0 && field->mask == 3 && !xy) xy = field;
+        else if (!field->system_value && !strcmp(field->semantic_name, "TEXCOORD") &&
+                 field->semantic_index == 1 && field->mask == 12 && !zw) zw = field;
+        else return false;
+    }
+    if (!position || !xy || !zw || position->register_id != 0 ||
+        xy->register_id != 1 || zw->register_id != xy->register_id) return false;
+    *packed_register = (int)xy->register_id;
+    return true;
+}
+
+/* Reuse the decoded source-use demand and component selection. Both retained
+ * immediate representations must agree; no float conversion or token rewrite
+ * participates in selecting the actual warm counterexample. */
+static bool packed_output_mul_literal(const USILProgram *program,
+    const USILInstruction *instruction, int operand_index, int packed_register,
+    uint8_t *component_mask, uint8_t *demanded_lanes) {
+    if (!program || !instruction || !component_mask || !demanded_lanes ||
+        instruction->opcode != USIL_OP_MUL || instruction->operand_count != 3 ||
+        instruction->saturate || instruction->precise_mask ||
+        operand_index < 1 || operand_index > 2) return false;
+    const DXBCOperand *destination = &instruction->operands[0];
+    const uint8_t lanes = usil_operand_destination_lane_mask(destination);
+    if ((lanes != 3 && lanes != 12 && lanes != 15) ||
+        destination->type != OPERAND_TYPE_OUTPUT ||
+        destination->register_index < 0 || destination->register_index_dim != 1 ||
+        destination->rel_op0 || destination->rel_op1 || destination->rel_op2 ||
+        destination->has_neg || destination->has_abs || destination->min_precision ||
+        destination->extended_token_count ||
+        destination->register_index != packed_register) return false;
+    const DXBCOperand *operand = &instruction->operands[operand_index];
+    USILOperandUseInfo use = {0};
+    if (operand->type != OPERAND_TYPE_IMMEDIATE32 || operand->has_neg || operand->has_abs ||
+        operand->min_precision || operand->extended_token_count ||
+        operand->register_index_dim || operand->rel_op0 || operand->rel_op1 || operand->rel_op2 ||
+        (operand->imm_value_count != 1 && operand->imm_value_count != 4) ||
+        operand->immediate_word_count != operand->imm_value_count ||
+        !usil_instruction_operand_use(program, instruction, operand_index, &use) ||
+        use.use != USIL_OPERAND_USE_SOURCE || use.source_lane_mask != lanes) return false;
+    uint8_t captured = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!(use.source_lane_mask & (1u << lane))) continue;
+        const int selected = operand->imm_value_count == 1 ? 0 :
+            usil_operand_source_component(operand, lane);
+        if (selected < 0 || selected >= operand->imm_value_count ||
+            selected >= operand->immediate_word_count ||
+            operand->imm_values[selected] != UINT32_C(0x3ec00000) ||
+            operand->immediate_words[selected] != UINT32_C(0x3ec00000)) return false;
+        captured |= (uint8_t)(1u << selected);
+    }
+    if (!captured) return false;
+    *component_mask = captured;
+    *demanded_lanes = use.source_lane_mask;
+    return true;
+}
+
 /* The warm counterexample changes the demanded components of one broadcast
  * literal owned by the decoded target. It replays the ordinary inverse; it never guesses a
  * literal span or supplies authored fragment text to reconstruction. */
 static bool reconstruct_structured(const DXBCContainerView *target,
-    StringBuilder *source, ProbeDecodedLiteral *literal_owner, bool change_literal, bool vertex_fixture) {
+    StringBuilder *source, ProbeDecodedLiteral *literal_owner, bool change_literal,
+    bool vertex_fixture, bool packed_output_fixture) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -481,13 +567,20 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         program.program_type != (vertex_fixture ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL) ||
         program.instruction_count > PROBE_DOMAIN_INSTRUCTION_LIMIT ||
         program.input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
-        program.output_count != (vertex_fixture ? 2 : 1) || !program.outputs) {
+        (packed_output_fixture
+            ? program.output_count < 1 || program.output_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
+              program.output_alloc < program.output_count
+            : program.output_count != (vertex_fixture ? 2 : 1)) || !program.outputs) {
         puts("structured_decode=failed structured_source_result=not-attempted");
         goto done;
     }
-    bool output_shape = !vertex_fixture && program.outputs[0].mask == 7 &&
-        program.outputs[0].component_type == 3;
-    if (vertex_fixture) {
+    int packed_register = -1;
+    const bool packed_shape = !packed_output_fixture ||
+        (print_domain_signature("packed-vertex-output", program.outputs, program.output_count) &&
+         packed_output_vertex_shape(&program, &packed_register));
+    bool output_shape = packed_output_fixture || (!vertex_fixture && program.outputs[0].mask == 7 &&
+        program.outputs[0].component_type == 3);
+    if (vertex_fixture && !packed_output_fixture) {
         unsigned position = 0, value = 0;
         for (int index = 0; index < program.output_count; ++index) {
             const DXBCSignatureElement *field = &program.outputs[index];
@@ -510,6 +603,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                field->component_type, (unsigned)field->interpolation_mode);
     }
     ProbeDecodedLiteral captured = {0};
+    unsigned packed_literal_count = 0;
     for (int index = 0; index < program.instruction_count; ++index) {
         USILInstruction *instruction = &program.instructions[index];
         printf("structured_instruction index=%d raw_instruction=%u opcode=%u name=%s "
@@ -527,11 +621,29 @@ static bool reconstruct_structured(const DXBCContainerView *target,
             instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE ||
             instruction->opcode == USIL_OP_IF || instruction->opcode == USIL_OP_MAD ||
             instruction->opcode == USIL_OP_DP2 || instruction->opcode == USIL_OP_DP3 || instruction->opcode == USIL_OP_DP4 ||
-            instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MOV) {
+            instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MOV ||
+            (packed_output_fixture && instruction->opcode == USIL_OP_MUL)) {
             size_t remaining = PROBE_DOMAIN_OPERAND_LIMIT;
             for (int operand_index = 0; operand_index < instruction->operand_count; ++operand_index)
                 if (!print_domain_operand(&instruction->operands[operand_index], index,
                     operand_index, 0, 0, &remaining)) goto done;
+        }
+        if (packed_output_fixture) {
+            if (!packed_shape) continue;
+            for (int operand_index = 1; operand_index < instruction->operand_count; ++operand_index) {
+                uint8_t component_mask = 0, demanded_lanes = 0;
+                if (!packed_output_mul_literal(&program, instruction, operand_index,
+                        packed_register, &component_mask, &demanded_lanes)) continue;
+                ++packed_literal_count;
+                captured = (ProbeDecodedLiteral){.instruction = index, .operand = operand_index,
+                    .component_mask = component_mask,
+                    .raw_instruction = instruction->source_instruction_index,
+                    .original_bits = UINT32_C(0x3ec00000), .opcode = instruction->opcode,
+                    .demanded_lanes = demanded_lanes,
+                    .destination_lanes = usil_operand_destination_lane_mask(&instruction->operands[0]),
+                    .valid = true};
+            }
+            continue;
         }
         const bool comparison = instruction->opcode == USIL_OP_LT || instruction->opcode == USIL_OP_GE ||
             instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE;
@@ -568,10 +680,33 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                 component_mask |= (uint8_t)(1u << selected);
             }
             if (!broadcast || !component_mask) continue;
-            captured = (ProbeDecodedLiteral){index, operand_index, component_mask,
-                instruction->source_instruction_index, expected_bits,
-                instruction->opcode, true};
+            captured = (ProbeDecodedLiteral){.instruction = index, .operand = operand_index,
+                .component_mask = component_mask,
+                .raw_instruction = instruction->source_instruction_index,
+                .original_bits = expected_bits, .opcode = instruction->opcode, .valid = true};
             break;
+        }
+    }
+    if (packed_output_fixture) {
+        if (!packed_shape) {
+            puts("packed_output_signature=unavailable packed_output_source=not-attempted");
+            goto done;
+        }
+        printf("packed_output_literal_candidates=%u required=1\n", packed_literal_count);
+        if (packed_literal_count != 1) {
+            puts("packed_output_literal_owner=unavailable packed_output_source=not-attempted");
+            goto done;
+        }
+        printf("packed_output_literal_scope=%s demanded_lanes=%u destination_lanes=%u\n",
+               captured.destination_lanes == 15 ? "whole-pair-boundary" : "whole-field",
+               (unsigned)captured.demanded_lanes, (unsigned)captured.destination_lanes);
+        if (captured.destination_lanes == 15) {
+            printf("packed_output_whole_pair_boundary=excluded instruction=%d "
+                   "raw_instruction=%u operand=%d component_mask=%u "
+                   "original_bits=0x%08" PRIx32 " packed_output_source=not-attempted\n",
+                   captured.instruction, captured.raw_instruction, captured.operand,
+                   (unsigned)captured.component_mask, captured.original_bits);
+            goto done;
         }
     }
     if (!captured.valid) {
@@ -582,7 +717,9 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         if (!literal_owner->valid || captured.instruction != literal_owner->instruction ||
             captured.operand != literal_owner->operand || captured.component_mask != literal_owner->component_mask ||
             captured.raw_instruction != literal_owner->raw_instruction ||
-            captured.opcode != literal_owner->opcode || captured.original_bits != literal_owner->original_bits)
+            captured.opcode != literal_owner->opcode || captured.original_bits != literal_owner->original_bits ||
+            captured.demanded_lanes != literal_owner->demanded_lanes ||
+            captured.destination_lanes != literal_owner->destination_lanes)
             goto done;
         DXBCOperand *operand = &program.instructions[captured.instruction].operands[captured.operand];
         for (int component = 0; component < 4; ++component) {
@@ -624,6 +761,16 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                map.complete, map.count, map_valid);
         accepted = map_valid && map.complete &&
             quality.classification != HLSL_SOURCE_QUALITY_FAILED;
+        if (packed_output_fixture) {
+            const HLSLExpressionOrigin *origin = (size_t)captured.instruction < map.count
+                ? &map.origins[captured.instruction] : NULL;
+            const bool owner_printed = origin && hlsl_expression_origin_has_span(origin->kind) &&
+                origin->instruction_index == captured.instruction &&
+                origin->source_instruction_index == captured.raw_instruction &&
+                origin->destination_lanes == captured.destination_lanes;
+            printf("packed_output_decoded_literal_map_owned=%d\n", owner_printed);
+            accepted = accepted && owner_printed;
+        }
     }
 done:
     usil_free(&program);
@@ -1628,7 +1775,7 @@ static void usage(const char *name) {
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture]\n"
+        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture]\n"
         "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -1652,6 +1799,12 @@ static void usage(const char *name) {
         "reconstructs vertex with a fragment stub. An exact cold comparison enables a "
         "decoded broadcast literal change, followed by exact original-target "
         "warm restoration. It cannot be combined with other fixture options.\n"
+        "--packed-output-vertex-fixture uses the same isolated vertex comparison, "
+        "requiring actual FLOAT32 SV_POSITION plus TEXCOORD0.xy/TEXCOORD1.zw "
+        "sharing one output register. It selects exactly one decoded MUL "
+        "broadcast 0.375 literal with whole-field demand for the warm change to 3.0. "
+        "A whole-pair MUL is separately labeled as a boundary observation. "
+        "Unavailable shapes never receive substitute source or target bytes.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -1665,7 +1818,9 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
-    const bool structured_vertex_fixture = argc == 5 && !strcmp(argv[4], "--structured-vertex-fixture");
+    const bool packed_output_vertex_fixture = argc == 5 && !strcmp(argv[4], "--packed-output-vertex-fixture");
+    const bool structured_vertex_fixture = packed_output_vertex_fixture ||
+        (argc == 5 && !strcmp(argv[4], "--structured-vertex-fixture"));
     const bool structured_fixture = structured_vertex_fixture ||
         (argc == 5 && !strcmp(argv[4], "--structured-fixture"));
     const bool scalar_fixture = argc >= 5 && !strcmp(argv[4], "--scalar-fixture");
@@ -1692,7 +1847,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     CommonFileBytes authored = {0};
-    const char *shader_name = structured_vertex_fixture ? "Fixture/HighLevel/StructuredFloat3VertexBranch" :
+    const char *shader_name = packed_output_vertex_fixture ? "Fixture/HighLevel/PackedFloat2VertexOutput" :
+        structured_vertex_fixture ? "Fixture/HighLevel/StructuredFloat3VertexBranch" :
         structured_fixture ? "Fixture/HighLevel/StructuredFloat3Branch" : scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
         : icb_fixture ? "Fixture/HighLevel/HullFloat3ICB" : default_shader_name;
     OwnedLiteralMutation icb_mutation = {0};
@@ -1746,7 +1902,8 @@ int main(int argc, char **argv) {
            "editor=not-run "
            "import=not-run semantic_certificate=not-run native_D3D11=not-run\n"
            "session raw_mask=0x%08" PRIx32 " valid_apis=0x%08" PRIx32 "\n",
-           structured_vertex_fixture ? "selected-native-structured-vertex" :
+           packed_output_vertex_fixture ? "selected-native-packed-output-vertex" :
+               structured_vertex_fixture ? "selected-native-structured-vertex" :
                structured_fixture ? "selected-native-structured-fragment" :
                domain_fixture ? "selected-native-domain" : "selected-native-hull",
            structured_vertex_fixture ? "fragment" : structured_fixture ? "vertex" : domain_fixture ? "vertex,hull,fragment" : "vertex,domain,fragment",
@@ -1764,8 +1921,14 @@ int main(int argc, char **argv) {
     if (structured_fixture) {
         if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target)) goto done;
         print_hash("target_complete_dxbc_sha256", target.data, target.size);
-        if (!reconstruct_structured(&target, &hull, &structured_literal, false, structured_vertex_fixture) ||
-            !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture)) goto done;
+        if (!reconstruct_structured(&target, &hull, &structured_literal, false,
+                structured_vertex_fixture, packed_output_vertex_fixture) ||
+            !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture)) {
+            if (packed_output_vertex_fixture)
+                puts("packed_output_candidate=not-run packed_output_warm_mutation=not-run "
+                     "packed_output_warm_restore=not-run");
+            goto done;
+        }
     }
     if (domain_fixture) {
         if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
@@ -1857,6 +2020,8 @@ int main(int argc, char **argv) {
         (!cold_equal && (domain_fixture || (!scalar_fixture && !icb_fixture)))) {
         if (domain_fixture)
             puts("domain_warm_mutation=not-run domain_warm_restore=not-run cold_exact=0");
+        if (packed_output_vertex_fixture)
+            puts("packed_output_warm_mutation=not-run packed_output_warm_restore=not-run cold_exact=0");
         goto done;
     }
 
@@ -1868,7 +2033,8 @@ int main(int argc, char **argv) {
     if (structured_fixture) {
         StringBuilder mutated_fragment;
         sb_init(&mutated_fragment);
-        mutation_built = reconstruct_structured(&target, &mutated_fragment, &structured_literal, true, structured_vertex_fixture) &&
+        mutation_built = reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
+                structured_vertex_fixture, packed_output_vertex_fixture) &&
             structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture);
         sb_free(&mutated_fragment);
     } else {
@@ -1943,6 +2109,11 @@ int main(int argc, char **argv) {
     if (structured_fixture)
         printf("structured_isolated_stage_qualified=%d original_target_reference=1 "
                "decoded_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
+               !result, mutation_diff && mutation_authority ? "different" : "failed",
+               !result ? "exact" : "failed");
+    if (packed_output_vertex_fixture)
+        printf("packed_output_isolated_stage_qualified=%d original_target_reference=1 "
+               "actual_mul_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
                !result, mutation_diff && mutation_authority ? "different" : "failed",
                !result ? "exact" : "failed");
     if (domain_fixture)

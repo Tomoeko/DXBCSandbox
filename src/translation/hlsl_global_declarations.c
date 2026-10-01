@@ -17,6 +17,20 @@ struct HLSLGlobalDeclarationUnion {
     size_t field_count;
 };
 
+const char *hlsl_global_declaration_status_name(HLSLGlobalDeclarationStatus status) {
+    switch (status) {
+    case HLSL_GLOBAL_DECLARATIONS_OK: return "ok";
+    case HLSL_GLOBAL_DECLARATIONS_NOT_APPLICABLE: return "not-applicable";
+    case HLSL_GLOBAL_DECLARATIONS_INVALID: return "invalid";
+    case HLSL_GLOBAL_DECLARATIONS_SCOPE_CONFLICT: return "scope-conflict";
+    case HLSL_GLOBAL_DECLARATIONS_SHELL_CONFLICT: return "shell-conflict";
+    case HLSL_GLOBAL_DECLARATIONS_FIELD_CONFLICT: return "field-conflict";
+    case HLSL_GLOBAL_DECLARATIONS_CURRENT_READ_UNAUTHORIZED: return "current-read-unauthorized";
+    case HLSL_GLOBAL_DECLARATIONS_ALLOCATION_FAILED: return "allocation-failed";
+    }
+    return "unknown";
+}
+
 static HLSLGlobalDeclarationStatus failure(HLSLGlobalDeclarationDiagnostic *diagnostic,
                                            HLSLGlobalDeclarationStatus status, int index,
                                            int conflict, int field) {

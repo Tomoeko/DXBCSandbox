@@ -387,12 +387,13 @@ static bool hash_owner_operand(CommonSha256Context *hash, const DXBCOperand *ope
 typedef enum {
     DECODED_OWNER_HULL,
     DECODED_OWNER_DOMAIN,
-    DECODED_OWNER_NATURAL_STRUCTURED
+    DECODED_OWNER_NATURAL_STRUCTURED,
+    DECODED_OWNER_PACKED_OUTPUT
 } DecodedOwnerStage;
 
 /* Storage and decoded-shape safety only. The structured producer separately
  * proves the complete IF/phi/value contract over the prepared CFG and SSA. */
-static bool natural_structured_owner_storage_valid(const USILProgram *program) {
+static bool natural_structured_owner_storage_valid(const USILProgram *program, bool packed_output) {
     if (!program || !program->has_stage_contract || !program->has_parsed_signature_authority ||
         (program->program_type != DXBC_PROGRAM_TYPE_VERTEX && program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
         (program->shader_model_major != 4 && program->shader_model_major != 5) ||
@@ -408,7 +409,7 @@ static bool natural_structured_owner_storage_valid(const USILProgram *program) {
         program->signature_declaration_alloc < program->signature_declaration_count ||
         (program->signature_declaration_count && !program->signature_declarations) ||
         program->temp_count < 0 || program->temp_count > HLSL_SM5_TEMP_REGISTER_COUNT ||
-        program->cbuffer_count || program->texture_count || program->sampler_count || program->uav_count ||
+        (!packed_output && program->cbuffer_count) || program->texture_count || program->sampler_count || program->uav_count ||
         program->indexable_temp_count || program->index_range_count || program->patch_constant_count ||
         program->icb_value_count || program->has_icb_declaration || !usil_icb_declaration_is_valid(program) ||
         program->tessellation.valid || program->tessellation.phase_count || program->geometry.valid ||
@@ -439,13 +440,18 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     if (stage == DECODED_OWNER_HULL ? !hull_contract(program, &checked)
         : stage == DECODED_OWNER_DOMAIN
             ? !hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
-            : stage != DECODED_OWNER_NATURAL_STRUCTURED || !natural_structured_owner_storage_valid(program)) return false;
+            : stage == DECODED_OWNER_PACKED_OUTPUT
+                ? !hlsl_packed_output_candidate(program) || !natural_structured_owner_storage_valid(program, true)
+                : stage != DECODED_OWNER_NATURAL_STRUCTURED || !natural_structured_owner_storage_valid(program, false)) return false;
     CommonSha256Context hash;
     common_sha256_init(&hash);
     static const char domain[] = "dxbc-hull-final-factor-owner-v1";
     static const char domain_output[] = "dxbc-domain-output-owner-v1";
     static const char natural_structured[] = "dxbc-natural-structured-owner-v1";
-    if (stage == DECODED_OWNER_NATURAL_STRUCTURED)
+    static const char packed_output[] = "dxbc-packed-output-owner-v1";
+    if (stage == DECODED_OWNER_PACKED_OUTPUT)
+        common_sha256_update(&hash, packed_output, sizeof(packed_output));
+    else if (stage == DECODED_OWNER_NATURAL_STRUCTURED)
         common_sha256_update(&hash, natural_structured, sizeof(natural_structured));
     else common_sha256_update(&hash, stage == DECODED_OWNER_DOMAIN ? domain_output : domain,
         stage == DECODED_OWNER_DOMAIN ? sizeof(domain_output) : sizeof(domain));
@@ -461,7 +467,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
         (uint64_t)program->index_range_count};
     for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); ++index)
         hash_owner_number(&hash, fields[index]);
-    if (stage == DECODED_OWNER_NATURAL_STRUCTURED) {
+    if (stage == DECODED_OWNER_NATURAL_STRUCTURED || stage == DECODED_OWNER_PACKED_OUTPUT) {
         const uint64_t authority[] = {program->has_stage_contract,
             (uint64_t)program->texture_count, (uint64_t)program->sampler_count, (uint64_t)program->uav_count,
             (uint64_t)program->indexable_temp_count, (uint64_t)program->icb_value_count,
@@ -509,7 +515,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
             const size_t length = strlen(semantic);
             hash_owner_number(&hash, length);
             common_sha256_update(&hash, semantic, length);
-            if (stage == DECODED_OWNER_NATURAL_STRUCTURED) {
+            if (stage == DECODED_OWNER_NATURAL_STRUCTURED || stage == DECODED_OWNER_PACKED_OUTPUT) {
                 hash_owner_number(&hash, element->semantic_name_length);
                 hash_owner_number(&hash, element->semantic_name_extended != NULL);
                 common_sha256_update(&hash, element->semantic_name, sizeof(element->semantic_name));
@@ -554,7 +560,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
         hash_owner_number(&hash, instruction->opcode);
         hash_owner_number(&hash, instruction->source_instruction_index);
         hash_owner_number(&hash, (uint64_t)instruction->operand_count);
-        if (stage == DECODED_OWNER_NATURAL_STRUCTURED) {
+        if (stage == DECODED_OWNER_NATURAL_STRUCTURED || stage == DECODED_OWNER_PACKED_OUTPUT) {
             USILEffectFlags effects;
             if (!usil_instruction_effects(program, instruction, &effects)) return false;
             const uint64_t controls[] = {instruction->saturate, instruction->precise_mask,
@@ -595,6 +601,10 @@ bool hlsl_domain_owned_contract_digest(const USILProgram *program, uint8_t diges
 
 bool hlsl_natural_structured_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
     return digest && decoded_stage_owner_digest(program, digest, DECODED_OWNER_NATURAL_STRUCTURED);
+}
+
+bool hlsl_packed_output_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
+    return digest && decoded_stage_owner_digest(program, digest, DECODED_OWNER_PACKED_OUTPUT);
 }
 
 static bool instance_operand(const DXBCOperand *operand, bool control_point) {

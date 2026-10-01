@@ -93,6 +93,128 @@ static bool same_semantic_base(const char *left, const char *right) {
   return *left == *right;
 }
 
+/* This layout belongs to one parsed straight-line vertex route. Input
+ * packing, integer/system varyings and partial field assembly remain separate
+ * contracts. Output RW bits mean never-written lanes, unlike input RW bits. */
+static bool packed_output_layout_supported(const USILProgram *program) {
+  if (!program || program->program_type != DXBC_PROGRAM_TYPE_VERTEX ||
+      !program->has_stage_contract || !program->has_parsed_signature_authority || program->patch_constant_count ||
+      program->input_count < 0 || program->input_count > HLSL_SM5_IO_REGISTER_COUNT ||
+      program->input_alloc < program->input_count || (program->input_count && !program->inputs) ||
+      program->output_count < 3 || program->output_count > HLSL_SM5_IO_REGISTER_COUNT ||
+      program->output_alloc < program->output_count || !program->outputs ||
+      program->signature_declaration_count < 0 || program->signature_declaration_count > 64 ||
+      program->signature_declaration_alloc < program->signature_declaration_count ||
+      (program->signature_declaration_count && !program->signature_declarations)) return false;
+  for (int input = 0; input < program->input_count; ++input)
+    if (!hlsl_signature_semantic_storage_valid(&program->inputs[input])) return false;
+  uint32_t inputs;
+  if (!natural_signature_registers(program->inputs, program->input_count, &inputs)) return false;
+  unsigned counts[HLSL_SM5_IO_REGISTER_COUNT] = {0};
+  uint8_t masks[HLSL_SM5_IO_REGISTER_COUNT] = {0};
+  unsigned position = 0, pairs = 0;
+  for (int index = 0; index < program->output_count; ++index) {
+    const DXBCSignatureElement *field = &program->outputs[index];
+    if (!hlsl_signature_semantic_storage_valid(field) || field->component_type != 3 ||
+        field->min_precision || field->stream_index || !field->mask || field->mask > 15 ||
+        field->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
+        (masks[field->register_id] & field->mask) || ++counts[field->register_id] > 2u) return false;
+    masks[field->register_id] |= field->mask;
+    if (field->system_value == 1u) {
+      if (field->mask != 15 || field->rw_mask || ++position > 1u) return false;
+    } else if (field->system_value) return false;
+    for (int previous = 0; previous < index; ++previous)
+      if (field->semantic_index == program->outputs[previous].semantic_index &&
+          same_semantic_base(dxbc_signature_semantic_name(field),
+                            dxbc_signature_semantic_name(&program->outputs[previous]))) return false;
+  }
+  for (int index = 0; index < program->output_count; ++index) {
+    const DXBCSignatureElement *field = &program->outputs[index];
+    if (counts[field->register_id] == 1u) {
+      if (field->mask & (field->mask + 1u)) return false;
+      continue;
+    }
+    if (field->system_value || (field->mask != 3 && field->mask != 12) ||
+        field->rw_mask != (uint8_t)(15u ^ field->mask) ||
+        !hlsl_custom_zero_index_semantic_supported(dxbc_signature_semantic_name(field))) return false;
+    for (int previous = 0; previous < index; ++previous)
+      if (program->outputs[previous].register_id == field->register_id &&
+          (masks[field->register_id] != 15 || ++pairs > 1u)) return false;
+  }
+  return position == 1u && pairs == 1u && usil_signature_authority_is_valid(program);
+}
+
+bool hlsl_high_level_output_projection(const USILProgram *program,
+    const DXBCOperand *destination, HLSLNaturalOutputProjection *projection) {
+  if (!projection) return false;
+  memset(projection, 0, sizeof(*projection));
+  if (!program || !destination || program->output_count < 1 ||
+      program->output_count > HLSL_SM5_IO_REGISTER_COUNT ||
+      program->output_alloc < program->output_count || !program->outputs ||
+      destination->type != OPERAND_TYPE_OUTPUT || !hlsl_lift_operand_is_plain(destination) ||
+      destination->register_index < 0 || destination->register_index >= HLSL_SM5_IO_REGISTER_COUNT ||
+      destination->register_index_dim != 1 || !destination->index_has_immediate[0] ||
+      destination->index_representations[0] || destination->index_value_exceeds_int[0] ||
+      destination->index_values[0] != (uint32_t)destination->register_index) return false;
+  const uint8_t mask = usil_operand_destination_lane_mask(destination);
+  int match = -1;
+  unsigned register_fields = 0;
+  for (int field = 0; field < program->output_count; ++field) {
+    const DXBCSignatureElement *signature = &program->outputs[field];
+    if (signature->register_id != (uint32_t)destination->register_index) continue;
+    ++register_fields;
+    if (signature->mask != mask) continue;
+    if (match >= 0) return false;
+    match = field;
+  }
+  if (match < 0 || !mask || (register_fields > 1u && !packed_output_layout_supported(program))) return false;
+  *projection = (HLSLNaturalOutputProjection){match, (uint32_t)destination->register_index,
+      mask, (uint8_t)signature_width(&program->outputs[match]), register_fields > 1u};
+  return true;
+}
+
+bool hlsl_packed_output_candidate(const USILProgram *program) {
+  if (!packed_output_layout_supported(program) ||
+      (program->shader_model_major != 4 && program->shader_model_major != 5) ||
+      program->instruction_count < 2 || program->instruction_count > 64 ||
+      program->instruction_alloc < program->instruction_count || !program->instructions ||
+      program->cbuffer_count < 0 || program->cbuffer_count > 8 ||
+      program->cbuffer_alloc < program->cbuffer_count || (program->cbuffer_count && !program->cbuffers) ||
+      program->texture_count || program->sampler_count || program->uav_count ||
+      program->indexable_temp_count || program->index_range_count || program->patch_constant_count ||
+      program->icb_value_count || program->has_icb_declaration || program->geometry.valid ||
+      program->tessellation.valid || program->compute.valid ||
+      (program->has_global_flags && program->global_flags != 1u)) return false;
+  bool written[HLSL_SM5_IO_REGISTER_COUNT] = {false};
+  for (int index = 0; index < program->instruction_count; ++index) {
+    const USILInstruction *instruction = &program->instructions[index];
+    const int arity = instruction->opcode == USIL_OP_MOV ? 2 :
+        instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MUL ? 3 :
+        instruction->opcode == USIL_OP_MAD ? 4 : instruction->opcode == USIL_OP_RET ? 0 : -1;
+    if (arity < 0 || instruction->operand_count != arity || instruction->saturate ||
+        instruction->precise_mask || instruction->condition_test ||
+        (instruction->opcode == USIL_OP_RET && index + 1 != program->instruction_count) ||
+        (arity && !hlsl_expression_effects_supported(program, instruction))) return false;
+    for (int operand = 0; operand < arity; ++operand) {
+      const DXBCOperand *value = &instruction->operands[operand];
+      if (!hlsl_lift_operand_is_plain(value) || value->extended_token_count || value->extended_tokens ||
+          (value->raw_token & UINT32_C(0x80000000))) return false;
+      if (!operand) {
+        if (value->type == OPERAND_TYPE_OUTPUT) {
+          HLSLNaturalOutputProjection projection;
+          if (!hlsl_high_level_output_projection(program, value, &projection) ||
+              written[projection.field_index]) return false;
+          written[projection.field_index] = true;
+        } else if (value->type != OPERAND_TYPE_TEMP) return false;
+      } else if (value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_INPUT &&
+          value->type != OPERAND_TYPE_IMMEDIATE32 && value->type != OPERAND_TYPE_CONSTANT_BUFFER) return false;
+    }
+  }
+  if (program->instructions[program->instruction_count - 1].opcode != USIL_OP_RET) return false;
+  for (int field = 0; field < program->output_count; ++field) if (!written[field]) return false;
+  return true;
+}
+
 bool hlsl_natural_input_layout_supported(const USILProgram *program, bool *has_packed) {
   if (has_packed) *has_packed = false;
   if (!program || program->input_count < 0 || program->input_count > HLSL_SM5_IO_REGISTER_COUNT ||
@@ -671,6 +793,16 @@ static bool natural_interface_input_registers(const HLSLEmitterContext *ctx, uin
   return true;
 }
 
+static bool natural_interface_output_registers(const HLSLEmitterContext *ctx, uint32_t *registers) {
+  if (!ctx->high_level_packed_outputs)
+    return natural_signature_registers(ctx->program->outputs, ctx->program->output_count, registers);
+  if (!ctx->packed_output_guard || !hlsl_packed_output_candidate(ctx->program)) return false;
+  *registers = 0;
+  for (int field = 0; field < ctx->program->output_count; ++field)
+    *registers |= UINT32_C(1) << ctx->program->outputs[field].register_id;
+  return true;
+}
+
 bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext *ctx) {
   if (!ctx || !ctx->program || ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
       !ctx->high_level_interface || !ctx->high_level_interface_prepared || ctx->unity_uv_helper ||
@@ -681,7 +813,7 @@ bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext 
   const USILProgram *program = ctx->program;
   uint32_t inputs, outputs;
   if (!natural_interface_input_registers(ctx, &inputs) ||
-      !natural_signature_registers(program->outputs, program->output_count, &outputs) ||
+      !natural_interface_output_registers(ctx, &outputs) ||
       !outputs) return false;
   for (int input = 0; input < program->input_count; ++input)
     if (!(ctx->high_level_packed_inputs ? hlsl_high_level_input_field_name(ctx, input)
@@ -700,10 +832,10 @@ bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext 
     /* The new IF plan is frozen before callbacks. Its actual body and return
      * still require independent replay before entry completion. */
     if (!hlsl_high_level_struct_interface_supported(program, ctx->emit_mode) &&
-        !ctx->natural_structured_owners_guarded) return false;
+        !ctx->natural_structured_owners_guarded && !ctx->high_level_packed_outputs) return false;
   }
   for (int output = 0; output < program->output_count; ++output)
-    if (!hlsl_high_level_output_name(ctx, (int)program->outputs[output].register_id)) return false;
+    if (!hlsl_high_level_output_field_name(ctx, output)) return false;
   return true;
 }
 
@@ -711,7 +843,7 @@ bool hlsl_source_quality_interface_inventory_complete(const HLSLEmitterContext *
   if (!hlsl_source_quality_interface_inventory_supported(ctx)) return false;
   uint32_t inputs, outputs;
   if (!natural_interface_input_registers(ctx, &inputs) ||
-      !natural_signature_registers(ctx->program->outputs, ctx->program->output_count, &outputs))
+      !natural_interface_output_registers(ctx, &outputs))
     return false;
   if (ctx->high_level_input_parameters_emitted != inputs ||
       ctx->high_level_output_statements_emitted != outputs ||
@@ -721,6 +853,12 @@ bool hlsl_source_quality_interface_inventory_complete(const HLSLEmitterContext *
     const uint32_t fields = ctx->program->input_count == HLSL_SM5_IO_REGISTER_COUNT
         ? UINT32_MAX : (UINT32_C(1) << (unsigned)ctx->program->input_count) - 1u;
     if (ctx->high_level_input_fields_emitted != fields) return false;
+  }
+  if (ctx->high_level_packed_outputs) {
+    const uint32_t fields = ctx->program->output_count == HLSL_SM5_IO_REGISTER_COUNT
+        ? UINT32_MAX : (UINT32_C(1) << (unsigned)ctx->program->output_count) - 1u;
+    if (ctx->high_level_output_field_declarations != fields ||
+        ctx->high_level_output_field_statements != fields) return false;
   }
   if (ctx->high_level_domain && (!ctx->high_level_domain_point_struct_emitted ||
       ctx->high_level_domain_point_fields_emitted != inputs || !ctx->high_level_domain_attribute_emitted ||
@@ -767,6 +905,14 @@ void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, in
   const USILInstruction *owner = &ctx->program->instructions[instruction];
   if (!owner->operand_count || owner->operands[0].type != OPERAND_TYPE_OUTPUT ||
       !hlsl_lift_operand_is_plain(&owner->operands[0])) return;
+  if (ctx->high_level_packed_outputs) {
+    HLSLNaturalOutputProjection projection;
+    if (!hlsl_high_level_output_projection(ctx->program, &owner->operands[0], &projection)) return;
+    ctx->high_level_output_statements_emitted |= UINT32_C(1) << projection.register_index;
+    ctx->high_level_output_field_statements |= UINT32_C(1) << (unsigned)projection.field_index;
+    ctx->high_level_statement_instruction = -1;
+    return;
+  }
   for (int output = 0; output < ctx->program->output_count; ++output) {
     const DXBCSignatureElement *element = &ctx->program->outputs[output];
     if (element->register_id != (uint32_t)owner->operands[0].register_index ||
@@ -793,13 +939,39 @@ void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, in
 
 const char *hlsl_high_level_output_name(const HLSLEmitterContext *ctx, int reg) {
   if (!ctx || !ctx->high_level_interface || ctx->high_level_direct_return || reg < 0 ||
-      reg >= HLSL_SM5_IO_REGISTER_COUNT || !ctx->high_level_output_names[reg][0]) return NULL;
-  return ctx->high_level_output_names[reg];
+      reg >= HLSL_SM5_IO_REGISTER_COUNT) return NULL;
+  if (ctx->high_level_packed_outputs) {
+    int match = -1;
+    for (int field = 0; field < ctx->program->output_count; ++field)
+      if (ctx->program->outputs[field].register_id == (uint32_t)reg) {
+        if (match >= 0) return NULL;
+        match = field;
+      }
+    return match >= 0 && ctx->high_level_output_names[match][0]
+        ? ctx->high_level_output_names[match] : NULL;
+  }
+  return ctx->high_level_output_names[reg][0] ? ctx->high_level_output_names[reg] : NULL;
+}
+
+const char *hlsl_high_level_output_field_name(const HLSLEmitterContext *ctx, int field) {
+  if (!ctx || !ctx->high_level_interface || ctx->high_level_direct_return || field < 0 ||
+      field >= ctx->program->output_count || field >= HLSL_SM5_IO_REGISTER_COUNT) return NULL;
+  if (!ctx->high_level_packed_outputs)
+    return hlsl_high_level_output_name(ctx, (int)ctx->program->outputs[field].register_id);
+  return ctx->high_level_output_names[field][0] ? ctx->high_level_output_names[field] : NULL;
 }
 
 bool hlsl_append_high_level_output(HLSLEmitterContext *ctx, const DXBCOperand *destination) {
   if (!ctx || !destination || destination->type != OPERAND_TYPE_OUTPUT ||
       !hlsl_lift_operand_is_plain(destination)) return false;
+  if (ctx->high_level_packed_outputs) {
+    HLSLNaturalOutputProjection projection;
+    if (!hlsl_high_level_output_projection(ctx->program, destination, &projection)) return false;
+    const char *field = hlsl_high_level_output_field_name(ctx, projection.field_index);
+    if (!field) return false;
+    sb_appendf(ctx->sb, "%s.%s", ctx->high_level_output_variable, field);
+    return sb_ok(ctx->sb);
+  }
   const char *name = hlsl_high_level_output_name(ctx, destination->register_index);
   if (!name) return false;
   for (int output = 0; output < ctx->program->output_count; ++output) {
@@ -925,10 +1097,12 @@ bool hlsl_allocate_interface_name(HLSLEmitterContext *ctx, const char *base, cha
   return false;
 }
 
-bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
+static bool prepare_high_level_interface(HLSLEmitterContext *ctx, bool packed_preflight_names) {
   if (!ctx || !ctx->high_level_interface) return false;
   ctx->high_level_interface_prepared = false;
   ctx->high_level_statement_instruction = -1;
+  if (ctx->high_level_packed_outputs && !packed_preflight_names &&
+      !hlsl_packed_output_preflight(ctx)) goto unsupported;
   if (ctx->program->input_count > HLSL_SM5_IO_REGISTER_COUNT) goto unsupported;
   bool packed = false;
   if ((ctx->program->program_type == DXBC_PROGRAM_TYPE_VERTEX ||
@@ -991,7 +1165,8 @@ bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
       } else if (strcmp(semantic, "TEXCOORD") == 0 || element->semantic_index) {
         if (!hlsl_format_checked(ctx, base, sizeof(base), "%s%u", role, element->semantic_index)) return false;
       } else if (!hlsl_copy_checked(ctx, base, sizeof(base), role)) return false;
-      if (!hlsl_allocate_interface_name(ctx, base, ctx->high_level_output_names[element->register_id])) goto unsupported;
+      if (!hlsl_allocate_interface_name(ctx, base, ctx->high_level_output_names[
+          ctx->high_level_packed_outputs ? (unsigned)output : element->register_id])) goto unsupported;
     }
   }
   ctx->high_level_interface_prepared = true;
@@ -1001,6 +1176,18 @@ unsupported:
   hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_INTERFACE_EMISSION,
                  HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
   return false;
+}
+
+bool hlsl_prepare_high_level_interface(HLSLEmitterContext *ctx) {
+  return prepare_high_level_interface(ctx, false);
+}
+
+bool hlsl_prepare_packed_output_preflight_names(HLSLEmitterContext *ctx) {
+  /* Only the private preflight's independent scratch context uses this seam.
+   * It reuses exact semantic/identifier naming without recursively proving
+   * the same plan. The live preparation always retains that complete proof. */
+  return ctx && ctx->high_level_packed_outputs && hlsl_packed_output_candidate(ctx->program) &&
+      prepare_high_level_interface(ctx, true);
 }
 
 bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
@@ -1292,7 +1479,7 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
     for (int output = 0; output < program->output_count; ++output) {
       const size_t field_begin = output ? sb->len : struct_begin;
       const DXBCSignatureElement *element = &program->outputs[output];
-      const char *name = hlsl_high_level_output_name(ctx, (int)element->register_id);
+      const char *name = hlsl_high_level_output_field_name(ctx, output);
       const char *semantic = dxbc_signature_semantic_name(element);
       if (!name) { sb->failed = true; return; }
       sb_appendf(sb, "    %s %s : %s", get_type_str(element->component_type,
@@ -1305,6 +1492,8 @@ void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const ch
                                        output, field_begin);
       if (sb_ok(sb))
         ctx->high_level_output_fields_emitted |= UINT32_C(1) << element->register_id;
+      if (sb_ok(sb) && ctx->high_level_packed_outputs)
+        ctx->high_level_output_field_declarations |= UINT32_C(1) << (unsigned)output;
     }
     const size_t output_end_begin = sb->len;
     sb_append(sb, "};\n\n");

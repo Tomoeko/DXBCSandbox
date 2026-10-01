@@ -242,6 +242,7 @@ typedef uint8_t HLSLTempLaneStorage[4];
 typedef int HLSLRegisterPermutation[4];
 
 struct HLSLNaturalStructuredBodyInventory;
+struct HLSLPackedOutputGuard;
 
 /* At most two pure two-MUL signatures: the product precedes or follows the
  * scale in the outer operation. A group is emitted only for repeated uses. */
@@ -310,6 +311,12 @@ typedef struct HLSLEmitterContext {
      * when two parameter declarations share one physical input register. */
     bool high_level_packed_inputs;
     uint32_t high_level_input_fields_emitted;
+    /* A separate straight-line proof binds packed output signature ordinals,
+     * while the established register bitmaps retain their original meaning. */
+    bool high_level_packed_outputs;
+    uint32_t high_level_output_field_declarations;
+    uint32_t high_level_output_field_statements;
+    struct HLSLPackedOutputGuard *packed_output_guard;
     /* Every frozen natural structured route retains this callback-free
      * interface replay. Disposal shares the natural body inventory lifecycle. */
     StringBuilder natural_structured_header_source;
@@ -477,6 +484,23 @@ const DXBCSignatureElement *hlsl_high_level_input_operand_signature(
     const HLSLEmitterContext *ctx, const DXBCOperand *operand);
 const char *hlsl_high_level_output_name(const HLSLEmitterContext *ctx, int register_index);
 bool hlsl_append_high_level_output(HLSLEmitterContext *ctx, const DXBCOperand *destination);
+typedef struct {
+    int field_index;
+    uint32_t register_index;
+    uint8_t field_mask;
+    uint8_t natural_components;
+    bool packed;
+} HLSLNaturalOutputProjection;
+/* Exact complete-field selection, never a physical-register fallback. */
+bool hlsl_high_level_output_projection(const USILProgram *program,
+    const DXBCOperand *destination, HLSLNaturalOutputProjection *projection);
+bool hlsl_packed_output_candidate(const USILProgram *program);
+bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);
+/* Scratch naming only, after program/input-demand proof; never grants live
+ * interface or quality authority. Ordinary preparation repeats preflight. */
+bool hlsl_prepare_packed_output_preflight_names(HLSLEmitterContext *ctx);
+const char *hlsl_high_level_output_field_name(const HLSLEmitterContext *ctx, int field);
+bool hlsl_packed_output_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
 const DXBCSignatureElement *hlsl_high_level_input_signature(
     const HLSLEmitterContext *ctx, int register_index);
 const char *hlsl_high_level_input_name(const HLSLEmitterContext *ctx, int register_index);

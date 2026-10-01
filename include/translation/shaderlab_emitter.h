@@ -12,6 +12,7 @@
 #include "io/shader_blob_archive.h"
 #include "io/serialized_shader.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_global_declarations.h"
 #include "translation/hlsl_source_quality.h"
 #include "translation/shaderlab_variant_plan.h"
 
@@ -48,6 +49,8 @@ typedef struct {
     ShaderLabVariantPlanStatus variant_plan_status;
     int raw_keyword_index;
     HLSLEmitDiagnostic hlsl;
+    bool has_global_declaration_diagnostic;
+    HLSLGlobalDeclarationDiagnostic global_declaration;
 } ShaderLabStageDiagnostic;
 
 typedef enum {

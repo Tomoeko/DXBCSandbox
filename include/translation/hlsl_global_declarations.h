@@ -41,6 +41,8 @@ typedef struct {
     int field_index;
 } HLSLGlobalDeclarationDiagnostic;
 
+const char *hlsl_global_declaration_status_name(HLSLGlobalDeclarationStatus status);
+
 /* Fast authority-only scope check before loading sibling metadata. */
 HLSLGlobalDeclarationStatus
 hlsl_global_declarations_scope_status(const SerializedProgramParameters *residual,

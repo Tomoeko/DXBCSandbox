@@ -51,6 +51,9 @@ static void set_diagnostic(ShaderLabStageDiagnostic *diagnostic,
   diagnostic->variant_plan_status = SHADERLAB_VARIANT_PLAN_OK;
   diagnostic->raw_keyword_index = -1;
   hlsl_emit_diagnostic_init(&diagnostic->hlsl);
+  diagnostic->has_global_declaration_diagnostic = false;
+  diagnostic->global_declaration = (HLSLGlobalDeclarationDiagnostic){
+      HLSL_GLOBAL_DECLARATIONS_OK, -1, -1, -1};
 }
 
 const char *shaderlab_stage_status_name(ShaderLabStageStatus status) {
@@ -587,7 +590,17 @@ static bool build_global_declarations(
   HLSLGlobalDeclarationStatus status = hlsl_global_declarations_scope_status(
       selected_parameters, &pass->common_parameters[stage]);
   if (status == HLSL_GLOBAL_DECLARATIONS_NOT_APPLICABLE) return true;
-  if (status != HLSL_GLOBAL_DECLARATIONS_OK || stage >= 5 ||
+  if (status != HLSL_GLOBAL_DECLARATIONS_OK) {
+    set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
+                   stage, current, -1);
+    if (diagnostic) {
+      diagnostic->has_global_declaration_diagnostic = true;
+      diagnostic->global_declaration = (HLSLGlobalDeclarationDiagnostic){
+          status, current, -1, -1};
+    }
+    return false;
+  }
+  if (stage >= 5 ||
       pass->subprogram_count[stage] <= 0 || pass->subprogram_count[stage] > 4096) {
     set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
                    stage, current, -1);
@@ -657,8 +670,14 @@ static bool build_global_declarations(
   status = hlsl_global_declarations_build(pass, stage, current, witnesses, count,
                                          output, &union_diagnostic);
   if (status == HLSL_GLOBAL_DECLARATIONS_OK) success = true;
-  else set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
-                       stage, current, union_diagnostic.conflicting_subprogram_index);
+  else {
+    set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
+                   stage, current, union_diagnostic.conflicting_subprogram_index);
+    if (diagnostic) {
+      diagnostic->has_global_declaration_diagnostic = true;
+      diagnostic->global_declaration = union_diagnostic;
+    }
+  }
 cleanup:
   for (size_t i = 0; i < count; ++i) {
     subprogram_metadata_free_variant(&players[i]);

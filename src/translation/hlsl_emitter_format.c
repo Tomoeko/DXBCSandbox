@@ -1080,7 +1080,11 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
             break;
         case OPERAND_TYPE_OUTPUT:
             if (ctx->high_level_interface && !ctx->high_level_direct_return) {
-                const char *name = hlsl_high_level_output_name(ctx, op->register_index);
+                HLSLNaturalOutputProjection projection;
+                const char *name = ctx->high_level_packed_outputs
+                    ? (hlsl_high_level_output_projection(ctx->program, op, &projection)
+                        ? hlsl_high_level_output_field_name(ctx, projection.field_index) : NULL)
+                    : hlsl_high_level_output_name(ctx, op->register_index);
                 if (!name) { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
                 else hlsl_builder_format_checked(ctx, &reg, "%s.%s", ctx->high_level_output_variable, name);
             } else {
@@ -1183,9 +1187,15 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
     bool swizzle_formatted = false;
     if (ctx->high_level_interface && !ctx->high_level_direct_return && op->type == OPERAND_TYPE_OUTPUT) {
         const DXBCSignatureElement *element = NULL;
-        for (int output_index = 0; output_index < ctx->program->output_count; ++output_index)
-            if (ctx->program->outputs[output_index].register_id == (uint32_t)op->register_index)
-                element = &ctx->program->outputs[output_index];
+        if (ctx->high_level_packed_outputs) {
+            HLSLNaturalOutputProjection projection;
+            if (hlsl_high_level_output_projection(ctx->program, op, &projection))
+                element = &ctx->program->outputs[projection.field_index];
+        } else {
+            for (int output_index = 0; output_index < ctx->program->output_count; ++output_index)
+                if (ctx->program->outputs[output_index].register_id == (uint32_t)op->register_index)
+                    element = &ctx->program->outputs[output_index];
+        }
         if (!ctx->is_formatting_dest || !element || usil_operand_destination_lane_mask(op) != element->mask) {
             hlsl_builder_failed(ctx, output);
             sb_free(&idx); sb_free(&reg);
