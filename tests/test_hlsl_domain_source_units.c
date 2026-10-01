@@ -551,7 +551,7 @@ static bool float3_domain_shape_source(unsigned domain, uint32_t points,
     const int xyz_index = program->instruction_count - 3;
     const int w_index = xyz_index + 1, return_index = xyz_index + 2;
     CHECK(usil_signature_authority_is_valid(program) && program->instruction_count == (domain == 3 ? 8 : domain == 1 ? 4 : 5) &&
-          program->tessellation.domain == domain && program->tessellation.input_control_point_count == points &&
+          (unsigned)program->tessellation.domain == domain && program->tessellation.input_control_point_count == points &&
           program->inputs[0].mask == 7 && program->inputs[0].rw_mask == 7 && !program->inputs[0].system_value &&
           program->outputs[0].mask == 15 && !program->outputs[0].rw_mask && program->outputs[0].system_value == 1);
     CHECK(!hlsl_high_level_patch_domain_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
@@ -933,7 +933,7 @@ static bool float3_shape_rejections(unsigned domain, uint32_t points) {
         case 6: program->patch_constants[0].semantic_index = 1; break;
         case 7: program->patch_constants[1].register_id = 0; break;
         case 8: program->signature_declarations[1].array_element_count = points + 1; break;
-        case 9: program->tessellation.input_control_point_count = points + 1; break;
+        case 9: program->tessellation.input_control_point_count = (uint8_t)(points + 1); break;
         case 10: program->instructions[0].operands[1].register_index = (int)points;
                  program->instructions[0].operands[1].index_values[0] = points; break;
         case 11: program->instructions[0].operands[1].rel_op0 = &relative;
