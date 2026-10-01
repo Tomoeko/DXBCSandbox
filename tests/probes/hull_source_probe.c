@@ -837,6 +837,42 @@ done:
     return accepted;
 }
 
+/* Print only bounded decoded facts for an actual explicit control-point phase.
+ * Reuse the existing signature/operand printer; no source or target is exported. */
+static bool print_hull_control_point_facts(const USILProgram *program) {
+    const USILTessellationContract *contract = &program->tessellation;
+    if (contract->phase_count > PROBE_DOMAIN_INSTRUCTION_LIMIT ||
+        contract->phase_capacity < contract->phase_count ||
+        (contract->phase_count && !contract->phases)) return false;
+    for (size_t phase = 0; phase < contract->phase_count; ++phase) {
+        const USILHullPhase *scope = &contract->phases[phase];
+        if (scope->kind != DXBC_HULL_PHASE_CONTROL_POINT) continue;
+        if (scope->first_instruction_index < 0 || scope->end_instruction_index < scope->first_instruction_index ||
+            scope->end_instruction_index > program->instruction_count ||
+            scope->end_instruction_index > program->instruction_alloc ||
+            scope->end_instruction_index - scope->first_instruction_index > PROBE_DOMAIN_INSTRUCTION_LIMIT)
+            return false;
+        printf("hull_cp_phase index=%zu marker=%u first=%d end=%d input_points=%u output_points=%u temps=%u\n",
+            phase, scope->marker_source_instruction_index, scope->first_instruction_index,
+            scope->end_instruction_index, contract->input_control_point_count,
+            contract->output_control_point_count, scope->temp_count);
+        if (!print_domain_signature("hull-input", program->inputs, program->input_count) ||
+            !print_domain_signature("hull-output", program->outputs, program->output_count)) return false;
+        size_t remaining = PROBE_DOMAIN_OPERAND_LIMIT;
+        for (int index = scope->first_instruction_index; index < scope->end_instruction_index; ++index) {
+            const USILInstruction *owner = &program->instructions[index];
+            printf("hull_cp_instruction index=%d raw_instruction=%u opcode=%u name=%s operands=%d shape_valid=%d\n",
+                index, owner->source_instruction_index, (unsigned)owner->opcode,
+                hlsl_emit_opcode_name(owner->opcode), owner->operand_count,
+                usil_instruction_shape_valid(program, owner));
+            if (owner->operand_count < 0 || owner->operand_count > DXBC_MAX_OPERANDS) return false;
+            for (int operand = 0; operand < owner->operand_count; ++operand)
+                if (!print_domain_operand(&owner->operands[operand], index, operand, 0, 0, &remaining)) return false;
+        }
+    }
+    return true;
+}
+
 /* The source inverse consumes the complete target and, in the explicit scalar
  * calibration, a fixed controlled API layout. Neither authored source nor its
  * preprocessing contract enters this function. No player authority is inferred.
@@ -857,7 +893,8 @@ static bool reconstruct_hull(const DXBCContainerView *target,
     if (!dxbc_document_parse(&document, target->data, target->size, NULL) ||
         !dxbc_document_decode_semantic(&document, &semantic) ||
         !dxbc_stage_contract_decode(&document, &semantic, &contract, NULL) ||
-        !usil_translate_with_stage_contract(&program, &semantic, &contract))
+        !usil_translate_with_stage_contract(&program, &semantic, &contract) ||
+        !print_hull_control_point_facts(&program))
         goto done;
     /* The isolated authored wrapper remains triangle-only. A paired wrapper
      * takes domain and patch extent from the actual copied stage interface. */

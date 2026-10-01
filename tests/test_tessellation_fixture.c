@@ -85,11 +85,12 @@ static uint8_t *make_hull_dxbc(uint32_t points, uint32_t output_points, uint8_t 
     uint32_t words[128];
     size_t word_count = 0;
     for (size_t word = 0; word < sizeof(base_words) / 4; ++word) {
-        if ((scenario == 4 || scenario == 5) && word == 9) {
+        if ((scenario == 4 || scenario == 5 || (float3 &&
+            (scenario == TEST_HULL_FLOAT3_EXPLICIT_ADD || scenario == TEST_HULL_FLOAT3_EXPLICIT_TEMPORARY))) && word == 9) {
             const uint32_t cp_header[] = {INSTRUCTION(114, 1), INSTRUCTION(95, 2), 0x00016000,
                 INSTRUCTION(95, 4), float3 ? 0x00201072 : 0x002010f2, points, 0,
                 INSTRUCTION(101, 3), float3 ? 0x00102072 : 0x001020f2, 0,
-                INSTRUCTION(104, 2), scenario == 5 ? 2 : 1,
+                INSTRUCTION(104, 2), scenario == 5 || scenario == TEST_HULL_FLOAT3_EXPLICIT_TEMPORARY ? 2 : 1,
                 INSTRUCTION(54, 4), 0x00100012, 0, 0x00016001};
             memcpy(words + word_count, cp_header, sizeof(cp_header));
             word_count += sizeof(cp_header) / 4;
@@ -98,11 +99,27 @@ static uint8_t *make_hull_dxbc(uint32_t points, uint32_t output_points, uint8_t 
                 memcpy(words + word_count, chained, sizeof(chained));
                 word_count += sizeof(chained) / 4;
             }
-            const uint32_t cp_body[] = {INSTRUCTION(56, 12), float3 ? 0x00102072 : 0x001020f2, 0,
-                0x00004002, 0x3fa00000, 0x3fa00000, 0x3fa00000, 0x3fa00000,
-                0x00a01e46, 0x0010000a, scenario == 5 ? 1 : 0, 0, INSTRUCTION(62, 1)};
-            memcpy(words + word_count, cp_body, sizeof(cp_body));
-            word_count += sizeof(cp_body) / 4;
+            if (scenario == TEST_HULL_FLOAT3_EXPLICIT_ADD) {
+                const uint32_t body[] = {INSTRUCTION(0, 11), 0x00102072, 0,
+                    0x00a01246, 0x0010000a, 0, 0, 0x00a01246, 0x0010000a, 0, 0,
+                    INSTRUCTION(62, 1)};
+                memcpy(words + word_count, body, sizeof(body));
+                word_count += sizeof(body) / 4;
+            } else if (scenario == TEST_HULL_FLOAT3_EXPLICIT_TEMPORARY) {
+                const uint32_t body[] = {
+                    INSTRUCTION(54, 7), 0x00100072, 1, 0x00a01246, 0x0010000a, 0, 0,
+                    INSTRUCTION(0, 7), 0x00100072, 1, 0x00100246, 1, 0x00004001, 0x3fa00000,
+                    INSTRUCTION(56, 7), 0x00102072, 0, 0x00100246, 1, 0x00004001, 0x40000000,
+                    INSTRUCTION(62, 1)};
+                memcpy(words + word_count, body, sizeof(body));
+                word_count += sizeof(body) / 4;
+            } else {
+                const uint32_t cp_body[] = {INSTRUCTION(56, 12), float3 ? 0x00102072 : 0x001020f2, 0,
+                    0x00004002, 0x3fa00000, 0x3fa00000, 0x3fa00000, 0x3fa00000,
+                    0x00a01e46, 0x0010000a, scenario == 5 ? 1 : 0, 0, INSTRUCTION(62, 1)};
+                memcpy(words + word_count, cp_body, sizeof(cp_body));
+                word_count += sizeof(cp_body) / 4;
+            }
         }
         /* New authored arithmetic follows the instance-index transport.
          * The inner read control deliberately has no phase-local definition. */
@@ -187,6 +204,7 @@ static uint8_t *make_hull_dxbc(uint32_t points, uint32_t output_points, uint8_t 
         offset += write_hull_signature(bytes + offset, role, scenario == 3, point_semantic, float3);
         offset = (offset + 3) & ~(size_t)3;
     }
+    if (offset > sizeof(bytes) - 16 || word_bytes > sizeof(bytes) - offset - 16) return NULL;
     write_u32(bytes + 44, (uint32_t)offset);
     memcpy(bytes + offset, "SHEX", 4);
     write_u32(bytes + offset + 4, (uint32_t)word_bytes + 8);

@@ -11,7 +11,14 @@
  * of captured compiler inputs. Scenario values retain the hull unit contract. */
 uint8_t *test_tessellation_hull_dxbc(uint32_t input_points, uint32_t output_points,
     uint8_t scenario, size_t *size);
-/* Custom FLOAT3 signature grammar for implicit control-point copies. */
+enum {
+    TEST_HULL_FLOAT3_EXPLICIT_ADD = 6,
+    TEST_HULL_FLOAT3_EXPLICIT_TEMPORARY = 7
+};
+/* Custom FLOAT3 signature grammar for implicit or explicit control points.
+ * Existing scenarios4/5 retain their MUL and singleton ID-transport bytes.
+ * The additional scenarios author repeated indexed XYZ reads or a full-XYZ
+ * temporary arithmetic chain before one complete output write. */
 uint8_t *test_tessellation_hull_float3_dxbc(uint32_t input_points, uint32_t output_points,
     uint8_t scenario, const char *semantic, size_t *size);
 /* Existing implicit triangle grammar with one scalar b0 input and two final

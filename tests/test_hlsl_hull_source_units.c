@@ -745,6 +745,236 @@ static bool owned_empty_hull_metadata(void) {
     return true;
 }
 
+typedef struct {
+    HullLedger owners;
+    HullFixture *fixture;
+    size_t events, mutate_at, reject_at, point_events;
+    unsigned mutation;
+    int output_instruction;
+    bool changed, rejected;
+} ExplicitFloat3Ledger;
+
+static bool observe_explicit_float3(void *context, const HLSLSourceQualityObservation *observation) {
+    ExplicitFloat3Ledger *ledger = context;
+    if (!observe_hull(&ledger->owners, observation)) return false;
+    ++ledger->events;
+    const HLSLSourceQualityFacts *facts = &observation->facts;
+    if (facts->known && facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL &&
+        facts->logical_value_id == UINT64_C(0x8000000000000100)) {
+        ++ledger->point_events;
+        if (facts->components != 3 || facts->lanes != 7 || facts->instruction_index < 0)
+            ledger->owners.bad_owner = true;
+    }
+    if (ledger->events == ledger->reject_at) { ledger->rejected = true; return false; }
+    if (ledger->fixture && ledger->events == ledger->mutate_at) {
+        USILProgram *program = &ledger->fixture->program;
+        if (ledger->mutation == 0) {
+            DXBCOperand *literal = &program->instructions[ledger->output_instruction].operands[1];
+            for (int word = 0; word < literal->imm_value_count; ++word)
+                literal->imm_values[word] = literal->immediate_words[word] = UINT32_C(0x40200000);
+        } else if (ledger->mutation == 1) {
+            for (unsigned role = 0; role < 2; ++role) {
+                DXBCSignatureElement *field = role ? program->outputs : program->inputs;
+                memset(field->semantic_name, 0, sizeof(field->semantic_name));
+                memcpy(field->semantic_name, "CONTROLVALUE", sizeof("CONTROLVALUE"));
+                field->semantic_name_length = sizeof("CONTROLVALUE") - 1u;
+            }
+        } else {
+            program->instructions[ledger->output_instruction].opcode = USIL_OP_MUL;
+        }
+        ledger->changed = true;
+    }
+    return true;
+}
+
+static bool explicit_float3_case(uint32_t points, uint8_t scenario, const char *semantic) {
+    size_t size = 0;
+    uint8_t *bytes = test_tessellation_hull_float3_dxbc(points, points, scenario, semantic, &size);
+    HullFixture fixture;
+    CHECK(hull_fixture_parse(&fixture, bytes, size));
+    USILProgram *program = &fixture.program;
+    const USILHullPhase *phase = &program->tessellation.phases[0];
+    CHECK(program->has_parsed_signature_authority && usil_signature_authority_is_valid(program) &&
+        program->tessellation.phase_count == 3 && phase->kind == DXBC_HULL_PHASE_CONTROL_POINT &&
+        phase->first_instruction_index == 0 && phase->end_instruction_index >= 3 &&
+        program->inputs[0].mask == 7 && program->inputs[0].rw_mask == 7 &&
+        program->outputs[0].mask == 7 && program->outputs[0].rw_mask == 8 &&
+        !program->inputs[0].system_value && !program->outputs[0].system_value);
+    const int output = phase->end_instruction_index - 2;
+    CHECK(program->instructions[output + 1].opcode == USIL_OP_RET &&
+        usil_operand_destination_lane_mask(&program->instructions[output].operands[0]) == 7 &&
+        program->instructions[0].operands[1].type == OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID);
+    CHECK(hlsl_high_level_hull_source_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) &&
+        !hlsl_high_level_hull_source_supported(program, HLSL_EMIT_MODE_RECOMPILE));
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLExpressionSourceMap normal_map, captured_map;
+    HLSLSourceQualityResult normal_quality, captured_quality;
+    HLSLEmitDiagnostic diagnostic;
+    options.expression_source_map = &normal_map; options.source_quality = &normal_quality;
+    options.source_quality_pass_index = 4; options.source_quality_entry_point_index = 3;
+    ExplicitFloat3Ledger ledger = {.owners = {.program = program}, .output_instruction = output};
+    options.source_quality_observer = observe_explicit_float3; options.source_quality_observer_context = &ledger;
+    StringBuilder normal, source, repeated;
+    sb_init(&normal); sb_init(&source); sb_init(&repeated);
+    CHECK(hlsl_emit_with_options_diagnostic(program, &normal, NULL, NULL, NULL, &options, &diagnostic));
+    CHECK(normal_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !normal_quality.reasons &&
+        normal_quality.counts.inspected_units == 3 && !normal_quality.counts.incomplete_units &&
+        !normal_quality.counts.residual_total && !normal_quality.counts.unknown_provenance &&
+        ledger.point_events && !ledger.owners.bad_owner && ledger.owners.units == 7 &&
+        hlsl_expression_source_map_matches(&normal_map, program, normal.buf));
+    char declaration[192], count[64];
+    snprintf(declaration, sizeof(declaration), "float3 pointValue : %s;", semantic);
+    snprintf(count, sizeof(count), "[outputcontrolpoints(%u)]", points);
+    CHECK(strstr(normal.buf, declaration) && strstr(normal.buf, count) &&
+        strstr(normal.buf, "controlPoint.pointValue =") && strstr(normal.buf, "patch[pointIndex].pointValue") &&
+        !strstr(normal.buf, "return patch[pointIndex];") && !strstr(normal.buf, "clipPosition") && !strstr(normal.buf, "float4"));
+    CHECK(normal_map.origins[0].kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
+        normal_map.origins[0].source_begin < normal_map.origins[0].source_end &&
+        normal_map.origins[output].destination_lanes == 7 &&
+        normal_map.origins[output + 1].kind == HLSL_EXPRESSION_ORIGIN_RETURN);
+    if (scenario == 5) CHECK(normal_map.origins[0].source_begin == normal_map.origins[1].source_begin);
+    const size_t events = ledger.events;
+    HLSLStageCoverage retained = {0}, independent = {0};
+    options.expression_source_map = &captured_map; options.source_quality = &captured_quality;
+    ledger = (ExplicitFloat3Ledger){.owners = {.program = program}, .output_instruction = output};
+    CHECK(hlsl_emit_with_stage_coverage(program, &source, NULL, NULL, NULL, &options, &retained, &diagnostic) &&
+        source.len == normal.len && !memcmp(source.buf, normal.buf, normal.len + 1) &&
+        hlsl_source_quality_results_equal(&normal_quality, &captured_quality) &&
+        captured_map.complete && captured_map.count == normal_map.count && hlsl_stage_coverage_validate(&retained, &source));
+    for (size_t index = 0; index < captured_map.count; ++index)
+        CHECK(hlsl_expression_origins_equal(&captured_map.origins[index], &normal_map.origins[index]));
+    options.source_quality_observer = NULL; options.source_quality_observer_context = NULL;
+    CHECK(hlsl_emit_with_stage_coverage(program, &repeated, NULL, NULL, NULL, &options, &independent, &diagnostic) &&
+        !strcmp(repeated.buf, normal.buf) && hlsl_stage_coverage_equal(&retained, &independent));
+    /* One coefficient and one repeated-read ADD fixture cover admission-valid
+     * decoded owner drift early and after the final unit observation. */
+    if (points == 3 && (scenario == 4 || scenario == TEST_HULL_FLOAT3_EXPLICIT_ADD)) {
+        const USILInstruction saved = program->instructions[output];
+        const DXBCSignatureElement input = program->inputs[0], output_signature = program->outputs[0];
+        for (unsigned action = 0; action < 3; ++action) {
+            for (unsigned late = 0; late < 2; ++late) {
+                for (unsigned captured = 0; captured < 2; ++captured) {
+                    ExplicitFloat3Ledger drift = {.owners = {.program = program}, .fixture = &fixture,
+                        .output_instruction = output, .mutation = action == 1 ? 1u : scenario == 4 ? 0u : 2u};
+                    if (action == 0) drift.reject_at = late ? events : 1;
+                    else drift.mutate_at = late ? events : 1;
+                    options.source_quality_observer = observe_explicit_float3; options.source_quality_observer_context = &drift;
+                    sb_free(&repeated); sb_init(&repeated);
+                    HLSLStageCoverage rejected = {0};
+                    const bool emitted = captured ? hlsl_emit_with_stage_coverage(program, &repeated, NULL, NULL, NULL,
+                        &options, &rejected, &diagnostic) : hlsl_emit_with_options_diagnostic(program, &repeated, NULL,
+                        NULL, NULL, &options, &diagnostic);
+                    CHECK(!emitted &&
+                        (drift.rejected || drift.changed) && diagnostic.status != HLSL_EMIT_STATUS_OK &&
+                        captured_quality.classification != HLSL_SOURCE_QUALITY_CLEAN && !captured_map.complete && !captured_map.count &&
+                        !rejected.began && !rejected.finished && !rejected.source && !rejected.root_count);
+                    options.source_quality_observer = NULL; options.source_quality_observer_context = NULL;
+                    sb_free(&repeated); sb_init(&repeated);
+                    CHECK(hlsl_emit_with_options_diagnostic(program, &repeated, NULL, NULL, NULL, &options, &diagnostic) &&
+                        captured_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && captured_map.complete &&
+                        hlsl_expression_source_map_matches(&captured_map, program, repeated.buf));
+                    CHECK((strcmp(normal.buf, repeated.buf) != 0) == drift.changed);
+                    program->instructions[output] = saved; program->inputs[0] = input; program->outputs[0] = output_signature;
+                    sb_free(&repeated); sb_init(&repeated);
+                    CHECK(hlsl_emit_with_stage_coverage(program, &repeated, NULL, NULL, NULL, &options, &rejected, &diagnostic) &&
+                        !strcmp(normal.buf, repeated.buf) && hlsl_stage_coverage_equal(&retained, &rejected) &&
+                        hlsl_source_quality_results_equal(&normal_quality, &captured_quality));
+                    hlsl_stage_coverage_dispose(&rejected);
+                }
+            }
+        }
+    }
+    hull_fixture_dispose(&fixture);
+    CHECK(hlsl_stage_coverage_validate(&retained, &source) && hlsl_stage_coverage_validate(&independent, &repeated) &&
+        hlsl_stage_coverage_equal(&retained, &independent));
+    hlsl_stage_coverage_dispose(&retained); hlsl_stage_coverage_dispose(&independent);
+    sb_free(&repeated); sb_free(&source); sb_free(&normal);
+    return true;
+}
+
+static bool explicit_float3_points(void) {
+    const uint32_t counts[] = {1, 3, 4, 32};
+    for (size_t index = 0; index < sizeof(counts) / sizeof(*counts); ++index)
+        CHECK(explicit_float3_case(counts[index], 4, "POINTVALUE"));
+    CHECK(explicit_float3_case(3, 5, "OBJECTCOORD"));
+    CHECK(explicit_float3_case(3, TEST_HULL_FLOAT3_EXPLICIT_ADD, "POINTVALUE"));
+    CHECK(explicit_float3_case(3, TEST_HULL_FLOAT3_EXPLICIT_TEMPORARY, "INTERNALTESSPOS"));
+    size_t size = 0;
+    uint8_t *bytes = test_tessellation_hull_float3_dxbc(3, 3, 5, "POINTVALUE", &size);
+    HullFixture fixture;
+    CHECK(hull_fixture_parse(&fixture, bytes, size));
+    USILProgram *program = &fixture.program;
+    const USILInstruction instruction = program->instructions[2];
+    const DXBCOperand relative = *program->instructions[2].operands[2].rel_op0;
+    const DXBCSignatureElement input = program->inputs[0], output = program->outputs[0];
+    const USILSignatureDeclaration input_declaration = program->signature_declarations[1];
+    const USILHullPhase phase = program->tessellation.phases[0];
+    const USILInstruction transport = program->instructions[1];
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLExpressionSourceMap baseline_map, map;
+    HLSLSourceQualityResult baseline_quality, quality;
+    HLSLStageCoverage baseline = {0};
+    HLSLEmitDiagnostic diagnostic;
+    StringBuilder original; sb_init(&original);
+    options.expression_source_map = &baseline_map; options.source_quality = &baseline_quality;
+    CHECK(hlsl_emit_with_stage_coverage(program, &original, NULL, NULL, NULL, &options, &baseline, &diagnostic));
+    options.expression_source_map = &map; options.source_quality = &quality;
+    for (unsigned mutation = 0; mutation < 14; ++mutation) {
+        DXBCOperand *point = &program->instructions[2].operands[2];
+        switch (mutation) {
+        case 0: program->inputs[0].mask = program->inputs[0].rw_mask = 15; break;
+        case 1: program->inputs[0].rw_mask = 6; break;
+        case 2: program->outputs[0].rw_mask = 0; break;
+        case 3: point->swizzle[2] = 3; break;
+        case 4: point->rel_op0->swizzle[0] = 1; break;
+        case 5: point->index_values[1] = 1; point->rel_offset0 = 1; break;
+        case 6: program->instructions[2].operands[0].destination_mask = 0x30; break;
+        case 7: program->instructions[1].opcode = USIL_OP_ADD; break;
+        case 8: program->tessellation.phases[0].temp_count = 1; break;
+        case 9: program->signature_declarations[1].array_element_count = 4; break;
+        case 10: program->signature_declarations[1].mask = 3; break;
+        case 11: program->inputs[0].system_value = 1; break;
+        case 12: program->outputs[0].semantic_index = 1; break;
+        case 13: program->tessellation.phases[0].end_instruction_index = 3; break;
+        }
+        CHECK(source_rejected(program));
+        HLSLStageCoverage rejected = {0};
+        StringBuilder source; sb_init(&source);
+        /* Capture's argument gate preserves an earlier independent result;
+         * a rejection after emission starts instead clears the partial map. */
+        map = baseline_map; quality = baseline_quality;
+        CHECK(!hlsl_emit_with_stage_coverage(program, &source, NULL, NULL, NULL, &options, &rejected, &diagnostic) &&
+            !rejected.began && !rejected.finished && !rejected.source && !rejected.root_count &&
+            diagnostic.status != HLSL_EMIT_STATUS_OK);
+        if (diagnostic.phase == HLSL_EMIT_PHASE_ARGUMENT_VALIDATION) {
+            CHECK(diagnostic.status == HLSL_EMIT_STATUS_INVALID_ARGUMENT &&
+                diagnostic.reason == HLSL_EMIT_REASON_INVALID_ARGUMENT && sb_ok(&source) && !source.len &&
+                hlsl_source_quality_results_equal(&quality, &baseline_quality) &&
+                map.complete == baseline_map.complete && map.count == baseline_map.count);
+            for (size_t index = 0; index < map.count; ++index)
+                CHECK(hlsl_expression_origins_equal(&map.origins[index], &baseline_map.origins[index]));
+        } else {
+            CHECK(!map.complete && !map.count && quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        }
+        program->instructions[2] = instruction; *program->instructions[2].operands[2].rel_op0 = relative;
+        program->instructions[1] = transport; program->inputs[0] = input; program->outputs[0] = output;
+        program->signature_declarations[1] = input_declaration; program->tessellation.phases[0] = phase;
+        sb_free(&source); sb_init(&source);
+        CHECK(hlsl_emit_with_stage_coverage(program, &source, NULL, NULL, NULL, &options, &rejected, &diagnostic) &&
+            !strcmp(source.buf, original.buf) && hlsl_stage_coverage_equal(&baseline, &rejected) &&
+            hlsl_source_quality_results_equal(&baseline_quality, &quality) && map.count == baseline_map.count &&
+            hlsl_expression_source_map_matches(&map, program, source.buf));
+        for (size_t index = 0; index < map.count; ++index)
+            CHECK(hlsl_expression_origins_equal(&map.origins[index], &baseline_map.origins[index]));
+        hlsl_stage_coverage_dispose(&rejected); sb_free(&source);
+    }
+    CHECK(hlsl_high_level_hull_source_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
+    hull_fixture_dispose(&fixture);
+    CHECK(hlsl_stage_coverage_validate(&baseline, &original));
+    hlsl_stage_coverage_dispose(&baseline); sb_free(&original);
+    return true;
+}
+
 static bool implicit_float3_points(void) {
     static const char *const semantics[] = {"INTERNALTESSPOS", "POINTVALUE", "arbitraryValue"};
     static const uint8_t scenarios[] = {0, 1, 3};
@@ -797,16 +1027,9 @@ static bool implicit_float3_points(void) {
         CHECK(source_rejected(&fixture.program));
         hull_fixture_dispose(&fixture);
     }
-    /* An independently decoded custom FLOAT3 CP arithmetic phase remains
-     * outside the existing FLOAT4 expression producer. */
     size_t size = 0;
-    uint8_t *bytes = test_tessellation_hull_float3_dxbc(3, 3, 4, "POINTVALUE", &size);
+    uint8_t *bytes = NULL;
     HullFixture fixture;
-    CHECK(hull_fixture_parse(&fixture, bytes, size));
-    CHECK(usil_signature_authority_is_valid(&fixture.program));
-    CHECK(fixture.program.tessellation.phases[0].kind == DXBC_HULL_PHASE_CONTROL_POINT);
-    CHECK(source_rejected(&fixture.program));
-    hull_fixture_dispose(&fixture);
     static const char *const rejected[] = {"point", "POINTVALUE1"};
     for (size_t test = 0; test < sizeof(rejected) / sizeof(rejected[0]); ++test) {
         size = 0;
@@ -838,5 +1061,5 @@ int main(void) {
     return natural_hull_source() && arithmetic_and_phase_ownership() &&
         malformed_contracts() && reordered_phase_roles() && scoped_cfg_ownership() &&
         other_domains_and_control_point_counts() && quad_factor_lexical_scopes() && explicit_control_point_phase() &&
-        differing_control_point_counts() && owned_empty_hull_metadata() && implicit_float3_points() ? 0 : 1;
+        differing_control_point_counts() && owned_empty_hull_metadata() && implicit_float3_points() && explicit_float3_points() ? 0 : 1;
 }

@@ -1244,7 +1244,9 @@ static bool float3_scalar_authority(void) {
     }
     Fixture explicit_cp;
     CHECK(fixture_init_shape(&explicit_cp, false, true, true, true));
-    CHECK(emit(&explicit_cp, false, &explicit_cp.parameters, NULL));
+    /* A complete XYZ control-point write preserves independent scalar
+     * authority in the patch-factor phases. */
+    CHECK(emit(&explicit_cp, true, &explicit_cp.parameters, NULL));
     fixture_free(&explicit_cp);
     return true;
 }

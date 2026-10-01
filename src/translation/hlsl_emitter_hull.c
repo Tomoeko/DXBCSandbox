@@ -15,7 +15,8 @@
  * producer uses the same CFG/SSA and pure expression planner as graphics,
  * retaining global semantic/raw owners. The source boundary is independent
  * scalar-factor fork phases and either signature-backed implicit copy or
- * a separately owned pure float4 control-point phase. It is not an inverse of the authored function. */
+ * a separately owned pure complete-field control-point phase. It is not an
+ * inverse of the authored function. */
 enum { HULL_SOURCE_INSTRUCTION_LIMIT = 64, HULL_SOURCE_NAME_COUNT = 12 };
 
 typedef struct {
@@ -59,8 +60,7 @@ static bool position_signature(const DXBCSignatureElement *element) {
         !dxbc_ascii_strcasecmp(dxbc_signature_semantic_name(element), "SV_POSITION");
 }
 
-static bool point_signatures(const USILProgram *program, HullSourcePlan *plan,
-                             bool explicit_phase) {
+static bool point_signatures(const USILProgram *program, HullSourcePlan *plan) {
     const DXBCSignatureElement *input = program->inputs, *output = program->outputs;
     if (position_signature(input) && position_signature(output) &&
         !strcmp(dxbc_signature_semantic_name(input), dxbc_signature_semantic_name(output)) &&
@@ -68,10 +68,8 @@ static bool point_signatures(const USILProgram *program, HullSourcePlan *plan,
         plan->point_width = 4;
         return true;
     }
-    /* An absent control-point phase copies the complete current signature.
-     * A custom FLOAT3 field has no inferred position or coordinate space.
-     * Explicit phase expressions retain their separate FLOAT4 contract. */
-    if (explicit_phase) return false;
+    /* Both implicit copies and explicit complete-field writes retain this
+     * custom FLOAT3 signature without inferring a position or coordinate space. */
     const char *semantic = dxbc_signature_semantic_name(input);
     if (!hlsl_custom_zero_index_semantic_supported(semantic) ||
         strcmp(semantic, dxbc_signature_semantic_name(output))) return false;
@@ -85,6 +83,11 @@ static bool point_signatures(const USILProgram *program, HullSourcePlan *plan,
     }
     plan->point_width = 3;
     return true;
+}
+
+static uint8_t point_field_mask(const HullSourcePlan *plan) {
+    /* Signature admission fixes point_width to three or four before phase checks. */
+    return (uint8_t)((1u << plan->point_width) - 1u);
 }
 
 /* Only a single static row is admitted here. Actual names, FLOAT scalar type,
@@ -166,7 +169,7 @@ static bool declarations_owned(const USILProgram *program, const HullSourcePlan 
                 !declaration->mask && !declaration->has_signature_register && !declaration->has_array_element_count)
                 role = 1;
             else if (!declaration->has_system_value && declaration->has_signature_register &&
-                     !declaration->register_id && declaration->mask == 15) {
+                     !declaration->register_id && declaration->mask == point_field_mask(plan)) {
                 if (declaration->kind == USIL_SIGNATURE_DECL_INPUT && declaration->operand_type == OPERAND_TYPE_INPUT &&
                     declaration->has_array_element_count &&
                     declaration->array_element_count == program->tessellation.input_control_point_count) role = 2;
@@ -245,7 +248,7 @@ static bool hull_contract(const USILProgram *program, HullSourcePlan *plan) {
         !program->tessellation.phases || program->input_count != 1 || program->output_count != 1 ||
         program->patch_constant_count != (int)factors || program->input_alloc < 1 || program->output_alloc < 1 ||
         program->patch_constant_alloc < (int)factors || !program->inputs || !program->outputs || !program->patch_constants ||
-        !point_signatures(program, plan, control_point) ||
+        !point_signatures(program, plan) ||
         program->signature_declaration_count != (int)(factors + indexed_groups + (control_point ? 3 : 0)) ||
         program->signature_declaration_alloc < program->signature_declaration_count ||
         !program->signature_declarations || !scalar_cbuffer_shape(program) || program->texture_count ||
@@ -660,7 +663,8 @@ static bool destination_supported(HLSLEmitterContext *ctx, int index, void *cont
             !destination->extended_tokens && destination->register_index_dim == 1 &&
             !destination->register_index && destination->index_has_immediate[0] &&
             !destination->index_representations[0] && !destination->index_values[0] &&
-            !destination->index_value_exceeds_int[0] && usil_operand_destination_lane_mask(destination) == 15;
+            !destination->index_value_exceeds_int[0] &&
+            usil_operand_destination_lane_mask(destination) == point_field_mask(plan);
     if (destination->type != OPERAND_TYPE_OUTPUT || destination->register_index_dim != 1 ||
         destination->swizzle_mode || destination->min_precision || destination->has_abs || destination->has_neg ||
         destination->extended_token_count || destination->extended_tokens || destination->rel_op1 || destination->rel_op2 ||
@@ -696,9 +700,11 @@ static bool control_point_source_supported(HLSLEmitterContext *ctx, int index, i
         source->index_representations[0] != 2 || source->index_has_immediate[0] || source->index_values[0] ||
         source->index_value_exceeds_int[0] || !source->rel_op0 || source->rel_op1 || source->rel_op2 ||
         source->index_representations[1] || !source->index_has_immediate[1] || source->index_values[1] ||
-        source->index_value_exceeds_int[1] || usil_operand_destination_lane_mask(&instruction->operands[0]) != 15 ||
+        source->index_value_exceeds_int[1] ||
+        usil_operand_destination_lane_mask(&instruction->operands[0]) != point_field_mask(plan) ||
         !scalar_temp(ctx->program, source->rel_op0, false)) return false;
-    for (unsigned lane = 0; lane < 4; ++lane) if (source->swizzle[lane] != lane) return false;
+    for (unsigned lane = 0; lane < plan->point_width; ++lane)
+        if (source->swizzle[lane] != lane) return false;
     return claim_index_transport(ctx, plan, hlsl_relative_operand_definition(ctx, index, operand, 0), index, source->rel_op0);
 }
 
@@ -1017,7 +1023,8 @@ static bool prepare_scalar_cbuffer(HLSLEmitterContext *ctx) {
 static ASTExpr *control_point_source_expression(HLSLEmitterContext *ctx, int index, int operand,
                                                 uint8_t mask, void *context) {
     HullSourcePlan *plan = context;
-    if (mask != 15 || !control_point_source_supported(ctx, index, operand, context)) return NULL;
+    if (mask != point_field_mask(plan) ||
+        !control_point_source_supported(ctx, index, operand, context)) return NULL;
     char text[320];
     if (!hlsl_format_checked(ctx, text, sizeof(text), "%s[%s].%s", plan->names[PATCH_VARIABLE],
                              plan->names[POINT_INDEX], plan->names[POINT_FIELD])) return NULL;
@@ -1026,8 +1033,9 @@ static ASTExpr *control_point_source_expression(HLSLEmitterContext *ctx, int ind
     origin.complete = true;
     origin.value_role = AST_OPERAND_VALUE_LOGICAL;
     origin.logical_value_id = UINT64_C(0x8000000000000100);
-    origin.natural_components = origin.result_components = 4;
-    for (unsigned lane = 0; lane < 4; ++lane) origin.selected_components[lane] = (uint8_t)lane;
+    origin.natural_components = origin.result_components = (uint8_t)plan->point_width;
+    for (unsigned lane = 0; lane < plan->point_width; ++lane)
+        origin.selected_components[lane] = (uint8_t)lane;
     origin.instruction_index = index;
     origin.source_instruction_index = ctx->program->instructions[index].source_instruction_index;
     origin.operand_index = operand;
@@ -1278,7 +1286,7 @@ static bool prepare_phase(HLSLEmitterContext *ctx, HullSourcePlan *plan, int pha
         const USILInstruction *instruction = &ctx->program->instructions[index];
         if (hlsl_instruction_owners_contains(&plan->index_transports, index)) continue;
         if (phase == plan->control_point_phase && instruction->operand_count &&
-            usil_operand_destination_lane_mask(&instruction->operands[0]) != 15) return false;
+            usil_operand_destination_lane_mask(&instruction->operands[0]) != point_field_mask(plan)) return false;
         for (int operand = 1; operand < instruction->operand_count; ++operand) {
             if (instruction->operands[operand].type == OPERAND_TYPE_CONSTANT_BUFFER &&
                 !factor_material_source_supported(ctx, index, operand, plan)) return false;

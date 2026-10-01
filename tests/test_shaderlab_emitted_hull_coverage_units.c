@@ -178,8 +178,9 @@ static bool fixture_init_icb(Fixture *fixture, bool scalar) {
 
 /* Pair two independently parsed stage targets. The whole-source receipt does
  * not infer a linked-stage or runtime certificate from matching semantics. */
-static bool fixture_init_float3(Fixture *fixture, bool scalar, bool icb,
-                               const char *semantic) {
+static bool fixture_init_float3_shape(Fixture *fixture, bool scalar, bool icb,
+                                     const char *semantic, bool control_point) {
+    CHECK(!control_point || (!scalar && !icb));
     CHECK(fixture_init(fixture, false, scalar));
     size_t size = 0;
     const uint32_t values[] = {UINT32_C(0x3fa00000), UINT32_C(0x40200000), UINT32_C(0x40700000)};
@@ -187,7 +188,8 @@ static bool fixture_init_float3(Fixture *fixture, bool scalar, bool icb,
     uint8_t *hull = icb
         ? test_tessellation_hull_icb_dxbc(3, 2, 3, 3, true, scalar, true, values, &size)
         : scalar ? test_tessellation_hull_scalar_cbuffer_dxbc(3, 3, true, semantic, &size)
-        : test_tessellation_hull_float3_dxbc(3, 3, 0, semantic, &size);
+        : test_tessellation_hull_float3_dxbc(3, 3,
+            control_point ? TEST_HULL_FLOAT3_EXPLICIT_ADD : 0, semantic, &size);
     free(fixture->segments[HULL_STAGE]); fixture->segments[HULL_STAGE] = NULL;
     CHECK(fixture_stage(fixture, HULL_STAGE, hull, size));
     uint8_t *domain = test_tessellation_domain_float3_dxbc(3, semantic,
@@ -195,6 +197,11 @@ static bool fixture_init_float3(Fixture *fixture, bool scalar, bool icb,
     free(fixture->segments[DOMAIN_STAGE]); fixture->segments[DOMAIN_STAGE] = NULL;
     CHECK(fixture_stage(fixture, DOMAIN_STAGE, domain, size));
     return true;
+}
+
+static bool fixture_init_float3(Fixture *fixture, bool scalar, bool icb,
+                               const char *semantic) {
+    return fixture_init_float3_shape(fixture, scalar, icb, semantic, false);
 }
 
 static bool fixture_second_state(Fixture *fixture, bool unsupported_hull) {
@@ -690,8 +697,8 @@ static bool paired_domain_mutations(Fixture *fixture, const ShaderLabSourceQuali
 static bool positive_capture_shape(bool control_point, bool scalar, bool two_states, bool icb,
                                    EmptyRoute route, bool renamed, const char *semantic) {
     Fixture fixture, replacement;
-    CHECK(!semantic || (!control_point && route == EMPTY_ROUTE_ABSENT));
-    CHECK(semantic ? fixture_init_float3(&fixture, scalar, icb, semantic) :
+    CHECK(!semantic || route == EMPTY_ROUTE_ABSENT);
+    CHECK(semantic ? fixture_init_float3_shape(&fixture, scalar, icb, semantic, control_point) :
           icb ? fixture_init_icb(&fixture, scalar) : fixture_init(&fixture, control_point, scalar));
     CHECK(!renamed || scalar);
     CHECK(fixture_scalar_names(&fixture, renamed));
@@ -729,7 +736,7 @@ static bool positive_capture_shape(bool control_point, bool scalar, bool two_sta
           normal_result.observed_stage_incomplete_units == owned_result.observed_stage_incomplete_units);
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &independent) == SHADERLAB_HULL_COVERAGE_OK);
     if (semantic) CHECK(check_paired_domain(&fixture, owned, &normal_inventory, semantic));
-    if (scalar || route != EMPTY_ROUTE_ABSENT) CHECK(check_selected_stage(&fixture, owned));
+    if (control_point || scalar || route != EMPTY_ROUTE_ABSENT) CHECK(check_selected_stage(&fixture, owned));
     for (size_t index = 0; index < owned->entry_count; ++index) {
         HLSLHullCoverageCapture *entry = &owned->entries[index];
         ShaderLabEmittedHullEntry observation;
@@ -751,6 +758,24 @@ static bool positive_capture_shape(bool control_point, bool scalar, bool two_sta
                   contract->tessellation.input_control_point_count == 3 &&
                   contract->tessellation.output_control_point_count == 3 &&
                   strstr(entry->coverage.source, "float3 "));
+            if (control_point) {
+                CHECK(contract->tessellation.phase_count == 3 &&
+                      contract->phases[0].kind == DXBC_HULL_PHASE_CONTROL_POINT &&
+                      observation.base_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                      !observation.base_quality.reasons &&
+                      observation.base_quality.counts.inspected_units == 3 &&
+                      !observation.base_quality.counts.incomplete_units &&
+                      !observation.base_quality.counts.residual_total &&
+                      !observation.base_quality.counts.unknown_provenance &&
+                      strstr(entry->coverage.source, "controlPoint.pointValue =") &&
+                      strstr(entry->coverage.source, "patch[pointIndex].pointValue") &&
+                      !strstr(entry->coverage.source, "return patch[pointIndex];"));
+                const int output = contract->phases[0].end_instruction_index - 2;
+                CHECK(output >= 0 && (size_t)output < entry->raw_map.count &&
+                      entry->raw_map.origins[output].destination_lanes == 7 &&
+                      entry->raw_map.origins[output].source_instruction_index ==
+                          entry->coverage.source_instructions[output]);
+            }
         }
         CHECK(entry->inputs.target != independent->entries[index].inputs.target &&
               entry->inputs.player_payload != independent->entries[index].inputs.player_payload);
@@ -828,7 +853,7 @@ static bool positive_capture_shape(bool control_point, bool scalar, bool two_sta
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &same) == SHADERLAB_HULL_COVERAGE_INVALID_ARGUMENT && same == owned);
     CHECK(!shaderlab_emitted_hull_coverage_entry(owned, owned->entry_count, &(ShaderLabEmittedHullEntry){0}));
 
-    CHECK(semantic ? fixture_init_float3(&replacement, scalar, icb, semantic) :
+    CHECK(semantic ? fixture_init_float3_shape(&replacement, scalar, icb, semantic, control_point) :
           icb ? fixture_init_icb(&replacement, scalar) : fixture_init(&replacement, control_point, scalar));
     CHECK(fixture_scalar_names(&replacement, renamed));
     if (two_states) CHECK(fixture_second_state(&replacement, false));
@@ -1221,6 +1246,7 @@ int main(void) {
         if (!empty_route_rejections(icb)) return 1;
     }
     if (!positive_capture_shape(false, false, false, false, EMPTY_ROUTE_ABSENT, false, "POINTVALUE") ||
+        !positive_capture_shape(true, false, true, false, EMPTY_ROUTE_ABSENT, false, "POINTVALUE") ||
         !positive_capture_shape(false, false, true, false, EMPTY_ROUTE_ABSENT, false, "OBJECTCOORD") ||
         !positive_capture_shape(false, true, true, false, EMPTY_ROUTE_ABSENT, false, "POINTVALUE") ||
         !positive_capture_shape(false, true, true, false, EMPTY_ROUTE_ABSENT, true, "OBJECTCOORD") ||
