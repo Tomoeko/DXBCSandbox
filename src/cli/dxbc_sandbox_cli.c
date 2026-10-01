@@ -115,11 +115,10 @@ static void print_usage(FILE* output, const char* program) {
         "  --flat-shaders     place graphics .shader files directly in DIR\n"
         "                     using names derived from Shader \"name\"\n"
         "                     (default: SerializedFile digest subfolders)\n"
-        "  --high-level       verify bounded high-level lifts; keep verified\n"
-        "                     low-level fallback (optional macOS compiler build)\n"
+        "  --high-level       reconstruct high-level ShaderLab from game assets\n"
         "  --compute-source-candidate  also emit bounded, unverified .compute\n"
         "                     candidates (extract --kind compute only)\n"
-        "  --compile-profile FILE  captured Unity profile required for lifting\n"
+        "  --compile-profile FILE  optional Unity compiler verification profile\n"
         "  --project-root DIR      compiler project root (default: .)\n"
         "  --includes DIR          additional compiler include authority\n"
         "  --lift-max-compiles N   per-shader compile limit (default: 4096)\n"
@@ -520,12 +519,21 @@ static bool parse_cli(int argc, char** argv, CliOptions* options,
         return false;
     }
     if (options->lift.enabled) {
-        if (options->command != CLI_COMMAND_EXTRACT || !options->lift.profile_path) {
-            fputs("Error: --high-level requires extract and --compile-profile FILE.\n", stderr);
+        if (options->command != CLI_COMMAND_EXTRACT) {
+            fputs("Error: --high-level requires extract.\n", stderr);
             return false;
         }
-        if (!cli_shaderlab_lift_supported()) {
-            fputs("Error: --high-level requires a macOS build with DXBCSANDBOX_BUILD_UNITY_COMPILER=ON.\n", stderr);
+        if (options->shader_kind == CLI_SHADER_KIND_COMPUTE) {
+            fputs("Error: --high-level supports graphics shaders; use --compute-source-candidate for compute.\n", stderr);
+            return false;
+        }
+        if (options->lift.profile_path && !cli_shaderlab_lift_verifier_supported()) {
+            fputs("Error: --compile-profile requires a macOS build with DXBCSANDBOX_BUILD_UNITY_COMPILER=ON.\n", stderr);
+            return false;
+        }
+        if (!options->lift.profile_path && (options->lift.project_root || options->lift.includes ||
+                                           options->lift_limits_set)) {
+            fputs("Error: compiler paths and lift limits require --compile-profile FILE.\n", stderr);
             return false;
         }
     } else if (options->lift.profile_path || options->lift.project_root || options->lift.includes ||
@@ -2827,7 +2835,9 @@ typedef struct {
     size_t high_level;
     size_t fallback;
     size_t unverified;
+    size_t unavailable;
     size_t not_run;
+    size_t published_generated;
     size_t published_verified;
 } CliLiftCoverage;
 
@@ -2842,7 +2852,10 @@ static CliLiftCoverage lift_coverage(const ShaderCatalog *catalog, const bool *s
         if (strcmp(selection, "high-level") == 0) ++coverage.high_level;
         else if (strcmp(selection, "low-level-fallback") == 0) ++coverage.fallback;
         else if (strcmp(selection, "unverified") == 0) ++coverage.unverified;
+        else if (strcmp(selection, "unavailable") == 0) ++coverage.unavailable;
         else ++coverage.not_run;
+        if (cli_shaderlab_lift_output_generated(lift, i, &batch->records[i]))
+            ++coverage.published_generated;
         if (cli_shaderlab_lift_output_verified(lift, i, &batch->records[i]))
             ++coverage.published_verified;
     }
@@ -2877,6 +2890,7 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                 textures, texture_publications, textures->record_count);
     }
     const bool catalog_complete = shader_catalog_is_complete(catalog);
+    const bool verification_requested = cli_shaderlab_lift_verification_requested(lift);
     const bool input_complete = catalog->issue_count == 0U;
     const bool emission_complete = batch->stats.selected != 0U &&
         shader_batch_is_complete(batch);
@@ -2925,8 +2939,9 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                    ? (exact_compute_packages == selected_compute
                           ? "exact-compute-package"
                           : "unpublished-compute-package")
-                   : (lift ? "shaderlab-with-local-domain-reports"
-                                      : "uncertified-shaderlab-candidate"));
+                   : (verification_requested ? "shaderlab-with-local-domain-reports"
+                       : lift ? "high-level-shaderlab-candidate"
+                              : "uncertified-shaderlab-candidate"));
     sb_append(output,
               "{\"report_schema\":\"dxbc-sandbox-report\","
               "\"report_version\":8,\"command\":\"extract\","
@@ -2938,11 +2953,14 @@ static bool render_extract_json(const ShaderCatalog* catalog,
     sb_json_string(output, artifact_kind);
     if (lift) {
         const CliLiftCoverage coverage = lift_coverage(catalog, selected, batch, lift);
-        sb_appendf(output, ",\"lifting\":{\"requested\":%zu,\"high_level_candidates\":%zu,"
-                           "\"low_level_fallback_candidates\":%zu,\"unverified\":%zu,"
-                           "\"not_run\":%zu,\"published_local_domain_verified\":%zu}",
+        sb_appendf(output, ",\"lifting\":{\"mode\":\"%s\",\"requested\":%zu,\"high_level_candidates\":%zu,"
+                           "\"low_level_fallback_candidates\":%zu,\"unverified\":%zu,\"unavailable\":%zu,"
+                           "\"not_run\":%zu,\"published_generated\":%zu,"
+                           "\"published_local_domain_verified\":%zu}",
+                   verification_requested ? "compiler-verification" : "source-only",
                    coverage.requested, coverage.high_level, coverage.fallback,
-                   coverage.unverified, coverage.not_run, coverage.published_verified);
+                   coverage.unverified, coverage.unavailable, coverage.not_run, coverage.published_generated,
+                   coverage.published_verified);
     }
     sb_append(output, ","
               "\"complete\":");
@@ -2960,22 +2978,22 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                           ? "true," : "false,");
     sb_append(output, "\"certification\":{\"status\":");
     sb_json_string(output,
-        lift ? "structural-with-local-domain-reports" : structurally_covered != 0U
+        verification_requested ? "structural-with-local-domain-reports" : structurally_covered != 0U
             ? (exact_compute_packages != 0U ? "mixed" : "structural-only")
             : (exact_compute_packages != 0U
                    ? "binary-exact-source-fail-closed" : "not-run"));
     sb_append(output, ",\"scope\":");
     sb_json_string(output,
-        lift ? "per-record-local-d3d11-programs-and-serialized-structure" : structurally_covered != 0U
+        verification_requested ? "per-record-local-d3d11-programs-and-serialized-structure" : structurally_covered != 0U
             ? (exact_compute_packages != 0U
                    ? "mixed-graphics-structure-and-compute-binary"
                    : "serialized-d3d11-shaderlab-structure")
             : (exact_compute_packages != 0U
                    ? "serialized-compute-binary-authority" : "not-run"));
     sb_append(output, ",\"d3d11\":");
-    sb_json_string(output, lift ? "see-local-domain-records" : "not-run");
+    sb_json_string(output, verification_requested ? "see-local-domain-records" : "not-run");
     sb_append(output, ",\"glsl\":\"not-run\",\"variant_selection\":");
-    sb_json_string(output, lift ? "see-local-domain-records" : "not-run");
+    sb_json_string(output, verification_requested ? "see-local-domain-records" : "not-run");
     sb_append(output, ",\"pipeline_state\":");
     sb_json_string(output, structural_failures != 0U
         ? "structural-coverage-failed"
@@ -3101,6 +3119,8 @@ static bool render_extract_json(const ShaderCatalog* catalog,
         }
         append_candidate_diagnostic_json(output, result);
         append_structural_diagnostic_json(output, result);
+        const bool lifted_output_generated = cli_shaderlab_lift_output_generated(lift, i, result) &&
+            strcmp(cli_shaderlab_lift_selection(lift, i), "high-level") == 0;
         const bool lifted_output_verified = cli_shaderlab_lift_output_verified(lift, i, result);
         if (lift) {
             sb_append(output, ",\"lift\":");
@@ -3110,6 +3130,8 @@ static bool render_extract_json(const ShaderCatalog* catalog,
             }
             sb_append(output, ",\"published_local_domain_verified\":");
             sb_append(output, lifted_output_verified ? "true" : "false");
+            sb_append(output, ",\"published_high_level_source\":");
+            sb_append(output, lifted_output_generated ? "true" : "false");
         }
         sb_append(output, ",\"published_bounded_source_inventory\":");
         if (!cli_shaderlab_lift_append_published_inventory_json(lift, i, result, output)) {
@@ -3122,7 +3144,8 @@ static bool render_extract_json(const ShaderCatalog* catalog,
                    ? "exact-compute-package"
                    : "unpublished-compute-package")
             : (lifted_output_verified ? "local-domain-verified-shaderlab-candidate"
-                                      : "uncertified-shaderlab-candidate"));
+               : lifted_output_generated ? "high-level-shaderlab-candidate"
+                                         : "uncertified-shaderlab-candidate"));
         sb_append(output, ",\"certification_status\":");
         if (record->class_id == 72 &&
             result->compute_artifact_status == COMPUTE_SHADER_ARTIFACT_OK &&
@@ -3222,7 +3245,8 @@ static bool render_extract_table(const ShaderCatalog* catalog,
             sb_append_char(output, '\t');
             sb_append(output, cli_shaderlab_lift_selection(lift, i));
             if (!cli_shaderlab_lift_output_verified(lift, i, result))
-                sb_append(output, " (unpublished or unverified)");
+                sb_append(output, cli_shaderlab_lift_output_generated(lift, i, result)
+                    ? " (unverified)" : " (unpublished or unverified)");
         }
         sb_append_char(output, '\n');
     }
@@ -3258,14 +3282,22 @@ static bool render_extract_table(const ShaderCatalog* catalog,
     if (lift) {
         const CliLiftCoverage coverage = lift_coverage(catalog, selected, batch, lift);
         sb_appendf(output, "Lifting: requested=%zu high-level=%zu low-level-fallback=%zu "
-                           "unverified=%zu not-run=%zu published-local-domain-verified=%zu\n",
+                           "unverified=%zu unavailable=%zu not-run=%zu published-generated=%zu "
+                           "published-local-domain-verified=%zu\n",
                    coverage.requested, coverage.high_level, coverage.fallback,
-                   coverage.unverified, coverage.not_run, coverage.published_verified);
-        sb_append(output,
-            "Artifacts: selected high-level or low-level fallback candidates. Published outputs "
-            "passed serialized structural coverage and their complete local D3D11 program domains. "
-            "Import, external dependencies, player/runtime selection and visual equivalence are "
-            "not certified by this command. Use JSON for per-request evidence.\n");
+                   coverage.unverified, coverage.unavailable, coverage.not_run, coverage.published_generated,
+                   coverage.published_verified);
+        if (cli_shaderlab_lift_verification_requested(lift)) {
+            sb_append(output,
+                "Artifacts: selected high-level or low-level fallback candidates. Published outputs "
+                "passed serialized structural coverage and their complete local D3D11 program domains. "
+                "Import, external dependencies, player/runtime selection and visual equivalence are "
+                "not certified by this command. Use JSON for per-request evidence.\n");
+        } else {
+            sb_append(output,
+                "Artifacts: unverified high-level ShaderLab candidates. Compilation, exact DXBC, "
+                "import and runtime checks were not run.\n");
+        }
     } else if (selection_kind == CLI_SHADER_KIND_COMPUTE) {
         sb_append(output,
             "Artifacts: exact serialized compute manifests and compiled "

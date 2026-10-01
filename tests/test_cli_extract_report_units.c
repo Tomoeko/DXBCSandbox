@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #define main dxbc_sandbox_cli_embedded_main
@@ -18,12 +20,66 @@
     } \
 } while (0)
 
-int main(void) {
+static bool bundled_registry_is_available(const char *executable) {
+    TypeTreeSchemaRegistry registry;
+    typetree_schema_registry_init(&registry);
+    char *path = NULL;
+    uint8_t actual[COMMON_SHA256_DIGEST_SIZE], expected[COMMON_SHA256_DIGEST_SIZE];
+    const TypeTreeSchemaStatus loaded = load_schema_registry(&registry, NULL, executable, &path, actual);
+    bool matched = loaded == TYPETREE_SCHEMA_OK && path &&
+        parse_expected_default_digest(expected) && !memcmp(actual, expected, sizeof(actual));
+    char *explicit_path = NULL;
+    if (matched) {
+        matched = load_schema_registry(&registry, path, executable, &explicit_path, actual) ==
+            TYPETREE_SCHEMA_OK && explicit_path && !strcmp(path, explicit_path) &&
+            !memcmp(actual, expected, sizeof(actual));
+    }
+    /* A valid empty registry is a 64-byte explicit override. Its canonical
+     * bytes are not the bundled pin, so default import must reject it before
+     * replacing the already loaded authoritative registry. */
+    TypeTreeSchemaRegistry empty;
+    typetree_schema_registry_init(&empty);
+    uint8_t *bytes = NULL;
+    size_t byte_count = 0;
+    char temporary[96];
+#ifdef _WIN32
+    const unsigned long process_id = (unsigned long)GetCurrentProcessId();
+#else
+    const unsigned long process_id = (unsigned long)getpid();
+#endif
+    const int count = snprintf(temporary, sizeof(temporary), "cli-registry-%lu.registry", process_id);
+    bool created = false;
+    if (matched && count > 0 && (size_t)count < sizeof(temporary) &&
+        typetree_schema_registry_serialize(&empty, &bytes, &byte_count) == TYPETREE_SCHEMA_OK &&
+        byte_count == 64 && common_file_write_new_atomic(temporary, bytes, byte_count) == COMMON_FILE_OK) {
+        created = true;
+        const size_t original_count = registry.count;
+        matched = import_registry_checked(&registry, temporary, true, actual) == TYPETREE_SCHEMA_DIGEST_MISMATCH &&
+            registry.count == original_count;
+        char *override_path = NULL;
+        if (matched) {
+            matched = load_schema_registry(&registry, temporary, executable, &override_path, actual) ==
+                TYPETREE_SCHEMA_OK && override_path && !strcmp(override_path, temporary) &&
+                registry.count == 0 && memcmp(actual, expected, sizeof(actual));
+        }
+        free(override_path);
+    } else matched = false;
+    if (created && remove(temporary) != 0) matched = false;
+    mem_free(bytes, byte_count);
+    typetree_schema_registry_dispose(&empty);
+    free(explicit_path);
+    free(path);
+    typetree_schema_registry_dispose(&registry);
+    return matched;
+}
+
+int main(int argc, char **argv) {
     int status = 0;
     CliOptions parsed_options;
     memset(&parsed_options, 0, sizeof(parsed_options));
     StringBuilder report;
     sb_init(&report);
+    CHECK(argc > 0 && bundled_registry_is_available(argv[0]));
 
     char* flat_arguments[] = {
         (char*)"dxbc-sandbox", (char*)"extract", (char*)"fixture.assets",
@@ -74,8 +130,8 @@ int main(void) {
         (char *)"--high-level", (char *)"--compile-profile", (char *)"captured.profile",
         (char *)"--lift-max-compiles", (char *)"17", (char *)"--lift-timeout-ms", (char *)"1200",
     };
-    CHECK(parse_cli(13, lift_arguments, &parsed_options, &help_requested) == cli_shaderlab_lift_supported());
-    if (cli_shaderlab_lift_supported()) {
+    CHECK(parse_cli(13, lift_arguments, &parsed_options, &help_requested) == cli_shaderlab_lift_verifier_supported());
+    if (cli_shaderlab_lift_verifier_supported()) {
         CHECK(parsed_options.lift.enabled && parsed_options.lift.max_compiles == 17 &&
               parsed_options.lift.max_elapsed_ms == 1200);
         CHECK(strcmp(parsed_options.lift.profile_path, "captured.profile") == 0);
@@ -85,8 +141,49 @@ int main(void) {
     CHECK(!parse_cli(13, lift_arguments, &parsed_options, &help_requested));
     cli_options_dispose(&parsed_options);
     lift_arguments[10] = (char *)"17";
-    CHECK(!parse_cli(7, lift_arguments, &parsed_options, &help_requested)); /* Missing profile. */
+    CHECK(parse_cli(7, lift_arguments, &parsed_options, &help_requested));
+    CHECK(parsed_options.lift.enabled && !parsed_options.lift.profile_path);
     cli_options_dispose(&parsed_options);
+
+    char *portable_lift_arguments[] = {
+        (char *)"dxbc-sandbox", (char *)"extract", (char *)"fixture.assets",
+        (char *)"--kind", (char *)"graphics", (char *)"--all",
+        (char *)"--out", (char *)"candidate-output", (char *)"--high-level",
+    };
+    CHECK(parse_cli(9, portable_lift_arguments, &parsed_options, &help_requested));
+    CHECK(parsed_options.lift.enabled && !parsed_options.lift.profile_path &&
+          parsed_options.shader_kind == CLI_SHADER_KIND_GRAPHICS && parsed_options.all);
+    cli_options_dispose(&parsed_options);
+    char *named_lift_arguments[] = {
+        (char *)"dxbc-sandbox", (char *)"extract", (char *)"fixture.assets",
+        (char *)"--name", (char *)"Graphics/Fixture", (char *)"--out",
+        (char *)"candidate-output", (char *)"--high-level",
+    };
+    CHECK(parse_cli(8, named_lift_arguments, &parsed_options, &help_requested));
+    CHECK(parsed_options.lift.enabled && !parsed_options.all && has_selectors(&parsed_options));
+    cli_options_dispose(&parsed_options);
+    portable_lift_arguments[4] = (char *)"compute";
+    CHECK(!parse_cli(9, portable_lift_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+    portable_lift_arguments[4] = (char *)"graphics";
+    portable_lift_arguments[1] = (char *)"list";
+    CHECK(!parse_cli(9, portable_lift_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+    portable_lift_arguments[1] = (char *)"extract";
+    portable_lift_arguments[5] = (char *)"--sources";
+    CHECK(!parse_cli(9, portable_lift_arguments, &parsed_options, &help_requested));
+    cli_options_dispose(&parsed_options);
+    const char *orphan_flags[] = {"--project-root", "--includes", "--lift-max-compiles", "--lift-timeout-ms"};
+    const char *orphan_values[] = {"project", "includes", "17", "1200"};
+    for (size_t index = 0; index < sizeof(orphan_flags) / sizeof(orphan_flags[0]); ++index) {
+        char *orphan_arguments[] = {
+            (char *)"dxbc-sandbox", (char *)"extract", (char *)"fixture.assets",
+            (char *)"--all", (char *)"--out", (char *)"candidate-output",
+            (char *)"--high-level", (char *)orphan_flags[index], (char *)orphan_values[index],
+        };
+        CHECK(!parse_cli(9, orphan_arguments, &parsed_options, &help_requested));
+        cli_options_dispose(&parsed_options);
+    }
     lift_arguments[6] = (char *)"--sources";
     CHECK(!parse_cli(13, lift_arguments, &parsed_options, &help_requested)); /* Orphan controls. */
     cli_options_dispose(&parsed_options);

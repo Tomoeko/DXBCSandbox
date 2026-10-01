@@ -174,6 +174,17 @@ if(BUILD_TESTING)
     endif()
 
     if(DXBCSANDBOX_BUILD_ASSET_CLI)
+        add_executable(test_cli_shaderlab_candidate_units
+            tests/test_cli_shaderlab_candidate_units.c src/cli/shaderlab_lift_cli.c
+            tests/test_shaderlab_fixture.c)
+        target_include_directories(test_cli_shaderlab_candidate_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(test_cli_shaderlab_candidate_units PRIVATE
+            CLI_CANDIDATE_TEST_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/expression_shaderlab/target.bin")
+        # Compile this adapter without the optional native verifier even when
+        # the surrounding build enables it, so the portable route stays tested.
+        target_link_libraries(test_cli_shaderlab_candidate_units PRIVATE dxbc_core dxbc_build_options)
+        add_test(NAME cli_shaderlab_candidate_units COMMAND test_cli_shaderlab_candidate_units)
+
         add_executable(test_cli_extract_report_units
             tests/test_cli_extract_report_units.c src/cli/shaderlab_lift_cli.c)
         target_include_directories(test_cli_extract_report_units PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

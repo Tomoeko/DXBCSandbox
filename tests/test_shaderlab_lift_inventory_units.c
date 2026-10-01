@@ -193,11 +193,19 @@ static bool test_inventory(void) {
 
     /* Compiler status is a separate dimension; source observations survive a
      * rejected comparison, but selected fallback JSON uses only its own view. */
-    ShaderBatchRecordResult publication = {.publication_authorized = true,
+    ShaderBatchRecordResult publication = {.status = SHADER_BATCH_EMITTED, .publication_authorized = true,
         .published_shader_content_recorded = true, .published_shader_size = artifact.source.len};
     memcpy(publication.published_shader_digest, artifact.bounded_source_inventory.source_digest, 32);
     sb_clear(&json);
     CHECK(append_published_artifact_inventory(&artifact, true, &publication, &json));
+    CHECK(strstr(json.buf, "\"status\":\"observed\""));
+    publication.status = SHADER_BATCH_FAILED;
+    publication.failure = SHADER_BATCH_FAILURE_OUTPUT_COLLISION;
+    sb_clear(&json); CHECK(append_published_artifact_inventory(&artifact, true, &publication, &json));
+    CHECK(strstr(json.buf, "not-published") && strstr(json.buf, "\"quality\":null"));
+    publication.status = SHADER_BATCH_EMITTED;
+    publication.failure = SHADER_BATCH_FAILURE_NONE;
+    sb_clear(&json); CHECK(append_published_artifact_inventory(&artifact, true, &publication, &json));
     CHECK(strstr(json.buf, "\"status\":\"observed\""));
     publication.published_shader_digest[0] ^= 1;
     sb_clear(&json); CHECK(append_published_artifact_inventory(&artifact, true, &publication, &json));

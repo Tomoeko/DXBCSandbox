@@ -155,8 +155,9 @@ bool shaderlab_emit_candidate_with_diagnostic(
  * HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE. Unsupported stages fail atomically;
  * no presentation fallback or placeholder is introduced. Metadata, variant
  * selection and declarations share the normal candidate pipeline. The caller
- * must verify the complete generated domain before accepting this source and
- * retain its verified low-level candidate on any failure. */
+ * may publish this source as an unverified candidate. Accepting it as verified
+ * requires checking the complete generated domain and retaining the verified
+ * low-level candidate if verification fails. */
 bool shaderlab_emit_high_level_candidate(
     const SerializedShader* shader,
     const BlobEntry* blob_entries,
