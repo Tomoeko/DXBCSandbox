@@ -1530,10 +1530,11 @@ static bool high_level_direct_return_supported(const USILProgram *program,
   return output_write >= 0 && output_write == final_value_instruction;
 }
 
-bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
-                                            const ASTExpr *expression, int instruction) {
+bool hlsl_source_quality_observe_owned_expression(HLSLEmitterContext *ctx,
+    const ASTExpr *expression, int instruction, const HLSLStageRootOwner *owner) {
   if (!ctx->source_quality_analysis) return true;
-  if (!hlsl_stage_coverage_root(ctx, expression, instruction)) return false;
+  if (!(owner ? hlsl_stage_coverage_owned_root(ctx, expression, instruction, owner) :
+        hlsl_stage_coverage_root(ctx, expression, instruction))) return false;
   hlsl_source_quality_interface_expression_begin(ctx, instruction);
   ctx->source_quality_root = expression;
   ctx->source_quality_instruction = instruction;
@@ -1543,6 +1544,11 @@ bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
     hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                    HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
   return accepted;
+}
+
+bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
+                                            const ASTExpr *expression, int instruction) {
+  return hlsl_source_quality_observe_owned_expression(ctx, expression, instruction, NULL);
 }
 
 /* Eligibility for independently inventoried natural stage-entry units. The
@@ -1596,7 +1602,8 @@ bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete) {
   ctx->source_quality_geometry_flow_required =
       hlsl_geometry_control_flow_admission(ctx->program, ctx->emit_mode);
   if (hlsl_source_quality_analysis_begin_unit(ctx->source_quality_analysis, 0,
-                                             HLSL_SOURCE_UNIT_ENTRY_POINT, complete))
+                                             HLSL_SOURCE_UNIT_ENTRY_POINT, complete) &&
+      hlsl_stage_coverage_begin_unit(ctx, 0, HLSL_SOURCE_UNIT_ENTRY_POINT))
     return true;
   hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                  HLSL_EMIT_PHASE_CONTEXT_ALLOCATION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
@@ -1647,8 +1654,8 @@ bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptio
       .emission_status = HLSL_EMIT_STATUS_OK,
       .expression_facts = emitter_source_quality_expression_facts,
       .facts_context = ctx,
-      .observer = ctx->matrix_use_capture ? owned_stage_quality_observer : options->source_quality_observer,
-      .observer_context = ctx->matrix_use_capture ? ctx : options->source_quality_observer_context};
+      .observer = ctx->stage_coverage || ctx->matrix_use_capture ? owned_stage_quality_observer : options->source_quality_observer,
+      .observer_context = ctx->stage_coverage || ctx->matrix_use_capture ? ctx : options->source_quality_observer_context};
   ctx->source_quality_analysis =
       hlsl_source_quality_analysis_create(&quality_request, options->source_quality);
   if (ctx->source_quality_analysis) return true;
@@ -1861,7 +1868,7 @@ static bool hlsl_emit_with_options_impl(
     const SerializedProgramParameters *params,
     const SerializedProgramParameters *common_params,
     const HLSLEmitNames *names, const HLSLEmitOptions *options,
-    HLSLMatrixUseCapture *matrix_capture, HLSLEmitDiagnostic *diagnostic) {
+    HLSLMatrixUseCapture *matrix_capture, HLSLStageCoverage *stage_coverage, HLSLEmitDiagnostic *diagnostic) {
   hlsl_emit_diagnostic_init(diagnostic);
   if (options && options->expression_source_map)
     memset(options->expression_source_map, 0, sizeof(*options->expression_source_map));
@@ -1969,6 +1976,7 @@ static bool hlsl_emit_with_options_impl(
       options ? options->reserved_preprocessor_identifier_count : 0;
   ctx.expression_source_map = options ? options->expression_source_map : NULL;
   ctx.matrix_use_capture = matrix_capture;
+  ctx.stage_coverage = stage_coverage ? stage_coverage : matrix_capture ? &matrix_capture->coverage : NULL;
   ctx.unity_uv_helper = options && options->unity_uv_helper;
   ctx.readable_screen_pos_helper = readable_screen_pos_helper;
   ctx.readable_screen_pos_mul_y_idx = -1;
@@ -2270,7 +2278,7 @@ static bool emit_with_diagnostic_and_capture(
     const SerializedProgramParameters *params,
     const SerializedProgramParameters *common_params,
     const HLSLEmitNames *names, const HLSLEmitOptions *options,
-    HLSLMatrixUseCapture *matrix_capture, HLSLEmitDiagnostic *diagnostic) {
+    HLSLMatrixUseCapture *matrix_capture, HLSLStageCoverage *stage_coverage, HLSLEmitDiagnostic *diagnostic) {
   HLSLEmitDiagnostic local_diagnostic;
   HLSLEmitDiagnostic *failure = diagnostic;
   HLSLSourceQualityResult *quality = options ? options->source_quality : NULL;
@@ -2283,7 +2291,7 @@ static bool emit_with_diagnostic_and_capture(
     quality->classification = HLSL_SOURCE_QUALITY_FAILED;
   }
   bool success = hlsl_emit_with_options_impl(program, sb, params, common_params,
-                                             names, options, matrix_capture, failure);
+                                             names, options, matrix_capture, stage_coverage, failure);
   if (quality) {
     quality->emission_status = failure->status;
     if (!success) {
@@ -2301,7 +2309,7 @@ bool hlsl_emit_with_options_diagnostic(
     const USILProgram *program, StringBuilder *output,
     const SerializedProgramParameters *current, const SerializedProgramParameters *common,
     const HLSLEmitNames *names, const HLSLEmitOptions *options, HLSLEmitDiagnostic *diagnostic) {
-  return emit_with_diagnostic_and_capture(program, output, current, common, names, options, NULL, diagnostic);
+  return emit_with_diagnostic_and_capture(program, output, current, common, names, options, NULL, NULL, diagnostic);
 }
 
 bool hlsl_emit_with_matrix_capture(
@@ -2309,7 +2317,56 @@ bool hlsl_emit_with_matrix_capture(
     const SerializedProgramParameters *current, const SerializedProgramParameters *common,
     const HLSLEmitNames *names, const HLSLEmitOptions *options,
     HLSLMatrixUseCapture *capture, HLSLEmitDiagnostic *diagnostic) {
-  return capture && emit_with_diagnostic_and_capture(program, output, current, common, names, options, capture, diagnostic);
+  return capture && emit_with_diagnostic_and_capture(program, output, current, common, names, options, capture, NULL, diagnostic);
+}
+
+bool hlsl_emit_with_stage_coverage(const USILProgram *program, StringBuilder *output,
+    const SerializedProgramParameters *current, const SerializedProgramParameters *common,
+    const HLSLEmitNames *names, const HLSLEmitOptions *options,
+    HLSLStageCoverage *coverage, HLSLEmitDiagnostic *diagnostic) {
+  uint8_t digest[32];
+  if (!coverage || coverage->began || coverage->finished || coverage->source || coverage->roots || coverage->syntax ||
+      coverage->recorded_syntax || coverage->root_count || coverage->syntax_count || coverage->unit_count ||
+      coverage->recorded_root_count || coverage->recorded_syntax_count || coverage->recorded_unit_count ||
+      coverage->instruction_count || coverage->source_size || coverage->node_count ||
+      coverage->obligations || coverage->required_binding_mask || coverage->schema != HLSL_STAGE_COVERAGE_ORDINARY_ENTRY ||
+      coverage->hull_contract.tessellation.valid || coverage->recorded_hull_contract.tessellation.valid ||
+      coverage->hull_contract.tessellation.phase_count || coverage->recorded_hull_contract.tessellation.phase_count ||
+      coverage->hull_contract.patch_constant_count || coverage->recorded_hull_contract.patch_constant_count ||
+      coverage->hull_contract.signature_declaration_count || coverage->recorded_hull_contract.signature_declaration_count ||
+      coverage->hull_contract.cbuffer_count || coverage->recorded_hull_contract.cbuffer_count ||
+      !output || !sb_ok(output) || output->len || !options || options->mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
+      !hlsl_hull_owned_contract_digest(program, digest)) {
+    hlsl_emit_diagnostic_init(diagnostic);
+    hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_ARGUMENT,
+        HLSL_EMIT_PHASE_ARGUMENT_VALIDATION, HLSL_EMIT_REASON_INVALID_ARGUMENT);
+    return false;
+  }
+  HLSLSourceQualityResult local_quality;
+  HLSLEmitDiagnostic local_diagnostic;
+  HLSLEmitDiagnostic *failure = diagnostic ? diagnostic : &local_diagnostic;
+  HLSLEmitOptions owned_options = *options;
+  if (!owned_options.source_quality) owned_options.source_quality = &local_quality;
+  coverage->schema = HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT;
+  bool emitted = emit_with_diagnostic_and_capture(program, output, current, common,
+      names, &owned_options, NULL, coverage, failure);
+  if (!emitted || !hlsl_stage_coverage_validate(coverage, output)) {
+    if (emitted) {
+      hlsl_emit_set_failure(failure, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+          HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+      output->failed = true;
+      owned_options.source_quality->classification = HLSL_SOURCE_QUALITY_FAILED;
+      owned_options.source_quality->emission_status = failure->status;
+      owned_options.source_quality->reasons |= HLSL_SOURCE_QUALITY_REASON_EMISSION_FAILED;
+    }
+    if (options->expression_source_map)
+      memset(options->expression_source_map, 0, sizeof(*options->expression_source_map));
+    /* A rejected capture never retains a successful receipt or a partial
+     * signature/tree lease. Argument rejection above preserves old results. */
+    hlsl_stage_coverage_dispose(coverage);
+    return false;
+  }
+  return true;
 }
 
 bool hlsl_emit_with_options(const USILProgram *program, StringBuilder *sb,

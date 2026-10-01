@@ -875,11 +875,14 @@ typedef struct {
     HLSLInstructionOwners owners;
     bool function;
     HLSLMatrixUseCapture *matrix_capture;
+    HLSLStageCoverage *stage_coverage;
 } ExpressionSpanContext;
 
 static bool record_expression_span(void *context, const ASTExpr *expression, size_t begin,
                                    size_t end) {
     ExpressionSpanContext *trace = context;
+    if ((!trace->matrix_capture || trace->stage_coverage != &trace->matrix_capture->coverage) &&
+        !hlsl_stage_coverage_span(trace->stage_coverage, expression, begin, end)) return false;
     if (!hlsl_matrix_uses_span(trace->matrix_capture, expression, begin, end)) return false;
     for (size_t index = 0; trace->map && index < trace->map->count; ++index) {
         if (!hlsl_instruction_owners_contains(&trace->owners, (int)index) || trace->roots[index] != expression)
@@ -1229,7 +1232,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
         roots[index] = expression;
         ExpressionSpanContext trace = {
             .map = map, .roots = roots, .owners = owners, .function = group >= 0,
-            .matrix_capture = ctx->matrix_use_capture};
+            .matrix_capture = ctx->matrix_use_capture, .stage_coverage = ctx->stage_coverage};
         const DXBCOperand *destination = &inst->operands[0];
         unsigned inline_nodes = 0;
         if (destination->type == OPERAND_TYPE_TEMP && uses[index] == 1 &&
@@ -1272,7 +1275,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
         }
         if (!hlsl_source_quality_observe_expression(ctx, expression, index))
             ctx->sb->failed = true;
-        ast_format_expr_traced(expression, ctx->sb, map || ctx->matrix_use_capture ? record_expression_span : NULL, &trace);
+        ast_format_expr_traced(expression, ctx->sb, map || ctx->matrix_use_capture || ctx->stage_coverage ? record_expression_span : NULL, &trace);
         if (!finish_expression_origins(&trace, false))
             ctx->sb->failed = true;
         sb_append(ctx->sb, ";\n");

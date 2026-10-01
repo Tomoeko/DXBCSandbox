@@ -464,6 +464,10 @@ static bool decoded_owner_digest(const USILProgram *program, uint8_t digest[COMM
     return true;
 }
 
+bool hlsl_hull_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
+    return digest && decoded_owner_digest(program, digest);
+}
+
 static bool instance_operand(const DXBCOperand *operand, bool control_point) {
     return operand->type == (control_point ? OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID : OPERAND_TYPE_FORK_INSTANCE_ID) &&
         hlsl_lift_operand_is_plain(operand) && !operand->extended_tokens && !operand->register_index_dim &&
@@ -1030,11 +1034,15 @@ static bool allocate_names(HLSLEmitterContext *ctx, HullSourcePlan *plan) {
 }
 
 static bool begin_unit(HLSLEmitterContext *ctx, uint32_t id, HLSLSourceQualityUnitKind kind) {
-    return !ctx->source_quality_analysis || hlsl_source_quality_analysis_begin_unit(ctx->source_quality_analysis, id, kind, true);
+    /* Closing the previous quality unit may report its incomplete coverage.
+     * Keep that event attached to its explicit old ID before recording the new
+     * unit's contiguous event range. */
+    return (!ctx->source_quality_analysis || hlsl_source_quality_analysis_begin_unit(ctx->source_quality_analysis, id, kind, true)) &&
+        hlsl_stage_coverage_begin_unit(ctx, id, kind);
 }
 
 static bool observe_owned_atom(HLSLEmitterContext *ctx, const char *text, int instruction,
-                                uint64_t logical_id, unsigned width) {
+    uint64_t logical_id, unsigned width, const HLSLStageRootOwner *owner, size_t begin) {
     ASTOperandProvenance provenance;
     ast_operand_provenance_init(&provenance);
     provenance.complete = true;
@@ -1049,7 +1057,8 @@ static bool observe_owned_atom(HLSLEmitterContext *ctx, const char *text, int in
         provenance.destination_lanes = usil_operand_destination_lane_mask(&ctx->program->instructions[instruction].operands[0]);
     }
     ASTExpr *expression = ast_create_emitter_operand_with_provenance(text, &provenance);
-    const bool accepted = expression && hlsl_source_quality_observe_expression(ctx, expression, instruction);
+    const bool accepted = expression && hlsl_source_quality_observe_owned_expression(ctx, expression, instruction, owner) &&
+        hlsl_stage_coverage_span(ctx->stage_coverage, expression, begin, begin + strlen(text));
     ast_free_expr(expression);
     return accepted;
 }
@@ -1068,6 +1077,7 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
     for (size_t phase = 0; phase < ctx->program->tessellation.phase_count; ++phase)
         if (!prepare_phase(ctx, &plan, (int)phase)) goto finish;
     plan.owners_frozen = true;
+    if (!hlsl_stage_coverage_begin(ctx)) goto finish;
     hlsl_expression_source_map_begin(ctx);
     StringBuilder *sb = ctx->sb;
     if (!begin_unit(ctx, 0, HLSL_SOURCE_UNIT_CONFIGURATION)) goto finish;
@@ -1110,8 +1120,11 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
             hlsl_source_quality_emission(ctx, 0, true, -1);
             for (int instruction = owned->first_instruction_index; instruction < owned->end_instruction_index; ++instruction)
                 if (hlsl_instruction_owners_contains(&plan.index_transports, instruction)) {
+                    const HLSLStageRootOwner owner = {.kind = HLSL_STAGE_ROOT_HULL_PHASE_INSTANCE,
+                        .phase_index = phase, .source_instruction_index = owned->marker_source_instruction_index,
+                        .instance_count = owned->instance_count};
                     if (!observe_owned_atom(ctx, plan.names[FACTOR_INDEX], instruction,
-                            UINT64_C(0x8000000000000000) | (uint64_t)phase << 32, 1)) goto finish;
+                            UINT64_C(0x8000000000000000) | (uint64_t)phase << 32, 1, &owner, index_begin)) goto finish;
                     hlsl_source_quality_emission(ctx, 0, false, instruction);
                     if (ctx->expression_source_map) {
                         HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[instruction];
@@ -1139,8 +1152,12 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
         }
     }
     ctx->indent = 4;
+    const size_t factor_return_begin = sb->len + strlen("    return ");
     sb_appendf(sb, "    return %s;\n}\n\n", plan.names[FACTOR_VARIABLE]);
-    if (!observe_owned_atom(ctx, plan.names[FACTOR_VARIABLE], -1, UINT64_C(0x8000000000000001), 0)) goto finish;
+    const HLSLStageRootOwner factor_return = {.kind = HLSL_STAGE_ROOT_HULL_FACTOR_RETURN,
+        .phase_index = -1, .source_instruction_index = UINT32_MAX};
+    if (!observe_owned_atom(ctx, plan.names[FACTOR_VARIABLE], -1, UINT64_C(0x8000000000000001), 0,
+            &factor_return, factor_return_begin)) goto finish;
     hlsl_source_quality_emission(ctx, 0, false, -1);
     if (!begin_unit(ctx, 2, HLSL_SOURCE_UNIT_ENTRY_POINT)) goto finish;
     sb_appendf(sb, "[domain(\"%s\")]\n[partitioning(\"%s\")]\n[outputtopology(\"%s\")]\n[outputcontrolpoints(%u)]\n[patchconstantfunc(\"%s\")]\n[maxtessfactor(",
@@ -1149,17 +1166,27 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
             ctx->program->tessellation.output_primitive == DXBC_TESSELLATOR_OUTPUT_TRIANGLE_CW ? "triangle_cw" : "triangle_ccw",
         (unsigned)ctx->program->tessellation.output_control_point_count, plan.names[PATCH_FUNCTION]);
     plan.maximum_attribute_begin = sb->len - strlen("[maxtessfactor(");
+    const size_t maximum_begin = sb->len;
     ASTExpr *maximum = ast_create_literal_bits(&ctx->program->tessellation.max_tessellation_factor_bits, 1, AST_SCALAR_FLOAT32);
-    if (!maximum || !hlsl_source_quality_observe_expression(ctx, maximum, -1)) { ast_free_expr(maximum); goto finish; }
-    ast_format_expr(maximum, sb); ast_free_expr(maximum);
+    const HLSLStageRootOwner maximum_owner = {.kind = HLSL_STAGE_ROOT_HULL_MAXIMUM, .phase_index = -1,
+        .source_instruction_index = ctx->program->tessellation.max_tessellation_factor_source_instruction_index,
+        .value_bits = ctx->program->tessellation.max_tessellation_factor_bits};
+    if (!maximum || !hlsl_source_quality_observe_owned_expression(ctx, maximum, -1, &maximum_owner)) { ast_free_expr(maximum); goto finish; }
+    ast_format_expr(maximum, sb);
+    const bool maximum_span = hlsl_stage_coverage_span(ctx->stage_coverage, maximum, maximum_begin, sb->len);
+    ast_free_expr(maximum);
+    if (!maximum_span) goto finish;
     plan.maximum_attribute_end = sb->len + 2; /* Closing )] is emitted with the entry signature. */
     if (plan.control_point_phase < 0) {
         sb_appendf(sb, ")]\n%s %s(InputPatch<%s, %u> %s, uint %s : SV_OutputControlPointID) {\n    return %s[%s];\n}\n",
             plan.names[POINT_TYPE], ctx->entry_point_name, plan.names[POINT_TYPE],
             (unsigned)ctx->program->tessellation.input_control_point_count, plan.names[PATCH_VARIABLE], plan.names[POINT_INDEX], plan.names[PATCH_VARIABLE], plan.names[POINT_INDEX]);
         char copy[256];
+        const HLSLStageRootOwner copy_owner = {.kind = HLSL_STAGE_ROOT_HULL_IMPLICIT_COPY,
+            .phase_index = -1, .source_instruction_index = UINT32_MAX};
         if (!hlsl_format_checked(ctx, copy, sizeof(copy), "%s[%s]", plan.names[PATCH_VARIABLE], plan.names[POINT_INDEX]) ||
-            !observe_owned_atom(ctx, copy, -1, UINT64_C(0x8000000000000002), 0)) goto finish;
+            !observe_owned_atom(ctx, copy, -1, UINT64_C(0x8000000000000002), 0, &copy_owner,
+                sb->len - strlen(";\n}\n") - strlen(copy))) goto finish;
         hlsl_source_quality_emission(ctx, 0, false, -1);
     } else {
         if (!prepare_phase(ctx, &plan, plan.control_point_phase)) goto finish;
@@ -1172,7 +1199,11 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
         hlsl_source_quality_emission(ctx, 0, false, -1);
         for (int instruction = phase->first_instruction_index; instruction < phase->end_instruction_index; ++instruction)
             if (hlsl_instruction_owners_contains(&plan.index_transports, instruction)) {
-                if (!observe_owned_atom(ctx, plan.names[POINT_INDEX], instruction, UINT64_C(0x8000000000000200), 1)) goto finish;
+                const HLSLStageRootOwner owner = {.kind = HLSL_STAGE_ROOT_HULL_PHASE_INSTANCE,
+                    .phase_index = plan.control_point_phase, .source_instruction_index = phase->marker_source_instruction_index,
+                    .instance_count = phase->instance_count};
+                if (!observe_owned_atom(ctx, plan.names[POINT_INDEX], instruction, UINT64_C(0x8000000000000200), 1,
+                        &owner, point_index_begin)) goto finish;
                 hlsl_source_quality_emission(ctx, 0, false, instruction);
                 if (ctx->expression_source_map) {
                     HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[instruction];
@@ -1189,7 +1220,10 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
         if (!hlsl_emit_pure_expression_scope(ctx, &scope)) goto finish;
         const size_t return_begin = sb->len;
         sb_appendf(sb, "    return %s;\n}\n", plan.names[POINT_VARIABLE]);
-        if (!observe_owned_atom(ctx, plan.names[POINT_VARIABLE], -1, UINT64_C(0x8000000000000300), 0)) goto finish;
+        const HLSLStageRootOwner point_return = {.kind = HLSL_STAGE_ROOT_HULL_POINT_RETURN,
+            .phase_index = plan.control_point_phase, .source_instruction_index = UINT32_MAX};
+        if (!observe_owned_atom(ctx, plan.names[POINT_VARIABLE], -1, UINT64_C(0x8000000000000300), 0,
+                &point_return, return_begin + strlen("    return "))) goto finish;
         hlsl_source_quality_emission(ctx, 0, false, phase->end_instruction_index - 1);
         if (ctx->expression_source_map) {
             HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[phase->end_instruction_index - 1];
@@ -1216,6 +1250,11 @@ finish:
         HLSLEmitStatus status = emitted ? HLSL_EMIT_STATUS_OK :
             ctx->diagnostic ? ctx->diagnostic->status : HLSL_EMIT_STATUS_UNSUPPORTED;
         if (!hlsl_source_quality_analysis_finish(ctx->source_quality_analysis, status, 3) && emitted) {
+            hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED, HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            emitted = false;
+        }
+        hlsl_stage_coverage_finish(ctx);
+        if (ctx->stage_coverage && !ctx->stage_coverage->finished && emitted) {
             hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED, HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
             emitted = false;
         }

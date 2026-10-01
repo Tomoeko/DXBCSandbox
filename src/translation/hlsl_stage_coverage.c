@@ -10,7 +10,114 @@
 #include <string.h>
 
 static HLSLStageCoverage *current_coverage(HLSLEmitterContext *ctx) {
-    return ctx && ctx->matrix_use_capture ? &ctx->matrix_use_capture->coverage : NULL;
+    if (!ctx) return NULL;
+    /* Preserve internal matrix test contexts as well as the owning wrapper. */
+    return ctx->stage_coverage ? ctx->stage_coverage :
+        ctx->matrix_use_capture ? &ctx->matrix_use_capture->coverage : NULL;
+}
+
+static bool operand_uses_equal(const HLSLStageOwnedOperandUse *a,
+    const HLSLStageOwnedOperandUse *b);
+
+static bool signature_equal(const DXBCSignatureElement *a, const DXBCSignatureElement *b) {
+    return a->stream_index == b->stream_index && a->semantic_index == b->semantic_index &&
+        a->system_value == b->system_value && a->component_type == b->component_type &&
+        a->register_id == b->register_id && a->min_precision == b->min_precision &&
+        a->interpolation_mode == b->interpolation_mode && a->mask == b->mask && a->rw_mask == b->rw_mask &&
+        !strcmp(dxbc_signature_semantic_name(a), dxbc_signature_semantic_name(b));
+}
+
+static bool phase_equal(const USILHullPhase *a, const USILHullPhase *b) {
+    return a->kind == b->kind && a->marker_source_instruction_index == b->marker_source_instruction_index &&
+        a->first_source_instruction_index == b->first_source_instruction_index &&
+        a->end_source_instruction_index == b->end_source_instruction_index &&
+        a->first_instruction_index == b->first_instruction_index && a->end_instruction_index == b->end_instruction_index &&
+        a->instance_count_declared == b->instance_count_declared && a->instance_count == b->instance_count &&
+        a->has_temp_count == b->has_temp_count && a->temp_count == b->temp_count &&
+        a->temp_count_source_instruction_index == b->temp_count_source_instruction_index;
+}
+
+static bool declaration_equal(const USILSignatureDeclaration *a, const USILSignatureDeclaration *b) {
+    return a->kind == b->kind && a->operand_type == b->operand_type &&
+        a->has_signature_register == b->has_signature_register && a->register_id == b->register_id &&
+        a->mask == b->mask && a->stream_index == b->stream_index &&
+        a->has_array_element_count == b->has_array_element_count && a->array_element_count == b->array_element_count &&
+        a->has_system_value == b->has_system_value && a->system_value_name == b->system_value_name &&
+        a->has_interpolation == b->has_interpolation && a->interpolation_mode == b->interpolation_mode &&
+        a->source_instruction_index == b->source_instruction_index;
+}
+
+static bool hull_contract_view(HLSLStageHullContract *view, const USILProgram *program) {
+    if (!program || program->input_count != 1 || program->output_count != 1 || !program->inputs || !program->outputs ||
+        program->patch_constant_count < 1 || program->patch_constant_count > 6 || !program->patch_constants ||
+        program->signature_declaration_count < 1 || program->signature_declaration_count > 11 || !program->signature_declarations ||
+        !program->tessellation.phase_count || program->tessellation.phase_count > 3 || !program->tessellation.phases ||
+        program->cbuffer_count < 0 || program->cbuffer_count > 1 || (program->cbuffer_count && !program->cbuffers)) return false;
+    memset(view, 0, sizeof(*view));
+    view->tessellation = program->tessellation;
+    view->tessellation.phases = NULL;
+    view->tessellation.phase_capacity = view->tessellation.phase_count;
+    memcpy(view->phases, program->tessellation.phases,
+        program->tessellation.phase_count * sizeof(*view->phases));
+    view->input = program->inputs[0]; view->output = program->outputs[0];
+    view->patch_constant_count = program->patch_constant_count;
+    memcpy(view->patch_constants, program->patch_constants,
+        (size_t)program->patch_constant_count * sizeof(*view->patch_constants));
+    view->signature_declaration_count = program->signature_declaration_count;
+    memcpy(view->signature_declarations, program->signature_declarations,
+        (size_t)program->signature_declaration_count * sizeof(*view->signature_declarations));
+    view->cbuffer_count = program->cbuffer_count;
+    if (program->cbuffer_count) view->cbuffer = program->cbuffers[0];
+    return true;
+}
+
+static void hull_contract_dispose(HLSLStageHullContract *contract) {
+    dxbc_signature_element_free(&contract->input);
+    dxbc_signature_element_free(&contract->output);
+    for (int index = 0; index < contract->patch_constant_count && index < 6; ++index)
+        dxbc_signature_element_free(&contract->patch_constants[index]);
+    memset(contract, 0, sizeof(*contract));
+}
+
+static bool hull_contract_copy(HLSLStageHullContract *copy, const USILProgram *program) {
+    HLSLStageHullContract view;
+    if (!hull_contract_view(&view, program)) return false;
+    *copy = view;
+    memset(&copy->input, 0, sizeof(copy->input));
+    memset(&copy->output, 0, sizeof(copy->output));
+    memset(copy->patch_constants, 0, sizeof(copy->patch_constants));
+    if (!dxbc_signature_element_clone(&copy->input, &view.input) ||
+        !dxbc_signature_element_clone(&copy->output, &view.output)) goto fail;
+    for (int index = 0; index < view.patch_constant_count; ++index)
+        if (!dxbc_signature_element_clone(&copy->patch_constants[index], &view.patch_constants[index])) goto fail;
+    return true;
+fail:
+    hull_contract_dispose(copy);
+    return false;
+}
+
+static bool hull_contract_equal(const HLSLStageHullContract *a, const HLSLStageHullContract *b) {
+    const USILTessellationContract *x = &a->tessellation, *y = &b->tessellation;
+    if (!x->valid || !y->valid || x->phases || y->phases || !x->phase_count || x->phase_count > 3 ||
+        x->phase_count != y->phase_count || x->input_control_point_count != y->input_control_point_count ||
+        x->output_control_point_count != y->output_control_point_count || x->domain != y->domain ||
+        x->partitioning != y->partitioning || x->output_primitive != y->output_primitive ||
+        x->has_max_tessellation_factor != y->has_max_tessellation_factor ||
+        x->max_tessellation_factor_bits != y->max_tessellation_factor_bits ||
+        x->max_tessellation_factor_source_instruction_index != y->max_tessellation_factor_source_instruction_index ||
+        a->patch_constant_count < 1 || a->patch_constant_count > 6 || a->patch_constant_count != b->patch_constant_count ||
+        a->signature_declaration_count < 1 || a->signature_declaration_count > 11 ||
+        a->signature_declaration_count != b->signature_declaration_count || a->cbuffer_count != b->cbuffer_count ||
+        a->cbuffer_count < 0 || a->cbuffer_count > 1 || !signature_equal(&a->input, &b->input) || !signature_equal(&a->output, &b->output)) return false;
+    if (a->cbuffer_count && (a->cbuffer.reg_idx != b->cbuffer.reg_idx || a->cbuffer.size != b->cbuffer.size ||
+        a->cbuffer.dynamic_indexed != b->cbuffer.dynamic_indexed)) return false;
+    for (size_t index = 0; index < x->phase_count; ++index)
+        if (!phase_equal(&a->phases[index], &b->phases[index])) return false;
+    for (int index = 0; index < a->patch_constant_count; ++index)
+        if (!signature_equal(&a->patch_constants[index], &b->patch_constants[index])) return false;
+    for (int index = 0; index < a->signature_declaration_count; ++index)
+        if (!declaration_equal(&a->signature_declarations[index], &b->signature_declarations[index])) return false;
+    return true;
 }
 
 static bool opcode_valid(USILOpcode opcode) {
@@ -21,6 +128,7 @@ static bool opcode_valid(USILOpcode opcode) {
  * owner. Known scalar/vector fields outside that inventory cannot silently
  * inherit the matrix declaration attachment. */
 static bool omitted_matrix_block_supported(const HLSLEmitterContext *ctx, int index) {
+    if (!ctx->matrix_use_capture) return false;
     const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[index];
     const HLSLCurrentMatrixReads *reads = &ctx->matrix_use_capture->reads;
     if (!layout->omit_declaration || !layout->is_unity_builtin || layout->raw_storage ||
@@ -61,6 +169,15 @@ bool hlsl_stage_coverage_begin(HLSLEmitterContext *ctx) {
     coverage->began = true;
     coverage->stage = ctx->program->program_type;
     coverage->instruction_count = (size_t)ctx->program->instruction_count;
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        if (coverage->stage != DXBC_PROGRAM_TYPE_HULL ||
+            !hlsl_hull_owned_contract_digest(ctx->program, coverage->hull_owner_digest) ||
+            !hull_contract_copy(&coverage->hull_contract, ctx->program) ||
+            !hull_contract_copy(&coverage->recorded_hull_contract, ctx->program)) return false;
+        /* Units and owned roots preserve evidence; they do not close HULL body
+         * or declaration completeness. The later target factory owns replay. */
+        coverage->obligations |= HLSL_STAGE_COVERAGE_BODY | HLSL_STAGE_COVERAGE_LOCAL_DECLARATION;
+    } else if (coverage->schema != HLSL_STAGE_COVERAGE_ORDINARY_ENTRY) return false;
     if (!hlsl_source_quality_body_inventory_supported(ctx)) coverage->obligations |= HLSL_STAGE_COVERAGE_BODY;
     for (int index = 0; index < ctx->program->instruction_count; ++index) {
         const USILInstruction *owner = &ctx->program->instructions[index];
@@ -88,14 +205,117 @@ bool hlsl_stage_coverage_begin(HLSLEmitterContext *ctx) {
             coverage->obligations |= HLSL_STAGE_COVERAGE_REQUIRED_EXTERNAL_DECLARATION;
         } else coverage->obligations |= HLSL_STAGE_COVERAGE_LOCAL_DECLARATION;
     }
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        memcpy(coverage->recorded_opcodes, coverage->opcodes, sizeof(coverage->opcodes));
+        memcpy(coverage->recorded_source_instructions, coverage->source_instructions, sizeof(coverage->source_instructions));
+        memcpy(coverage->recorded_destination_lanes, coverage->destination_lanes, sizeof(coverage->destination_lanes));
+        memcpy(coverage->recorded_operand_counts, coverage->operand_counts, sizeof(coverage->operand_counts));
+        memcpy(coverage->recorded_operand_uses, coverage->operand_uses, sizeof(coverage->operand_uses));
+    }
     return true;
 }
 
-bool hlsl_stage_coverage_root(HLSLEmitterContext *ctx, const ASTExpr *root, int instruction) {
+static bool unit_kind_matches(HLSLStageCoverageSchema schema, uint32_t id, HLSLSourceQualityUnitKind kind) {
+    if (schema == HLSL_STAGE_COVERAGE_ORDINARY_ENTRY) return id == 0 && kind == HLSL_SOURCE_UNIT_ENTRY_POINT;
+    static const HLSLSourceQualityUnitKind kinds[] = {
+        HLSL_SOURCE_UNIT_CONFIGURATION, HLSL_SOURCE_UNIT_HELPER, HLSL_SOURCE_UNIT_ENTRY_POINT};
+    return schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT && id < 3 && kind == kinds[id];
+}
+
+static void close_unit(HLSLStageCoverage *coverage, size_t end) {
+    if (!coverage->unit_count) return;
+    HLSLStageOwnedUnit *unit = &coverage->units[coverage->unit_count - 1];
+    unit->end = end;
+    unit->root_end = coverage->root_count;
+    unit->syntax_end = coverage->syntax_count;
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        HLSLStageOwnedUnit *recorded = &coverage->recorded_units[coverage->unit_count - 1];
+        recorded->end = end;
+        recorded->root_end = coverage->recorded_root_count;
+        recorded->syntax_end = coverage->recorded_syntax_count;
+    }
+}
+
+bool hlsl_stage_coverage_begin_unit(HLSLEmitterContext *ctx, uint32_t id, HLSLSourceQualityUnitKind kind) {
     HLSLStageCoverage *coverage = current_coverage(ctx);
     if (!coverage) return true;
-    if (!coverage->began || coverage->finished || instruction < 0 ||
-        (size_t)instruction >= coverage->instruction_count ||
+    if (!coverage->began || coverage->finished || !ctx->sb || id != coverage->unit_count ||
+        coverage->unit_count == 3 || !unit_kind_matches(coverage->schema, id, kind)) return false;
+    close_unit(coverage, ctx->sb->len);
+    HLSLStageOwnedUnit *unit = &coverage->units[coverage->unit_count++];
+    *unit = (HLSLStageOwnedUnit){.source_unit_id = id, .kind = kind, .begin = ctx->sb->len,
+        .root_begin = coverage->root_count, .syntax_begin = coverage->syntax_count};
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        unit->obligations = id == 0 ? HLSL_STAGE_COVERAGE_LOCAL_DECLARATION : HLSL_STAGE_COVERAGE_BODY;
+        coverage->recorded_units[id] = *unit;
+        coverage->recorded_unit_count = coverage->unit_count;
+    }
+    return true;
+}
+
+static int instruction_phase(const HLSLStageCoverage *coverage, int instruction) {
+    if (coverage->schema != HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) return -1;
+    for (size_t phase = 0; phase < coverage->hull_contract.tessellation.phase_count; ++phase) {
+        const USILHullPhase *scope = &coverage->hull_contract.phases[phase];
+        if (instruction >= scope->first_instruction_index && instruction < scope->end_instruction_index) return (int)phase;
+    }
+    return -1;
+}
+
+static bool root_owners_equal(const HLSLStageRootOwner *a, const HLSLStageRootOwner *b) {
+    return a->kind == b->kind && a->phase_index == b->phase_index &&
+        a->source_instruction_index == b->source_instruction_index && a->value_bits == b->value_bits &&
+        a->instance_count == b->instance_count && a->input_signature_index == b->input_signature_index &&
+        a->output_signature_index == b->output_signature_index;
+}
+
+static bool root_owner_valid(const HLSLStageCoverage *coverage, const HLSLStageRootOwner *owner,
+    int instruction, uint32_t unit) {
+    if (!owner || owner->input_signature_index || owner->output_signature_index) return false;
+    if (owner->kind == HLSL_STAGE_ROOT_INSTRUCTION) {
+        if (instruction < 0 || (size_t)instruction >= coverage->instruction_count || owner->value_bits || owner->instance_count ||
+            owner->source_instruction_index != coverage->source_instructions[instruction] ||
+            owner->phase_index != instruction_phase(coverage, instruction)) return false;
+        if (coverage->schema != HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) return true;
+        return owner->phase_index >= 0 && unit ==
+            (coverage->hull_contract.phases[owner->phase_index].kind == DXBC_HULL_PHASE_CONTROL_POINT ? 2u : 1u);
+    }
+    if (coverage->schema != HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) return false;
+    const HLSLStageHullContract *contract = &coverage->hull_contract;
+    if (owner->kind == HLSL_STAGE_ROOT_HULL_PHASE_INSTANCE) {
+        if (owner->phase_index < 0 || (size_t)owner->phase_index >= contract->tessellation.phase_count || owner->value_bits ||
+            instruction < 0 || (size_t)instruction >= coverage->instruction_count || coverage->opcodes[instruction] != USIL_OP_MOV ||
+            coverage->operand_counts[instruction] != 2 || instruction_phase(coverage, instruction) != owner->phase_index) return false;
+        const USILHullPhase *phase = &contract->phases[owner->phase_index];
+        return owner->source_instruction_index == phase->marker_source_instruction_index &&
+            owner->instance_count == phase->instance_count && unit == (phase->kind == DXBC_HULL_PHASE_CONTROL_POINT ? 2u : 1u);
+    }
+    if (instruction != -1 || owner->instance_count) return false;
+    if (owner->kind == HLSL_STAGE_ROOT_HULL_MAXIMUM)
+        return unit == 2 && owner->phase_index == -1 &&
+            owner->source_instruction_index == contract->tessellation.max_tessellation_factor_source_instruction_index &&
+            owner->value_bits == contract->tessellation.max_tessellation_factor_bits;
+    if (owner->value_bits || owner->source_instruction_index != UINT32_MAX) return false;
+    if (owner->kind == HLSL_STAGE_ROOT_HULL_FACTOR_RETURN) return unit == 1 && owner->phase_index == -1;
+    if (owner->kind == HLSL_STAGE_ROOT_HULL_IMPLICIT_COPY)
+        return unit == 2 && owner->phase_index == -1 && contract->phases[0].kind != DXBC_HULL_PHASE_CONTROL_POINT &&
+            contract->tessellation.input_control_point_count == contract->tessellation.output_control_point_count &&
+            contract->input.mask == contract->output.mask && contract->input.register_id == contract->output.register_id &&
+            contract->input.semantic_index == contract->output.semantic_index && contract->input.system_value == contract->output.system_value &&
+            contract->input.component_type == contract->output.component_type &&
+            !strcmp(dxbc_signature_semantic_name(&contract->input), dxbc_signature_semantic_name(&contract->output));
+    if (owner->kind == HLSL_STAGE_ROOT_HULL_POINT_RETURN)
+        return unit == 2 && owner->phase_index == 0 && contract->phases[0].kind == DXBC_HULL_PHASE_CONTROL_POINT;
+    return false;
+}
+
+bool hlsl_stage_coverage_owned_root(HLSLEmitterContext *ctx, const ASTExpr *root, int instruction,
+    const HLSLStageRootOwner *owner) {
+    HLSLStageCoverage *coverage = current_coverage(ctx);
+    if (!coverage) return true;
+    const uint32_t unit = coverage->unit_count ? coverage->units[coverage->unit_count - 1].source_unit_id : 0;
+    const HLSLSourceQualityUnitKind kind = coverage->unit_count ? coverage->units[coverage->unit_count - 1].kind : HLSL_SOURCE_UNIT_ENTRY_POINT;
+    if (!coverage->began || coverage->finished || !root_owner_valid(coverage, owner, instruction, unit) ||
         coverage->root_count == HLSL_STAGE_COVERAGE_ROOT_LIMIT) return false;
     size_t nodes;
     ASTExpr *copy = hlsl_owned_expression_copy(root, &nodes);
@@ -117,24 +337,54 @@ bool hlsl_stage_coverage_root(HLSLEmitterContext *ctx, const ASTExpr *root, int 
     if (!roots) { ast_free_expr(copy); ast_free_expr(recorded); return false; }
     coverage->roots = roots;
     coverage->roots[coverage->root_count++] = (HLSLStageOwnedRoot){
-        .tree = copy, .recorded_tree = recorded, .live_tree = root, .instruction = instruction};
+        .tree = copy, .recorded_tree = recorded, .live_tree = root, .instruction = instruction,
+        .source_unit_id = unit, .unit_kind = kind, .owner = *owner, .recorded_owner = *owner};
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT)
+        ++coverage->recorded_root_count;
     coverage->node_count += nodes;
     if (coverage->global_node_count) *coverage->global_node_count += nodes;
     return true;
 }
 
+bool hlsl_stage_coverage_root(HLSLEmitterContext *ctx, const ASTExpr *root, int instruction) {
+    HLSLStageCoverage *coverage = current_coverage(ctx);
+    if (!coverage) return true;
+    if (instruction < 0 || (size_t)instruction >= coverage->instruction_count) return false;
+    const HLSLStageRootOwner owner = {.kind = HLSL_STAGE_ROOT_INSTRUCTION,
+        .phase_index = instruction_phase(coverage, instruction), .source_instruction_index = coverage->source_instructions[instruction]};
+    return hlsl_stage_coverage_owned_root(ctx, root, instruction, &owner);
+}
+
 bool hlsl_stage_coverage_observation(HLSLEmitterContext *ctx, const HLSLSourceQualityObservation *observation) {
     HLSLStageCoverage *coverage = current_coverage(ctx);
-    if (!coverage || observation->kind != HLSL_SOURCE_OBSERVATION_EMISSION) return true;
-    if (!coverage->began || coverage->finished || observation->unit_kind != HLSL_SOURCE_UNIT_ENTRY_POINT ||
-        observation->source_unit_id || coverage->syntax_count >= HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
+    if (!coverage || (observation->kind != HLSL_SOURCE_OBSERVATION_EMISSION &&
+        !(coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT && observation->kind == HLSL_SOURCE_OBSERVATION_COVERAGE))) return true;
+    if (!coverage->began || coverage->finished || !unit_kind_matches(coverage->schema, observation->source_unit_id, observation->unit_kind) ||
+        (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT && observation->source_unit_id >= coverage->unit_count) ||
+        coverage->syntax_count >= HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
         (coverage->global_event_count && *coverage->global_event_count >= HLSL_STAGE_COVERAGE_GLOBAL_EVENT_LIMIT))
         return false;
     HLSLStageOwnedSyntax *syntax = realloc(coverage->syntax, (coverage->syntax_count + 1) * sizeof(*syntax));
     if (!syntax) return false;
     coverage->syntax = syntax;
-    coverage->syntax[coverage->syntax_count++] = (HLSLStageOwnedSyntax){
-        .facts = observation->facts, .source_end = ctx->sb->len};
+    const HLSLStageOwnedSyntax event = {
+        .facts = observation->facts, .source_end = ctx->sb->len,
+        .source_unit_id = observation->source_unit_id, .unit_kind = observation->unit_kind,
+        .kind = observation->kind, .reasons = observation->reasons};
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        if (coverage->recorded_syntax_count != coverage->syntax_count) return false;
+        HLSLStageOwnedSyntax *recorded = realloc(coverage->recorded_syntax,
+            (coverage->recorded_syntax_count + 1) * sizeof(*recorded));
+        if (!recorded) return false;
+        coverage->recorded_syntax = recorded;
+        coverage->recorded_syntax[coverage->recorded_syntax_count++] = event;
+    }
+    coverage->syntax[coverage->syntax_count++] = event;
+    if (observation->kind == HLSL_SOURCE_OBSERVATION_COVERAGE) {
+        coverage->units[observation->source_unit_id].obligations |= HLSL_STAGE_COVERAGE_SYNTAX;
+        coverage->recorded_units[observation->source_unit_id].obligations |= HLSL_STAGE_COVERAGE_SYNTAX;
+        coverage->obligations |= HLSL_STAGE_COVERAGE_SYNTAX;
+    }
     if (coverage->global_event_count) ++*coverage->global_event_count;
     return true;
 }
@@ -165,6 +415,38 @@ void hlsl_stage_coverage_finish(HLSLEmitterContext *ctx) {
     for (size_t index = 0; index < coverage->instruction_count; ++index)
         if (!opcode_valid(coverage->opcodes[index]) ||
             ctx->program->instructions[index].opcode != coverage->opcodes[index]) return;
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        uint8_t digest[32];
+        HLSLStageHullContract current;
+        if (!ctx->sb || !sb_ok(ctx->sb) ||
+            (ctx->diagnostic && ctx->diagnostic->status != HLSL_EMIT_STATUS_OK) ||
+            coverage->unit_count != 3 || coverage->recorded_unit_count != 3 ||
+            coverage->root_count != coverage->recorded_root_count ||
+            coverage->syntax_count != coverage->recorded_syntax_count ||
+            !hlsl_hull_owned_contract_digest(ctx->program, digest) ||
+            memcmp(digest, coverage->hull_owner_digest, sizeof(digest)) ||
+            !hull_contract_view(&current, ctx->program) || !hull_contract_equal(&current, &coverage->hull_contract) ||
+            !hull_contract_equal(&coverage->hull_contract, &coverage->recorded_hull_contract)) return;
+        for (size_t index = 0; index < coverage->instruction_count; ++index) {
+            const USILInstruction *owner = &ctx->program->instructions[index];
+            if (owner->source_instruction_index != coverage->source_instructions[index] ||
+                owner->operand_count != coverage->operand_counts[index] ||
+                (owner->operand_count ? usil_operand_destination_lane_mask(&owner->operands[0]) : 0) != coverage->destination_lanes[index] ||
+                coverage->opcodes[index] != coverage->recorded_opcodes[index] ||
+                coverage->source_instructions[index] != coverage->recorded_source_instructions[index] ||
+                coverage->destination_lanes[index] != coverage->recorded_destination_lanes[index] ||
+                coverage->operand_counts[index] != coverage->recorded_operand_counts[index]) return;
+            for (int operand = 0; operand < owner->operand_count; ++operand) {
+                USILOperandUseInfo use;
+                const DXBCOperand *value = &owner->operands[operand];
+                if (!usil_instruction_operand_use(ctx->program, owner, operand, &use)) return;
+                const HLSLStageOwnedOperandUse actual = {.type = value->type, .source_lanes = use.source_lane_mask,
+                    .is_source = use.use == USIL_OPERAND_USE_SOURCE, .absolute = value->has_abs, .negative = value->has_neg};
+                if (!operand_uses_equal(&actual, &coverage->operand_uses[index][operand]) ||
+                    !operand_uses_equal(&actual, &coverage->recorded_operand_uses[index][operand])) return;
+            }
+        }
+    }
     if (!hlsl_source_quality_interface_inventory_complete(ctx) ||
         !hlsl_source_quality_resource_inventory_complete(ctx)) coverage->obligations |= HLSL_STAGE_COVERAGE_SYNTAX;
     for (int index = 0; index < ctx->cbuffer_layout_count; ++index)
@@ -180,16 +462,23 @@ void hlsl_stage_coverage_finish(HLSLEmitterContext *ctx) {
     for (size_t index = 0; index < coverage->root_count; ++index)
         if (!coverage->roots[index].emitted || coverage->roots[index].live_tree)
             coverage->obligations |= HLSL_STAGE_COVERAGE_AST;
-    memcpy(coverage->recorded_operand_counts, coverage->operand_counts, sizeof(coverage->operand_counts));
-    memcpy(coverage->recorded_operand_uses, coverage->operand_uses, sizeof(coverage->operand_uses));
-    memcpy(coverage->recorded_opcodes, coverage->opcodes, sizeof(coverage->opcodes));
-    coverage->recorded_syntax_count = coverage->syntax_count;
-    coverage->recorded_root_count = coverage->root_count;
-    if (coverage->syntax_count) {
-        coverage->recorded_syntax = malloc(coverage->syntax_count * sizeof(*coverage->recorded_syntax));
-        if (coverage->recorded_syntax)
-            memcpy(coverage->recorded_syntax, coverage->syntax,
-                coverage->syntax_count * sizeof(*coverage->recorded_syntax));
+    if (coverage->schema == HLSL_STAGE_COVERAGE_ORDINARY_ENTRY) {
+        memcpy(coverage->recorded_operand_counts, coverage->operand_counts, sizeof(coverage->operand_counts));
+        memcpy(coverage->recorded_operand_uses, coverage->operand_uses, sizeof(coverage->operand_uses));
+        memcpy(coverage->recorded_opcodes, coverage->opcodes, sizeof(coverage->opcodes));
+    }
+    close_unit(coverage, coverage->source_size);
+    if (coverage->schema == HLSL_STAGE_COVERAGE_ORDINARY_ENTRY) {
+        coverage->recorded_unit_count = coverage->unit_count;
+        memcpy(coverage->recorded_units, coverage->units, sizeof(coverage->units));
+        coverage->recorded_syntax_count = coverage->syntax_count;
+        coverage->recorded_root_count = coverage->root_count;
+        if (coverage->syntax_count) {
+            coverage->recorded_syntax = malloc(coverage->syntax_count * sizeof(*coverage->recorded_syntax));
+            if (coverage->recorded_syntax)
+                memcpy(coverage->recorded_syntax, coverage->syntax,
+                    coverage->syntax_count * sizeof(*coverage->recorded_syntax));
+        }
     }
     coverage->finished = true;
 }
@@ -277,11 +566,87 @@ static bool tree_owners_valid(const HLSLStageCoverage *coverage, const ASTExpr *
     }
 }
 
+static bool units_equal(const HLSLStageOwnedUnit *a, const HLSLStageOwnedUnit *b) {
+    return a->source_unit_id == b->source_unit_id && a->kind == b->kind && a->begin == b->begin && a->end == b->end &&
+        a->root_begin == b->root_begin && a->root_end == b->root_end && a->syntax_begin == b->syntax_begin &&
+        a->syntax_end == b->syntax_end && a->obligations == b->obligations;
+}
+
+static bool syntax_equal(const HLSLStageOwnedSyntax *a, const HLSLStageOwnedSyntax *b) {
+    return a->source_end == b->source_end && a->source_unit_id == b->source_unit_id && a->unit_kind == b->unit_kind &&
+        a->kind == b->kind && a->reasons == b->reasons && hlsl_source_quality_facts_equal(&a->facts, &b->facts);
+}
+
+static bool hull_units_valid(const HLSLStageCoverage *coverage) {
+    if (coverage->stage != DXBC_PROGRAM_TYPE_HULL || coverage->unit_count != 3 || coverage->recorded_unit_count != 3 ||
+        !(coverage->obligations & HLSL_STAGE_COVERAGE_BODY) || !(coverage->obligations & HLSL_STAGE_COVERAGE_LOCAL_DECLARATION) ||
+        !hull_contract_equal(&coverage->hull_contract, &coverage->recorded_hull_contract)) return false;
+    int next_instruction = 0;
+    for (size_t index = 0; index < coverage->hull_contract.tessellation.phase_count; ++index) {
+        const USILHullPhase *phase = &coverage->hull_contract.phases[index];
+        if ((phase->kind != DXBC_HULL_PHASE_FORK && !(index == 0 && phase->kind == DXBC_HULL_PHASE_CONTROL_POINT)) ||
+            phase->first_instruction_index != next_instruction || phase->end_instruction_index <= next_instruction ||
+            phase->end_instruction_index > (int)coverage->instruction_count || !phase->instance_count ||
+            phase->marker_source_instruction_index >= phase->first_source_instruction_index ||
+            phase->first_source_instruction_index >= phase->end_source_instruction_index) return false;
+        next_instruction = phase->end_instruction_index;
+    }
+    if (next_instruction != (int)coverage->instruction_count) return false;
+    size_t source_end = 0, root_end = 0, syntax_end = 0;
+    for (size_t index = 0; index < 3; ++index) {
+        const HLSLStageOwnedUnit *unit = &coverage->units[index];
+        const uint32_t required = index == 0 ? HLSL_STAGE_COVERAGE_LOCAL_DECLARATION : HLSL_STAGE_COVERAGE_BODY;
+        if (!units_equal(unit, &coverage->recorded_units[index]) || unit->source_unit_id != index ||
+            !unit_kind_matches(coverage->schema, unit->source_unit_id, unit->kind) || unit->begin != source_end ||
+            unit->begin >= unit->end || unit->end > coverage->source_size || unit->root_begin != root_end ||
+            unit->root_begin > unit->root_end || unit->root_end > coverage->root_count || unit->syntax_begin != syntax_end ||
+            unit->syntax_begin >= unit->syntax_end || unit->syntax_end > coverage->syntax_count || !(unit->obligations & required) ||
+            (unit->obligations & ~coverage->obligations)) return false;
+        for (size_t root = unit->root_begin; root < unit->root_end; ++root) {
+            const HLSLStageOwnedRoot *owned = &coverage->roots[root];
+            if (owned->source_unit_id != unit->source_unit_id || owned->unit_kind != unit->kind ||
+                owned->begin < unit->begin || owned->end > unit->end) return false;
+        }
+        for (size_t event = unit->syntax_begin; event < unit->syntax_end; ++event) {
+            const HLSLStageOwnedSyntax *owned = &coverage->syntax[event];
+            if (owned->source_unit_id != unit->source_unit_id || owned->unit_kind != unit->kind ||
+                owned->source_end < unit->begin || owned->source_end > unit->end) return false;
+        }
+        source_end = unit->end; root_end = unit->root_end; syntax_end = unit->syntax_end;
+    }
+    return source_end == coverage->source_size && root_end == coverage->root_count && syntax_end == coverage->syntax_count;
+}
+
+static bool structural_tree_valid(const HLSLStageOwnedRoot *root) {
+    if (root->owner.kind == HLSL_STAGE_ROOT_INSTRUCTION) return true;
+    if (root->owner.kind == HLSL_STAGE_ROOT_HULL_MAXIMUM)
+        return root->tree->kind == AST_EXPR_LITERAL && root->tree->u.literal.components == 1 &&
+            root->tree->u.literal.scalar_type == AST_SCALAR_FLOAT32 && root->tree->u.literal.val[0] == root->owner.value_bits;
+    if (root->tree->kind != AST_EXPR_EMITTER_OPERAND || !root->tree->operand_provenance.complete ||
+        root->tree->operand_provenance.value_role != AST_OPERAND_VALUE_LOGICAL ||
+        root->tree->operand_provenance.selection_role != AST_COMPONENT_SELECTION_NONE ||
+        root->tree->operand_provenance.bitcast_role != AST_OPERAND_BITCAST_NONE ||
+        root->tree->operand_provenance.raw_buffer_reconstruction || root->tree->operand_provenance.synthetic_interface ||
+        root->tree->operand_provenance.operand_index !=
+            (root->owner.kind == HLSL_STAGE_ROOT_HULL_PHASE_INSTANCE ? 1 : -1)) return false;
+    if (root->owner.kind == HLSL_STAGE_ROOT_HULL_PHASE_INSTANCE)
+        return root->tree->operand_provenance.natural_components == 1 &&
+            root->tree->operand_provenance.result_components == 1 &&
+            root->tree->operand_provenance.instruction_index == root->instruction;
+    return root->tree->operand_provenance.complete &&
+        root->tree->operand_provenance.value_role == AST_OPERAND_VALUE_LOGICAL &&
+        root->tree->operand_provenance.natural_components == 0 && root->tree->operand_provenance.result_components == 0 &&
+        root->tree->operand_provenance.instruction_index == -1 &&
+        root->tree->operand_provenance.source_instruction_index == UINT32_MAX && !root->tree->operand_provenance.destination_lanes;
+}
+
 bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const StringBuilder *source) {
     const uint32_t known_obligations = HLSL_STAGE_COVERAGE_BODY | HLSL_STAGE_COVERAGE_LOCAL_DECLARATION |
         HLSL_STAGE_COVERAGE_REQUIRED_EXTERNAL_DECLARATION | HLSL_STAGE_COVERAGE_SYNTAX | HLSL_STAGE_COVERAGE_AST;
     if (!coverage || !coverage->began || !coverage->finished || !coverage->instruction_count ||
-        coverage->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT || !source || !sb_ok(source) || !source->buf ||
+        coverage->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
+        ((coverage->stage == DXBC_PROGRAM_TYPE_HULL) != (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT)) ||
+        !source || !sb_ok(source) || !source->buf ||
         source->len != coverage->source_size || !coverage->source ||
         memcmp(source->buf, coverage->source, coverage->source_size + 1) ||
         (coverage->obligations & ~known_obligations) || (coverage->required_binding_mask & ~UINT32_C(0x7fff)) ||
@@ -295,11 +660,17 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
         (!(coverage->obligations & HLSL_STAGE_COVERAGE_SYNTAX) &&
             (!coverage->syntax_count || coverage->syntax[coverage->syntax_count - 1].source_end != source->len)))
         return false;
+    if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        if (!hull_units_valid(coverage)) return false;
+    } else if (coverage->schema != HLSL_STAGE_COVERAGE_ORDINARY_ENTRY) return false;
     for (size_t index = 0; index < coverage->instruction_count; ++index) {
         if (!opcode_valid(coverage->opcodes[index]) ||
             coverage->opcodes[index] != coverage->recorded_opcodes[index] ||
             coverage->operand_counts[index] > DXBC_MAX_OPERANDS ||
             coverage->operand_counts[index] != coverage->recorded_operand_counts[index]) return false;
+        if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT &&
+            (coverage->source_instructions[index] != coverage->recorded_source_instructions[index] ||
+             coverage->destination_lanes[index] != coverage->recorded_destination_lanes[index])) return false;
         for (unsigned operand = 0; operand < coverage->operand_counts[index]; ++operand)
             if (!operand_uses_equal(&coverage->operand_uses[index][operand],
                     &coverage->recorded_operand_uses[index][operand])) return false;
@@ -307,24 +678,44 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
     size_t previous = 0, nodes = 0;
     for (size_t index = 0; index < coverage->syntax_count; ++index) {
         const HLSLStageOwnedSyntax *syntax = &coverage->syntax[index];
-        if (syntax->source_end != coverage->recorded_syntax[index].source_end ||
-            !hlsl_source_quality_facts_equal(&syntax->facts, &coverage->recorded_syntax[index].facts) ||
+        if (!syntax_equal(syntax, &coverage->recorded_syntax[index]) ||
             syntax->source_end < previous || syntax->source_end > source->len ||
+            !unit_kind_matches(coverage->schema, syntax->source_unit_id, syntax->unit_kind) ||
+            (syntax->kind != HLSL_SOURCE_OBSERVATION_EMISSION &&
+             !(coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT && syntax->kind == HLSL_SOURCE_OBSERVATION_COVERAGE)) ||
             !owner_valid(coverage, syntax->facts.instruction_index,
                 syntax->facts.source_instruction_index, syntax->facts.lanes)) return false;
+        if (syntax->kind == HLSL_SOURCE_OBSERVATION_COVERAGE &&
+            (syntax->reasons != HLSL_SOURCE_QUALITY_REASON_INCOMPLETE_SOURCE ||
+             !(coverage->units[syntax->source_unit_id].obligations & HLSL_STAGE_COVERAGE_SYNTAX))) return false;
         previous = syntax->source_end;
     }
     for (size_t index = 0; index < coverage->root_count; ++index) {
         const HLSLStageOwnedRoot *root = &coverage->roots[index];
-        if (!root->emitted || root->live_tree || root->instruction < 0 ||
-            (size_t)root->instruction >= coverage->instruction_count || root->begin >= root->end ||
+        if (!root->emitted || root->live_tree || !root->tree ||
+            !root_owners_equal(&root->owner, &root->recorded_owner) ||
+            !root_owner_valid(coverage, &root->owner, root->instruction, root->source_unit_id) ||
+            !unit_kind_matches(coverage->schema, root->source_unit_id, root->unit_kind) || !structural_tree_valid(root) || root->begin >= root->end ||
             root->end > source->len || !hlsl_matrix_uses_trees_equal(root->tree, root->recorded_tree) ||
             !tree_owners_valid(coverage, root->tree, 0, &nodes)) return false;
         StringBuilder formatted;
         sb_init(&formatted);
         ast_format_expr(root->tree, &formatted);
-        bool valid = sb_ok(&formatted) && formatted.len == root->end - root->begin &&
-            !memcmp(formatted.buf, source->buf + root->begin, formatted.len);
+        /* The bounded HULL producer spells its typed loop atoms and aggregate
+         * returns directly. EMITTER_OPERAND owns their exact payload but its
+         * generic expression formatter adds parentheses. Replay that producer's
+         * known atom spelling; arithmetic and maximum literals retain the full
+         * generic formatting contract. No source text is parsed or rewritten. */
+        const bool manual_atom = root->owner.kind == HLSL_STAGE_ROOT_HULL_PHASE_INSTANCE ||
+            root->owner.kind == HLSL_STAGE_ROOT_HULL_FACTOR_RETURN ||
+            root->owner.kind == HLSL_STAGE_ROOT_HULL_IMPLICIT_COPY ||
+            root->owner.kind == HLSL_STAGE_ROOT_HULL_POINT_RETURN;
+        const size_t wrapper = manual_atom ? 2 : 0;
+        bool valid = sb_ok(&formatted) && formatted.len >= wrapper &&
+            (!manual_atom || root->tree->kind == AST_EXPR_EMITTER_OPERAND) &&
+            formatted.len - wrapper == root->end - root->begin &&
+            (!manual_atom || (formatted.buf[0] == '(' && formatted.buf[formatted.len - 1] == ')')) &&
+            !memcmp(formatted.buf + (manual_atom ? 1 : 0), source->buf + root->begin, formatted.len - wrapper);
         sb_free(&formatted);
         if (!valid) return false;
     }
@@ -333,12 +724,26 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
 
 bool hlsl_stage_coverage_equal(const HLSLStageCoverage *a, const HLSLStageCoverage *b) {
     if (!a || !b || !a->instruction_count || a->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
+        (a->schema != HLSL_STAGE_COVERAGE_ORDINARY_ENTRY && a->schema != HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) ||
+        ((a->stage == DXBC_PROGRAM_TYPE_HULL) != (a->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT)) ||
         a->obligations != b->obligations || a->required_binding_mask != b->required_binding_mask ||
-        a->stage != b->stage || a->instruction_count != b->instruction_count || a->source_size != b->source_size ||
+        a->stage != b->stage || a->schema != b->schema || a->instruction_count != b->instruction_count || a->source_size != b->source_size ||
         a->node_count != b->node_count || a->root_count != b->root_count || a->syntax_count != b->syntax_count ||
         a->recorded_root_count != b->recorded_root_count || a->recorded_syntax_count != b->recorded_syntax_count ||
         !a->finished || !b->finished || !a->source || !b->source ||
         memcmp(a->source, b->source, a->source_size + 1)) return false;
+    if (a->unit_count != b->unit_count || a->recorded_unit_count != b->recorded_unit_count || a->unit_count > 3) return false;
+    if (a->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT &&
+        (!hull_units_valid(a) || !hull_units_valid(b) || !hull_contract_equal(&a->hull_contract, &b->hull_contract) ||
+         !hull_contract_equal(&a->recorded_hull_contract, &b->recorded_hull_contract) ||
+         memcmp(a->hull_owner_digest, b->hull_owner_digest, sizeof(a->hull_owner_digest)))) return false;
+    if (a->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
+        const StringBuilder left_source = {.buf = a->source, .len = a->source_size, .capacity = a->source_size + 1};
+        const StringBuilder right_source = {.buf = b->source, .len = b->source_size, .capacity = b->source_size + 1};
+        if (!hlsl_stage_coverage_validate(a, &left_source) || !hlsl_stage_coverage_validate(b, &right_source)) return false;
+    }
+    for (size_t index = 0; index < a->unit_count; ++index)
+        if (!units_equal(&a->units[index], &b->units[index]) || !units_equal(&a->recorded_units[index], &b->recorded_units[index])) return false;
     for (size_t index = 0; index < a->instruction_count; ++index) {
         if (!opcode_valid(a->opcodes[index]) || !opcode_valid(b->opcodes[index]) ||
             a->opcodes[index] != a->recorded_opcodes[index] ||
@@ -358,11 +763,12 @@ bool hlsl_stage_coverage_equal(const HLSLStageCoverage *a, const HLSLStageCovera
         }
     }
     for (size_t index = 0; index < a->syntax_count; ++index)
-        if (a->syntax[index].source_end != b->syntax[index].source_end ||
-            !hlsl_source_quality_facts_equal(&a->syntax[index].facts, &b->syntax[index].facts)) return false;
+        if (!syntax_equal(&a->syntax[index], &b->syntax[index])) return false;
     for (size_t index = 0; index < a->root_count; ++index) {
         const HLSLStageOwnedRoot *x = &a->roots[index], *y = &b->roots[index];
         if (!x->emitted || !y->emitted || x->live_tree || y->live_tree || x->instruction != y->instruction ||
+            x->source_unit_id != y->source_unit_id || x->unit_kind != y->unit_kind ||
+            !root_owners_equal(&x->owner, &y->owner) || !root_owners_equal(&x->recorded_owner, &y->recorded_owner) ||
             x->begin != y->begin || x->end != y->end || x->whole_begin != y->whole_begin ||
             x->whole_end != y->whole_end || !hlsl_matrix_uses_trees_equal(x->tree, y->tree) ||
             !hlsl_matrix_uses_trees_equal(x->recorded_tree, y->recorded_tree)) return false;
@@ -379,5 +785,7 @@ void hlsl_stage_coverage_dispose(HLSLStageCoverage *coverage) {
     free(coverage->syntax);
     free(coverage->recorded_syntax);
     free(coverage->source);
+    hull_contract_dispose(&coverage->hull_contract);
+    hull_contract_dispose(&coverage->recorded_hull_contract);
     memset(coverage, 0, sizeof(*coverage));
 }

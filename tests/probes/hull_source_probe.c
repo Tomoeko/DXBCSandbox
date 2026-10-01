@@ -7,6 +7,8 @@
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter.h"
 #include "translation/hlsl_source_quality.h"
+#include "translation/hlsl_source_quality_internal.h"
+#include "translation/hlsl_stage_coverage_internal.h"
 #include "translation/usil_validation.h"
 
 #include <inttypes.h>
@@ -295,6 +297,34 @@ static bool reconstruct_hull(const DXBCContainerView *target,
            program.instruction_count, quality.counts.inspected_units, compiler_clamps,
            program.inputs[0].mask, program.inputs[0].rw_mask,
            program.outputs[0].mask, program.outputs[0].rw_mask);
+    StringBuilder owned_source;
+    sb_init(&owned_source);
+    HLSLStageCoverage coverage = {0};
+    HLSLExpressionSourceMap owned_map = {0};
+    HLSLSourceQualityResult owned_quality = {0};
+    HLSLEmitOptions owned_options = options;
+    owned_options.expression_source_map = &owned_map;
+    owned_options.source_quality = &owned_quality;
+    const bool captured = hlsl_emit_with_stage_coverage(&program, &owned_source,
+        parameters, NULL, &names, &owned_options, &coverage, &diagnostic);
+    const bool coverage_valid = captured &&
+        hlsl_stage_coverage_validate(&coverage, &owned_source);
+    bool unchanged = captured && owned_source.len == source->len &&
+        !memcmp(owned_source.buf, source->buf, source->len) &&
+        hlsl_source_quality_results_equal(&owned_quality, &quality) &&
+        owned_map.complete == map.complete && owned_map.count == map.count &&
+        hlsl_expression_source_map_matches(&owned_map, &program, owned_source.buf);
+    for (size_t index = 0; unchanged && index < map.count; ++index)
+        unchanged = hlsl_expression_origins_equal(&map.origins[index], &owned_map.origins[index]);
+    printf("private_stage_capture=%d units=%zu roots=%zu syntax=%zu "
+           "obligations=0x%x source_and_classification_unchanged=%d "
+           "original_target_receipt=not-supplied\n",
+           coverage_valid, coverage.unit_count, coverage.root_count,
+           coverage.syntax_count, coverage.obligations, unchanged);
+    accepted = accepted && coverage_valid && unchanged && coverage.unit_count == 3 &&
+        (coverage.obligations & HLSL_STAGE_COVERAGE_BODY);
+    hlsl_stage_coverage_dispose(&coverage);
+    sb_free(&owned_source);
 done:
     usil_free(&program);
     dxbc_stage_contract_free(&contract);
@@ -365,6 +395,39 @@ static bool changed_factor_wrapper(const StringBuilder *hull,
         print_hash("mutated_hull_sha256", mutated.buf, mutated.len);
     }
     sb_free(&mutated);
+    return built;
+}
+
+static bool static_factor_calibration(const StringBuilder *hull,
+                                      StringBuilder *wrapper,
+                                      const char *shader_name) {
+    /* A controlled compiler experiment, not an inverse-source lift. Keep the
+     * normal candidate's comparison and provenance unchanged. */
+    const char *loop =
+        "    for (uint factorIndex = 0; factorIndex < 3; ++factorIndex) {\n"
+        "        factors.outer[factorIndex] = (_Factor);\n"
+        "    }\n";
+    const char *assignments =
+        "    factors.outer[0] = (_Factor);\n"
+        "    factors.outer[1] = (_Factor);\n"
+        "    factors.outer[2] = (_Factor);\n";
+    if (!sb_ok(hull) || !hull->buf || hull->len > PROBE_SOURCE_LIMIT)
+        return false;
+    const char *match = strstr(hull->buf, loop);
+    if (!match || strstr(match + strlen(loop), loop)) return false;
+    StringBuilder calibration;
+    sb_init(&calibration);
+    sb_append_len(&calibration, hull->buf, (size_t)(match - hull->buf));
+    sb_append(&calibration, assignments);
+    sb_append(&calibration, match + strlen(loop));
+    const bool built = sb_ok(&calibration) &&
+        candidate_wrapper(&calibration, wrapper, shader_name);
+    if (built) {
+        puts("source_shape_calibration=three-authored-static-assignments "
+             "inverse_source_map=not-retained quality=not-classified");
+        print_hash("calibration_hull_sha256", calibration.buf, calibration.len);
+    }
+    sb_free(&calibration);
     return built;
 }
 
@@ -456,11 +519,14 @@ compiler_environment_equal(const UnityCompilerToolchainProvenance *left,
 static void usage(const char *name) {
     fprintf(
         stderr,
-        "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--scalar-fixture]\n"
+        "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--scalar-fixture "
+        "[--static-factor-calibration]]\n"
         "Use '-' for no additional includes. Selected-native HULL comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
-        "validated against native reflection; no player metadata authority.\n",
+        "validated against native reflection; no player metadata authority.\n"
+        "Static-factor calibration is a separate cold compiler experiment; it "
+        "does not repair the normal inverse-source comparison.\n",
         name);
 }
 
@@ -469,12 +535,15 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
-    if (argc != 4 && (argc != 5 || strcmp(argv[4], "--scalar-fixture"))) {
+    if (argc != 4 && ((argc != 5 && argc != 6) ||
+        strcmp(argv[4], "--scalar-fixture") ||
+        (argc == 6 && strcmp(argv[5], "--static-factor-calibration")))) {
         usage(argv[0]);
         return 2;
     }
     CommonFileBytes authored = {0};
-    const bool scalar_fixture = argc == 5;
+    const bool scalar_fixture = argc >= 5;
+    const bool calibrate_static_factors = argc == 6;
     const char *shader_name = scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
                                             : default_shader_name;
     SerializedVariable field = {.name = "_Factor", .layout = {0, 0, 0, 1, 0, 0}};
@@ -485,15 +554,16 @@ int main(int argc, char **argv) {
     SerializedProgramParameters parameters = {.constant_buffers = &buffer,
         .cb_count = 1, .resources = &binding, .res_count = 1};
     UnityCompilerChannel channel = {.socket_fd = -1};
-    UnityCompilerPreprocessResponse preprocessing[4];
-    UnityCompilerBinaryResponse compiled[4];
-    UnityCompilerSnippetCompileRequest requests[4] = {0};
-    UnityCompilerToolchainProvenance provenance[4];
-    StringBuilder hull, wrapper, changed_wrapper;
+    UnityCompilerPreprocessResponse preprocessing[5];
+    UnityCompilerBinaryResponse compiled[5];
+    UnityCompilerSnippetCompileRequest requests[5] = {0};
+    UnityCompilerToolchainProvenance provenance[5];
+    StringBuilder hull, wrapper, changed_wrapper, calibration_wrapper;
     sb_init(&hull);
     sb_init(&wrapper);
     sb_init(&changed_wrapper);
-    for (unsigned index = 0; index < 4; ++index) {
+    sb_init(&calibration_wrapper);
+    for (unsigned index = 0; index < 5; ++index) {
         unity_compiler_preprocess_response_init(&preprocessing[index]);
         unity_compiler_binary_response_init(&compiled[index]);
     }
@@ -661,8 +731,60 @@ int main(int argc, char **argv) {
                      repeated_authority
                  ? 0
                  : 1;
+    if (calibrate_static_factors) {
+        /* The held target bytes survive a third independent cold process.
+         * This optional result cannot change the normal candidate's failure. */
+        const int normal_candidate_result = result;
+        result = 1;
+        DXBCContainerView calibration = {0};
+        if (!static_factor_calibration(&hull, &calibration_wrapper, shader_name))
+            goto done;
+        unity_compiler_shutdown(&channel);
+        channel = (UnityCompilerChannel){.socket_fd = -1};
+        UnityCompilerSessionCapabilities calibration_capabilities;
+        uint32_t calibration_valid_apis = 0;
+        if (!unity_compiler_start_lazy(&channel, argv[2],
+                !strcmp(argv[3], "-") ? NULL : argv[3]) ||
+            !unity_compiler_capture_session_capabilities(&channel,
+                &calibration_capabilities) ||
+            !unity_compiler_session_capabilities_valid_apis(
+                &calibration_capabilities, &calibration_valid_apis) ||
+            calibration_valid_apis != valid_apis ||
+            !unity_compiler_session_capabilities_equal(&capabilities,
+                &calibration_capabilities) ||
+            !unity_compiler_set_expected_valid_apis(&channel, valid_apis) ||
+            !compile_source(&channel, "cold-static-factor-calibration",
+                calibration_wrapper.buf, directory, shader_name, valid_apis,
+                &preprocessing[4], &requests[4], &compiled[4], &provenance[4]) ||
+            !scalar_fixture_reflection(&compiled[4]) ||
+            !dxbc_container_view_first(compiled[4].data, compiled[4].size,
+                &calibration)) goto done;
+        const DXBCCompareStatus calibration_status = dxbc_compare_exact(
+            target.data, target.size, calibration.data, calibration.size,
+            &comparison);
+        print_hash("calibration_complete_dxbc_sha256", calibration.data,
+                   calibration.size);
+        const bool calibration_controls =
+            selected_controls_equal(&requests[0], &requests[4]);
+        const bool calibration_environment =
+            compiler_environment_equal(&provenance[0], &provenance[4]);
+        printf("static_calibration_comparison=%s cold_process=3 "
+               "selected_controls_equal=%d compiler_environment_equal=%d "
+               "normal_candidate_result=%d\n",
+               dxbc_compare_status_name(calibration_status),
+               calibration_controls, calibration_environment,
+               normal_candidate_result);
+        printf("static_calibration_difference chunk=%u instruction=%u token=%u "
+               "expected=0x%" PRIx64 " actual=0x%" PRIx64 "\n",
+               comparison.chunk_index, comparison.instruction_index,
+               comparison.token_index, comparison.expected_value,
+               comparison.actual_value);
+        result = !normal_candidate_result &&
+            calibration_status == DXBC_COMPARE_EQUAL &&
+            calibration_controls && calibration_environment ? 0 : 1;
+    }
 done:
-    for (unsigned index = 0; index < 4; ++index) {
+    for (unsigned index = 0; index < 5; ++index) {
         unity_compiler_binary_response_free(&compiled[index]);
         unity_compiler_preprocess_response_free(&preprocessing[index]);
     }
@@ -671,5 +793,6 @@ done:
     sb_free(&hull);
     sb_free(&wrapper);
     sb_free(&changed_wrapper);
+    sb_free(&calibration_wrapper);
     return result;
 }

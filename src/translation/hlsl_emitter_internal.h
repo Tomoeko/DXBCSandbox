@@ -14,6 +14,7 @@
 #include "hlsl_instruction_owners.h"
 #include "translation/hlsl_ast.h"
 #include "translation/hlsl_source_quality.h"
+#include "translation/hlsl_stage_coverage_internal.h"
 #include "translation/hlsl_literal.h"
 #include "translation/hlsl_value_analysis.h"
 #include "translation/dxbc_cbuffer_projection.h"
@@ -261,6 +262,7 @@ typedef struct HLSLEmitterContext {
     size_t reserved_preprocessor_identifier_count;
     HLSLExpressionSourceMap *expression_source_map;
     struct HLSLMatrixUseCapture *matrix_use_capture; /* Private owned factory only. */
+    struct HLSLStageCoverage *stage_coverage; /* Independent private stage capture. */
     HLSLSourceQualityAnalysis *source_quality_analysis;
     HLSLSourceQualityObserver source_quality_forward_observer;
     void *source_quality_forward_observer_context;
@@ -394,6 +396,8 @@ bool hlsl_source_quality_owned_expression_facts(
     HLSLSourceQualityFacts *facts);
 bool hlsl_source_quality_observe_expression(HLSLEmitterContext *ctx,
                                             const ASTExpr *expression, int instruction);
+bool hlsl_source_quality_observe_owned_expression(HLSLEmitterContext *ctx,
+    const ASTExpr *expression, int instruction, const HLSLStageRootOwner *owner);
 void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
                                   bool logical_operation, int instruction);
 /* Initialize after program/sb/diagnostic/context fields, then begin one unit

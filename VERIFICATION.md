@@ -125,6 +125,13 @@ API likewise returns unverified source and owned per-kernel evidence. Controlled
 compiler equality does not supply the missing generic compute, import or native
 producers or enlarge the closed whole-shader scope above.
 
+Private HULL coverage records configuration, patch helper and entry-point units
+separately, including owned expression trees, source spans and typed phase or
+signature owners for structural values. It preserves the normal emitted source
+and classification. Body and declaration obligations remain open until a separate
+factory replays immutable target bytes and current metadata through the complete
+ShaderLab producer. Local capture integrity does not supply that receipt.
+
 Native compute preprocessing and kernel responses remain compiler observations.
 Their canonical identities retain every ordered request field and current
 compiler/include authority. Malformed or over-budget responses discard partial

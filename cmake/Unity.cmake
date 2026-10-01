@@ -108,6 +108,7 @@ if(DXBCSANDBOX_BUILD_UNITY_COMPILER)
 
     # Manual target-only HULL inverse and selected-native container comparison.
     add_executable(hull_source_probe tests/probes/hull_source_probe.c)
+    target_include_directories(hull_source_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(hull_source_probe PRIVATE
         unity_compiler_support dxbc_build_options)
 
