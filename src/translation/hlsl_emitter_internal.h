@@ -310,11 +310,17 @@ typedef struct HLSLEmitterContext {
      * when two parameter declarations share one physical input register. */
     bool high_level_packed_inputs;
     uint32_t high_level_input_fields_emitted;
-    /* Only the packed IF route retains this callback-free interface replay.
-     * Disposal shares the existing natural body inventory lifecycle. */
-    StringBuilder natural_packed_header_source;
-    size_t natural_packed_header_begin;
-    bool natural_packed_header_replay;
+    /* Every frozen natural structured route retains this callback-free
+     * interface replay. Disposal shares the natural body inventory lifecycle. */
+    StringBuilder natural_structured_header_source;
+    size_t natural_structured_header_begin;
+    bool natural_structured_header_replay;
+    /* The original append prefix is frozen before source callbacks. The second
+     * digest binds preceding bytes from header preparation onward; it does
+     * not establish independent syntax authority for a generated preamble. */
+    size_t natural_structured_append_prefix_length;
+    uint8_t natural_structured_append_prefix_digest[32];
+    uint8_t natural_structured_header_prefix_digest[32];
     uint32_t high_level_output_fields_emitted;
     uint32_t high_level_output_statements_emitted;
     bool high_level_output_struct_emitted;
@@ -490,7 +496,7 @@ typedef struct {
 bool hlsl_natural_input_layout_supported(const USILProgram *program, bool *has_packed);
 bool hlsl_natural_input_projection(const USILProgram *program, const DXBCOperand *operand,
     uint8_t demanded_lanes, HLSLNaturalInputProjection *projection);
-bool hlsl_natural_packed_header_matches(const HLSLEmitterContext *ctx);
+bool hlsl_natural_structured_header_matches(const HLSLEmitterContext *ctx);
 bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
     const DXBCOperand *operand, uint8_t demanded_lanes, ASTOperandProvenance *provenance);
 

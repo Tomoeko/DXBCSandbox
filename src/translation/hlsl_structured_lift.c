@@ -1211,17 +1211,17 @@ cleanup:
     return success;
 }
 
-static bool packed_header_ends_at(const HLSLEmitterContext *ctx, size_t offset) {
-    return !ctx->high_level_packed_inputs ||
-        (hlsl_natural_packed_header_matches(ctx) && offset >= ctx->natural_packed_header_begin &&
-         ctx->natural_packed_header_source.len == offset - ctx->natural_packed_header_begin);
+static bool natural_header_ends_at(const HLSLEmitterContext *ctx, size_t offset) {
+    return (!ctx->natural_structured_owners_guarded && !ctx->high_level_packed_inputs) ||
+        (hlsl_natural_structured_header_matches(ctx) && offset >= ctx->natural_structured_header_begin &&
+         ctx->natural_structured_header_source.len == offset - ctx->natural_structured_header_begin);
 }
 
 bool emit_high_level_structured(HLSLEmitterContext *ctx) {
     StructuredPlan plan = {0};
     HLSLNaturalStructuredBodyInventory *inventory = NULL;
     bool success = false;
-    if (!natural_model_stable(ctx) || !packed_header_ends_at(ctx, ctx->sb->len) ||
+    if (!natural_model_stable(ctx) || !natural_header_ends_at(ctx, ctx->sb->len) ||
         !build_plan(ctx, &plan)) goto cleanup;
     if (plan.natural_width) {
         if (!ctx->natural_structured_owners_guarded || ctx->natural_structured_body_inventory)
@@ -1354,10 +1354,10 @@ static bool body_replay(HLSLEmitterContext *ctx,
 
 bool hlsl_natural_structured_body_inventory_complete(HLSLEmitterContext *ctx) {
     if (!ctx || !ctx->natural_structured_owners_guarded || !natural_model_stable(ctx) ||
-        !hlsl_natural_packed_header_matches(ctx)) return false;
+        !hlsl_natural_structured_header_matches(ctx)) return false;
     HLSLNaturalStructuredBodyInventory *inventory = ctx->natural_structured_body_inventory;
     if (!inventory || !inventory->source || !ctx->expression_source_map ||
-        !body_prefix_matches(ctx, inventory) || !packed_header_ends_at(ctx, inventory->source_begin) ||
+        !body_prefix_matches(ctx, inventory) || !natural_header_ends_at(ctx, inventory->source_begin) ||
         inventory->body_end < inventory->source_begin ||
         ctx->sb->len <= inventory->body_end ||
         ctx->sb->len - inventory->source_begin > (size_t)NATURAL_BODY_BYTE_LIMIT) return false;
@@ -1396,14 +1396,17 @@ bool hlsl_natural_structured_body_inventory_matches(HLSLEmitterContext *ctx) {
         !memcmp(ctx->sb->buf + inventory->source_begin, inventory->source,
             inventory->source_end - inventory->source_begin) &&
         body_map_equal(ctx->expression_source_map, &inventory->map) && natural_model_stable(ctx) &&
-        packed_header_ends_at(ctx, inventory->source_begin);
+        natural_header_ends_at(ctx, inventory->source_begin);
 }
 
 void hlsl_natural_structured_body_inventory_dispose(HLSLEmitterContext *ctx) {
     if (!ctx) return;
-    sb_free(&ctx->natural_packed_header_source);
-    ctx->natural_packed_header_begin = 0;
-    ctx->natural_packed_header_replay = false;
+    sb_free(&ctx->natural_structured_header_source);
+    ctx->natural_structured_header_begin = 0;
+    ctx->natural_structured_header_replay = false;
+    ctx->natural_structured_append_prefix_length = 0;
+    memset(ctx->natural_structured_append_prefix_digest, 0, sizeof(ctx->natural_structured_append_prefix_digest));
+    memset(ctx->natural_structured_header_prefix_digest, 0, sizeof(ctx->natural_structured_header_prefix_digest));
     if (!ctx->natural_structured_body_inventory) return;
     HLSLNaturalStructuredBodyInventory *inventory = ctx->natural_structured_body_inventory;
     if (ctx->expression_source_map == &inventory->internal_map)

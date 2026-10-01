@@ -1977,6 +1977,8 @@ typedef struct {
     HLSLExpressionSourceMap *mutable_map;
     size_t source_offset;
     size_t signature_observation;
+    size_t first_header_observation;
+    size_t first_preheader_observation;
     size_t mutate_at;
     unsigned mutation;
     int arithmetic_instruction, condition_instruction;
@@ -1996,6 +1998,14 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
         observation->entry_point_index != 4 || observation->source_unit_id != 0)
         ledger->wrong_owner = true;
     const HLSLSourceQualityFacts *facts = &observation->facts;
+    if (!ledger->first_preheader_observation && observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION &&
+        facts->instruction_index < 0 && ledger->mutable_source && ledger->mutable_source->buf &&
+        strstr(ledger->mutable_source->buf, "// Model:") && !strstr(ledger->mutable_source->buf, "float"))
+        ledger->first_preheader_observation = ledger->observations;
+    if (!ledger->first_header_observation && observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION &&
+        facts->instruction_index < 0 && ledger->mutable_source && ledger->mutable_source->buf &&
+        strstr(ledger->mutable_source->buf, "float"))
+        ledger->first_header_observation = ledger->observations;
     if (observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION &&
         facts->instruction_index < 0 && ledger->mutable_source && ledger->mutable_source->buf &&
         ledger->mutable_source->len >= sizeof(" output;\n") - 1u &&
@@ -2193,6 +2203,11 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
             memset(&owner->operands[3], 0, sizeof(owner->operands[3]));
             break;
         }
+        case 25:
+            if (!ledger->mutable_source) return false;
+            sb_append(ledger->mutable_source, "static const float injectedValue = 1.0f;\n");
+            if (!sb_ok(ledger->mutable_source)) return false;
+            break;
         }
         ledger->mutated = true;
     }
@@ -3842,6 +3857,123 @@ static bool check_natural_mad_emission(void) {
     return true;
 }
 
+/* Unique-input headers need the same immutable byte ownership as packed
+ * headers. These existing parsed fixtures isolate header stability from any
+ * new operation admission; callbacks alter only the caller's source or map. */
+static bool check_natural_unique_header_callbacks(void) {
+    const NaturalIfArithmetic arithmetic = {.then_opcode = USIL_OP_MAD, .else_opcode = USIL_OP_MAD,
+        .join_opcode = USIL_OP_MAD, .arm_right = NATURAL_IF_RIGHT_SCALAR_LITERAL,
+        .join_right = NATURAL_IF_RIGHT_VECTOR_INPUT, .arm_third = NATURAL_IF_RIGHT_SCALAR_LITERAL,
+        .join_third = NATURAL_IF_RIGHT_VECTOR_INPUT};
+    bool all_rejected = true;
+    for (unsigned vertex = 0; vertex < 2u; ++vertex) {
+        NaturalIfFixture fixture;
+        CHECK(vertex ? natural_if_multiple_outputs_fixture_mode(&fixture, true, USIL_OP_LT, 8, true)
+            : natural_if_fixture_init_arithmetic(&fixture, 2, 12, true, false, false, false,
+                USIL_OP_LT, 2, UINT32_C(0x3ec00000), &arithmetic));
+        USILProgram *program = &fixture.program;
+        bool packed = true;
+        CHECK(program->has_parsed_signature_authority && usil_signature_authority_is_valid(program) &&
+            hlsl_natural_input_layout_supported(program, &packed) && !packed &&
+            program->instruction_count <= 11 && program->input_count <= 3 && program->signature_declaration_count <= 5);
+        const USILProgram model = *program;
+        USILInstruction instructions[11]; DXBCSignatureElement inputs[3]; USILSignatureDeclaration declarations[5];
+        memcpy(instructions, program->instructions, (size_t)program->instruction_count * sizeof(*instructions));
+        memcpy(inputs, program->inputs, (size_t)program->input_count * sizeof(*inputs));
+        memcpy(declarations, program->signature_declarations,
+            (size_t)program->signature_declaration_count * sizeof(*declarations));
+        const char prefix[] = "// caller prefix\n";
+        StringBuilder original, changed; sb_init(&original); sb_init(&changed); sb_append(&original, prefix);
+        HLSLExpressionSourceMap original_map, changed_map;
+        HLSLSourceQualityResult original_quality, changed_quality; HLSLEmitDiagnostic diagnostic;
+        NaturalIfObservations baseline = {.program = program, .mutable_source = &original};
+        CHECK(natural_if_emit(program, &original, &original_map, &original_quality, &baseline, &diagnostic) &&
+            original_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !original_quality.reasons &&
+            !baseline.wrong_owner && baseline.first_preheader_observation == 1u &&
+            baseline.first_preheader_observation < baseline.first_header_observation &&
+            baseline.first_header_observation < baseline.signature_observation && baseline.signature_observation < baseline.observations &&
+            original_map.complete && hlsl_expression_source_map_matches(&original_map, program, original.buf));
+        const char *type = strstr(original.buf, "float");
+        CHECK(type && (size_t)(type - original.buf) >= sizeof(prefix) - 1u &&
+            (size_t)(type - original.buf) < original_map.origins[0].source_begin);
+        const size_t header_offset = (size_t)(type - original.buf);
+        const char *comment = strstr(original.buf + sizeof(prefix) - 1u, "// Translated by Codex C-emitter\n");
+        CHECK(comment && comment[3] == 'T' && (size_t)(comment - original.buf) + 3u < header_offset);
+        const size_t generated_comment_offset = (size_t)(comment - original.buf) + 3u;
+        CHECK(fixture.then_value >= 0 && (size_t)fixture.then_value < original_map.count &&
+            original_map.origins[fixture.then_value].source_begin < original_map.origins[fixture.then_value].source_end);
+        for (unsigned outputs = 0; outputs < 4u; ++outputs) {
+            HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+            options.expression_source_map = outputs & 1u ? &changed_map : NULL;
+            options.source_quality = outputs & 2u ? &changed_quality : NULL;
+            options.source_quality_pass_index = 3; options.source_quality_entry_point_index = 4;
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(hlsl_emit_with_options_diagnostic(program, &changed, NULL, NULL, NULL, &options, &diagnostic) &&
+                changed.len == original.len && !memcmp(changed.buf, original.buf, original.len));
+            if (outputs & 1u) CHECK(natural_if_maps_equal(&original_map, &changed_map));
+            if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+        }
+        /* Complete UNIT_BEGIN itself has no observer event. The first real
+         * callback is the preheader configuration emission recorded above.
+         * An empty caller builder must use the same guarded header/body path. */
+        HLSLEmitOptions empty_options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        empty_options.expression_source_map = &changed_map;
+        empty_options.source_quality = &changed_quality;
+        empty_options.source_quality_pass_index = 3; empty_options.source_quality_entry_point_index = 4;
+        sb_free(&changed); sb_init(&changed);
+        CHECK(hlsl_emit_with_options_diagnostic(program, &changed, NULL, NULL, NULL, &empty_options, &diagnostic) &&
+            changed.len == original.len - (sizeof(prefix) - 1u) &&
+            !memcmp(changed.buf, original.buf + sizeof(prefix) - 1u, changed.len) &&
+            hlsl_source_quality_results_equal(&original_quality, &changed_quality) &&
+            changed_map.complete && hlsl_expression_source_map_matches(&changed_map, program, changed.buf));
+        CHECK(hlsl_expression_source_map_offset(&changed_map, sizeof(prefix) - 1u) &&
+            natural_if_maps_equal(&original_map, &changed_map));
+        const char *labels[] = {"early-header-type", "last-header-gap", "final-header-type",
+            "final-body-byte", "final-map-range", "final-caller-prefix", "early-caller-prefix",
+            "first-preheader-caller-prefix", "first-preheader-declaration-insertion", "first-preheader-comment-byte"};
+        for (unsigned attack = 0; attack < sizeof(labels) / sizeof(*labels); ++attack) {
+            NaturalIfObservations drift = {.program = program, .mutable_program = program, .mutable_source = &changed,
+                .mutable_map = &changed_map, .mutation = attack == 0u ? 19u : attack == 1u ? 20u :
+                    attack == 4u ? 15u : attack == 8u ? 25u : 4u,
+                .mutate_at = attack == 0u ? 0u : attack == 1u ? baseline.signature_observation :
+                    attack == 6u ? baseline.first_header_observation :
+                    attack >= 7u ? baseline.first_preheader_observation : baseline.observations,
+                .source_offset = attack == 3u ? original_map.origins[fixture.then_value].source_begin :
+                    attack == 9u ? generated_comment_offset : attack >= 5u ? 0u : header_offset,
+                .arithmetic_instruction = fixture.then_value};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            const bool emitted = natural_if_emit(program, &changed, &changed_map, &changed_quality, &drift, &diagnostic);
+            const bool rejected = drift.mutated && !emitted && changed.failed && !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && diagnostic.status != HLSL_EMIT_STATUS_OK;
+            if (!rejected) fprintf(stderr,
+                "unique header guard stage=%s attack=%s emitted=%d mutated=%d quality=%d map_complete=%d map_count=%zu status=%s\n",
+                vertex ? "vertex" : "pixel", labels[attack], emitted, drift.mutated, (int)changed_quality.classification,
+                changed_map.complete, changed_map.count, hlsl_emit_status_name(diagnostic.status));
+            all_rejected = all_rejected && rejected;
+            if (rejected && (attack < 2u || attack >= 6u)) CHECK(drift.observations < baseline.observations);
+            if (attack < 5u || attack >= 8u) CHECK(changed.len >= sizeof(prefix) - 1u &&
+                !memcmp(changed.buf, prefix, sizeof(prefix) - 1u));
+            CHECK(!memcmp(program, &model, sizeof(model)) &&
+                !memcmp(program->instructions, instructions, (size_t)program->instruction_count * sizeof(*instructions)) &&
+                !memcmp(program->inputs, inputs, (size_t)program->input_count * sizeof(*inputs)) &&
+                !memcmp(program->signature_declarations, declarations,
+                    (size_t)program->signature_declaration_count * sizeof(*declarations)));
+            /* A failed ordinary V/F builder can retain partial source. Fresh
+             * emission, rather than an invented truncation contract, proves
+             * the original full source and evidence are restored exactly. */
+            NaturalIfObservations restored = {.program = program};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality, &restored, &diagnostic) &&
+                changed.len == original.len && !memcmp(changed.buf, original.buf, original.len) &&
+                natural_if_maps_equal(&original_map, &changed_map) &&
+                hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+        }
+        sb_free(&changed); sb_free(&original); natural_if_fixture_dispose(&fixture);
+    }
+    CHECK(all_rejected);
+    return true;
+}
+
 static bool check_natural_conditional_emission(void) {
     const struct {unsigned width; uint8_t mask;} shapes[] = {
         {1, 1}, {2, 3}, {3, 7}, {1, 2}, {2, 12}};
@@ -3864,6 +3996,7 @@ static bool check_natural_conditional_emission(void) {
     CHECK(check_natural_arithmetic_emission());
     CHECK(check_natural_packed_inputs());
     CHECK(check_natural_mad_emission());
+    CHECK(check_natural_unique_header_callbacks());
     /* DXBC IF_Z/NZ compares the raw DWORD, including the float sign bit. A
      * numeric float comparison would take the opposite branch for -0. */
     const struct {uint32_t bits; bool nonzero;} conditions[] = {

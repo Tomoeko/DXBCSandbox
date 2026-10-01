@@ -2,6 +2,7 @@
 
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_source_identifier.h"
+#include "common/sha256.h"
 #include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include <stdio.h>
@@ -1142,13 +1143,23 @@ static void geometry_flow_interface_receipt(HLSLEmitterContext *ctx,
                    HLSL_EMIT_PHASE_INTERFACE_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
 }
 
-enum { NATURAL_PACKED_HEADER_BYTE_LIMIT = 16384 };
+enum { NATURAL_STRUCTURED_HEADER_BYTE_LIMIT = 16384 };
 
-static bool prepare_natural_packed_header(HLSLEmitterContext *ctx,
+static bool natural_structured_append_prefix_matches(const HLSLEmitterContext *ctx) {
+  const StringBuilder *source = ctx->sb;
+  if (!source || !sb_ok(source) || ctx->natural_structured_append_prefix_length > source->len ||
+      (source->buf ? source->len >= source->capacity || source->buf[source->len] != '\0'
+                   : source->len || source->capacity)) return false;
+  uint8_t digest[32];
+  common_sha256(source->buf, ctx->natural_structured_append_prefix_length, digest);
+  return !memcmp(digest, ctx->natural_structured_append_prefix_digest, sizeof(digest));
+}
+
+static bool prepare_natural_structured_header(HLSLEmitterContext *ctx,
     const char *input_struct, const char *output_struct) {
   if (!ctx->natural_structured_owners_guarded || !ctx->high_level_interface_prepared ||
-      ctx->natural_packed_header_source.buf || ctx->natural_packed_header_source.len ||
-      !ctx->entry_point_name || !sb_ok(ctx->sb)) return false;
+      ctx->natural_structured_header_source.buf || ctx->natural_structured_header_source.len ||
+      !ctx->entry_point_name || !natural_structured_append_prefix_matches(ctx)) return false;
   uint8_t digest[32];
   if (!hlsl_natural_structured_owned_contract_digest(ctx->program, digest) ||
       memcmp(digest, ctx->natural_structured_owner_digest, sizeof(digest))) return false;
@@ -1170,8 +1181,8 @@ static bool prepare_natural_packed_header(HLSLEmitterContext *ctx,
   scratch->stage_coverage = NULL;
   scratch->natural_structured_body_inventory = NULL;
   scratch->natural_structured_owners_guarded = false;
-  scratch->natural_packed_header_source = (StringBuilder){0};
-  scratch->natural_packed_header_replay = true;
+  scratch->natural_structured_header_source = (StringBuilder){0};
+  scratch->natural_structured_header_replay = true;
   scratch->high_level_input_parameters_emitted = 0;
   scratch->high_level_input_fields_emitted = 0;
   scratch->high_level_output_fields_emitted = 0;
@@ -1182,31 +1193,38 @@ static bool prepare_natural_packed_header(HLSLEmitterContext *ctx,
   if (sb_ok(&expected)) emit_entry_point_declarations(scratch, ctx->entry_point_name,
       input_struct, output_struct, NULL, NULL);
   const bool prepared = sb_ok(&expected) && expected.len &&
-      expected.len <= (size_t)NATURAL_PACKED_HEADER_BYTE_LIMIT &&
+      expected.len <= (size_t)NATURAL_STRUCTURED_HEADER_BYTE_LIMIT &&
       diagnostic.status == HLSL_EMIT_STATUS_OK && scratch->high_level_entry_signature_emitted;
   free(scratch); /* No borrowed analysis, map or receipt is disposed here. */
   if (!prepared) { sb_free(&expected); return false; }
-  ctx->natural_packed_header_begin = ctx->sb->len;
-  ctx->natural_packed_header_source = expected;
+  ctx->natural_structured_header_begin = ctx->sb->len;
+  common_sha256(ctx->sb->buf, ctx->natural_structured_header_begin,
+      ctx->natural_structured_header_prefix_digest);
+  ctx->natural_structured_header_source = expected;
   return true;
 }
 
-bool hlsl_natural_packed_header_matches(const HLSLEmitterContext *ctx) {
+bool hlsl_natural_structured_header_matches(const HLSLEmitterContext *ctx) {
   if (!ctx) return false;
-  if (!ctx->high_level_packed_inputs) return true;
-  const StringBuilder *expected = &ctx->natural_packed_header_source;
-  return ctx->natural_structured_owners_guarded && !ctx->natural_packed_header_replay &&
+  if (!ctx->natural_structured_owners_guarded && !ctx->high_level_packed_inputs) return true;
+  const StringBuilder *expected = &ctx->natural_structured_header_source;
+  if (!(ctx->natural_structured_owners_guarded && !ctx->natural_structured_header_replay &&
+      natural_structured_append_prefix_matches(ctx) &&
       sb_ok(expected) && expected->buf && expected->len &&
-      expected->len <= (size_t)NATURAL_PACKED_HEADER_BYTE_LIMIT && expected->len < expected->capacity &&
+      expected->len <= (size_t)NATURAL_STRUCTURED_HEADER_BYTE_LIMIT && expected->len < expected->capacity &&
       expected->buf[expected->len] == '\0' && ctx->sb && sb_ok(ctx->sb) && ctx->sb->buf &&
-      ctx->sb->len < ctx->sb->capacity && ctx->natural_packed_header_begin <= ctx->sb->len &&
-      expected->len <= ctx->sb->len - ctx->natural_packed_header_begin &&
-      !memcmp(expected->buf, ctx->sb->buf + ctx->natural_packed_header_begin, expected->len);
+      ctx->sb->len < ctx->sb->capacity && ctx->natural_structured_header_begin <= ctx->sb->len &&
+      expected->len <= ctx->sb->len - ctx->natural_structured_header_begin &&
+      !memcmp(expected->buf, ctx->sb->buf + ctx->natural_structured_header_begin, expected->len))) return false;
+  uint8_t digest[32];
+  common_sha256(ctx->sb->buf, ctx->natural_structured_header_begin, digest);
+  return !memcmp(digest, ctx->natural_structured_header_prefix_digest, sizeof(digest));
 }
 
 void emit_io_structs(HLSLEmitterContext* ctx, const char* input_struct, const char* output_struct) {
-  if (ctx->high_level_packed_inputs && !ctx->natural_packed_header_replay &&
-      !prepare_natural_packed_header(ctx, input_struct, output_struct)) {
+  if ((ctx->natural_structured_owners_guarded || ctx->high_level_packed_inputs) &&
+      !ctx->natural_structured_header_replay &&
+      !prepare_natural_structured_header(ctx, input_struct, output_struct)) {
     hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
         HLSL_EMIT_PHASE_INTERFACE_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
     return;

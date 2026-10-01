@@ -500,12 +500,15 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                instruction->operand_count && (instruction->opcode == USIL_OP_MOV ||
                instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MUL || instruction->opcode == USIL_OP_MAD ||
                instruction->opcode == USIL_OP_MIN || instruction->opcode == USIL_OP_MAX || instruction->opcode == USIL_OP_DIV ||
+               instruction->opcode == USIL_OP_DP2 || instruction->opcode == USIL_OP_DP3 || instruction->opcode == USIL_OP_DP4 ||
                instruction->opcode == USIL_OP_LT || instruction->opcode == USIL_OP_GE ||
                instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE)
                    ? (unsigned)usil_operand_destination_lane_mask(&instruction->operands[0]) : 0u);
         if (instruction->opcode == USIL_OP_LT || instruction->opcode == USIL_OP_GE ||
             instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE ||
-            instruction->opcode == USIL_OP_IF || instruction->opcode == USIL_OP_MAD) {
+            instruction->opcode == USIL_OP_IF || instruction->opcode == USIL_OP_MAD ||
+            instruction->opcode == USIL_OP_DP2 || instruction->opcode == USIL_OP_DP3 || instruction->opcode == USIL_OP_DP4 ||
+            instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MOV) {
             size_t remaining = PROBE_DOMAIN_OPERAND_LIMIT;
             for (int operand_index = 0; operand_index < instruction->operand_count; ++operand_index)
                 if (!print_domain_operand(&instruction->operands[operand_index], index,

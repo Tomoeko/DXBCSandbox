@@ -2,6 +2,7 @@
 
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_emitted_matrix_uses_internal.h"
+#include "common/sha256.h"
 #include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include <limits.h>
@@ -1619,6 +1620,12 @@ bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete) {
   return false;
 }
 
+static bool source_builder_storage_valid(const StringBuilder *source) {
+  return source && sb_ok(source) && (source->buf
+      ? source->len < source->capacity && source->buf[source->len] == '\0'
+      : !source->len && !source->capacity);
+}
+
 void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
                                   bool logical_operation, int instruction) {
   if (!ctx->source_quality_analysis) return;
@@ -1638,7 +1645,31 @@ void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
         facts.lanes = usil_operand_destination_lane_mask(&owner->operands[0]);
     }
   }
-  if (!hlsl_source_quality_analysis_emission(ctx->source_quality_analysis, &facts))
+  /* Before independent header replay begins, keep each actual preheader
+   * emission stable across its synchronous callback. This owns byte stability,
+   * without granting independent syntax authority to a generated preamble. */
+  const bool guard_preheader = ctx->natural_structured_owners_guarded &&
+      !ctx->natural_structured_header_source.buf;
+  if (guard_preheader && !source_builder_storage_valid(ctx->sb)) {
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    return;
+  }
+  const size_t source_length = guard_preheader ? ctx->sb->len : 0;
+  uint8_t source_digest[32];
+  if (guard_preheader) common_sha256(ctx->sb->buf, source_length, source_digest);
+  const bool observed = hlsl_source_quality_analysis_emission(ctx->source_quality_analysis, &facts);
+  if (guard_preheader) {
+    uint8_t current_digest[32];
+    const bool same_storage = source_builder_storage_valid(ctx->sb) && ctx->sb->len == source_length;
+    if (same_storage) common_sha256(ctx->sb->buf, source_length, current_digest);
+    if (!same_storage || memcmp(source_digest, current_digest, sizeof(source_digest))) {
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+      return;
+    }
+  }
+  if (!observed)
     hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                    HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
   else
@@ -2183,13 +2214,16 @@ static bool hlsl_emit_with_options_impl(
     return false;
   }
   if (natural_structured) {
-    if (!hlsl_natural_structured_owned_contract_digest(program, ctx.natural_structured_owner_digest)) {
+    if (sb->len != source_start || !source_builder_storage_valid(sb) ||
+        !hlsl_natural_structured_owned_contract_digest(program, ctx.natural_structured_owner_digest)) {
       hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                      HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
       free_emitter_context(&ctx);
       free(ctx_ptr);
       return false;
     }
+    ctx.natural_structured_append_prefix_length = source_start;
+    common_sha256(sb->buf, source_start, ctx.natural_structured_append_prefix_digest);
     ctx.natural_structured_owners_guarded = true;
   }
   if (!hlsl_source_quality_begin_entry(&ctx, hlsl_source_quality_inventory_supported(&ctx))) {
