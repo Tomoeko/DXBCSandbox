@@ -395,7 +395,7 @@ bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSL
       } else if (value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_IMMEDIATE32) return false;
     }
   }
-  return writes == (constructed_output ? HLSL_DOMAIN_OUTPUT_PIECE_COUNT : 1);
+  return writes == (constructed_output ? (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT : 1u);
 }
 
 static bool geometry_effect_supported(const USILProgram *program,
