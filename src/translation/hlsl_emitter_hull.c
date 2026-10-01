@@ -381,17 +381,71 @@ static bool hash_owner_operand(CommonSha256Context *hash, const DXBCOperand *ope
     return true;
 }
 
-static bool decoded_tessellation_owner_digest(const USILProgram *program,
-    uint8_t digest[COMMON_SHA256_DIGEST_SIZE], bool domain_stage) {
+typedef enum {
+    DECODED_OWNER_HULL,
+    DECODED_OWNER_DOMAIN,
+    DECODED_OWNER_NATURAL_STRUCTURED
+} DecodedOwnerStage;
+
+/* Storage and decoded-shape safety only. The structured producer separately
+ * proves the complete IF/phi/value contract over the prepared CFG and SSA. */
+static bool natural_structured_owner_storage_valid(const USILProgram *program) {
+    if (!program || !program->has_stage_contract || !program->has_parsed_signature_authority ||
+        (program->program_type != DXBC_PROGRAM_TYPE_VERTEX && program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
+        (program->shader_model_major != 4 && program->shader_model_major != 5) ||
+        !memchr(program->shader_type_model, 0, sizeof(program->shader_type_model)) ||
+        program->instruction_count < 1 || program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+        program->instruction_alloc < program->instruction_count || !program->instructions ||
+        program->input_count < 0 || program->input_count > HLSL_SM5_IO_REGISTER_COUNT ||
+        program->input_alloc < program->input_count || (program->input_count && !program->inputs) ||
+        program->output_count < 1 || program->output_count > HLSL_SM5_IO_REGISTER_COUNT ||
+        program->output_alloc < program->output_count || !program->outputs ||
+        program->signature_declaration_count < 0 ||
+        program->signature_declaration_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+        program->signature_declaration_alloc < program->signature_declaration_count ||
+        (program->signature_declaration_count && !program->signature_declarations) ||
+        program->temp_count < 0 || program->temp_count > HLSL_SM5_TEMP_REGISTER_COUNT ||
+        program->cbuffer_count || program->texture_count || program->sampler_count || program->uav_count ||
+        program->indexable_temp_count || program->index_range_count || program->patch_constant_count ||
+        program->icb_value_count || program->has_icb_declaration || !usil_icb_declaration_is_valid(program) ||
+        program->tessellation.valid || program->tessellation.phase_count || program->geometry.valid ||
+        program->compute.valid || program->compute.shared_memory_count || program->compute.barrier_count)
+        return false;
+    const DXBCSignatureElement *signatures[] = {program->inputs, program->outputs};
+    const int counts[] = {program->input_count, program->output_count};
+    for (unsigned role = 0; role < 2; ++role)
+        for (int index = 0; index < counts[role]; ++index)
+            if (!hlsl_signature_semantic_storage_valid(&signatures[role][index])) return false;
+    if (!usil_signature_authority_is_valid(program)) return false;
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILInstruction *instruction = &program->instructions[index];
+        USILEffectFlags effects;
+        if (instruction->source_instruction_index == UINT32_MAX ||
+            (index && instruction->source_instruction_index <= program->instructions[index - 1].source_instruction_index) ||
+            instruction->operand_count < 0 || instruction->operand_count > DXBC_MAX_OPERANDS ||
+            !memchr(instruction->resource_dimension, 0, sizeof(instruction->resource_dimension)) ||
+            !usil_instruction_shape_valid(program, instruction) ||
+            !usil_instruction_effects(program, instruction, &effects)) return false;
+    }
+    return true;
+}
+
+static bool decoded_stage_owner_digest(const USILProgram *program,
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE], DecodedOwnerStage stage) {
     HullSourcePlan checked = {0};
-    if (domain_stage ? !hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
-                     : !hull_contract(program, &checked)) return false;
+    if (stage == DECODED_OWNER_HULL ? !hull_contract(program, &checked)
+        : stage == DECODED_OWNER_DOMAIN
+            ? !hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
+            : stage != DECODED_OWNER_NATURAL_STRUCTURED || !natural_structured_owner_storage_valid(program)) return false;
     CommonSha256Context hash;
     common_sha256_init(&hash);
     static const char domain[] = "dxbc-hull-final-factor-owner-v1";
     static const char domain_output[] = "dxbc-domain-output-owner-v1";
-    common_sha256_update(&hash, domain_stage ? domain_output : domain,
-        domain_stage ? sizeof(domain_output) : sizeof(domain));
+    static const char natural_structured[] = "dxbc-natural-structured-owner-v1";
+    if (stage == DECODED_OWNER_NATURAL_STRUCTURED)
+        common_sha256_update(&hash, natural_structured, sizeof(natural_structured));
+    else common_sha256_update(&hash, stage == DECODED_OWNER_DOMAIN ? domain_output : domain,
+        stage == DECODED_OWNER_DOMAIN ? sizeof(domain_output) : sizeof(domain));
     const USILTessellationContract *tessellation = &program->tessellation;
     const uint64_t fields[] = {program->program_type, program->shader_model_major,
         program->shader_model_minor, program->has_parsed_signature_authority,
@@ -404,6 +458,27 @@ static bool decoded_tessellation_owner_digest(const USILProgram *program,
         (uint64_t)program->index_range_count};
     for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); ++index)
         hash_owner_number(&hash, fields[index]);
+    if (stage == DECODED_OWNER_NATURAL_STRUCTURED) {
+        const uint64_t authority[] = {program->has_stage_contract,
+            (uint64_t)program->texture_count, (uint64_t)program->sampler_count, (uint64_t)program->uav_count,
+            (uint64_t)program->indexable_temp_count, (uint64_t)program->icb_value_count,
+            program->has_icb_declaration, program->icb_source_instruction_index,
+            program->icb_declaration_token, program->icb_declaration_word_count,
+            tessellation->valid, tessellation->has_max_tessellation_factor,
+            program->geometry.valid, program->geometry.input_primitive, program->geometry.output_topology,
+            program->geometry.input_vertex_count, program->geometry.max_output_vertex_count,
+            program->geometry.has_instance_count, program->geometry.instance_count,
+            program->geometry.declared_stream_mask, program->geometry.referenced_stream_mask,
+            program->geometry.effect_count, program->geometry.output_tuple_state_persists,
+            program->compute.valid, program->compute.declaration_source_instruction_index,
+            program->compute.system_value_mask, program->compute.shared_memory_bytes,
+            program->compute.shared_memory_count, program->compute.barrier_count};
+        for (size_t index = 0; index < sizeof(authority) / sizeof(authority[0]); ++index)
+            hash_owner_number(&hash, authority[index]);
+        common_sha256_update(&hash, program->shader_type_model, sizeof(program->shader_type_model));
+        for (unsigned index = 0; index < 3; ++index)
+            hash_owner_number(&hash, program->compute.thread_group_size[index]);
+    }
     /* Preserve old non-ICB observations while extending the actual parsed
      * declaration guard with every admitted raw payload word. */
     if (program->has_icb_declaration) {
@@ -431,6 +506,11 @@ static bool decoded_tessellation_owner_digest(const USILProgram *program,
             const size_t length = strlen(semantic);
             hash_owner_number(&hash, length);
             common_sha256_update(&hash, semantic, length);
+            if (stage == DECODED_OWNER_NATURAL_STRUCTURED) {
+                hash_owner_number(&hash, element->semantic_name_length);
+                hash_owner_number(&hash, element->semantic_name_extended != NULL);
+                common_sha256_update(&hash, element->semantic_name, sizeof(element->semantic_name));
+            }
             const uint64_t signature[] = {element->register_id, element->semantic_index, element->system_value,
                 element->component_type, element->mask, element->rw_mask, element->stream_index,
                 element->min_precision, element->interpolation_mode};
@@ -471,6 +551,23 @@ static bool decoded_tessellation_owner_digest(const USILProgram *program,
         hash_owner_number(&hash, instruction->opcode);
         hash_owner_number(&hash, instruction->source_instruction_index);
         hash_owner_number(&hash, (uint64_t)instruction->operand_count);
+        if (stage == DECODED_OWNER_NATURAL_STRUCTURED) {
+            USILEffectFlags effects;
+            if (!usil_instruction_effects(program, instruction, &effects)) return false;
+            const uint64_t controls[] = {instruction->saturate, instruction->precise_mask,
+                instruction->condition_test, instruction->has_resource_dimension, instruction->resource_stride,
+                instruction->has_texel_offset, instruction->has_resource_return_types,
+                instruction->resource_info_return_type, instruction->sample_info_return_type,
+                instruction->geometry_effect, instruction->geometry_stream_id,
+                instruction->geometry_stream_explicit, instruction->sync_flags, effects};
+            for (size_t field = 0; field < sizeof(controls) / sizeof(controls[0]); ++field)
+                hash_owner_number(&hash, controls[field]);
+            common_sha256_update(&hash, instruction->resource_dimension, sizeof(instruction->resource_dimension));
+            for (unsigned field = 0; field < 3; ++field)
+                hash_owner_number(&hash, (uint64_t)instruction->texel_offsets[field]);
+            for (unsigned field = 0; field < 4; ++field)
+                hash_owner_number(&hash, instruction->resource_return_types[field]);
+        }
         for (int operand = 0; operand < instruction->operand_count; ++operand) {
             unsigned remaining = DXBC_MAX_NESTED_OPERAND_TOKENS;
             if (!hash_owner_operand(&hash, &instruction->operands[operand], &remaining)) return false;
@@ -482,7 +579,7 @@ static bool decoded_tessellation_owner_digest(const USILProgram *program,
 
 static bool decoded_owner_digest(const USILProgram *program,
     uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
-    return decoded_tessellation_owner_digest(program, digest, false);
+    return decoded_stage_owner_digest(program, digest, DECODED_OWNER_HULL);
 }
 
 bool hlsl_hull_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
@@ -490,7 +587,11 @@ bool hlsl_hull_owned_contract_digest(const USILProgram *program, uint8_t digest[
 }
 
 bool hlsl_domain_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
-    return digest && decoded_tessellation_owner_digest(program, digest, true);
+    return digest && decoded_stage_owner_digest(program, digest, DECODED_OWNER_DOMAIN);
+}
+
+bool hlsl_natural_structured_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
+    return digest && decoded_stage_owner_digest(program, digest, DECODED_OWNER_NATURAL_STRUCTURED);
 }
 
 static bool instance_operand(const DXBCOperand *operand, bool control_point) {

@@ -333,6 +333,10 @@ static bool signature_semantic_is_valid(
          memchr(semantic, '\0', element->semantic_name_length) == NULL;
 }
 
+bool hlsl_signature_semantic_storage_valid(const DXBCSignatureElement *element) {
+  return signature_semantic_is_valid(element);
+}
+
 static bool signature_has_register(const DXBCSignatureElement *elements,
                                    int count, int register_index) {
   for (int i = 0; i < count; i++) {
@@ -1670,6 +1674,8 @@ bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptio
 }
 
 void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
+  const bool natural_body_complete = !ctx->natural_structured_owners_guarded ||
+      !sb_ok(ctx->sb) || hlsl_natural_structured_body_inventory_complete(ctx);
   hlsl_stage_coverage_finish(ctx);
   if (ctx->source_quality_analysis) {
     HLSLEmitStatus status = ctx->diagnostic ? ctx->diagnostic->status : HLSL_EMIT_STATUS_OK;
@@ -1680,7 +1686,8 @@ void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
          (ctx->source_quality_cbuffer_required &&
           !hlsl_source_quality_cbuffer_inventory_complete(ctx)) ||
          (ctx->source_quality_geometry_flow_required &&
-          !hlsl_geometry_control_flow_inventory_complete(ctx))) &&
+          !hlsl_geometry_control_flow_inventory_complete(ctx)) ||
+         !natural_body_complete) &&
         !hlsl_source_quality_analysis_mark_incomplete_unit(ctx->source_quality_analysis)) {
       hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                      HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
@@ -1697,6 +1704,15 @@ void hlsl_source_quality_finish_emission(HLSLEmitterContext *ctx) {
 
 static void free_emitter_context(HLSLEmitterContext *ctx) {
   hlsl_source_quality_finish_emission(ctx);
+  if (ctx->natural_structured_owners_guarded && !sb_ok(ctx->sb) && ctx->expression_source_map)
+    memset(ctx->expression_source_map, 0, sizeof(*ctx->expression_source_map));
+  if (ctx->natural_structured_owners_guarded && sb_ok(ctx->sb) &&
+      !hlsl_natural_structured_body_inventory_matches(ctx)) {
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    if (ctx->expression_source_map) memset(ctx->expression_source_map, 0, sizeof(*ctx->expression_source_map));
+  }
+  hlsl_natural_structured_body_inventory_dispose(ctx);
   hlsl_geometry_control_flow_inventory_free(ctx);
   free(ctx->cb_reg_map);
   free_sampler_name_map(ctx);
@@ -2015,9 +2031,13 @@ static bool hlsl_emit_with_options_impl(
     free(ctx_ptr);
     return false;
   }
+  const bool defer_multi_output_interface = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+      !ctx.high_level_interface && !ctx.unity_uv_helper && program->output_count > 1 &&
+      (program->program_type == DXBC_PROGRAM_TYPE_VERTEX || program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
+      hlsl_natural_structured_candidate(program);
   if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE && program->output_count > 1 &&
       (program->program_type == DXBC_PROGRAM_TYPE_VERTEX || program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
-      !ctx.high_level_interface) {
+      !ctx.high_level_interface && !defer_multi_output_interface) {
     hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_INTERFACE_EMISSION,
                    HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     free_emitter_context(&ctx);
@@ -2129,6 +2149,25 @@ static bool hlsl_emit_with_options_impl(
     free(ctx_ptr);
     return false;
   }
+  /* A complete natural-width IF plan supplies the natural struct route.
+   * Keep its proof after CFG/SSA analysis and before naming or quality begins;
+   * the established direct-return and full-width interfaces retain their path. */
+  const bool natural_structured = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+      !ctx.unity_uv_helper && hlsl_natural_structured_preflight(&ctx);
+  if (defer_multi_output_interface && !natural_structured) {
+    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_INTERFACE_EMISSION,
+                   HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
+  if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+      !ctx.high_level_interface && !ctx.unity_uv_helper && program->output_count >= 1 &&
+      program->output_count <= HLSL_SM5_IO_REGISTER_COUNT &&
+      (program->program_type == DXBC_PROGRAM_TYPE_VERTEX || program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
+      natural_structured) {
+    ctx.high_level_interface = true;
+  }
   if (ctx.high_level_interface && !hlsl_prepare_high_level_interface(&ctx)) {
     free_emitter_context(&ctx);
     free(ctx_ptr);
@@ -2142,6 +2181,16 @@ static bool hlsl_emit_with_options_impl(
     free_emitter_context(&ctx);
     free(ctx_ptr);
     return false;
+  }
+  if (natural_structured) {
+    if (!hlsl_natural_structured_owned_contract_digest(program, ctx.natural_structured_owner_digest)) {
+      hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+      free_emitter_context(&ctx);
+      free(ctx_ptr);
+      return false;
+    }
+    ctx.natural_structured_owners_guarded = true;
   }
   if (!hlsl_source_quality_begin_entry(&ctx, hlsl_source_quality_inventory_supported(&ctx))) {
     free_emitter_context(&ctx);
@@ -2280,10 +2329,14 @@ cleanup:
   /* The final quality callbacks can still touch caller-owned input. Keep the
    * complete admitted decoded model stable through every callback, including
    * unit completion, before returning source or an owned capture. */
-  if (ctx.high_level_domain) {
+  if (ctx.high_level_domain || ctx.natural_structured_owners_guarded) {
     uint8_t current[32];
-    if (!hlsl_domain_owned_contract_digest(program, current) ||
-        memcmp(current, ctx.domain_owner_digest, sizeof(current))) {
+    const bool stable = ctx.high_level_domain
+        ? hlsl_domain_owned_contract_digest(program, current) &&
+          !memcmp(current, ctx.domain_owner_digest, sizeof(current))
+        : hlsl_natural_structured_owned_contract_digest(program, current) &&
+          !memcmp(current, ctx.natural_structured_owner_digest, sizeof(current));
+    if (!stable) {
       hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                      HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
       if (ctx.expression_source_map) memset(ctx.expression_source_map, 0, sizeof(*ctx.expression_source_map));

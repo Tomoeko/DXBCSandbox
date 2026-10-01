@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 33U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 34U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -129,6 +129,14 @@ typedef enum HLSLEmitMode {
      * UGE/BREAKC_NZ against immutable input bits, a unit IADD latch, and complete
      * float4 carried values. Control SSA must have no other uses. Nested loops,
      * branches inside loops, early exits and unresolved/partial phi inputs reject.
+     * v34 adds a parsed scalar/float2/float3 V/F route for one IF with explicit
+     * ELSE, pure MOV/ADD/MUL and complete two-edge values of identical lane mask
+     * and width. Unique prefix input/output signatures become natural fields;
+     * TEMP physical lanes become compact logical components. Every complete
+     * output write must be unconditional. Conditions retain their raw-bit test.
+     * Owned body/return bytes and typed spans replay through the same planner;
+     * callbacks cannot publish changed decoded owners or retained body receipts.
+     * Nested control, loops, modifiers, resources and partial live joins reject.
      * Repeated straight-line two-MUL chains with immutable arguments and
      * identity single-use producer lanes may share a float4 value helper;
      * each call result remains named at its original site. No captures or

@@ -145,6 +145,20 @@ static ASTExpr *logical_expression(HLSLEmitterContext *ctx, ASTExpr *expression,
     return expression;
 }
 
+ASTExpr *hlsl_instruction_logical_expression(HLSLEmitterContext *ctx,
+    ASTExpr *expression, int instruction, uint8_t lanes, unsigned width) {
+    if (!ctx || !ctx->program || !ctx->program->instructions || instruction < 0 ||
+        instruction >= ctx->program->instruction_count || !lanes || (lanes & ~15u) ||
+        !width || width > 4 || ctx->program->instructions[instruction].operand_count < 1 ||
+        ctx->program->instructions[instruction].operand_count > DXBC_MAX_OPERANDS ||
+        (lanes & ~usil_operand_destination_lane_mask(
+            &ctx->program->instructions[instruction].operands[0]))) {
+        ast_free_expr(expression);
+        return NULL;
+    }
+    return logical_expression(ctx, expression, instruction, lanes, width);
+}
+
 static uint8_t source_lanes(const HLSLEmitterContext *ctx, int instruction, int operand) {
     USILOperandUseInfo use;
     if (!usil_instruction_operand_use(ctx->program,
@@ -194,6 +208,10 @@ static HLSLEmitReason float_program_contract(const USILProgram *program, bool fu
 
 HLSLEmitReason hlsl_float4_program_contract(const USILProgram *program) {
     return float_program_contract(program, true);
+}
+
+HLSLEmitReason hlsl_natural_float_program_contract(const USILProgram *program) {
+    return program ? float_program_contract(program, false) : HLSL_EMIT_REASON_UNSUPPORTED_FEATURE;
 }
 
 bool hlsl_float4_program_supported(HLSLEmitterContext *ctx) {
@@ -368,13 +386,23 @@ bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int index) {
     return float_instruction_supported(ctx, index, true, NULL);
 }
 
+bool hlsl_natural_float_instruction_supported(HLSLEmitterContext *ctx, int index) {
+    return ctx && ctx->program && ctx->program->instructions && index >= 0 &&
+        index < ctx->program->instruction_count &&
+        float_instruction_supported(ctx, index, false, NULL);
+}
+
 /* The straight-line planner can represent a partial register definition as a
  * logical scalar/vector. It does not widen the structured float4 contract or
  * pretend that lanes from different definitions form one source value. */
 static bool vector_program_supported(HLSLEmitterContext *ctx) {
     const HLSLEmitReason reason = ctx->use_uint_temps ? HLSL_EMIT_REASON_UNSUPPORTED_FEATURE
-                                                    : float_program_contract(ctx->program, false);
+                                                    : hlsl_natural_float_program_contract(ctx->program);
     return reason == HLSL_EMIT_REASON_NONE || reject(ctx, -1, reason);
+}
+
+bool hlsl_natural_float_program_supported(HLSLEmitterContext *ctx) {
+    return ctx && ctx->program && vector_program_supported(ctx);
 }
 
 static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, bool full_width,
@@ -666,6 +694,70 @@ static ASTExpr *vector_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *s
     return formatted_source_atom(ctx, source, mask, false, instruction, operand);
 }
 
+ASTExpr *hlsl_natural_source_atom(HLSLEmitterContext *ctx, int instruction,
+                                 int operand, uint8_t mask) {
+    if (!ctx || !ctx->program || !ctx->program->instructions || instruction < 0 ||
+        instruction >= ctx->program->instruction_count || operand < 0 ||
+        operand >= ctx->program->instructions[instruction].operand_count ||
+        operand >= DXBC_MAX_OPERANDS || !mask || (mask & ~15u) ||
+        (mask & ~source_lanes(ctx, instruction, operand))) return NULL;
+    return vector_source_atom(ctx, &ctx->program->instructions[instruction].operands[operand],
+        mask, instruction, operand);
+}
+
+static ASTExpr *project_logical_temp(HLSLEmitterContext *ctx, ASTExpr *value,
+    uint8_t producer_mask, unsigned natural_width, const DXBCOperand *source,
+    uint8_t mask, int instruction, bool scalar_broadcast) {
+    if (!ctx || !ctx->program || !ctx->program->instructions || !value || !source ||
+        source->type != OPERAND_TYPE_TEMP || instruction < 0 ||
+        instruction >= ctx->program->instruction_count || !mask || (mask & ~15u) ||
+        !producer_mask || (producer_mask & ~15u) || !natural_width || natural_width > 4 ||
+        (natural_width != 1 && natural_width != (unsigned)lane_count(producer_mask))) {
+        ast_free_expr(value);
+        return NULL;
+    }
+    /* A proved scalar can occupy several identical physical destination lanes.
+     * HLSL assignment/arithmetic broadcasts it; selecting the copies adds no
+     * operation. The caller owns that scalar and all selected TEMP definitions. */
+    if (scalar_broadcast) return value;
+    int components[4], width = 0;
+    bool identity = lane_count(mask) == (int)natural_width;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!(mask & (1u << lane))) continue;
+        const int selected = usil_operand_source_component(source, lane);
+        if (selected < 0 || selected > 3 || !(producer_mask & (1u << selected))) {
+            ast_free_expr(value);
+            return NULL;
+        }
+        components[width] = lane_count((uint8_t)(producer_mask & ((1u << selected) - 1u)));
+        identity = identity && components[width] == width;
+        ++width;
+    }
+    if (identity) return value;
+    bool same = true, ascending = true;
+    for (int component = 1; component < width; ++component) {
+        same = same && components[component] == components[0];
+        ascending = ascending && components[component] > components[component - 1];
+    }
+    /* One selected logical component stays scalar at its consumer. */
+    if (same) width = 1;
+    ASTExpr *selected = ast_create_swizzle(value, components, width);
+    if (!selected) ast_free_expr(value);
+    /* A control instruction's operand zero is a source, so its selection has
+     * an actual instruction owner without claiming a destination write. */
+    const uint8_t origin_lanes = source_lanes(ctx, instruction, 0) ? 0 : mask;
+    selected = logical_expression(ctx, selected, instruction, origin_lanes, (unsigned)width);
+    if (selected) selected->logical_origin.semantic_projection = same || ascending;
+    return selected;
+}
+
+ASTExpr *hlsl_project_logical_temp(HLSLEmitterContext *ctx, ASTExpr *value,
+    uint8_t producer_mask, unsigned natural_width, const DXBCOperand *source,
+    uint8_t mask, int instruction) {
+    return project_logical_temp(ctx, value, producer_mask, natural_width, source,
+        mask, instruction, natural_width == 1);
+}
+
 static ASTExpr *disjoint_temp_composition(HLSLEmitterContext *ctx, int instruction, int operand,
                                         uint8_t mask, const DXBCOperand *source,
                                         const uint8_t *logical_widths) {
@@ -762,41 +854,8 @@ static ASTExpr *source_expression_unmodified(HLSLEmitterContext *ctx, int instru
                                        (unsigned)producer_width);
             if (!value) return NULL;
         }
-        /* A dot result is one scalar even when DXBC replicates it into several
-         * physical destination lanes. HLSL assignment/arithmetic broadcasts
-         * that scalar; selecting those identical copies adds no operation. */
-        if (scalar_producer)
-            return value;
-        int components[4], width = 0;
-        bool identity = lane_count(mask) == producer_width;
-        for (int lane = 0; lane < 4; ++lane) {
-            if (!(mask & (1u << lane)))
-                continue;
-            const int selected = usil_operand_source_component(source, lane);
-            if (selected < 0 || selected > 3 || !(producer_mask & (1u << selected))) {
-                ast_free_expr(value);
-                return NULL;
-            }
-            components[width] = lane_count((uint8_t)(producer_mask & ((1u << selected) - 1u)));
-            identity = identity && components[width] == width;
-            ++width;
-        }
-        if (identity)
-            return value;
-        bool same = true, ascending = true;
-        for (int component = 1; component < width; ++component) {
-            same = same && components[component] == components[0];
-            ascending = ascending && components[component] > components[component - 1];
-        }
-        /* A repeated component of a proved logical vector is one scalar.
-         * HLSL broadcasts it at its consumer; no .xxxx reconstruction remains. */
-        if (same) width = 1;
-        ASTExpr *selected = ast_create_swizzle(value, components, width);
-        if (!selected)
-            ast_free_expr(value);
-        selected = logical_expression(ctx, selected, instruction, mask, (unsigned)width);
-        if (selected) selected->logical_origin.semantic_projection = same || ascending;
-        return selected;
+        return project_logical_temp(ctx, value, producer_mask,
+            (unsigned)producer_width, source, mask, instruction, scalar_producer);
     }
     if (mask == 15 && source->type != OPERAND_TYPE_CONSTANT_BUFFER &&
         source->type != OPERAND_TYPE_INPUT &&

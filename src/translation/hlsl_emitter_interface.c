@@ -560,7 +560,12 @@ bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext 
     if (!hlsl_high_level_geometry_interface_supported(program, ctx->emit_mode) ||
         !ctx->high_level_geometry_input_type[0] || !ctx->high_level_geometry_input_variable[0] ||
         !ctx->high_level_geometry_stream_variable[0]) return false;
-  } else if (!hlsl_high_level_struct_interface_supported(program, ctx->emit_mode)) return false;
+  } else {
+    /* The new IF plan is frozen before callbacks. Its actual body and return
+     * still require independent replay before entry completion. */
+    if (!hlsl_high_level_struct_interface_supported(program, ctx->emit_mode) &&
+        !ctx->natural_structured_owners_guarded) return false;
+  }
   for (int output = 0; output < program->output_count; ++output)
     if (!hlsl_high_level_output_name(ctx, (int)program->outputs[output].register_id)) return false;
   return true;

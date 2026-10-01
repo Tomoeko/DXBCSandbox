@@ -4,6 +4,9 @@
 #include "translation/hlsl_copy_lift.h"
 #include "translation/hlsl_lift_transaction.h"
 #include "dxbc/dxbc_hash.h"
+#include "dxbc/dxbc_document.h"
+#include "dxbc/dxbc_stage_contract.h"
+#include "translation/hlsl_source_quality_internal.h"
 #include "translation/usil_validation.h"
 
 #include <stdio.h>
@@ -1609,6 +1612,901 @@ static bool check_conditional_emission(void) {
     return true;
 }
 
+typedef struct {
+    DXBCDocument document;
+    DXBCContainer semantic;
+    DXBCStageContract contract;
+    USILProgram program;
+    int condition, then_value, else_value, join_value, output;
+} NaturalIfFixture;
+
+static void natural_if_write_u32(uint8_t *bytes, uint32_t value) {
+    for (unsigned index = 0; index < 4; ++index)
+        bytes[index] = (uint8_t)(value >> (index * 8u));
+}
+
+/* This is authored signature/token grammar, not a retained compiler target.
+ * The normal document, stage-contract and USIL decoders supply its authority. */
+static size_t natural_if_signature(uint8_t *bytes, bool output,
+    const DXBCSignatureElement *fields, unsigned count) {
+    if (!count || count > 3) return 0;
+    const size_t name_offset = 8u + count * 24u;
+    size_t offsets[3], payload_size = name_offset;
+    for (unsigned index = 0; index < count; ++index) {
+        unsigned previous = 0;
+        while (previous < index && strcmp(fields[index].semantic_name,
+            fields[previous].semantic_name)) ++previous;
+        offsets[index] = previous < index ? offsets[previous] : payload_size;
+        if (previous == index) payload_size += strlen(fields[index].semantic_name) + 1u;
+    }
+    memcpy(bytes, output ? "OSGN" : "ISGN", 4);
+    natural_if_write_u32(bytes + 4, (uint32_t)payload_size);
+    uint8_t *payload = bytes + 8;
+    natural_if_write_u32(payload, count);
+    natural_if_write_u32(payload + 4, 8);
+    for (unsigned index = 0; index < count; ++index) {
+        uint8_t *element = payload + 8u + index * 24u;
+        natural_if_write_u32(element, (uint32_t)offsets[index]);
+        natural_if_write_u32(element + 4, fields[index].semantic_index);
+        natural_if_write_u32(element + 8, fields[index].system_value);
+        natural_if_write_u32(element + 12, fields[index].component_type);
+        natural_if_write_u32(element + 16, fields[index].register_id);
+        natural_if_write_u32(element + 20, fields[index].mask | (uint32_t)fields[index].rw_mask << 8u);
+        memcpy(payload + offsets[index], fields[index].semantic_name,
+            strlen(fields[index].semantic_name) + 1u);
+    }
+    return payload_size + 8u;
+}
+
+static uint32_t natural_if_source_token(DXBCOperandType type, const uint8_t components[4]) {
+    uint32_t token = UINT32_C(0x00100006) | (uint32_t)type << 12u;
+    for (unsigned lane = 0; lane < 4; ++lane)
+        token |= (uint32_t)components[lane] << (4u + lane * 2u);
+    return token;
+}
+
+static void natural_if_fixture_dispose(NaturalIfFixture *fixture) {
+    usil_free(&fixture->program);
+    dxbc_free(&fixture->semantic);
+    dxbc_stage_contract_free(&fixture->contract);
+    dxbc_document_free(&fixture->document);
+}
+
+static bool natural_if_fixture_decode_words(NaturalIfFixture *fixture, uint32_t program_token,
+    const uint32_t *words, size_t word_count, const DXBCSignatureElement *inputs,
+    unsigned input_count, const DXBCSignatureElement *outputs, unsigned output_count) {
+    uint8_t bytes[1024] = {0};
+    memcpy(bytes, "DXBC", 4);
+    natural_if_write_u32(bytes + 20, 1);
+    natural_if_write_u32(bytes + 28, 3);
+    size_t offset = 44;
+    for (unsigned index = 0; index < 2; ++index) {
+        natural_if_write_u32(bytes + 32u + index * 4u, (uint32_t)offset);
+        const size_t signature_size = natural_if_signature(bytes + offset, index != 0,
+            index ? outputs : inputs, index ? output_count : input_count);
+        CHECK(signature_size);
+        offset += signature_size;
+        offset = (offset + 3u) & ~(size_t)3u;
+    }
+    CHECK(word_count <= 128 && offset + 16u + word_count * 4u <= sizeof(bytes));
+    natural_if_write_u32(bytes + 40, (uint32_t)offset);
+    memcpy(bytes + offset, "SHEX", 4);
+    natural_if_write_u32(bytes + offset + 4, (uint32_t)(word_count + 2u) * 4u);
+    natural_if_write_u32(bytes + offset + 8, program_token);
+    natural_if_write_u32(bytes + offset + 12, (uint32_t)word_count + 2u);
+    for (size_t index = 0; index < word_count; ++index)
+        natural_if_write_u32(bytes + offset + 16u + index * 4u, words[index]);
+    const size_t byte_count = offset + 16u + word_count * 4u;
+    natural_if_write_u32(bytes + 24, (uint32_t)byte_count);
+    CHECK(dxbc_compute_hash(bytes, byte_count, bytes + 4));
+    DXBCDocumentDiagnostic document_diagnostic;
+    DXBCStageContractDiagnostic contract_diagnostic;
+    CHECK(dxbc_document_parse(&fixture->document, bytes, byte_count, &document_diagnostic));
+    CHECK(dxbc_document_decode_semantic(&fixture->document, &fixture->semantic));
+    CHECK(dxbc_stage_contract_decode(&fixture->document, &fixture->semantic,
+        &fixture->contract, &contract_diagnostic));
+    CHECK(usil_translate_with_stage_contract(&fixture->program, &fixture->semantic,
+        &fixture->contract));
+    CHECK(fixture->program.has_parsed_signature_authority);
+    return true;
+}
+
+static bool natural_if_fixture_init(NaturalIfFixture *fixture, unsigned width,
+    uint8_t temp_mask, bool nonzero, bool dead_phi, bool vector_literal, bool temp_condition) {
+    memset(fixture, 0, sizeof(*fixture));
+    dxbc_document_init(&fixture->document);
+    dxbc_stage_contract_init(&fixture->contract);
+    CHECK(width >= 1 && width <= 3);
+    const uint8_t output_mask = (uint8_t)((1u << width) - 1u);
+    uint8_t physical[4] = {0};
+    unsigned physical_count = 0;
+    for (unsigned lane = 0; lane < 4; ++lane)
+        if (temp_mask & (1u << lane)) physical[physical_count++] = (uint8_t)lane;
+    CHECK(physical_count == width);
+    const uint8_t identity[4] = {0, 1, 2, 3};
+    uint8_t input_for_temp[4] = {0}, temp_for_output[4] = {0};
+    for (unsigned lane = 0; lane < width; ++lane) {
+        input_for_temp[physical[lane]] = (uint8_t)lane;
+        temp_for_output[lane] = physical[lane];
+    }
+    for (unsigned lane = width; lane < 4; ++lane)
+        temp_for_output[lane] = physical[0];
+    uint32_t words[128];
+    size_t word_count = 0;
+#define NATURAL_WORD(value) do { \
+    CHECK(word_count < sizeof(words) / sizeof(words[0])); \
+    words[word_count++] = (value); \
+} while (0)
+#define NATURAL_INST(opcode, length) ((uint32_t)(opcode) | (uint32_t)(length) << 24u)
+#define NATURAL_DEST(type, mask) (UINT32_C(0x00100002) | \
+    (uint32_t)(type) << 12u | (uint32_t)(mask) << 4u)
+    NATURAL_WORD(NATURAL_INST(106, 1) | 1u << 11u);
+    NATURAL_WORD(NATURAL_INST(98, 3) | 2u << 11u);
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_INPUT, output_mask)); NATURAL_WORD(0);
+    NATURAL_WORD(NATURAL_INST(98, 3) | 2u << 11u);
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_INPUT, 1)); NATURAL_WORD(1);
+    NATURAL_WORD(NATURAL_INST(101, 3));
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_OUTPUT, output_mask)); NATURAL_WORD(0);
+    NATURAL_WORD(NATURAL_INST(104, 2)); NATURAL_WORD(3);
+    if (temp_condition) {
+        NATURAL_WORD(NATURAL_INST(54, 5));
+        NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(2);
+        NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, input_for_temp)); NATURAL_WORD(0);
+    }
+    NATURAL_WORD(NATURAL_INST(31, 3) | (nonzero ? UINT32_C(0x40000) : 0));
+    NATURAL_WORD(temp_condition ? UINT32_C(0x0010000a) |
+        (uint32_t)physical[width - 1u] << 4u : UINT32_C(0x0010100a));
+    NATURAL_WORD(temp_condition ? 2 : 1);
+    NATURAL_WORD(NATURAL_INST(54, vector_literal ? 8 : 5));
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
+    if (vector_literal) {
+        const uint32_t bits[4] = {UINT32_C(0x80000000), 1,
+            UINT32_C(0x7fc12345), UINT32_C(0x3f800000)};
+        NATURAL_WORD(UINT32_C(0x00004002));
+        for (unsigned lane = 0; lane < 4; ++lane) NATURAL_WORD(bits[lane]);
+    } else {
+        NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, input_for_temp)); NATURAL_WORD(0);
+    }
+    if (dead_phi) {
+        /* TEMP2 has an undefined false edge but is never demanded at the join. */
+        NATURAL_WORD(NATURAL_INST(54, 5));
+        NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(2);
+        NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, input_for_temp)); NATURAL_WORD(0);
+    }
+    NATURAL_WORD(NATURAL_INST(0, 7));
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
+    NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, identity)); NATURAL_WORD(0);
+    NATURAL_WORD(UINT32_C(0x00004001)); NATURAL_WORD(UINT32_C(0x3fa00000));
+    NATURAL_WORD(NATURAL_INST(18, 1));
+    NATURAL_WORD(NATURAL_INST(54, 5));
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
+    NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, input_for_temp)); NATURAL_WORD(0);
+    NATURAL_WORD(NATURAL_INST(56, 7));
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
+    NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, identity)); NATURAL_WORD(0);
+    NATURAL_WORD(UINT32_C(0x00004001)); NATURAL_WORD(UINT32_C(0x40000000));
+    NATURAL_WORD(NATURAL_INST(21, 1));
+    NATURAL_WORD(NATURAL_INST(0, 7));
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, output_mask)); NATURAL_WORD(1);
+    NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, temp_for_output)); NATURAL_WORD(0);
+    NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, identity)); NATURAL_WORD(0);
+    NATURAL_WORD(NATURAL_INST(54, 5));
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_OUTPUT, output_mask)); NATURAL_WORD(0);
+    NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, identity)); NATURAL_WORD(1);
+    NATURAL_WORD(NATURAL_INST(62, 1));
+#undef NATURAL_DEST
+#undef NATURAL_INST
+#undef NATURAL_WORD
+    const DXBCSignatureElement inputs[2] = {
+        {.semantic_name = "TEXCOORD", .component_type = 3, .mask = output_mask, .rw_mask = output_mask},
+        {.semantic_name = "TEXCOORD", .semantic_index = 1, .register_id = 1,
+            .component_type = 3, .mask = 1, .rw_mask = 1}};
+    const DXBCSignatureElement output = {.semantic_name = "SV_Target", .system_value = 64,
+        .component_type = 3, .mask = output_mask, .rw_mask = (uint8_t)(15u & ~output_mask)};
+    CHECK(natural_if_fixture_decode_words(fixture, UINT32_C(0x00000050), words, word_count,
+        inputs, 2, &output, 1));
+    CHECK(fixture->program.input_count == 2 && fixture->program.output_count == 1);
+    CHECK(fixture->program.inputs[0].mask == output_mask &&
+        fixture->program.inputs[0].rw_mask == output_mask &&
+        fixture->program.inputs[1].mask == 1 && fixture->program.inputs[1].rw_mask == 1);
+    CHECK(fixture->program.outputs[0].mask == output_mask &&
+        fixture->program.outputs[0].rw_mask == (15u & ~output_mask));
+    const int prefix = temp_condition ? 1 : 0;
+    const int extra = dead_phi ? 1 : 0;
+    CHECK(fixture->program.instruction_count == 10 + prefix + extra);
+    fixture->condition = prefix;
+    fixture->then_value = 2 + prefix + extra;
+    fixture->else_value = 5 + prefix + extra;
+    fixture->join_value = 7 + prefix + extra;
+    fixture->output = 8 + prefix + extra;
+    CHECK(fixture->program.instructions[fixture->condition].source_instruction_index ==
+        (uint32_t)(5 + prefix));
+    CHECK(fixture->program.instructions[fixture->condition].condition_test == (nonzero ?
+        DXBC_INSTRUCTION_TEST_NONZERO : DXBC_INSTRUCTION_TEST_ZERO));
+    CHECK(usil_operand_destination_lane_mask(
+        &fixture->program.instructions[fixture->then_value].operands[0]) == temp_mask);
+    return true;
+}
+
+typedef struct {
+    const USILProgram *program;
+    uint32_t logical_widths;
+    size_t observations;
+    size_t declaration_events, return_events;
+    size_t reject_at;
+    USILProgram *mutable_program;
+    StringBuilder *mutable_source;
+    HLSLExpressionSourceMap *mutable_map;
+    size_t source_offset;
+    size_t mutate_at;
+    unsigned mutation;
+    bool mutated;
+    bool wrong_owner;
+} NaturalIfObservations;
+
+static bool observe_natural_if(void *context, const HLSLSourceQualityObservation *observation) {
+    NaturalIfObservations *ledger = context;
+    ++ledger->observations;
+    if (ledger->reject_at && ledger->observations == ledger->reject_at) return false;
+    if (observation->stage != ledger->program->program_type || observation->pass_index != 3 ||
+        observation->entry_point_index != 4 || observation->source_unit_id != 0)
+        ledger->wrong_owner = true;
+    const HLSLSourceQualityFacts *facts = &observation->facts;
+    if (observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION) {
+        if (facts->instruction_index < 0) ++ledger->declaration_events;
+        else if (facts->instruction_index < ledger->program->instruction_count &&
+            ledger->program->instructions[facts->instruction_index].opcode == USIL_OP_RET)
+            ++ledger->return_events;
+    }
+    if (facts->instruction_index >= 0 &&
+        (facts->instruction_index >= ledger->program->instruction_count ||
+         facts->source_instruction_index != ledger->program->instructions[
+            facts->instruction_index].source_instruction_index))
+        ledger->wrong_owner = true;
+    if (facts->known && facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL &&
+        facts->components >= 1 && facts->components <= 4)
+        ledger->logical_widths |= 1u << facts->components;
+    if (ledger->mutable_program && ledger->observations == ledger->mutate_at) {
+        USILProgram *program = ledger->mutable_program;
+        switch (ledger->mutation) {
+        case 0:
+            program->instructions[0].condition_test = DXBC_INSTRUCTION_TEST_ZERO;
+            break;
+        case 1:
+            program->instructions[5].operands[2].imm_values[0] = UINT32_C(0x40400000);
+            program->instructions[5].operands[2].immediate_words[0] = UINT32_C(0x40400000);
+            break;
+        case 2:
+            memset(program->inputs[0].semantic_name, 0, sizeof(program->inputs[0].semantic_name));
+            memcpy(program->inputs[0].semantic_name, "COORDINATE", sizeof("COORDINATE"));
+            program->inputs[0].semantic_name_length = sizeof("COORDINATE") - 1u;
+            break;
+        case 3: {
+            DXBCOperand *source = &program->instructions[7].operands[1];
+            source->swizzle[0] = 3;
+            source->swizzle[1] = 2;
+            source->raw_token &= ~UINT32_C(0x00000ff0);
+            for (unsigned lane = 0; lane < 4; ++lane)
+                source->raw_token |= (uint32_t)source->swizzle[lane] << (4u + lane * 2u);
+            break;
+        }
+        case 4:
+            if (!ledger->mutable_source || ledger->source_offset >= ledger->mutable_source->len)
+                return false;
+            ledger->mutable_source->buf[ledger->source_offset] ^= 1;
+            break;
+        case 5:
+            if (!ledger->mutable_map || ledger->mutable_map->count <= 2)
+                return false;
+            ++ledger->mutable_map->origins[2].source_end;
+            break;
+        }
+        ledger->mutated = true;
+    }
+    return true;
+}
+
+static bool natural_if_maps_equal(const HLSLExpressionSourceMap *a,
+    const HLSLExpressionSourceMap *b) {
+    CHECK(a->complete == b->complete && a->count == b->count);
+    for (size_t index = 0; index < a->count; ++index)
+        CHECK(hlsl_expression_origins_equal(&a->origins[index], &b->origins[index]));
+    return true;
+}
+
+static bool natural_if_emit(const USILProgram *program, StringBuilder *source,
+    HLSLExpressionSourceMap *map, HLSLSourceQualityResult *quality,
+    NaturalIfObservations *observations, HLSLEmitDiagnostic *diagnostic) {
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    options.expression_source_map = map;
+    options.source_quality = quality;
+    options.source_quality_pass_index = 3;
+    options.source_quality_entry_point_index = 4;
+    options.source_quality_observer = observe_natural_if;
+    options.source_quality_observer_context = observations;
+    return hlsl_emit_with_options_diagnostic(program, source, NULL, NULL, NULL,
+        &options, diagnostic);
+}
+
+static bool check_natural_if_positive(unsigned width, uint8_t temp_mask, bool nonzero,
+    bool dead_phi, bool vector_literal, bool temp_condition) {
+    NaturalIfFixture fixture;
+    CHECK(natural_if_fixture_init(&fixture, width, temp_mask, nonzero, dead_phi,
+        vector_literal, temp_condition));
+    HLSLExpressionSourceMap map, repeated_map;
+    HLSLSourceQualityResult quality, repeated_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations observations = {.program = &fixture.program};
+    StringBuilder source, repeated;
+    sb_init(&source);
+    sb_init(&repeated);
+    const bool emitted = natural_if_emit(&fixture.program, &source, &map, &quality,
+        &observations, &diagnostic);
+    if (!emitted)
+        fprintf(stderr, "Natural IF width %u/mask %u: %s at instruction %d, phase %d\n",
+            width, temp_mask, hlsl_emit_reason_name(diagnostic.reason),
+            diagnostic.instruction_index, (int)diagnostic.phase);
+    CHECK(emitted && map.complete && map.count == (size_t)fixture.program.instruction_count);
+    CHECK(hlsl_expression_source_map_matches(&map, &fixture.program, source.buf));
+    CHECK(observations.observations && !observations.wrong_owner);
+    CHECK(observations.logical_widths & (1u << width));
+    CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.reasons &&
+        quality.counts.inspected_units == 1 && !quality.counts.incomplete_units &&
+        !quality.counts.residual_total && !quality.counts.unknown_provenance);
+    CHECK(quality.counts.real_bitcasts > 0);
+    CHECK(strstr(source.buf, nonzero ? "[branch] if (asuint(" : "[branch] if (!asuint("));
+    if (temp_condition) {
+        CHECK(fixture.program.instructions[fixture.condition].operands[0].type == OPERAND_TYPE_TEMP);
+        CHECK(usil_operand_source_component(
+            &fixture.program.instructions[fixture.condition].operands[0], 0) ==
+            (temp_mask == 2 ? 1 : 3));
+        CHECK(strstr(source.buf, width == 1 ? "asuint(dxbc_value_i0)" :
+            "asuint(dxbc_value_i0.y)"));
+    }
+    CHECK(!strstr(source.buf, "float4 dxbc_value") && !strstr(source.buf, "float4 dxbc_merge"));
+    CHECK(!strstr(source.buf, "u_xlat") && !strstr(source.buf, "float4 r0"));
+    char declaration[96];
+    if (width == 1)
+        snprintf(declaration, sizeof(declaration), "float dxbc_merge_i%d_r0;", fixture.join_value);
+    else
+        snprintf(declaration, sizeof(declaration), "float%u dxbc_merge_i%d_r0;",
+            width, fixture.join_value);
+    CHECK(strstr(source.buf, declaration));
+    char assignment[96];
+    snprintf(assignment, sizeof(assignment), "dxbc_merge_i%d_r0 = dxbc_value_i%d;",
+        fixture.join_value, fixture.then_value);
+    CHECK(strstr(source.buf, assignment));
+    snprintf(assignment, sizeof(assignment), "dxbc_merge_i%d_r0 = dxbc_value_i%d;",
+        fixture.join_value, fixture.else_value);
+    CHECK(strstr(source.buf, assignment));
+    if (dead_phi) CHECK(!strstr(source.buf, "_r2;"));
+    if (temp_mask == 2 || temp_mask == 12) {
+        /* A named scalar/float2 is compact. Projecting its old .y/.zw physical
+         * register coordinates would read the wrong logical components. */
+        snprintf(assignment, sizeof(assignment), "dxbc_merge_i%d_r0.y", fixture.join_value);
+        CHECK(!strstr(source.buf, assignment));
+        snprintf(assignment, sizeof(assignment), "dxbc_merge_i%d_r0.z", fixture.join_value);
+        CHECK(!strstr(source.buf, assignment));
+        snprintf(assignment, sizeof(assignment), "dxbc_merge_i%d_r0.w", fixture.join_value);
+        CHECK(!strstr(source.buf, assignment));
+    }
+    if (vector_literal)
+        CHECK(strstr(source.buf, "-0.0f") && strstr(source.buf, "asfloat(0x00000001u)") &&
+            strstr(source.buf, "asfloat(0x7FC12345u)"));
+    /* Physical TEMP lane coordinates must survive compaction in the map. */
+    for (int index = 0; index < fixture.program.instruction_count; ++index) {
+        const USILInstruction *instruction = &fixture.program.instructions[index];
+        const HLSLExpressionOrigin *origin = &map.origins[index];
+        CHECK(origin->instruction_index == index && origin->source_instruction_index ==
+            instruction->source_instruction_index);
+        if (instruction->opcode == USIL_OP_MOV || instruction->opcode == USIL_OP_ADD ||
+            instruction->opcode == USIL_OP_MUL)
+            CHECK(origin->destination_lanes == usil_operand_destination_lane_mask(
+                &instruction->operands[0]));
+        if (instruction->opcode == USIL_OP_IF || instruction->opcode == USIL_OP_ELSE ||
+            instruction->opcode == USIL_OP_ENDIF)
+            CHECK(origin->kind == HLSL_EXPRESSION_ORIGIN_CONTROL && !origin->destination_lanes &&
+                origin->source_begin < origin->source_end);
+    }
+    HLSLExpressionSourceMap changed = map;
+    changed.origins[fixture.then_value].destination_lanes ^= 1u;
+    CHECK(!hlsl_expression_source_map_matches(&changed, &fixture.program, source.buf));
+    changed = map;
+    changed.origins[fixture.condition].kind = HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+    CHECK(!hlsl_expression_source_map_matches(&changed, &fixture.program, source.buf));
+    changed = map;
+    changed.origins[fixture.join_value].source_end = source.len + 1u;
+    CHECK(!hlsl_expression_source_map_matches(&changed, &fixture.program, source.buf));
+    NaturalIfObservations repeated_observations = {.program = &fixture.program};
+    CHECK(natural_if_emit(&fixture.program, &repeated, &repeated_map, &repeated_quality,
+        &repeated_observations, &diagnostic));
+    CHECK(source.len == repeated.len && !strcmp(source.buf, repeated.buf));
+    CHECK(natural_if_maps_equal(&map, &repeated_map));
+    CHECK(hlsl_source_quality_results_equal(&quality, &repeated_quality));
+    CHECK(observations.observations == repeated_observations.observations &&
+        observations.logical_widths == repeated_observations.logical_widths &&
+        !repeated_observations.wrong_owner);
+    const size_t rejection_points[] = {1, observations.observations / 2u,
+        observations.observations};
+    for (size_t index = 0; index < sizeof(rejection_points) / sizeof(rejection_points[0]); ++index) {
+        sb_free(&repeated);
+        sb_init(&repeated);
+        repeated_observations = (NaturalIfObservations){.program = &fixture.program,
+            .reject_at = rejection_points[index]};
+        CHECK(!natural_if_emit(&fixture.program, &repeated, &repeated_map, &repeated_quality,
+            &repeated_observations, &diagnostic));
+        CHECK(repeated_observations.observations == rejection_points[index] &&
+            !repeated_map.complete && !repeated_map.count &&
+            repeated_quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+        sb_free(&repeated);
+        sb_init(&repeated);
+        repeated_observations = (NaturalIfObservations){.program = &fixture.program};
+        CHECK(natural_if_emit(&fixture.program, &repeated, &repeated_map, &repeated_quality,
+            &repeated_observations, &diagnostic));
+        CHECK(!strcmp(source.buf, repeated.buf) && natural_if_maps_equal(&map, &repeated_map));
+        CHECK(hlsl_source_quality_results_equal(&quality, &repeated_quality));
+    }
+    sb_free(&repeated);
+    sb_free(&source);
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool natural_if_rejected(USILProgram *program, HLSLEmitDiagnostic *failure) {
+    StringBuilder source;
+    sb_init(&source);
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations observations = {.program = program};
+    const bool emitted = natural_if_emit(program, &source, &map, &quality,
+        &observations, &diagnostic);
+    if (emitted) fprintf(stderr, "Unexpected natural IF admission\n");
+    CHECK(!emitted && diagnostic.status != HLSL_EMIT_STATUS_OK);
+    CHECK(!map.complete && !map.count && quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+    if (failure) *failure = diagnostic;
+    sb_free(&source);
+    return true;
+}
+
+static bool check_natural_if_rejections(void) {
+    NaturalIfFixture fixture;
+    CHECK(natural_if_fixture_init(&fixture, 2, 12, true, false, false, false));
+    USILProgram *program = &fixture.program;
+    CHECK(program->instruction_count == 10);
+    USILInstruction saved[10];
+    memcpy(saved, program->instructions, sizeof(saved));
+    const DXBCSignatureElement saved_input = program->inputs[0];
+    const DXBCSignatureElement saved_output = program->outputs[0];
+    for (unsigned mutation = 0; mutation < 20; ++mutation) {
+        /* Every case starts from the same valid parsed grammar. These edits
+         * exercise current decoded-model preconditions, not target authority. */
+        memcpy(program->instructions, saved, sizeof(saved));
+        program->inputs[0] = saved_input;
+        program->outputs[0] = saved_output;
+        switch (mutation) {
+        case 0: /* Different producer widths on the two incoming edges. */
+            program->instructions[5].operands[0].destination_mask = 0x40;
+            break;
+        case 1: /* Same width, different physical masks are not one phi value. */
+            program->instructions[5].operands[0].destination_mask = 0x30;
+            program->instructions[5].operands[1].swizzle[0] = 2;
+            program->instructions[5].operands[1].swizzle[1] = 3;
+            break;
+        case 2: /* Undefined temporary source. */
+            program->instructions[1].operands[1].type = OPERAND_TYPE_TEMP;
+            program->instructions[1].operands[1].register_index = 2;
+            program->instructions[1].operands[1].index_values[0] = 2;
+            break;
+        case 3: /* The join combines true-arm lanes from distinct generations. */
+            program->instructions[2].operands[0].destination_mask = 0x40;
+            break;
+        case 4: /* A branch-local output cannot stand in for an unconditional one. */
+            program->instructions[2].operands[0].type = OPERAND_TYPE_OUTPUT;
+            program->instructions[2].operands[0].destination_mask = 0x30;
+            break;
+        case 5: /* No explicit false arm is outside this bounded natural route. */
+            program->instructions[3] = (USILInstruction){.opcode = USIL_OP_NOP,
+                .source_instruction_index = saved[3].source_instruction_index};
+            break;
+        case 6:
+            program->instructions[2].operands[1].has_neg = true;
+            break;
+        case 7:
+            program->instructions[2].operands[1].has_abs = true;
+            break;
+        case 8:
+            program->instructions[2].saturate = true;
+            break;
+        case 9:
+            program->instructions[2].precise_mask = 1;
+            break;
+        case 10:
+            program->instructions[1].operands[1].type = OPERAND_TYPE_RESOURCE;
+            break;
+        case 11:
+            program->instructions[1].operands[1].type = OPERAND_TYPE_CONSTANT_BUFFER;
+            break;
+        case 12:
+            program->instructions[2].opcode = USIL_OP_DERIV_RTX;
+            program->instructions[2].operand_count = 2;
+            break;
+        case 13:
+            program->instructions[2].opcode = USIL_OP_DISCARD;
+            program->instructions[2].operand_count = 1;
+            program->instructions[2].condition_test = DXBC_INSTRUCTION_TEST_NONZERO;
+            program->instructions[2].operands[0] = program->instructions[0].operands[0];
+            break;
+        case 14: /* Output does not cover the complete actual signature. */
+            program->instructions[8].operands[0].destination_mask = 0x10;
+            break;
+        case 15:
+            program->inputs[0].component_type = 2;
+            break;
+        case 16:
+            program->inputs[0].mask = 1;
+            program->inputs[0].rw_mask = 1;
+            break;
+        case 17:
+            program->outputs[0].mask = 7;
+            program->outputs[0].rw_mask = 8;
+            break;
+        case 18:
+            program->instructions[0].operands[0].has_neg = true;
+            break;
+        case 19: /* An undeclared physical TEMP lane has no logical component. */
+            program->instructions[7].operands[1].swizzle[0] = 1;
+            break;
+        }
+        CHECK(natural_if_rejected(program, NULL));
+    }
+    memcpy(program->instructions, saved, sizeof(saved));
+    program->inputs[0] = saved_input;
+    program->outputs[0] = saved_output;
+    /* Well-formed nested IF has an explicit ELSE at both levels; its rejection
+     * tests the bounded scope rather than an unbalanced control-flow stream. */
+    USILInstruction nested[16] = {0};
+    nested[0] = saved[0];
+    nested[1] = saved[0];
+    nested[2] = saved[1]; nested[3] = saved[2];
+    nested[4] = saved[3]; nested[5] = saved[4]; nested[6] = saved[5];
+    nested[7] = saved[6];
+    nested[8] = saved[3]; nested[9] = saved[4]; nested[10] = saved[5];
+    nested[11] = saved[6]; nested[12] = saved[7];
+    nested[13] = saved[8]; nested[14] = saved[9];
+    for (int index = 0; index < 15; ++index)
+        nested[index].source_instruction_index = (uint32_t)index + 5u;
+    USILProgram extended = *program;
+    extended.instructions = nested;
+    extended.instruction_count = 15;
+    extended.instruction_alloc = 16;
+    CHECK(natural_if_rejected(&extended, NULL));
+    /* A balanced loop containing the complete IF is also outside the route. */
+    nested[0] = (USILInstruction){.opcode = USIL_OP_LOOP};
+    memcpy(nested + 1, saved, 9u * sizeof(*saved));
+    nested[10] = (USILInstruction){.opcode = USIL_OP_ENDLOOP};
+    nested[11] = saved[9];
+    for (int index = 0; index < 12; ++index)
+        nested[index].source_instruction_index = (uint32_t)index + 5u;
+    extended.instruction_count = 12;
+    CHECK(natural_if_rejected(&extended, NULL));
+    /* An extra output write after the first would silently replace its value. */
+    memcpy(nested, saved, 9u * sizeof(*saved));
+    nested[9] = saved[8]; nested[10] = saved[9];
+    nested[9].source_instruction_index = 14;
+    nested[10].source_instruction_index = 15;
+    extended.instruction_count = 11;
+    CHECK(natural_if_rejected(&extended, NULL));
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_if_optional_outputs(void) {
+    NaturalIfFixture fixture;
+    CHECK(natural_if_fixture_init(&fixture, 2, 12, true, false, false, false));
+    StringBuilder original, selected;
+    sb_init(&original);
+    sb_init(&selected);
+    HLSLExpressionSourceMap original_map, selected_map;
+    HLSLSourceQualityResult original_quality, selected_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations observations = {.program = &fixture.program};
+    CHECK(natural_if_emit(&fixture.program, &original, &original_map, &original_quality,
+        &observations, &diagnostic));
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        options.expression_source_map = (outputs & 1u) ? &selected_map : NULL;
+        options.source_quality = (outputs & 2u) ? &selected_quality : NULL;
+        options.source_quality_pass_index = 3;
+        options.source_quality_entry_point_index = 4;
+        sb_free(&selected);
+        sb_init(&selected);
+        CHECK(hlsl_emit_with_options_diagnostic(&fixture.program, &selected, NULL, NULL, NULL,
+            &options, &diagnostic));
+        CHECK(original.len == selected.len && !strcmp(original.buf, selected.buf));
+        if (outputs & 1u) {
+            CHECK(hlsl_expression_source_map_matches(&selected_map, &fixture.program, selected.buf));
+            CHECK(natural_if_maps_equal(&original_map, &selected_map));
+        }
+        if (outputs & 2u)
+            CHECK(hlsl_source_quality_results_equal(&original_quality, &selected_quality));
+    }
+    sb_free(&selected);
+    sb_free(&original);
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_if_callback_drift(void) {
+    NaturalIfFixture fixture;
+    CHECK(natural_if_fixture_init(&fixture, 2, 12, true, false, false, false));
+    USILProgram *program = &fixture.program;
+    USILInstruction saved[10];
+    memcpy(saved, program->instructions, sizeof(saved));
+    const DXBCSignatureElement saved_input = program->inputs[0];
+    StringBuilder original, changed;
+    sb_init(&original);
+    sb_init(&changed);
+    HLSLExpressionSourceMap original_map, changed_map;
+    HLSLSourceQualityResult original_quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations baseline = {.program = program};
+    CHECK(natural_if_emit(program, &original, &original_map, &original_quality,
+        &baseline, &diagnostic));
+    CHECK(baseline.observations > 2);
+    const size_t mutation_points[] = {1, baseline.observations / 2u, baseline.observations};
+    for (unsigned mutation = 0; mutation < 6; ++mutation) {
+        /* Source/map corruption waits until the selected actual ADD span has
+         * been emitted; model drift additionally covers early callbacks. */
+        const size_t first_point = mutation >= 4 ? 2u : 0u;
+        for (size_t point = first_point; point < sizeof(mutation_points) / sizeof(mutation_points[0]); ++point) {
+            NaturalIfObservations drift = {.program = program, .mutable_program = program,
+                .mutation = mutation, .mutate_at = mutation_points[point],
+                .mutable_source = &changed, .mutable_map = &changed_map,
+                .source_offset = original_map.origins[2].source_begin};
+            sb_free(&changed);
+            sb_init(&changed);
+            CHECK(!natural_if_emit(program, &changed, &changed_map, &changed_quality,
+                &drift, &diagnostic));
+            CHECK(drift.mutated && diagnostic.status != HLSL_EMIT_STATUS_OK &&
+                !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+            /* Model edits are admission-valid in a fresh emission. This
+             * separates frozen-owner rejection from unsupported shapes.
+             * External source/map edits leave the original model unchanged. */
+            NaturalIfObservations fresh = {.program = program};
+            sb_free(&changed);
+            sb_init(&changed);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality,
+                &fresh, &diagnostic));
+            CHECK(changed_map.complete && hlsl_expression_source_map_matches(
+                &changed_map, program, changed.buf));
+            if (mutation < 4) CHECK(strcmp(original.buf, changed.buf));
+            else CHECK(!strcmp(original.buf, changed.buf));
+            memcpy(program->instructions, saved, sizeof(saved));
+            program->inputs[0] = saved_input;
+            fresh = (NaturalIfObservations){.program = program};
+            sb_free(&changed);
+            sb_init(&changed);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality,
+                &fresh, &diagnostic));
+            CHECK(original.len == changed.len && !strcmp(original.buf, changed.buf));
+            CHECK(natural_if_maps_equal(&original_map, &changed_map));
+            CHECK(hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+        }
+    }
+    sb_free(&changed);
+    sb_free(&original);
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool natural_if_multiple_outputs_fixture(NaturalIfFixture *fixture, bool vertex) {
+    memset(fixture, 0, sizeof(*fixture));
+    dxbc_document_init(&fixture->document);
+    dxbc_stage_contract_init(&fixture->contract);
+    uint32_t words[96];
+    size_t count = 0;
+#define MULTI_WORD(value) do { \
+    CHECK(count < sizeof(words) / sizeof(words[0])); \
+    words[count++] = (value); \
+} while (0)
+#define MULTI_INST(opcode, length) ((uint32_t)(opcode) | (uint32_t)(length) << 24u)
+    MULTI_WORD(MULTI_INST(106, 1) | 1u << 11u);
+    const uint8_t masks[3] = {15, 7, 1};
+    for (unsigned input = 0; input < 3; ++input) {
+        MULTI_WORD(MULTI_INST(vertex ? 95 : 98, 3) | (vertex ? 0 : 2u << 11u));
+        MULTI_WORD(UINT32_C(0x00101002) | (uint32_t)masks[input] << 4u);
+        MULTI_WORD(input);
+    }
+    MULTI_WORD(MULTI_INST(vertex ? 103 : 101, vertex ? 4 : 3));
+    MULTI_WORD(UINT32_C(0x001020f2)); MULTI_WORD(0);
+    if (vertex) MULTI_WORD(1);
+    MULTI_WORD(MULTI_INST(101, 3));
+    MULTI_WORD(UINT32_C(0x00102072)); MULTI_WORD(1);
+    MULTI_WORD(MULTI_INST(104, 2)); MULTI_WORD(1);
+    MULTI_WORD(MULTI_INST(31, 3) | UINT32_C(0x40000));
+    MULTI_WORD(UINT32_C(0x0010100a)); MULTI_WORD(2);
+    MULTI_WORD(MULTI_INST(0, 7));
+    MULTI_WORD(UINT32_C(0x00100072)); MULTI_WORD(0);
+    MULTI_WORD(UINT32_C(0x00101246)); MULTI_WORD(1);
+    MULTI_WORD(UINT32_C(0x00004001)); MULTI_WORD(UINT32_C(0x3f800000));
+    MULTI_WORD(MULTI_INST(18, 1));
+    MULTI_WORD(MULTI_INST(0, 7));
+    MULTI_WORD(UINT32_C(0x00100072)); MULTI_WORD(0);
+    MULTI_WORD(UINT32_C(0x00101246)); MULTI_WORD(1);
+    MULTI_WORD(UINT32_C(0x00004001)); MULTI_WORD(UINT32_C(0x40400000));
+    MULTI_WORD(MULTI_INST(21, 1));
+    MULTI_WORD(MULTI_INST(56, 7));
+    MULTI_WORD(UINT32_C(0x00102072)); MULTI_WORD(1);
+    MULTI_WORD(UINT32_C(0x00100246)); MULTI_WORD(0);
+    MULTI_WORD(UINT32_C(0x00004001)); MULTI_WORD(UINT32_C(0x3fa00000));
+    MULTI_WORD(MULTI_INST(54, 5));
+    MULTI_WORD(UINT32_C(0x001020f2)); MULTI_WORD(0);
+    MULTI_WORD(UINT32_C(0x00101e46)); MULTI_WORD(0);
+    MULTI_WORD(MULTI_INST(62, 1));
+#undef MULTI_INST
+#undef MULTI_WORD
+    DXBCSignatureElement inputs[3] = {
+        {.semantic_name = "POSITION", .component_type = 3, .mask = 15, .rw_mask = 15},
+        {.semantic_name = "NORMAL", .register_id = 1, .component_type = 3, .mask = 7, .rw_mask = 7},
+        {.semantic_name = "TEXCOORD", .register_id = 2, .component_type = 3, .mask = 1, .rw_mask = 1}};
+    DXBCSignatureElement outputs[2] = {
+        {.semantic_name = "SV_POSITION", .system_value = 1, .component_type = 3, .mask = 15},
+        {.semantic_name = "TEXCOORD", .register_id = 1, .component_type = 3, .mask = 7, .rw_mask = 8}};
+    if (!vertex) {
+        memset(inputs[0].semantic_name, 0, sizeof(inputs[0].semantic_name));
+        memcpy(inputs[0].semantic_name, "TEXCOORD", sizeof("TEXCOORD"));
+        inputs[2].semantic_index = 1;
+        for (unsigned output = 0; output < 2; ++output) {
+            memset(outputs[output].semantic_name, 0, sizeof(outputs[output].semantic_name));
+            memcpy(outputs[output].semantic_name, "SV_Target", sizeof("SV_Target"));
+            outputs[output].semantic_index = output;
+            outputs[output].system_value = 64;
+        }
+    }
+    CHECK(natural_if_fixture_decode_words(fixture,
+        vertex ? UINT32_C(0x00010050) : UINT32_C(0x00000050), words, count, inputs, 3, outputs, 2));
+    CHECK(fixture->program.program_type == (vertex ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL));
+    CHECK(fixture->program.input_count == 3 && fixture->program.output_count == 2 &&
+        fixture->program.instruction_count == 8 && fixture->program.signature_declaration_count == 5);
+    for (unsigned input = 0; input < 3; ++input)
+        CHECK(fixture->program.inputs[input].mask == masks[input] &&
+            fixture->program.inputs[input].rw_mask == masks[input]);
+    CHECK(fixture->program.outputs[0].mask == 15 && !fixture->program.outputs[0].rw_mask &&
+        fixture->program.outputs[1].mask == 7 && fixture->program.outputs[1].rw_mask == 8);
+    fixture->condition = 0;
+    fixture->then_value = 1;
+    fixture->else_value = 3;
+    fixture->join_value = 5;
+    fixture->output = 5;
+    CHECK(fixture->program.instructions[0].source_instruction_index == 7);
+    return true;
+}
+
+static bool check_natural_if_multiple_outputs(bool vertex) {
+    NaturalIfFixture fixture;
+    CHECK(natural_if_multiple_outputs_fixture(&fixture, vertex));
+    USILProgram *program = &fixture.program;
+    StringBuilder source, selected;
+    sb_init(&source);
+    sb_init(&selected);
+    HLSLExpressionSourceMap map, selected_map;
+    HLSLSourceQualityResult quality, selected_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations observations = {.program = program};
+    const bool emitted = natural_if_emit(program, &source, &map, &quality,
+        &observations, &diagnostic);
+    if (!emitted)
+        fprintf(stderr, "Natural IF %s two-output emission: %s at instruction %d, phase %d\n",
+            vertex ? "vertex" : "pixel", hlsl_emit_reason_name(diagnostic.reason),
+            diagnostic.instruction_index, (int)diagnostic.phase);
+    CHECK(emitted && map.complete && map.count == 8);
+    CHECK(quality.stage == program->program_type && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        !quality.reasons && quality.counts.inspected_units == 1 && !quality.counts.incomplete_units &&
+        !quality.counts.residual_total && !quality.counts.unknown_provenance && quality.counts.real_bitcasts);
+    CHECK(observations.observations && !observations.wrong_owner &&
+        (observations.logical_widths & (1u << 3)) && (observations.logical_widths & (1u << 4)));
+    /* Struct begin/two fields/end, three parameters, result local and entry
+     * signature are nine declaration records; RET owns the one return record. */
+    CHECK(observations.declaration_events == 9 && observations.return_events == 1);
+    CHECK(strstr(source.buf, "float3 dxbc_merge_i5_r0;") && strstr(source.buf, "return output;"));
+    CHECK(strstr(source.buf, vertex ? "float4 clipPosition : SV_POSITION;" : "float4 color : SV_Target;") &&
+        strstr(source.buf, vertex ? "float3 texcoord0_1 : TEXCOORD0;" : "float3 color1 : SV_Target1;"));
+    CHECK(!strstr(source.buf, "u_xlat") && !strstr(source.buf, "float4 r0"));
+    CHECK(hlsl_expression_source_map_matches(&map, program, source.buf));
+    CHECK(map.origins[5].destination_lanes == 7 && map.origins[6].destination_lanes == 15 &&
+        map.origins[7].kind == HLSL_EXPRESSION_ORIGIN_RETURN && !map.origins[7].destination_lanes);
+    CHECK(map.origins[7].source_begin < map.origins[7].source_end &&
+        map.origins[7].source_end == source.len);
+    for (size_t index = 0; index < map.count; ++index)
+        CHECK(map.origins[index].instruction_index == (int)index &&
+            map.origins[index].source_instruction_index == (uint32_t)index + 7u);
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        options.expression_source_map = (outputs & 1u) ? &selected_map : NULL;
+        options.source_quality = (outputs & 2u) ? &selected_quality : NULL;
+        options.source_quality_pass_index = 3;
+        options.source_quality_entry_point_index = 4;
+        sb_free(&selected);
+        sb_init(&selected);
+        CHECK(hlsl_emit_with_options_diagnostic(program, &selected, NULL, NULL, NULL,
+            &options, &diagnostic));
+        CHECK(source.len == selected.len && !strcmp(source.buf, selected.buf));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &selected_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &selected_quality));
+    }
+    USILInstruction saved[8];
+    memcpy(saved, program->instructions, sizeof(saved));
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
+        memcpy(program->instructions, saved, sizeof(saved));
+        if (mutation == 0) { /* Second output is written only in the true arm. */
+            program->instructions[1] = saved[5];
+            program->instructions[1].operands[1] = saved[1].operands[1];
+            program->instructions[1].source_instruction_index = saved[1].source_instruction_index;
+            program->instructions[5] = (USILInstruction){.opcode = USIL_OP_NOP,
+                .source_instruction_index = saved[5].source_instruction_index};
+        } else if (mutation == 1) {
+            program->instructions[5].operands[0].destination_mask = 0x30;
+        } else if (mutation == 2) { /* Both writes target output1; output0 is missing. */
+            program->instructions[6].operands[0] = saved[5].operands[0];
+        } else {
+            program->instructions[5] = (USILInstruction){.opcode = USIL_OP_NOP,
+                .source_instruction_index = saved[5].source_instruction_index};
+        }
+        CHECK(natural_if_rejected(program, &diagnostic));
+        if (!vertex && mutation == 1)
+            CHECK(diagnostic.status == HLSL_EMIT_STATUS_UNSUPPORTED &&
+                diagnostic.phase == HLSL_EMIT_PHASE_INTERFACE_EMISSION &&
+                diagnostic.reason == HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+    }
+    memcpy(program->instructions, saved, sizeof(saved));
+    sb_free(&selected);
+    sb_init(&selected);
+    NaturalIfObservations restored = {.program = program};
+    CHECK(natural_if_emit(program, &selected, &selected_map, &selected_quality, &restored, &diagnostic));
+    CHECK(!strcmp(source.buf, selected.buf) && natural_if_maps_equal(&map, &selected_map) &&
+        hlsl_source_quality_results_equal(&quality, &selected_quality));
+    sb_free(&selected);
+    sb_free(&source);
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_conditional_emission(void) {
+    const struct {unsigned width; uint8_t mask;} shapes[] = {
+        {1, 1}, {2, 3}, {3, 7}, {1, 2}, {2, 12}};
+    for (size_t index = 0; index < sizeof(shapes) / sizeof(shapes[0]); ++index)
+        for (unsigned nonzero = 0; nonzero < 2; ++nonzero)
+            CHECK(check_natural_if_positive(shapes[index].width, shapes[index].mask,
+                nonzero != 0, false, false, false));
+    CHECK(check_natural_if_positive(2, 12, true, true, false, false));
+    CHECK(check_natural_if_positive(3, 7, false, false, true, false));
+    for (unsigned nonzero = 0; nonzero < 2; ++nonzero) {
+        CHECK(check_natural_if_positive(1, 2, nonzero != 0, false, false, true));
+        CHECK(check_natural_if_positive(2, 12, nonzero != 0, false, false, true));
+    }
+    CHECK(check_natural_if_rejections());
+    CHECK(check_natural_if_optional_outputs());
+    CHECK(check_natural_if_callback_drift());
+    CHECK(check_natural_if_multiple_outputs(true));
+    CHECK(check_natural_if_multiple_outputs(false));
+    /* DXBC IF_Z/NZ compares the raw DWORD, including the float sign bit. A
+     * numeric float comparison would take the opposite branch for -0. */
+    const struct {uint32_t bits; bool nonzero;} conditions[] = {
+        {0, false}, {UINT32_C(0x80000000), true}, {1, true},
+        {UINT32_C(0x3f800000), true}, {UINT32_C(0x7fc12345), true}};
+    for (size_t index = 0; index < sizeof(conditions) / sizeof(conditions[0]); ++index) {
+        CHECK((conditions[index].bits != 0) == conditions[index].nonzero);
+        CHECK((conditions[index].bits == 0) != conditions[index].nonzero);
+    }
+    float negative_zero;
+    const uint32_t negative_zero_bits = UINT32_C(0x80000000);
+    memcpy(&negative_zero, &negative_zero_bits, sizeof(negative_zero));
+    CHECK(negative_zero == 0.0f && negative_zero_bits != 0);
+    return true;
+}
+
 static bool check_counted_loop_emission(void) {
     USILInstruction instructions[10] = {0};
     instructions[0] = move(emission_reg(OPERAND_TYPE_TEMP, 0), emission_reg(OPERAND_TYPE_INPUT, 0));
@@ -2056,6 +2954,7 @@ int main(void) {
         !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
         !check_expression_emission() || !check_conditional_emission() ||
+        !check_natural_conditional_emission() ||
         !check_counted_loop_emission() || !check_function_emission() || !check_unity_uv_emission())
         return 1;
     puts("HLSL dataflow contracts passed");

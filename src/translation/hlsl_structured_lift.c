@@ -2,22 +2,25 @@
 
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
+#include "common/sha256.h"
 
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Reuse the full-vector expression contract, CFG and lane SSA. This pass
- * gives each instruction result an immutable value and each live phi one
- * explicitly assigned float4. It does not speculate expressions across an
- * arm, duplicate work, or assume an undefined incoming lane has a value. */
+/* Reuse the expression contracts, CFG and lane SSA. The established full
+ * vector route retains its spelling and loop boundary. A separate bounded
+ * natural-width mode proves one complete two-arm join and the physical lanes
+ * belonging to each scalar/vector value before assigning it a source type. */
 enum { STRUCTURED_VALUE_LIMIT = HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT * 2 };
+#define STRUCTURED_PHI_LOGICAL_ID_BASE UINT64_C(0x8000000000060000)
 
 typedef struct {
     int instruction; /* -1 for a phi vector. */
     int block;
     int register_index;
+    uint8_t mask, width;
     const HLSLPhiNode *lanes[4];
     int incoming[2];
     unsigned resolution; /* 0 unseen, 1 visiting, 2 proven/live. */
@@ -40,11 +43,161 @@ typedef struct {
     int *ssa_value;
     int *ssa_lane;
     CountedLoop loop;
+    bool natural_width;
 } StructuredPlan;
+
+/* This receipt is producer-private. Expected syntax owners are independently
+ * enumerated from the proved plan before any body callback. Actual ranges are
+ * recorded only after their syntax was appended, then replayed through the
+ * same planner/emitter without observers. No source names or text are parsed. */
+typedef enum {
+    NATURAL_BODY_PHI_DECLARATION,
+    NATURAL_BODY_PHI_EDGE,
+    NATURAL_BODY_IF,
+    NATURAL_BODY_ELSE,
+    NATURAL_BODY_ENDIF,
+    NATURAL_BODY_TEMP_ASSIGNMENT,
+    NATURAL_BODY_OUTPUT_ASSIGNMENT,
+    NATURAL_BODY_RETURN
+} NaturalBodySyntaxKind;
+
+enum {
+    NATURAL_BODY_RECEIPT_LIMIT = STRUCTURED_VALUE_LIMIT * 3 + HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT + 1,
+    NATURAL_BODY_BYTE_LIMIT = 1024 * 1024
+};
+
+typedef struct {
+    NaturalBodySyntaxKind kind;
+    int instruction, value, incoming, edge;
+    uint32_t source_instruction;
+    uint8_t mask, width;
+    size_t begin, end, expression_begin, expression_end;
+} NaturalBodySyntax;
+
+typedef struct HLSLNaturalStructuredBodyInventory {
+    NaturalBodySyntax expected[NATURAL_BODY_RECEIPT_LIMIT];
+    NaturalBodySyntax emitted[NATURAL_BODY_RECEIPT_LIMIT];
+    size_t expected_count, emitted_count;
+    size_t source_begin, body_end, source_end;
+    int indent;
+    char *source;
+    uint8_t prefix_digest[COMMON_SHA256_DIGEST_SIZE];
+    HLSLExpressionSourceMap internal_map, map;
+    HLSLExpressionSourceMap *caller_map;
+    bool sealed;
+} HLSLNaturalStructuredBodyInventory;
 
 static bool reject(HLSLEmitterContext *ctx, int instruction, HLSLEmitReason reason) {
     hlsl_emit_fail_instruction(ctx, HLSL_EMIT_STATUS_UNSUPPORTED, reason, instruction, -1);
     return false;
+}
+
+static bool natural_model_stable(HLSLEmitterContext *ctx) {
+    if (!ctx->natural_structured_owners_guarded) return true;
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE];
+    if (hlsl_natural_structured_owned_contract_digest(ctx->program, digest) &&
+        !memcmp(digest, ctx->natural_structured_owner_digest, sizeof(digest))) return true;
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+        HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    return false;
+}
+
+static unsigned mask_width(uint8_t mask) {
+    unsigned width = 0;
+    for (unsigned lane = 0; lane < 4; ++lane)
+        if (mask & (1u << lane)) ++width;
+    return width;
+}
+
+/* A loop's scalar induction values belong to the old FLOAT4 route. Select
+ * natural mode only for a new width in a loop-free instruction stream; the
+ * subsequent closed gate still rejects every unsupported opcode or shape. */
+static bool natural_width_requested(const USILProgram *program) {
+    for (int index = 0; index < program->instruction_count; ++index)
+        if (program->instructions[index].opcode == USIL_OP_LOOP) return false;
+    for (int direction = 0; direction < 2; ++direction) {
+        const DXBCSignatureElement *fields = direction ? program->outputs : program->inputs;
+        const int count = direction ? program->output_count : program->input_count;
+        for (int index = 0; index < count; ++index)
+            if (fields[index].mask != 15) return true;
+    }
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILInstruction *instruction = &program->instructions[index];
+        if ((instruction->opcode == USIL_OP_MOV || instruction->opcode == USIL_OP_ADD ||
+             instruction->opcode == USIL_OP_MUL) && instruction->operand_count &&
+            usil_operand_destination_lane_mask(&instruction->operands[0]) != 15) return true;
+    }
+    return false;
+}
+
+static bool natural_program_features_supported(const USILProgram *program) {
+    return (program->program_type == DXBC_PROGRAM_TYPE_VERTEX ||
+        program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
+        !program->cbuffer_count && !program->texture_count && !program->sampler_count &&
+        !program->patch_constant_count;
+}
+
+static bool natural_signature_layout_supported(const USILProgram *program) {
+    for (int direction = 0; direction < 2; ++direction) {
+        const DXBCSignatureElement *fields = direction ? program->outputs : program->inputs;
+        const int count = direction ? program->output_count : program->input_count;
+        for (int index = 0; index < count; ++index) {
+            if (!hlsl_signature_semantic_storage_valid(&fields[index]) ||
+                !fields[index].mask || fields[index].mask > 15 ||
+                (fields[index].mask & (fields[index].mask + 1u)) ||
+                fields[index].register_id >= HLSL_SM5_IO_REGISTER_COUNT)
+                return false;
+            for (int previous = 0; previous < index; ++previous)
+                if (fields[previous].register_id == fields[index].register_id)
+                    return false;
+        }
+    }
+    return true;
+}
+
+static bool natural_program_supported(HLSLEmitterContext *ctx) {
+    if (!hlsl_natural_float_program_supported(ctx)) return false;
+    if (!natural_program_features_supported(ctx->program))
+        return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+    return natural_signature_layout_supported(ctx->program) ||
+        reject(ctx, -1, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+}
+
+/* Only defer the early interface rejection long enough to prepare CFG/SSA.
+ * This hint shares the program/layout gates and width classifier with the
+ * planner, but proves no joins, reaching definitions, output completeness or
+ * source syntax. Only the later complete preflight may enable an interface. */
+bool hlsl_natural_structured_candidate(const USILProgram *program) {
+    if (!program || !program->instructions || program->instruction_count < 1 ||
+        program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+        program->instruction_alloc < program->instruction_count ||
+        program->input_count < 0 || program->input_count > HLSL_SM5_IO_REGISTER_COUNT ||
+        program->input_alloc < program->input_count ||
+        (program->input_count && !program->inputs) ||
+        program->output_count < 1 || program->output_count > HLSL_SM5_IO_REGISTER_COUNT ||
+        program->output_alloc < program->output_count ||
+        !program->outputs || !program->has_stage_contract || !program->has_parsed_signature_authority ||
+        program->signature_declaration_count < 0 ||
+        program->signature_declaration_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+        !natural_program_features_supported(program) ||
+        !natural_signature_layout_supported(program) ||
+        hlsl_natural_float_program_contract(program) != HLSL_EMIT_REASON_NONE ||
+        !usil_signature_authority_is_valid(program) || !natural_width_requested(program))
+        return false;
+    unsigned conditions = 0, alternatives = 0, joins = 0;
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILOpcode opcode = program->instructions[index].opcode;
+        if (opcode == USIL_OP_IF) ++conditions;
+        else if (opcode == USIL_OP_ELSE) ++alternatives;
+        else if (opcode == USIL_OP_ENDIF) ++joins;
+    }
+    return conditions == 1u && alternatives == 1u && joins == 1u;
+}
+
+static uint8_t demanded_lanes(const HLSLEmitterContext *ctx, int instruction, int operand) {
+    USILOperandUseInfo use;
+    return usil_instruction_operand_use(ctx->program, &ctx->program->instructions[instruction],
+                operand, &use) && use.use == USIL_OPERAND_USE_SOURCE ? use.source_lane_mask : 0;
 }
 
 static int operand_variable(const HLSLEmitterContext *ctx, int instruction, int operand, int lane) {
@@ -81,6 +234,7 @@ static bool resolve_value(HLSLEmitterContext *ctx, StructuredPlan *plan, int ind
         for (int edge = 0; edge < 2; ++edge) {
             int incoming = -1;
             for (int lane = 0; lane < 4; ++lane) {
+                if (plan->natural_width && !(value->mask & (1u << lane))) continue;
                 const HLSLPhiNode *phi = value->lanes[lane];
                 if (!phi || phi->incoming_blocks[edge] != block->predecessors[edge])
                     return false;
@@ -89,13 +243,20 @@ static bool resolve_value(HLSLEmitterContext *ctx, StructuredPlan *plan, int ind
                     plan->ssa_lane[variable] != lane || plan->ssa_value[variable] < 0)
                     return false;
                 int source = plan->ssa_value[variable];
-                if ((lane && incoming != source) ||
+                if ((incoming >= 0 && incoming != source) ||
                     !hlsl_cfg_dominates(&ctx->cfg, plan->values[source].block,
                                         block->predecessors[edge]))
                     return false;
                 incoming = source;
             }
             if (!resolve_value(ctx, plan, incoming, depth + 1))
+                return false;
+            /* One natural value must own every lane on both edges. A
+             * collection of independently updated register fragments cannot
+             * supply a complete typed phi, even if its consumed lane exists. */
+            if (plan->natural_width && (!value->mask || !value->width ||
+                plan->values[incoming].mask != value->mask ||
+                plan->values[incoming].width != value->width))
                 return false;
             value->incoming[edge] = incoming;
         }
@@ -108,13 +269,17 @@ static int source_value(HLSLEmitterContext *ctx, StructuredPlan *plan, int instr
                         int lanes) {
     const DXBCOperand *source = &ctx->program->instructions[instruction].operands[operand];
     int result = -1;
-    for (int lane = 0; lane < lanes; ++lane) {
+    const uint8_t mask = plan->natural_width ? demanded_lanes(ctx, instruction, operand)
+        : (uint8_t)((1u << lanes) - 1u);
+    if (!mask) return -1;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!(mask & (1u << lane))) continue;
         int variable = operand_variable(ctx, instruction, operand, lane);
         if (variable < 0 || variable >= ctx->ssa.ssa_var_count || plan->ssa_value[variable] < 0 ||
             plan->ssa_lane[variable] != usil_operand_source_component(source, lane))
             return -1;
         int value = plan->ssa_value[variable];
-        if ((lane && result != value) ||
+        if ((result >= 0 && result != value) ||
             !hlsl_cfg_dominates(&ctx->cfg, plan->values[value].block,
                                 ctx->cfg.instruction_block[instruction]))
             return -1;
@@ -270,7 +435,8 @@ static bool is_loop_control(const CountedLoop *loop, int index) {
 }
 
 static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
-    if (!hlsl_float4_program_supported(ctx))
+    plan->natural_width = natural_width_requested(ctx->program);
+    if (!(plan->natural_width ? natural_program_supported(ctx) : hlsl_float4_program_supported(ctx)))
         return false;
     const USILProgram *program = ctx->program;
     if (!ctx->ssa.operand_ssa_vars || !ctx->ssa.block_phis || ctx->ssa.ssa_var_count < 0 ||
@@ -311,6 +477,7 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
     }
     const int return_block = ctx->cfg.instruction_block[program->instruction_count - 1];
     bool outputs[HLSL_SM5_IO_REGISTER_COUNT] = {0};
+    unsigned natural_if_count = 0, natural_else_count = 0, natural_end_count = 0;
     for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *inst = &program->instructions[index];
         if (inst->precise_mask || inst->saturate)
@@ -323,13 +490,23 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
         if (is_loop_control(&plan->loop, index))
             continue;
         if (inst->opcode == USIL_OP_NOP || inst->opcode == USIL_OP_ELSE ||
-            inst->opcode == USIL_OP_ENDIF)
+            inst->opcode == USIL_OP_ENDIF) {
+            if (plan->natural_width) {
+                if (inst->opcode == USIL_OP_ELSE) ++natural_else_count;
+                if (inst->opcode == USIL_OP_ENDIF) ++natural_end_count;
+            }
             continue;
+        }
         if (inst->opcode == USIL_OP_IF) {
             if (plan->loop.instruction >= 0)
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             if (!hlsl_cfg_if_region(ctx, index, &plan->regions[index]))
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            if (plan->natural_width && (++natural_if_count != 1 ||
+                plan->regions[index].else_instruction < 0 || inst->operand_count != 1 ||
+                (inst->condition_test != DXBC_INSTRUCTION_TEST_ZERO &&
+                 inst->condition_test != DXBC_INSTRUCTION_TEST_NONZERO)))
+                return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             int join = plan->regions[index].join_block;
             if (plan->join_if[join] >= 0)
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
@@ -340,7 +517,12 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             continue;
         }
-        if (!hlsl_float4_instruction_supported(ctx, index))
+        if (plan->natural_width &&
+            ((inst->opcode != USIL_OP_MOV && inst->opcode != USIL_OP_ADD && inst->opcode != USIL_OP_MUL) ||
+             !plain_instruction(inst)))
+            return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+        if (!(plan->natural_width ? hlsl_natural_float_instruction_supported(ctx, index)
+                                  : hlsl_float4_instruction_supported(ctx, index)))
             return false;
         const DXBCOperand *dest = &inst->operands[0];
         const int block = ctx->cfg.instruction_block[index];
@@ -351,6 +533,15 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
             if (dest->register_index < 0 || dest->register_index >= HLSL_SM5_IO_REGISTER_COUNT ||
                 !hlsl_cfg_dominates(&ctx->cfg, block, return_block))
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            if (plan->natural_width) {
+                const DXBCSignatureElement *field = NULL;
+                for (int output = 0; output < program->output_count; ++output)
+                    if (program->outputs[output].register_id == (uint32_t)dest->register_index)
+                        field = &program->outputs[output];
+                if (!field || outputs[dest->register_index] ||
+                    usil_operand_destination_lane_mask(dest) != field->mask)
+                    return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            }
             outputs[dest->register_index] = true;
             continue;
         }
@@ -359,12 +550,18 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
         value->instruction = index;
         value->block = block;
         value->register_index = dest->register_index;
+        value->mask = usil_operand_destination_lane_mask(dest);
+        value->width = (uint8_t)mask_width(value->mask);
         snprintf(value->name, sizeof(value->name), "dxbc_value_i%d", index);
         plan->instruction_value[index] = value_index;
-        for (int lane = 0; lane < 4; ++lane)
+        for (int lane = 0; lane < 4; ++lane) {
+            if (plan->natural_width && !(value->mask & (1u << lane))) continue;
             if (!map_variable(ctx, plan, operand_variable(ctx, index, 0, lane), value_index, lane))
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+        }
     }
+    if (plan->natural_width && (natural_if_count != 1 || natural_else_count != 1 || natural_end_count != 1))
+        return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
     for (int index = 0; index < program->output_count; ++index)
         if (program->outputs[index].register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
             !outputs[program->outputs[index].register_id])
@@ -397,6 +594,8 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
                 !map_variable(ctx, plan, phi->ssa_var, value_index, phi->component))
                 return reject(ctx, -1, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
             value->lanes[phi->component] = phi;
+            value->mask |= (uint8_t)(1u << phi->component);
+            value->width = (uint8_t)mask_width(value->mask);
         }
     }
     /* Resolve only actually read phi vectors. Unpruned SSA can contain a dead
@@ -414,6 +613,35 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
     return true;
 }
 
+/* The entry interface is chosen before source emission. Borrow the already
+ * prepared CFG/SSA through a separate diagnostic/builder context, so a
+ * rejected new shape cannot poison the established emission route. No
+ * borrowed analysis state is freed or modified by the planner. */
+bool hlsl_natural_structured_preflight(HLSLEmitterContext *ctx) {
+    if (!ctx || !ctx->program || !ctx->program->instructions ||
+        ctx->program->instruction_count < 1 ||
+        ctx->program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
+        !ctx->cfg.blocks || !ctx->cfg.instruction_block ||
+        !ctx->ssa.operand_ssa_vars || !ctx->ssa.block_phis)
+        return false;
+    HLSLEmitterContext *scratch = malloc(sizeof(*scratch));
+    if (!scratch) return false;
+    *scratch = *ctx;
+    HLSLEmitDiagnostic diagnostic;
+    hlsl_emit_diagnostic_init(&diagnostic);
+    StringBuilder output;
+    sb_init(&output);
+    scratch->diagnostic = &diagnostic;
+    scratch->sb = &output;
+    StructuredPlan plan = {0};
+    const bool supported = build_plan(scratch, &plan) && plan.natural_width;
+    free(plan.ssa_value);
+    free(plan.ssa_lane);
+    sb_free(&output);
+    free(scratch);
+    return supported;
+}
+
 static ASTExpr *input_expression(HLSLEmitterContext *ctx, const DXBCOperand *source, int lanes) {
     if (lanes == 4)
         return hlsl_float4_source_atom(ctx, source);
@@ -425,14 +653,189 @@ static ASTExpr *input_expression(HLSLEmitterContext *ctx, const DXBCOperand *sou
     return value;
 }
 
+static ASTExpr *planned_value_expression(HLSLEmitterContext *ctx,
+    const StructuredPlan *plan, int value_index) {
+    if (value_index < 0 || value_index >= plan->value_count) return NULL;
+    const StructuredValue *planned = &plan->values[value_index];
+    ASTExpr *value = ast_create_var(planned->instruction, planned->register_index,
+        OPERAND_TYPE_TEMP, planned->name);
+    if (!value) return NULL;
+    if (planned->instruction >= 0)
+        return hlsl_instruction_logical_expression(ctx, value, planned->instruction,
+            planned->mask, planned->width);
+    if (planned->resolution != 2 || !planned->mask || !planned->width) {
+        ast_free_expr(value);
+        return NULL;
+    }
+    /* The closed FLOAT32 operation/source contract and both complete incoming
+     * tuples prove this value. Its identity is the planned phi, rather than
+     * its physical register or an invented source instruction. */
+    ASTLogicalValueOrigin origin;
+    ast_logical_value_origin_init(&origin);
+    origin.complete = true;
+    origin.scalar_type = AST_SCALAR_FLOAT32;
+    origin.components = planned->width;
+    origin.logical_value_id = STRUCTURED_PHI_LOGICAL_ID_BASE | (uint64_t)value_index;
+    if (!ast_set_logical_value_origin(value, &origin)) {
+        ast_free_expr(value);
+        return NULL;
+    }
+    return value;
+}
+
+static bool structured_expression_span(void *context, const ASTExpr *expression,
+    size_t begin, size_t end) {
+    HLSLEmitterContext *ctx = context;
+    return hlsl_stage_coverage_span(ctx->stage_coverage, expression, begin, end);
+}
+
+static void format_structured_expression(HLSLEmitterContext *ctx, const StructuredPlan *plan,
+    const ASTExpr *expression) {
+    if (plan->natural_width)
+        ast_format_expr_traced(expression, ctx->sb, structured_expression_span, ctx);
+    else
+        ast_format_expr(expression, ctx->sb);
+}
+
+static const char *natural_type(unsigned width) {
+    static const char *const types[] = {NULL, "float", "float2", "float3", "float4"};
+    return width > 0 && width < sizeof(types) / sizeof(types[0]) ? types[width] : NULL;
+}
+
+static NaturalBodySyntax body_syntax(const HLSLEmitterContext *ctx,
+    NaturalBodySyntaxKind kind, int instruction, int value, int incoming,
+    int edge, uint8_t mask, uint8_t width) {
+    NaturalBodySyntax result = {0};
+    result.kind = kind;
+    result.instruction = instruction;
+    result.source_instruction = ctx->program->instructions[instruction].source_instruction_index;
+    result.value = value;
+    result.incoming = incoming;
+    result.edge = edge;
+    result.mask = mask;
+    result.width = width;
+    return result;
+}
+
+static bool body_syntax_owners_equal(const NaturalBodySyntax *a, const NaturalBodySyntax *b) {
+    return a->kind == b->kind && a->instruction == b->instruction &&
+        a->source_instruction == b->source_instruction && a->value == b->value &&
+        a->incoming == b->incoming && a->edge == b->edge &&
+        a->mask == b->mask && a->width == b->width;
+}
+
+static bool body_expect(HLSLNaturalStructuredBodyInventory *inventory, NaturalBodySyntax syntax) {
+    if (inventory->expected_count >= (size_t)NATURAL_BODY_RECEIPT_LIMIT) return false;
+    inventory->expected[inventory->expected_count++] = syntax;
+    return true;
+}
+
+static int phi_predecessor_edge(const HLSLEmitterContext *ctx, int join, int predecessor) {
+    const HLSLBasicBlock *block = &ctx->cfg.blocks[join];
+    for (int edge = 0; edge < block->predecessor_count; ++edge)
+        if (block->predecessors[edge] == predecessor) return edge;
+    return -1;
+}
+
+static bool body_expect_phi(HLSLEmitterContext *ctx, const StructuredPlan *plan,
+    HLSLNaturalStructuredBodyInventory *inventory, int instruction, int join, int edge) {
+    if (edge < -1 || edge > 1) return false;
+    for (int index = 0; index < plan->value_count; ++index) {
+        const StructuredValue *value = &plan->values[index];
+        if (value->instruction >= 0 || value->block != join || value->resolution != 2) continue;
+        if (!value->mask || value->width != mask_width(value->mask) ||
+            !body_expect(inventory, body_syntax(ctx,
+                edge < 0 ? NATURAL_BODY_PHI_DECLARATION : NATURAL_BODY_PHI_EDGE,
+                instruction, index, edge < 0 ? -1 : value->incoming[edge], edge,
+                value->mask, value->width))) return false;
+    }
+    return true;
+}
+
+/* This enumeration uses only proved CFG/SSA owners. It neither observes the
+ * output builder nor shares the emitter's append counters/ranges. */
+static bool body_expected_inventory(HLSLEmitterContext *ctx, const StructuredPlan *plan,
+    HLSLNaturalStructuredBodyInventory *inventory) {
+    if (!plan->natural_width || inventory->expected_count || inventory->emitted_count) return false;
+    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+        const USILInstruction *instruction = &ctx->program->instructions[index];
+        if (instruction->opcode == USIL_OP_NOP) continue;
+        NaturalBodySyntaxKind kind;
+        int value = -1;
+        uint8_t mask = 0, width = 0;
+        if (instruction->opcode == USIL_OP_IF) {
+            if (!body_expect_phi(ctx, plan, inventory, index, plan->regions[index].join_block, -1))
+                return false;
+            kind = NATURAL_BODY_IF;
+        } else if (instruction->opcode == USIL_OP_ELSE || instruction->opcode == USIL_OP_ENDIF) {
+            const HLSLInstructionFlow *flow = &ctx->cfg.instruction_flow[index];
+            const int header = instruction->opcode == USIL_OP_ENDIF ? flow->jump_scope
+                : ctx->cfg.instruction_flow[flow->end].jump_scope;
+            const int join = plan->regions[header].join_block;
+            const int edge = phi_predecessor_edge(ctx, join, ctx->cfg.instruction_block[index]);
+            if (edge < 0 || !body_expect_phi(ctx, plan, inventory, index, join, edge)) return false;
+            kind = instruction->opcode == USIL_OP_ELSE ? NATURAL_BODY_ELSE : NATURAL_BODY_ENDIF;
+        } else if (instruction->opcode == USIL_OP_RET) {
+            kind = NATURAL_BODY_RETURN;
+        } else {
+            const DXBCOperand *destination = &instruction->operands[0];
+            kind = destination->type == OPERAND_TYPE_TEMP ? NATURAL_BODY_TEMP_ASSIGNMENT
+                : NATURAL_BODY_OUTPUT_ASSIGNMENT;
+            value = plan->instruction_value[index];
+            mask = usil_operand_destination_lane_mask(destination);
+            width = (uint8_t)mask_width(mask);
+        }
+        if (!body_expect(inventory, body_syntax(ctx, kind, index, value, -1, -1, mask, width)))
+            return false;
+    }
+    return inventory->expected_count > 0 &&
+        inventory->expected[inventory->expected_count - 1].kind == NATURAL_BODY_RETURN;
+}
+
+static bool body_record(HLSLNaturalStructuredBodyInventory *inventory,
+    NaturalBodySyntax syntax, size_t begin, size_t end, size_t expression_begin,
+    size_t expression_end) {
+    if (!inventory) return true; /* Established FLOAT4/loop spelling. */
+    if (inventory->sealed || inventory->emitted_count >= inventory->expected_count ||
+        !body_syntax_owners_equal(&syntax, &inventory->expected[inventory->emitted_count]) ||
+        begin >= end || end < inventory->source_begin ||
+        end - inventory->source_begin > (size_t)NATURAL_BODY_BYTE_LIMIT ||
+        begin != (inventory->emitted_count
+            ? inventory->emitted[inventory->emitted_count - 1].end : inventory->source_begin) ||
+        ((expression_begin || expression_end) &&
+            (expression_begin < begin || expression_begin >= expression_end || expression_end > end)))
+        return false;
+    syntax.begin = begin;
+    syntax.end = end;
+    syntax.expression_begin = expression_begin;
+    syntax.expression_end = expression_end;
+    inventory->emitted[inventory->emitted_count++] = syntax;
+    return true;
+}
+
+static bool body_map_equal(const HLSLExpressionSourceMap *a, const HLSLExpressionSourceMap *b) {
+    if (!a || !b || a->count != b->count || a->complete != b->complete) return false;
+    for (size_t index = 0; index < HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT; ++index)
+        if (!hlsl_expression_origins_equal(&a->origins[index], &b->origins[index])) return false;
+    return true;
+}
+
 static ASTExpr *source_expression(HLSLEmitterContext *ctx, StructuredPlan *plan, int index,
                                   int operand, int lanes) {
     const DXBCOperand *source = &ctx->program->instructions[index].operands[operand];
-    if (source->type != OPERAND_TYPE_TEMP)
+    if (source->type != OPERAND_TYPE_TEMP) {
+        if (plan->natural_width)
+            return hlsl_natural_source_atom(ctx, index, operand, demanded_lanes(ctx, index, operand));
         return input_expression(ctx, source, lanes);
+    }
     int value_index = source_value(ctx, plan, index, operand, lanes);
     if (value_index < 0)
         return NULL;
+    if (plan->natural_width) {
+        ASTExpr *value = planned_value_expression(ctx, plan, value_index);
+        return hlsl_project_logical_temp(ctx, value, plan->values[value_index].mask,
+            plan->values[value_index].width, source, demanded_lanes(ctx, index, operand), index);
+    }
     ASTExpr *value = ast_create_var(-1, source->register_index, OPERAND_TYPE_TEMP,
                                     plan->values[value_index].name);
     int components[4];
@@ -450,7 +853,7 @@ static ASTExpr *source_expression(HLSLEmitterContext *ctx, StructuredPlan *plan,
 }
 
 static bool emit_phi_edge(HLSLEmitterContext *ctx, const StructuredPlan *plan, int join,
-                          int predecessor) {
+                          int predecessor, HLSLNaturalStructuredBodyInventory *inventory) {
     const HLSLBasicBlock *block = &ctx->cfg.blocks[join];
     int edge = 0;
     while (edge < block->predecessor_count && block->predecessors[edge] != predecessor)
@@ -463,7 +866,28 @@ static bool emit_phi_edge(HLSLEmitterContext *ctx, const StructuredPlan *plan, i
             continue;
         if (edge >= 2)
             return false;
+        const size_t statement_begin = ctx->sb->len;
         sb_append_spaces(ctx->sb, ctx->indent);
+        if (plan->natural_width) {
+            const int instruction = ctx->current_instruction_index;
+            ASTExpr *incoming = planned_value_expression(ctx, plan, value->incoming[edge]);
+            if (!incoming || !hlsl_source_quality_observe_expression(ctx, incoming, instruction)) {
+                ast_free_expr(incoming);
+                return false;
+            }
+            sb_appendf(ctx->sb, "%s = ", value->name);
+            const size_t expression_begin = ctx->sb->len;
+            format_structured_expression(ctx, plan, incoming);
+            const size_t expression_end = ctx->sb->len;
+            ast_free_expr(incoming);
+            sb_append(ctx->sb, ";\n");
+            hlsl_source_quality_emission(ctx, 0, false, instruction);
+            if (!natural_model_stable(ctx) || !sb_ok(ctx->sb) ||
+                !body_record(inventory, body_syntax(ctx, NATURAL_BODY_PHI_EDGE,
+                    instruction, index, value->incoming[edge], edge, value->mask, value->width),
+                    statement_begin, ctx->sb->len, expression_begin, expression_end)) return false;
+            continue;
+        }
         sb_appendf(ctx->sb, "%s = %s;\n", value->name, plan->values[value->incoming[edge]].name);
     }
     return sb_ok(ctx->sb);
@@ -506,20 +930,19 @@ static bool emit_counted_loop_begin(HLSLEmitterContext *ctx, StructuredPlan *pla
     return sb_ok(ctx->sb);
 }
 
-bool emit_high_level_structured(HLSLEmitterContext *ctx) {
-    StructuredPlan plan = {0};
+static bool emit_structured_plan(HLSLEmitterContext *ctx, StructuredPlan *plan,
+    HLSLNaturalStructuredBodyInventory *inventory) {
     bool success = false;
     const int initial_indent = ctx->indent;
-    if (!build_plan(ctx, &plan))
-        goto cleanup;
     hlsl_expression_source_map_begin(ctx);
     for (int index = 0; index < ctx->program->instruction_count; ++index) {
+        if (!natural_model_stable(ctx)) goto cleanup;
         const USILInstruction *inst = &ctx->program->instructions[index];
         ctx->current_instruction_index = index;
         if (inst->opcode == USIL_OP_NOP || inst->opcode == USIL_OP_RET)
             continue;
         size_t begin = ctx->sb->len, end = begin;
-        const CountedLoop *loop = &plan.loop;
+        const CountedLoop *loop = &plan->loop;
         if (is_loop_control(loop, index)) {
             if (index == loop->comparison || index == loop->test || index == loop->increment)
                 continue; /* Their operation is represented in the for header. */
@@ -528,7 +951,7 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
                 sb_appendf(ctx->sb, "const uint dxbc_initial_i%d = %" PRIu32 "u;\n", index,
                            loop->initial_bits);
             } else if (index == loop->instruction) {
-                if (!emit_counted_loop_begin(ctx, &plan))
+                if (!emit_counted_loop_begin(ctx, plan))
                     goto cleanup;
                 if (ctx->expression_source_map) {
                     const int folded[] = {loop->comparison, loop->test, loop->increment};
@@ -541,27 +964,50 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
                     }
                 }
             } else {
-                if (!emit_phi_edge(ctx, &plan, loop->body_block, loop->latch_block))
+                if (!emit_phi_edge(ctx, plan, loop->body_block, loop->latch_block, inventory))
                     goto cleanup;
                 ctx->indent -= 4;
                 sb_append_spaces(ctx->sb, ctx->indent);
                 sb_append(ctx->sb, "}\n");
             }
         } else if (inst->opcode == USIL_OP_IF) {
-            const HLSLIfRegion *region = &plan.regions[index];
-            for (int item = 0; item < plan.value_count; ++item) {
-                const StructuredValue *value = &plan.values[item];
+            const HLSLIfRegion *region = &plan->regions[index];
+            for (int item = 0; item < plan->value_count; ++item) {
+                const StructuredValue *value = &plan->values[item];
                 if (value->instruction < 0 && value->block == region->join_block &&
                     value->resolution == 2) {
+                    const size_t declaration_begin = ctx->sb->len;
                     sb_append_spaces(ctx->sb, ctx->indent);
-                    sb_appendf(ctx->sb, "float4 %s;\n", value->name);
+                    sb_appendf(ctx->sb, "%s %s;\n",
+                        plan->natural_width ? natural_type(value->width) : "float4", value->name);
+                    if (plan->natural_width) hlsl_source_quality_emission(ctx, 0, false, index);
+                    if (!natural_model_stable(ctx) ||
+                        !body_record(inventory, body_syntax(ctx, NATURAL_BODY_PHI_DECLARATION,
+                            index, item, -1, -1, value->mask, value->width),
+                            declaration_begin, ctx->sb->len, 0, 0)) goto cleanup;
                 }
             }
-            ASTExpr *condition = source_expression(ctx, &plan, index, 0, 1);
+            const size_t control_begin = ctx->sb->len;
+            ASTExpr *condition = source_expression(ctx, plan, index, 0, 1);
             ASTExpr *bits = ast_create_bitcast(AST_SCALAR_UINT32, condition);
             if (!bits) {
                 ast_free_expr(condition);
                 goto cleanup;
+            }
+            if (plan->natural_width) {
+                ASTLogicalValueOrigin origin;
+                ast_logical_value_origin_init(&origin);
+                origin.complete = true;
+                origin.scalar_type = AST_SCALAR_UINT32;
+                origin.components = 1;
+                origin.logical_value_id = (uint64_t)index;
+                origin.instruction_index = index;
+                origin.source_instruction_index = inst->source_instruction_index;
+                origin.program_bitcast = true;
+                if (!ast_set_logical_value_origin(bits, &origin)) {
+                    ast_free_expr(bits);
+                    goto cleanup;
+                }
             }
             sb_append_spaces(ctx->sb, ctx->indent);
             sb_append(ctx->sb, inst->condition_test == DXBC_INSTRUCTION_TEST_NONZERO
@@ -571,18 +1017,30 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
                 ast_free_expr(bits);
                 goto cleanup;
             }
-            ast_format_expr(bits, ctx->sb);
+            if (!natural_model_stable(ctx)) {
+                ast_free_expr(bits);
+                goto cleanup;
+            }
+            const size_t expression_begin = ctx->sb->len;
+            format_structured_expression(ctx, plan, bits);
+            const size_t expression_end = ctx->sb->len;
             ast_free_expr(bits);
             sb_append(ctx->sb, ") {\n");
+            if (plan->natural_width) hlsl_source_quality_emission(ctx, 0, false, index);
+            if (!natural_model_stable(ctx) ||
+                !body_record(inventory, body_syntax(ctx, NATURAL_BODY_IF,
+                    index, -1, -1, -1, 0, 0), control_begin, ctx->sb->len,
+                    expression_begin, expression_end)) goto cleanup;
             ctx->indent += 4;
         } else if (inst->opcode == USIL_OP_ELSE || inst->opcode == USIL_OP_ENDIF) {
             const HLSLInstructionFlow *flow = &ctx->cfg.instruction_flow[index];
             const int header = inst->opcode == USIL_OP_ENDIF
                                    ? flow->jump_scope
                                    : ctx->cfg.instruction_flow[flow->end].jump_scope;
-            const HLSLIfRegion *region = &plan.regions[header];
-            if (!emit_phi_edge(ctx, &plan, region->join_block, ctx->cfg.instruction_block[index]))
+            const HLSLIfRegion *region = &plan->regions[header];
+            if (!emit_phi_edge(ctx, plan, region->join_block, ctx->cfg.instruction_block[index], inventory))
                 goto cleanup;
+            const size_t control_begin = ctx->sb->len;
             ctx->indent -= 4;
             sb_append_spaces(ctx->sb, ctx->indent);
             if (inst->opcode == USIL_OP_ELSE) {
@@ -591,7 +1049,7 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
             } else if (region->else_instruction < 0) {
                 sb_append(ctx->sb, "} else {\n");
                 ctx->indent += 4;
-                if (!emit_phi_edge(ctx, &plan, region->join_block, region->header_block))
+                if (!emit_phi_edge(ctx, plan, region->join_block, region->header_block, inventory))
                     goto cleanup;
                 ctx->indent -= 4;
                 sb_append_spaces(ctx->sb, ctx->indent);
@@ -599,18 +1057,25 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
             } else {
                 sb_append(ctx->sb, "}\n");
             }
+            if (plan->natural_width) hlsl_source_quality_emission(ctx, 0, false, index);
+            if (!natural_model_stable(ctx) ||
+                !body_record(inventory, body_syntax(ctx,
+                    inst->opcode == USIL_OP_ELSE ? NATURAL_BODY_ELSE : NATURAL_BODY_ENDIF,
+                    index, -1, -1, -1, 0, 0), control_begin, ctx->sb->len, 0, 0)) goto cleanup;
         } else {
-            ASTExpr *left = source_expression(ctx, &plan, index, 1, 4);
+            const size_t statement_begin = ctx->sb->len;
+            ASTExpr *left = source_expression(ctx, plan, index, 1, 4);
             ASTExpr *right =
-                inst->opcode == USIL_OP_MOV ? NULL : source_expression(ctx, &plan, index, 2, 4);
+                inst->opcode == USIL_OP_MOV ? NULL : source_expression(ctx, plan, index, 2, 4);
             ASTExpr *expression = hlsl_float4_operation(ctx, index, left, right);
             if (!expression)
                 goto cleanup;
             sb_append_spaces(ctx->sb, ctx->indent);
             const DXBCOperand *destination = &inst->operands[0];
             if (destination->type == OPERAND_TYPE_TEMP) {
-                sb_appendf(ctx->sb, "const float4 %s",
-                           plan.values[plan.instruction_value[index]].name);
+                sb_appendf(ctx->sb, "const %s %s",
+                           plan->natural_width ? natural_type(plan->values[plan->instruction_value[index]].width) : "float4",
+                           plan->values[plan->instruction_value[index]].name);
             } else if (!hlsl_float4_append_output(ctx, destination)) {
                 ast_free_expr(expression);
                 goto cleanup;
@@ -621,10 +1086,25 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
                 ast_free_expr(expression);
                 goto cleanup;
             }
-            ast_format_expr(expression, ctx->sb);
+            if (!natural_model_stable(ctx)) {
+                ast_free_expr(expression);
+                goto cleanup;
+            }
+            format_structured_expression(ctx, plan, expression);
             end = ctx->sb->len;
             ast_free_expr(expression);
             sb_append(ctx->sb, ";\n");
+            if (plan->natural_width) hlsl_source_quality_emission(ctx,
+                destination->type == OPERAND_TYPE_OUTPUT && !ctx->high_level_interface
+                    ? HLSL_SOURCE_ARTIFACT_REGISTER_STORAGE : 0, false, index);
+            if (!natural_model_stable(ctx) ||
+                !body_record(inventory, body_syntax(ctx,
+                    destination->type == OPERAND_TYPE_TEMP ? NATURAL_BODY_TEMP_ASSIGNMENT
+                        : NATURAL_BODY_OUTPUT_ASSIGNMENT,
+                    index, plan->instruction_value[index], -1, -1,
+                    usil_operand_destination_lane_mask(destination),
+                    (uint8_t)mask_width(usil_operand_destination_lane_mask(destination))),
+                    statement_begin, ctx->sb->len, begin, end)) goto cleanup;
         }
         if (ctx->expression_source_map) {
             HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[index];
@@ -643,7 +1123,193 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
     success = ctx->indent == initial_indent && sb_ok(ctx->sb);
 cleanup:
     ctx->indent = initial_indent;
+    return success;
+}
+
+bool emit_high_level_structured(HLSLEmitterContext *ctx) {
+    StructuredPlan plan = {0};
+    HLSLNaturalStructuredBodyInventory *inventory = NULL;
+    bool success = false;
+    if (!natural_model_stable(ctx) || !build_plan(ctx, &plan)) goto cleanup;
+    if (plan.natural_width) {
+        if (!ctx->natural_structured_owners_guarded || ctx->natural_structured_body_inventory)
+            goto cleanup;
+        inventory = calloc(1, sizeof(*inventory));
+        if (!inventory) goto cleanup;
+        inventory->source_begin = ctx->sb->len;
+        inventory->indent = ctx->indent;
+        inventory->caller_map = ctx->expression_source_map;
+        common_sha256(ctx->sb->buf, inventory->source_begin, inventory->prefix_digest);
+        if (!body_expected_inventory(ctx, &plan, inventory)) goto cleanup;
+        ctx->natural_structured_body_inventory = inventory;
+        if (!ctx->expression_source_map) ctx->expression_source_map = &inventory->internal_map;
+    }
+    if (!emit_structured_plan(ctx, &plan, inventory)) goto cleanup;
+    if (inventory) {
+        inventory->body_end = ctx->sb->len;
+        const size_t length = inventory->body_end - inventory->source_begin;
+        if (!length || length > (size_t)NATURAL_BODY_BYTE_LIMIT ||
+            inventory->emitted_count + 1u != inventory->expected_count) goto cleanup;
+        inventory->source = malloc(length);
+        if (!inventory->source) goto cleanup;
+        memcpy(inventory->source, ctx->sb->buf + inventory->source_begin, length);
+        inventory->map = *ctx->expression_source_map;
+    }
+    success = sb_ok(ctx->sb);
+cleanup:
     free(plan.ssa_value);
     free(plan.ssa_lane);
+    if (!success && ctx->natural_structured_owners_guarded) {
+        /* The new route must never return a partly owned body. Model drift is
+         * detected before borrowing analysis or reading the next instruction. */
+        natural_model_stable(ctx);
+        hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+            HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    }
+    if (inventory && ctx->natural_structured_body_inventory != inventory) free(inventory);
     return success;
+}
+
+static bool body_prefix_matches(const HLSLEmitterContext *ctx,
+    const HLSLNaturalStructuredBodyInventory *inventory) {
+    if (!ctx->sb || !sb_ok(ctx->sb) || !ctx->sb->buf || ctx->sb->len < inventory->source_begin)
+        return false;
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE];
+    common_sha256(ctx->sb->buf, inventory->source_begin, digest);
+    return !memcmp(digest, inventory->prefix_digest, sizeof(digest));
+}
+
+static bool body_receipts_equal(const HLSLNaturalStructuredBodyInventory *a,
+    const HLSLNaturalStructuredBodyInventory *b, size_t offset) {
+    if (a->expected_count != b->expected_count || a->emitted_count != a->expected_count ||
+        b->emitted_count != b->expected_count) return false;
+    for (size_t index = 0; index < a->expected_count; ++index) {
+        const NaturalBodySyntax *left = &a->emitted[index], *right = &b->emitted[index];
+        if (!body_syntax_owners_equal(&a->expected[index], &b->expected[index]) ||
+            !body_syntax_owners_equal(left, right) ||
+            left->begin != right->begin + offset || left->end != right->end + offset ||
+            left->expression_begin != (right->expression_begin ? right->expression_begin + offset : 0) ||
+            left->expression_end != (right->expression_end ? right->expression_end + offset : 0))
+            return false;
+    }
+    return true;
+}
+
+/* Complete the same ordinary return path and its final RET raw map owner.
+ * The outer emitter uses these exact offsets; no source token is searched. */
+static bool body_record_return(HLSLEmitterContext *ctx,
+    HLSLNaturalStructuredBodyInventory *inventory, size_t begin) {
+    const int instruction = ctx->program->instruction_count - 1;
+    if (!ctx->expression_source_map || !ctx->expression_source_map->count ||
+        ctx->program->instructions[instruction].opcode != USIL_OP_RET ||
+        !body_record(inventory, body_syntax(ctx, NATURAL_BODY_RETURN,
+            instruction, -1, -1, -1, 0, 0), begin, ctx->sb->len, 0, 0)) return false;
+    HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[instruction];
+    origin->source_begin = begin;
+    origin->source_end = ctx->sb->len;
+    ctx->expression_source_map->complete = sb_ok(ctx->sb);
+    return true;
+}
+
+static bool body_replay(HLSLEmitterContext *ctx,
+    const HLSLNaturalStructuredBodyInventory *inventory) {
+    HLSLEmitterContext *scratch = malloc(sizeof(*scratch));
+    HLSLNaturalStructuredBodyInventory *replay = calloc(1, sizeof(*replay));
+    if (!scratch || !replay) {
+        free(scratch);
+        free(replay);
+        return false;
+    }
+    *scratch = *ctx;
+    HLSLEmitDiagnostic diagnostic;
+    hlsl_emit_diagnostic_init(&diagnostic);
+    StringBuilder output;
+    sb_init(&output);
+    scratch->diagnostic = &diagnostic;
+    scratch->sb = &output;
+    scratch->indent = inventory->indent;
+    scratch->expression_source_map = &replay->internal_map;
+    scratch->natural_structured_body_inventory = NULL;
+    scratch->natural_structured_owners_guarded = false;
+    scratch->source_quality_analysis = NULL;
+    scratch->source_quality_root = NULL;
+    scratch->source_quality_forward_observer = NULL;
+    scratch->source_quality_forward_observer_context = NULL;
+    scratch->matrix_use_capture = NULL;
+    scratch->stage_coverage = NULL;
+    StructuredPlan plan = {0};
+    bool success = build_plan(scratch, &plan) && plan.natural_width &&
+        body_expected_inventory(scratch, &plan, replay) &&
+        emit_structured_plan(scratch, &plan, replay);
+    if (success) {
+        replay->body_end = output.len;
+        emit_return_block(scratch);
+        success = sb_ok(&output) && body_record_return(scratch, replay, replay->body_end) &&
+            output.len == inventory->source_end - inventory->source_begin &&
+            replay->body_end == inventory->body_end - inventory->source_begin &&
+            !memcmp(output.buf, inventory->source, output.len) &&
+            body_receipts_equal(inventory, replay, inventory->source_begin) &&
+            hlsl_expression_source_map_offset(scratch->expression_source_map, inventory->source_begin) &&
+            body_map_equal(&inventory->map, scratch->expression_source_map);
+    }
+    free(plan.ssa_value);
+    free(plan.ssa_lane);
+    sb_free(&output);
+    free(replay);
+    free(scratch);
+    return success;
+}
+
+bool hlsl_natural_structured_body_inventory_complete(HLSLEmitterContext *ctx) {
+    if (!ctx || !ctx->natural_structured_owners_guarded || !natural_model_stable(ctx)) return false;
+    HLSLNaturalStructuredBodyInventory *inventory = ctx->natural_structured_body_inventory;
+    if (!inventory || !inventory->source || !ctx->expression_source_map ||
+        !body_prefix_matches(ctx, inventory) || inventory->body_end < inventory->source_begin ||
+        ctx->sb->len <= inventory->body_end ||
+        ctx->sb->len - inventory->source_begin > (size_t)NATURAL_BODY_BYTE_LIMIT) return false;
+    if (inventory->sealed) return hlsl_natural_structured_body_inventory_matches(ctx);
+    const size_t body_length = inventory->body_end - inventory->source_begin;
+    if (memcmp(inventory->source, ctx->sb->buf + inventory->source_begin, body_length) ||
+        inventory->emitted_count + 1u != inventory->expected_count) return false;
+    /* The body's map is held before return callbacks. Only the final RET
+     * range/complete flag is legitimately added by the outer return path. */
+    for (size_t index = 0; index + 1u < inventory->map.count; ++index)
+        if (!hlsl_expression_origins_equal(&inventory->map.origins[index],
+            &ctx->expression_source_map->origins[index])) return false;
+    const size_t length = ctx->sb->len - inventory->source_begin;
+    char *source = realloc(inventory->source, length);
+    if (!source) return false;
+    inventory->source = source;
+    memcpy(source + body_length, ctx->sb->buf + inventory->body_end, length - body_length);
+    inventory->source_end = ctx->sb->len;
+    /* Do not repair the caller's map: the outer path already appended this
+     * RET owner, and an observer changing it must fail independent replay. */
+    const int instruction = ctx->program->instruction_count - 1;
+    if (!body_record(inventory, body_syntax(ctx, NATURAL_BODY_RETURN,
+        instruction, -1, -1, -1, 0, 0), inventory->body_end, inventory->source_end, 0, 0)) return false;
+    inventory->map = *ctx->expression_source_map;
+    if (!inventory->map.complete || !hlsl_expression_source_map_matches(&inventory->map,
+        ctx->program, ctx->sb->buf) || !body_replay(ctx, inventory)) return false;
+    inventory->sealed = true;
+    return true;
+}
+
+bool hlsl_natural_structured_body_inventory_matches(HLSLEmitterContext *ctx) {
+    const HLSLNaturalStructuredBodyInventory *inventory = ctx ? ctx->natural_structured_body_inventory : NULL;
+    return inventory && inventory->sealed && inventory->source &&
+        inventory->source_end > inventory->source_begin &&
+        ctx->sb->len == inventory->source_end && body_prefix_matches(ctx, inventory) &&
+        !memcmp(ctx->sb->buf + inventory->source_begin, inventory->source,
+            inventory->source_end - inventory->source_begin) &&
+        body_map_equal(ctx->expression_source_map, &inventory->map) && natural_model_stable(ctx);
+}
+
+void hlsl_natural_structured_body_inventory_dispose(HLSLEmitterContext *ctx) {
+    if (!ctx || !ctx->natural_structured_body_inventory) return;
+    HLSLNaturalStructuredBodyInventory *inventory = ctx->natural_structured_body_inventory;
+    if (ctx->expression_source_map == &inventory->internal_map)
+        ctx->expression_source_map = inventory->caller_map;
+    free(inventory->source);
+    free(inventory);
+    ctx->natural_structured_body_inventory = NULL;
 }

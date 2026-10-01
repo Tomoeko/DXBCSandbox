@@ -241,6 +241,8 @@ typedef bool HLSLTempLaneFlags[4];
 typedef uint8_t HLSLTempLaneStorage[4];
 typedef int HLSLRegisterPermutation[4];
 
+struct HLSLNaturalStructuredBodyInventory;
+
 /* At most two pure two-MUL signatures: the product precedes or follows the
  * scale in the outer operation. A group is emitted only for repeated uses. */
 typedef struct {
@@ -281,6 +283,9 @@ typedef struct HLSLEmitterContext {
     HLSLDomainOutputPlan domain_output_plan;
     size_t domain_output_return_begin;
     uint8_t domain_owner_digest[32];
+    bool natural_structured_owners_guarded;
+    uint8_t natural_structured_owner_digest[32];
+    struct HLSLNaturalStructuredBodyInventory *natural_structured_body_inventory;
     char high_level_domain_point_type[96];
     char high_level_domain_factors_type[96];
     char high_level_domain_factors_variable[96];
@@ -612,6 +617,19 @@ ASTExpr *hlsl_float4_function_call(HLSLEmitterContext *ctx, int instruction);
 bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
                                      unsigned uses[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT]);
 bool emit_high_level_structured(HLSLEmitterContext *ctx);
+/* A bounded parsed natural-width IF hint can defer the early multi-output
+ * rejection. Only the complete post-analysis preflight grants admission. */
+bool hlsl_natural_structured_candidate(const USILProgram *program);
+/* Reuses the complete natural-width plan over already prepared CFG/SSA without
+ * emitting text, changing diagnostics, or notifying quality observers. */
+bool hlsl_natural_structured_preflight(HLSLEmitterContext *ctx);
+/* The natural structured producer retains and independently replays its actual
+ * body, return syntax and instruction map. The final check needs no analysis
+ * state and runs after the last quality callback, before owned disposal. */
+bool hlsl_natural_structured_body_inventory_complete(HLSLEmitterContext *ctx);
+bool hlsl_natural_structured_body_inventory_matches(HLSLEmitterContext *ctx);
+void hlsl_natural_structured_body_inventory_dispose(HLSLEmitterContext *ctx);
+bool hlsl_signature_semantic_storage_valid(const DXBCSignatureElement *element);
 void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx);
 /* Shared closed float4 contracts and compiler inverse AST construction. */
 bool hlsl_lift_operand_is_plain(const DXBCOperand *value);
@@ -624,6 +642,21 @@ ASTExpr *hlsl_float4_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *sou
 /* Consumes both children on success and failure. MOV expects a NULL right. */
 ASTExpr *hlsl_float4_operation(HLSLEmitterContext *ctx, int instruction, ASTExpr *left,
                               ASTExpr *right);
+
+/* Shared natural-width atoms and physical-lane projection. Structured callers
+ * retain their own closed opcode/control-flow gate and prove that every TEMP
+ * lane belongs to the supplied logical value, including synthetic phi values.
+ * Expression-taking helpers consume their argument on success and failure. */
+bool hlsl_natural_float_program_supported(HLSLEmitterContext *ctx);
+HLSLEmitReason hlsl_natural_float_program_contract(const USILProgram *program);
+bool hlsl_natural_float_instruction_supported(HLSLEmitterContext *ctx, int instruction);
+ASTExpr *hlsl_natural_source_atom(HLSLEmitterContext *ctx, int instruction,
+                                 int operand, uint8_t demanded_lanes);
+ASTExpr *hlsl_project_logical_temp(HLSLEmitterContext *ctx, ASTExpr *owned_expression,
+    uint8_t producer_mask, unsigned natural_width, const DXBCOperand *source,
+    uint8_t demanded_lanes, int consumer_instruction);
+ASTExpr *hlsl_instruction_logical_expression(HLSLEmitterContext *ctx,
+    ASTExpr *owned_expression, int instruction, uint8_t lanes, unsigned width);
 
 bool hlsl_expression_identifiers_available(HLSLEmitterContext* ctx, size_t source_start);
 void emit_return_block(HLSLEmitterContext* ctx);

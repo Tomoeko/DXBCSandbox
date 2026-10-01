@@ -28,6 +28,14 @@ typedef struct {
     bool valid;
 } OwnedLiteralMutation;
 
+typedef struct {
+    int instruction, operand;
+    uint8_t component_mask;
+    uint32_t raw_instruction, original_bits;
+    USILOpcode opcode;
+    bool valid;
+} ProbeDecodedLiteral;
+
 /* A small by-value link summary of actual admitted targets. No source spelling
  * or compiler reflection is used to manufacture an interface. This fixture
  * route requires inline names and retains role-specific RW masks. */
@@ -115,7 +123,7 @@ static bool linked_interfaces_match(const ProbeLinkedInterface *hull,
     return true;
 }
 
-/* Manual selected-native isolated HULL or DOMAIN comparison. Other stages are
+/* Manual selected-native isolated stage comparison. Other stages are
  * authored compilation stubs. No Editor, import, linked or runtime certificate. */
 static const char *const default_shader_name =
     "Fixture/HighLevel/HullFloat3Implicit";
@@ -388,6 +396,173 @@ static bool print_domain_operand(const DXBCOperand *operand, int instruction,
                                   path * 4 + dimension + 1, depth + 1, remaining))
             complete = false;
     return complete;
+}
+
+/* The warm counterexample changes the demanded components of one broadcast
+ * literal owned by the decoded target. It replays the ordinary inverse; it never guesses a
+ * literal span or supplies authored fragment text to reconstruction. */
+static bool reconstruct_structured(const DXBCContainerView *target,
+    StringBuilder *source, ProbeDecodedLiteral *literal_owner, bool change_literal, bool vertex_fixture) {
+    DXBCDocument document;
+    dxbc_document_init(&document);
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract;
+    dxbc_stage_contract_init(&contract);
+    USILProgram program = {0};
+    HLSLExpressionSourceMap map = {0};
+    HLSLSourceQualityResult quality = {0};
+    HLSLEmitDiagnostic diagnostic;
+    bool accepted = false;
+    if (!target || !source || !literal_owner || !sb_ok(source) || source->len ||
+        !dxbc_document_parse(&document, target->data, target->size, NULL) ||
+        !dxbc_document_decode_semantic(&document, &semantic) ||
+        !dxbc_stage_contract_decode(&document, &semantic, &contract, NULL) ||
+        !usil_translate_with_stage_contract(&program, &semantic, &contract) ||
+        program.program_type != (vertex_fixture ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL) ||
+        program.instruction_count > PROBE_DOMAIN_INSTRUCTION_LIMIT ||
+        program.input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
+        program.output_count != (vertex_fixture ? 2 : 1) || !program.outputs) {
+        puts("structured_decode=failed structured_source_result=not-attempted");
+        goto done;
+    }
+    bool output_shape = !vertex_fixture && program.outputs[0].mask == 7 &&
+        program.outputs[0].component_type == 3;
+    if (vertex_fixture) {
+        unsigned position = 0, value = 0;
+        for (int index = 0; index < program.output_count; ++index) {
+            const DXBCSignatureElement *field = &program.outputs[index];
+            if (field->component_type != 3) goto done;
+            if (field->system_value == 1 && field->mask == 15) ++position;
+            else if (!field->system_value && field->mask == 7) ++value;
+        }
+        output_shape = position == 1 && value == 1;
+    }
+    if (!output_shape) goto done;
+    printf("structured_decode=complete stage=%u signature_authority=%d stage_contract=%d "
+           "inputs=%d outputs=%d instructions=%d temps=%d\n",
+           (unsigned)program.program_type, program.has_parsed_signature_authority, program.has_stage_contract,
+           program.input_count, program.output_count, program.instruction_count, program.temp_count);
+    for (int index = 0; index < program.input_count; ++index) {
+        const DXBCSignatureElement *field = &program.inputs[index];
+        printf("structured_input index=%d semantic=%.64s register=%u mask=%u rw_mask=%u "
+               "type=%u interpolation=%u\n", index, dxbc_signature_semantic_name(field),
+               field->register_id, (unsigned)field->mask, (unsigned)field->rw_mask,
+               field->component_type, (unsigned)field->interpolation_mode);
+    }
+    ProbeDecodedLiteral captured = {0};
+    for (int index = 0; index < program.instruction_count; ++index) {
+        USILInstruction *instruction = &program.instructions[index];
+        printf("structured_instruction index=%d raw_instruction=%u opcode=%u name=%s "
+               "operands=%d destination_lanes=%u\n", index,
+               instruction->source_instruction_index, (unsigned)instruction->opcode,
+               hlsl_emit_opcode_name(instruction->opcode), instruction->operand_count,
+               instruction->operand_count && (instruction->opcode == USIL_OP_MOV ||
+               instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MUL)
+                   ? (unsigned)usil_operand_destination_lane_mask(&instruction->operands[0]) : 0u);
+        if (captured.valid || (instruction->opcode != USIL_OP_MUL && instruction->opcode != USIL_OP_ADD) ||
+            instruction->operand_count != 3) continue;
+        for (int operand_index = 1; operand_index < 3 && !captured.valid; ++operand_index) {
+            DXBCOperand *operand = &instruction->operands[operand_index];
+            USILOperandUseInfo use = {0};
+            if (operand->type != OPERAND_TYPE_IMMEDIATE32 || operand->has_neg || operand->has_abs ||
+                operand->min_precision || operand->extended_token_count ||
+                !usil_instruction_operand_use(&program, instruction, operand_index, &use) ||
+                use.use != USIL_OPERAND_USE_SOURCE || !use.source_lane_mask) continue;
+            uint8_t component_mask = 0;
+            bool broadcast = true;
+            const uint32_t expected_bits = instruction->opcode == USIL_OP_MUL
+                ? UINT32_C(0x40000000) : UINT32_C(0x3f800000);
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!(use.source_lane_mask & (1u << lane))) continue;
+                const int selected = operand->imm_value_count == 1 ? 0 :
+                    usil_operand_source_component(operand, lane);
+                if (selected < 0 || selected >= operand->imm_value_count ||
+                    selected >= operand->immediate_word_count ||
+                    operand->imm_values[selected] != expected_bits ||
+                    operand->immediate_words[selected] != expected_bits) {
+                    broadcast = false;
+                    break;
+                }
+                component_mask |= (uint8_t)(1u << selected);
+            }
+            if (!broadcast || !component_mask) continue;
+            captured = (ProbeDecodedLiteral){index, operand_index, component_mask,
+                instruction->source_instruction_index, expected_bits,
+                instruction->opcode, true};
+        }
+    }
+    if (!captured.valid) {
+        puts("structured_literal_owner=unavailable");
+        goto done;
+    }
+    if (change_literal) {
+        if (!literal_owner->valid || captured.instruction != literal_owner->instruction ||
+            captured.operand != literal_owner->operand || captured.component_mask != literal_owner->component_mask ||
+            captured.raw_instruction != literal_owner->raw_instruction ||
+            captured.opcode != literal_owner->opcode || captured.original_bits != literal_owner->original_bits)
+            goto done;
+        DXBCOperand *operand = &program.instructions[captured.instruction].operands[captured.operand];
+        for (int component = 0; component < 4; ++component) {
+            if (!(captured.component_mask & (1u << component))) continue;
+            operand->imm_values[component] = UINT32_C(0x40400000);
+            operand->immediate_words[component] = UINT32_C(0x40400000);
+        }
+    } else {
+        *literal_owner = captured;
+    }
+    printf("structured_literal_owner=decoded-target instruction=%d raw_instruction=%u "
+           "operand=%d component_mask=%u original_bits=0x%08" PRIx32 " changed=%d\n",
+           captured.instruction, captured.raw_instruction, captured.operand,
+           (unsigned)captured.component_mask, captured.original_bits, change_literal);
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    options.expression_source_map = &map;
+    options.source_quality = &quality;
+    const HLSLEmitNames names = {.entry_point = vertex_fixture ? "vert" : "frag",
+        .input_struct = vertex_fixture ? "VertexInput" : "FragmentInput",
+        .output_struct = vertex_fixture ? "VertexOutput" : "FragmentOutput"};
+    const bool emitted = hlsl_emit_with_options_diagnostic(&program, source,
+        NULL, NULL, &names, &options, &diagnostic);
+    printf("structured_source_result=%s status=%s phase=%s reason=%s instruction=%d "
+           "raw_instruction=%u bytes=%zu\n", emitted ? "generated" : "unavailable",
+           hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase),
+           hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index,
+           diagnostic.source_instruction_index, source->len);
+    if (emitted) {
+        const bool map_valid = hlsl_expression_source_map_matches(&map, &program, source->buf);
+        print_hash(vertex_fixture
+                       ? (change_literal ? "mutated_vertex_sha256" : "reconstructed_vertex_sha256")
+                       : (change_literal ? "mutated_fragment_sha256" : "reconstructed_fragment_sha256"),
+                   source->buf, source->len);
+        printf("structured_quality=%s reasons=0x%x units=%zu incomplete=%zu residual=%zu "
+               "unknown_provenance=%zu map_complete=%d map_count=%zu map_valid=%d\n",
+               hlsl_source_quality_class_name(quality.classification), quality.reasons,
+               quality.counts.inspected_units, quality.counts.incomplete_units,
+               quality.counts.residual_total, quality.counts.unknown_provenance,
+               map.complete, map.count, map_valid);
+        accepted = map_valid && map.complete &&
+            quality.classification != HLSL_SOURCE_QUALITY_FAILED;
+    }
+done:
+    usil_free(&program);
+    dxbc_stage_contract_free(&contract);
+    dxbc_free(&semantic);
+    dxbc_document_free(&document);
+    return accepted;
+}
+
+static bool structured_wrapper(const StringBuilder *fragment, StringBuilder *wrapper,
+                               const char *shader_name, bool vertex_fixture) {
+    if (!fragment || !sb_ok(fragment) || !fragment->buf || fragment->len > PROBE_SOURCE_LIMIT ||
+        !wrapper || !sb_ok(wrapper) || wrapper->len) return false;
+    sb_appendf(wrapper, "Shader \"%s\"\n{\n    SubShader\n    {\n        Pass\n        {\n"
+        "            HLSLPROGRAM\n#pragma target 5.0\n#pragma only_renderers d3d11\n"
+        "#pragma vertex vert\n#pragma fragment frag\n", shader_name);
+    sb_append_len(wrapper, fragment->buf, fragment->len);
+    sb_append(wrapper, vertex_fixture
+        ? "float4 frag() : SV_Target { return float4(0.25f, 0.5f, 0.75f, 1.0f); }\n"
+        : "float4 vert(float4 position : POSITION) : SV_POSITION { return position; }\n");
+    sb_append(wrapper, "ENDHLSL\n        }\n    }\n}\n");
+    return sb_ok(wrapper) && wrapper->len <= PROBE_SOURCE_LIMIT;
 }
 
 /* Inspect the compiler's actual DOMAIN target, then attempt the normal inverse.
@@ -1315,7 +1490,7 @@ static void usage(const char *name) {
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture]\n"
+        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture]\n"
         "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -1334,6 +1509,11 @@ static void usage(const char *name) {
         "independent owned maximum/W mutations and exact sibling/restoration checks. "
         "This summary-only experiment grants no runtime or semantic certificate "
         "and cannot be combined with a source calibration.\n"
+        "--structured-fixture reconstructs the actual FLOAT3 fragment target. "
+        "Only vertex is an authored stub; --structured-vertex-fixture instead "
+        "reconstructs vertex with a fragment stub. An exact cold comparison enables a "
+        "decoded broadcast literal change, followed by exact original-target "
+        "warm restoration. It cannot be combined with other fixture options.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -1347,6 +1527,9 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
+    const bool structured_vertex_fixture = argc == 5 && !strcmp(argv[4], "--structured-vertex-fixture");
+    const bool structured_fixture = structured_vertex_fixture ||
+        (argc == 5 && !strcmp(argv[4], "--structured-fixture"));
     const bool scalar_fixture = argc >= 5 && !strcmp(argv[4], "--scalar-fixture");
     const bool icb_fixture = argc >= 5 && !strcmp(argv[4], "--icb-fixture");
     const bool domain_fixture =
@@ -1365,16 +1548,22 @@ int main(int argc, char **argv) {
         !strcmp(argv[5], "--inner-factor-brace-calibration");
     const bool calibrate_source_shape = calibrate_static_factors ||
         calibrate_explicit_packoffset || calibrate_inner_factor_brace;
-    if (argc != 4 && !domain_fixture && !linked_fixture && !(icb_fixture && argc == 5) &&
+    if (argc != 4 && !domain_fixture && !linked_fixture && !structured_fixture && !(icb_fixture && argc == 5) &&
         !(scalar_fixture && (argc == 5 || calibrate_source_shape))) {
         usage(argv[0]);
         return 2;
     }
     CommonFileBytes authored = {0};
-    const char *shader_name = scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
+    const char *shader_name = structured_vertex_fixture ? "Fixture/HighLevel/StructuredFloat3VertexBranch" :
+        structured_fixture ? "Fixture/HighLevel/StructuredFloat3Branch" : scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
         : icb_fixture ? "Fixture/HighLevel/HullFloat3ICB" : default_shader_name;
     OwnedLiteralMutation icb_mutation = {0};
     OwnedLiteralMutation domain_mutation = {0};
+    ProbeDecodedLiteral structured_literal = {0};
+    const UnityCompilerProgramStage selected_stage = structured_vertex_fixture ? UNITY_COMPILER_PROGRAM_VERTEX :
+        structured_fixture ? UNITY_COMPILER_PROGRAM_FRAGMENT :
+        domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL;
+    const bool summary_only = domain_fixture || structured_fixture;
     SerializedVariable field = {.name = "_Factor", .layout = {0, 0, 0, 1, 0, 0}};
     SerializedConstantBuffer buffer = {.name = "FactorInputs", .size = 16,
         .role = SERIALIZED_CBUFFER_NAMED, .variables = &field, .var_count = 1};
@@ -1419,19 +1608,27 @@ int main(int argc, char **argv) {
            "editor=not-run "
            "import=not-run semantic_certificate=not-run native_D3D11=not-run\n"
            "session raw_mask=0x%08" PRIx32 " valid_apis=0x%08" PRIx32 "\n",
-           domain_fixture ? "selected-native-domain" : "selected-native-hull",
-           domain_fixture ? "vertex,hull,fragment" : "vertex,domain,fragment",
+           structured_vertex_fixture ? "selected-native-structured-vertex" :
+               structured_fixture ? "selected-native-structured-fragment" :
+               domain_fixture ? "selected-native-domain" : "selected-native-hull",
+           structured_vertex_fixture ? "fragment" : structured_fixture ? "vertex" : domain_fixture ? "vertex,hull,fragment" : "vertex,domain,fragment",
            capabilities.raw_available_platform_mask, valid_apis);
     print_hash("authored_source_sha256", authored.data, authored.size);
     printf("metadata_authority=%s player_metadata=not-supplied\n",
            scalar_fixture && !domain_fixture ? "controlled-API-fixture" : "none-required");
-    if (!compile_selected(&channel, domain_fixture ? "authored-domain-target" : "authored-target",
+    if (!compile_selected(&channel, structured_fixture ? "authored-structured-target" :
+                          domain_fixture ? "authored-domain-target" : "authored-target",
                           (char *)authored.data, directory, shader_name, valid_apis,
-                          domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
-                          domain_fixture, &preprocessing[0], &requests[0],
+                          selected_stage, summary_only, &preprocessing[0], &requests[0],
                           &compiled[0], &provenance[0]))
         goto done;
     DXBCContainerView target = {0}, candidate = {0};
+    if (structured_fixture) {
+        if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target)) goto done;
+        print_hash("target_complete_dxbc_sha256", target.data, target.size);
+        if (!reconstruct_structured(&target, &hull, &structured_literal, false, structured_vertex_fixture) ||
+            !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture)) goto done;
+    }
     if (domain_fixture) {
         if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
             goto done;
@@ -1446,7 +1643,7 @@ int main(int argc, char **argv) {
         fputs("Controlled scalar fixture reflection mismatch.\n", stderr);
         goto done;
     }
-    if (!domain_fixture) {
+    if (!domain_fixture && !structured_fixture) {
         if (scalar_fixture) printf("controlled_API_layout_native_reflection_checked=1\n");
         if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
             goto done;
@@ -1477,10 +1674,10 @@ int main(int argc, char **argv) {
         goto done;
     printf(
         "process_count=2 candidate_cold=1 session_capabilities_identical=1\n");
-    if (!compile_selected(&channel, domain_fixture ? "target-only-domain-candidate" : "target-only-hull-candidate",
+    if (!compile_selected(&channel, structured_fixture ? "target-only-structured-candidate" :
+                        domain_fixture ? "target-only-domain-candidate" : "target-only-hull-candidate",
                         wrapper.buf, directory, shader_name, valid_apis,
-                        domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
-                        domain_fixture, &preprocessing[1], &requests[1],
+                        selected_stage, summary_only, &preprocessing[1], &requests[1],
                         &compiled[1], &provenance[1]) ||
         !dxbc_container_view_first(compiled[1].data, compiled[1].size,
                                    &candidate))
@@ -1529,14 +1726,22 @@ int main(int argc, char **argv) {
      * original source must restore both exact bytes and canonical identity. */
     const pid_t candidate_process = channel.process_id;
     DXBCContainerView changed = {0}, repeated = {0};
-    if (!candidate_process ||
-        !changed_factor_wrapper(&hull, &changed_wrapper, shader_name, scalar_fixture,
-                                domain_fixture ? &domain_mutation : icb_fixture ? &icb_mutation : NULL,
-                                domain_fixture) ||
-        !compile_selected(&channel, domain_fixture ? "warm-mutated-domain" : "warm-mutated-hull",
+    bool mutation_built = false;
+    if (structured_fixture) {
+        StringBuilder mutated_fragment;
+        sb_init(&mutated_fragment);
+        mutation_built = reconstruct_structured(&target, &mutated_fragment, &structured_literal, true, structured_vertex_fixture) &&
+            structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture);
+        sb_free(&mutated_fragment);
+    } else {
+        mutation_built = changed_factor_wrapper(&hull, &changed_wrapper, shader_name, scalar_fixture,
+            domain_fixture ? &domain_mutation : icb_fixture ? &icb_mutation : NULL, domain_fixture);
+    }
+    if (!candidate_process || !mutation_built ||
+        !compile_selected(&channel, structured_fixture ? "warm-mutated-structured" :
+                        domain_fixture ? "warm-mutated-domain" : "warm-mutated-hull",
                         changed_wrapper.buf, directory, shader_name, valid_apis,
-                        domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
-                        domain_fixture, &preprocessing[2], &requests[2],
+                        selected_stage, summary_only, &preprocessing[2], &requests[2],
                         &compiled[2], &provenance[2]) ||
         !dxbc_container_view_first(compiled[2].data, compiled[2].size,
                                    &changed))
@@ -1563,18 +1768,18 @@ int main(int argc, char **argv) {
            mutation_authority, candidate_process == channel.process_id);
     if (!mutation_diff || !mutation_authority)
         goto done;
-    if (!compile_selected(&channel, domain_fixture ? "warm-original-domain" : "warm-original-hull",
+    if (!compile_selected(&channel, structured_fixture ? "warm-original-structured" :
+                        domain_fixture ? "warm-original-domain" : "warm-original-hull",
                         wrapper.buf, directory, shader_name, valid_apis,
-                        domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
-                        domain_fixture, &preprocessing[3], &requests[3],
+                        selected_stage, summary_only, &preprocessing[3], &requests[3],
                         &compiled[3], &provenance[3]) ||
         !dxbc_container_view_first(compiled[3].data, compiled[3].size,
                                    &repeated))
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
     const DXBCCompareStatus repeated_status = dxbc_compare_exact(
-        domain_fixture ? target.data : candidate.data,
-        domain_fixture ? target.size : candidate.size,
+        summary_only ? target.data : candidate.data,
+        summary_only ? target.size : candidate.size,
         repeated.data, repeated.size, &comparison);
     const bool repeated_identity =
         !memcmp(compiled[1].request_digest, compiled[3].request_digest, 32) &&
@@ -1591,12 +1796,17 @@ int main(int argc, char **argv) {
            "authority_equal=%d same_process=%d\n",
            repeated_status == DXBC_COMPARE_EQUAL,
            dxbc_compare_status_name(repeated_status),
-           domain_fixture ? "original-target" : "cold-candidate", repeated_identity,
+           summary_only ? "original-target" : "cold-candidate", repeated_identity,
            repeated_authority, candidate_process == channel.process_id);
     result = cold_equal && repeated_status == DXBC_COMPARE_EQUAL && repeated_identity &&
                      repeated_authority
                  ? 0
                  : 1;
+    if (structured_fixture)
+        printf("structured_isolated_stage_qualified=%d original_target_reference=1 "
+               "decoded_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
+               !result, mutation_diff && mutation_authority ? "different" : "failed",
+               !result ? "exact" : "failed");
     if (domain_fixture)
         printf("domain_isolated_stage_qualified=%d domain_warm_mutation=%s "
                "domain_warm_restore=%s linked_hull_domain_reconstruction=not-run "

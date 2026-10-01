@@ -169,6 +169,7 @@ bool hlsl_stage_coverage_owned_root(struct HLSLEmitterContext *ctx,
     const ASTExpr *root, int instruction, const HLSLStageRootOwner *owner);
 bool hlsl_hull_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
 bool hlsl_domain_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+bool hlsl_natural_structured_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
 bool hlsl_stage_coverage_domain_owners_empty(const HLSLStageCoverage *coverage);
 bool hlsl_stage_coverage_hull_icb_plan(struct HLSLEmitterContext *ctx, const HLSLHullICBPlan *plan);
 bool hlsl_stage_coverage_hull_icb_declaration(struct HLSLEmitterContext *ctx, size_t begin, size_t end);
