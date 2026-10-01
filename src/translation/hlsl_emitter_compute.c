@@ -104,10 +104,14 @@ static bool typed_resources_valid(HLSLEmitterContext *ctx, const HLSLComputeType
     const USILProgram *program = ctx->program;
     const bool scalar_atomic = typed && typed->resource_count == 1u && typed->resources &&
         typed->resources[0].scalar_atomic;
+    const bool system_values_valid = scalar_atomic
+        ? program->compute.system_value_mask == 0u ||
+          program->compute.system_value_mask == USIL_COMPUTE_DISPATCH_THREAD_ID
+        : program->compute.system_value_mask == USIL_COMPUTE_DISPATCH_THREAD_ID;
     if (!typed || typed->resource_count < 1 || typed->resource_count > 2 || !typed->resources ||
         program->shader_model_major != 5 || program->shader_model_minor != 0 ||
         program->compute.shared_memory_count || program->compute.barrier_count ||
-        program->compute.system_value_mask != (scalar_atomic ? 0u : USIL_COMPUTE_DISPATCH_THREAD_ID) ||
+        !system_values_valid ||
         program->texture_count < 0 || program->texture_count > 1 || program->uav_count != 1 ||
         program->texture_alloc < program->texture_count || program->uav_alloc < program->uav_count ||
         !program->uavs || (program->texture_count && !program->textures) ||
@@ -449,6 +453,35 @@ static const HLSLComputeTypedResource *typed_binding(const HLSLComputeTypedSourc
     return NULL;
 }
 
+static bool atomic_dispatch_address_valid(const USILProgram *program, const DXBCOperand *address,
+                                           uint8_t demanded_lanes) {
+    if (program->compute.system_value_mask != USIL_COMPUTE_DISPATCH_THREAD_ID ||
+        program->signature_declaration_count != 1 || program->signature_declaration_alloc < 1 ||
+        !program->signature_declarations || address->type != OPERAND_TYPE_INPUT_THREAD_ID ||
+        !static_indices(address, 0) || address->raw_token != UINT32_C(0x00020046) ||
+        address->swizzle_mode != 1u || address->imm_value_count || address->immediate_word_count ||
+        demanded_lanes != 3u) return false;
+    const USILSignatureDeclaration *declaration = &program->signature_declarations[0];
+    if (declaration->kind != USIL_SIGNATURE_DECL_INPUT ||
+        declaration->operand_type != OPERAND_TYPE_INPUT_THREAD_ID || declaration->has_signature_register ||
+        declaration->register_id != UINT32_MAX || declaration->mask != 3u || declaration->stream_index ||
+        declaration->has_array_element_count || declaration->array_element_count ||
+        declaration->has_system_value || declaration->system_value_name ||
+        declaration->has_interpolation || declaration->interpolation_mode ||
+        declaration->source_instruction_index >= program->compute.declaration_source_instruction_index)
+        return false;
+    /* The raw selector retains unused Z/W components too. Demanded XY must
+     * select exactly the independently declared builtin lanes, in order. */
+    static const uint8_t components[4] = {0u, 1u, 0u, 0u};
+    for (unsigned lane = 0; lane < 4; ++lane)
+        if (address->swizzle[lane] != components[lane]) return false;
+    for (int lane = 0; lane < 4; ++lane) if (demanded_lanes & (1u << lane)) {
+        const int component = usil_operand_source_component(address, lane);
+        if (component != lane || !(declaration->mask & (1u << component))) return false;
+    }
+    return true;
+}
+
 /* This complete SM5 use, rather than four repeated declaration formats,
  * establishes the legal scalar R32_UINT view required by typed atomics. */
 static bool typed_atomic_instruction_valid(HLSLEmitterContext *ctx, int index) {
@@ -488,10 +521,18 @@ static bool typed_atomic_instruction_valid(HLSLEmitterContext *ctx, int index) {
     for (int operand_index = 0; operand_index < 3; ++operand_index) {
         const DXBCOperand *operand = &instruction->operands[operand_index];
         USILOperandUseInfo use;
-        if (!operand_plain(operand) || operand->swizzle_mode ||
+        if (!operand_plain(operand) ||
             !usil_instruction_operand_use(program, instruction, operand_index, &use) ||
             use.use != (operand_index ? USIL_OPERAND_USE_SOURCE : USIL_OPERAND_USE_RESOURCE_BINDING) ||
             use.source_lane_mask != (operand_index == 1 ? 3u : operand_index == 2 ? 1u : 0u))
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+        if (operand_index == 1 && operand->type == OPERAND_TYPE_INPUT_THREAD_ID) {
+            if (!atomic_dispatch_address_valid(program, operand, use.source_lane_mask))
+                return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+            continue;
+        }
+        if (operand->swizzle_mode || (operand_index == 1 &&
+            (program->signature_declaration_count || program->compute.system_value_mask)))
             return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
         for (unsigned component = 0; component < 4; ++component)
             if (operand->swizzle[component] != component)
@@ -1116,7 +1157,16 @@ static bool emit_typed_atomic_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
     origin.source_instruction_index = instruction->source_instruction_index;
     origin.operand_index = 0;
     ASTExpr *resource = ast_create_emitter_operand_with_provenance(typed->resources[0].name, &origin);
-    ASTExpr *coordinates = memory_operand(&plan, 0, 1, 3u, AST_SCALAR_SINT32, 0);
+    ASTExpr *coordinates = NULL;
+    if (instruction->operands[1].type == OPERAND_TYPE_INPUT_THREAD_ID) {
+        ASTExpr *dispatch = memory_operand(&plan, 0, 1, 3u, AST_SCALAR_UINT32, 0);
+        ASTExpr *arguments[] = {dispatch};
+        coordinates = dispatch ? ast_create_call("int2", arguments, 1) : NULL;
+        if (!coordinates) ast_free_expr(dispatch);
+        coordinates = memory_origin(&plan, coordinates, 0, 3u, AST_SCALAR_SINT32, 2);
+    } else {
+        coordinates = memory_operand(&plan, 0, 1, 3u, AST_SCALAR_SINT32, 0);
+    }
     ASTExpr *value = memory_operand(&plan, 0, 2, 1u, AST_SCALAR_UINT32, 0);
     if (!resource || !coordinates || !value) {
         ast_free_expr(resource); ast_free_expr(coordinates); ast_free_expr(value);
@@ -1248,6 +1298,7 @@ typedef struct {
     USILProgram program_owner, owned_program;
     USILInstruction instructions[2];
     USILUav uav;
+    USILSignatureDeclaration declaration;
     const HLSLComputeTypedSource *typed;
     HLSLComputeTypedSource typed_owner, owned_typed;
     HLSLComputeTypedResource resource_owner, owned_resource;
@@ -1284,12 +1335,16 @@ static bool atomic_program_top_supported(const USILProgram *program) {
         program->instruction_count == 2 && program->instruction_alloc >= 2 && program->instructions &&
         program->uav_count == 1 && program->uav_alloc >= 1 && program->uavs &&
         !program->temp_count && !program->input_count && !program->output_count &&
-        !program->patch_constant_count && !program->signature_declaration_count &&
+        !program->patch_constant_count && program->signature_declaration_count >= 0 &&
+        program->signature_declaration_count <= 1 &&
+        program->signature_declaration_alloc >= program->signature_declaration_count &&
+        ((program->signature_declaration_alloc == 0) == (program->signature_declarations == NULL)) &&
         !program->cbuffer_count && !program->texture_count && !program->sampler_count &&
         !program->indexable_temp_count && !program->index_range_count && !program->icb_value_count &&
         !program->has_icb_declaration && !program->icb_declaration_owner &&
         !program->geometry.valid && !program->tessellation.valid &&
-        !program->compute.system_value_mask && !program->compute.shared_memory_count &&
+        program->compute.system_value_mask == (program->signature_declaration_count
+            ? (unsigned)USIL_COMPUTE_DISPATCH_THREAD_ID : 0u) && !program->compute.shared_memory_count &&
         !program->compute.shared_memory_capacity && !program->compute.shared_memory &&
         !program->compute.shared_memory_bytes && !program->compute.barrier_count;
 }
@@ -1303,6 +1358,8 @@ static bool atomic_guard_model_matches(const ComputeAtomicGuard *guard) {
         (guard->names && memcmp(guard->names, &guard->names_owner, sizeof(guard->names_owner)))) return false;
     if (memcmp(guard->program_owner.instructions, guard->instructions, sizeof(guard->instructions)) ||
         memcmp(guard->program_owner.uavs, &guard->uav, sizeof(guard->uav)) ||
+        (guard->program_owner.signature_declaration_count &&
+         memcmp(guard->program_owner.signature_declarations, &guard->declaration, sizeof(guard->declaration))) ||
         memcmp(guard->typed_owner.resources, &guard->resource_owner, sizeof(guard->resource_owner)) ||
         memcmp(guard->resource_owner.name, guard->resource, guard->resource_length + 1u) ||
         (guard->entry_owner && memcmp(guard->entry_owner,
@@ -1390,6 +1447,7 @@ static bool atomic_guard_prepare(ComputeAtomicGuard *guard, const USILProgram *p
         options->expression_source_map || options->unity_uv_helper) return false;
     memcpy(guard->instructions, program->instructions, sizeof(guard->instructions));
     guard->uav = program->uavs[0];
+    if (program->signature_declaration_count) guard->declaration = program->signature_declarations[0];
     guard->resource_owner = typed->resources[0];
     if (!atomic_copy_identifier(guard->resource, guard->resource_owner.name, &guard->resource_length)) return false;
     guard->entry_owner = names ? names->entry_point : NULL;
@@ -1410,6 +1468,10 @@ static bool atomic_guard_prepare(ComputeAtomicGuard *guard, const USILProgram *p
     guard->owned_program.instruction_alloc = 2;
     guard->owned_program.uavs = &guard->uav;
     guard->owned_program.uav_alloc = 1;
+    if (guard->owned_program.signature_declaration_count) {
+        guard->owned_program.signature_declarations = &guard->declaration;
+        guard->owned_program.signature_declaration_alloc = 1;
+    }
     guard->owned_resource = guard->resource_owner;
     guard->owned_resource.name = guard->resource;
     guard->owned_typed = guard->typed_owner;

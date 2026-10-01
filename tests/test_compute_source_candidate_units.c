@@ -1489,18 +1489,24 @@ static const uint32_t atomic_candidate_words[] = {
     INSTRUCTION(62, 1)
 };
 
-static bool atomic_candidate_fixture(Fixture *fixture, const uint32_t *words, size_t count) {
+static bool atomic_candidate_fixture_at_group(Fixture *fixture, const uint32_t *words, size_t count,
+                                              size_t group_offset) {
+    CHECK(group_offset < count && count - group_offset >= 3u);
     CHECK(fixture_init(fixture, NULL, 0));
     CHECK(typed_code(fixture, words, count));
     const ComputeShaderStringView name = text(fixture, "AtomicCounts");
     for (size_t kernel = 0; kernel < 2; ++kernel) for (size_t variant = 0; variant < 4; ++variant) {
-        for (size_t axis = 0; axis < 3; ++axis) fixture->groups[kernel][variant][axis] = words[6u + axis];
+        for (size_t axis = 0; axis < 3; ++axis) fixture->groups[kernel][variant][axis] = words[group_offset + axis];
         fixture->outputs[kernel][variant] = (ComputeShaderResource){.name = name,
             .bind_point = (int)words[3], .sampler_bind_point = -1, .texture_dimension = 2};
         fixture->variants[kernel][variant].output_buffers = &fixture->outputs[kernel][variant];
         fixture->variants[kernel][variant].output_buffer_count = 1;
     }
     return true;
+}
+
+static bool atomic_candidate_fixture(Fixture *fixture, const uint32_t *words, size_t count) {
+    return atomic_candidate_fixture_at_group(fixture, words, count, 6u);
 }
 
 static bool check_atomic_candidate_evidence(const ComputeSourceCandidate *candidate,
@@ -1706,8 +1712,203 @@ static bool check_atomic_descriptor_boundary(void) {
     return true;
 }
 
+static const uint32_t dispatch_atomic_candidate_words[] = {
+    INSTRUCTION(106, 1) | (1u << 11u),
+    INSTRUCTION(156, 4) | (3u << 11u), UINT32_C(0x0011e000), 0u, UINT32_C(0x4444),
+    INSTRUCTION(95, 2), UINT32_C(0x00020032),
+    INSTRUCTION(155, 4), 1u, 1u, 1u,
+    INSTRUCTION(173, 6), UINT32_C(0x0011e000), 0u,
+    UINT32_C(0x00020046), UINT32_C(0x00004001), 1u,
+    INSTRUCTION(62, 1)
+};
+
+static bool check_dispatch_atomic_candidate_evidence(const ComputeSourceCandidate *candidate,
+                                                     uint32_t binding, uint32_t increment) {
+    CHECK(candidate->status == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED && candidate->domain_complete &&
+        candidate->kernel_count == 2u && candidate->variant_count == 8u && candidate->resource_count == 1u);
+    CHECK(candidate->source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !candidate->source_quality.reasons &&
+        !candidate->source_quality.counts.incomplete_units && !candidate->source_quality.counts.unknown_provenance &&
+        !candidate->source_quality.counts.residual_total && candidate->source_quality.counts.semantic_projections);
+    const ComputeSourceTypedResource *resource = &candidate->resources[0];
+    CHECK(resource->kind == COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC && resource->writable &&
+        resource->binding_register == binding && resource->original_element_type_known && resource->witness_count == 8u);
+    char declaration[96];
+    const int declaration_size = snprintf(declaration, sizeof(declaration),
+        "RWTexture2D<uint> AtomicCounts : register(u%u);\n", binding);
+    CHECK(declaration_size > 0 && (size_t)declaration_size < sizeof(declaration));
+    CHECK(strstr(candidate->source.buf, declaration) &&
+        strstr(candidate->source.buf, "uint3 dispatchThreadId : SV_DispatchThreadID") &&
+        strstr(candidate->source.buf, "InterlockedAdd((AtomicCounts)[int2((dispatchThreadId.xy))], ") &&
+        !strstr(candidate->source.buf, "].x") && !strstr(candidate->source.buf, "uint4") && !strstr(candidate->source.buf, "asint("));
+    for (size_t row = 0; row < candidate->variant_count; ++row) {
+        const ComputeSourceVariant *entry = &candidate->variants[row];
+        CHECK(resource->variant_witnesses[row] == (uint32_t)row && entry->source_unit_id == (uint32_t)row + 1u &&
+            entry->kernel_index == row / 4u && entry->variant_index == row % 4u && entry->expression_count == 3u &&
+            entry->memory_effect_count == 1u && entry->entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+            !entry->entry_quality.reasons && !entry->entry_quality.counts.incomplete_units &&
+            !entry->entry_quality.counts.residual_total && !entry->entry_quality.counts.unknown_provenance);
+        const ComputeSourceMemoryEffect *effect = &entry->memory_effects[0];
+        CHECK(effect->opcode == USIL_OP_ATOMIC_IADD && effect->instruction_index == 0 &&
+            effect->source_instruction_index == 4u && effect->binding_register == binding &&
+            effect->effect_flags == (uint32_t)(USIL_EFFECT_ATOMIC | USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_EXTERNAL_WRITE));
+        const ASTExpr *aggregate = entry->expressions[0];
+        CHECK(aggregate->kind == AST_EXPR_EMITTER_OPERAND && aggregate->operand_provenance.complete &&
+            aggregate->operand_provenance.instruction_index == 0 && aggregate->operand_provenance.source_instruction_index == 4u &&
+            aggregate->operand_provenance.operand_index == 0);
+        const ASTExpr *coordinates = entry->expressions[1];
+        CHECK(coordinates->kind == AST_EXPR_CALL && !strcmp(coordinates->u.call.name, "int2") &&
+            coordinates->u.call.arg_count == 1 && coordinates->u.call.args && coordinates->logical_origin.complete &&
+            coordinates->logical_origin.scalar_type == AST_SCALAR_SINT32 && coordinates->logical_origin.components == 2u &&
+            coordinates->logical_origin.destination_lanes == 3u && coordinates->logical_origin.instruction_index == 0 &&
+            coordinates->logical_origin.logical_value_id == 0u && coordinates->logical_origin.source_instruction_index == 4u);
+        const ASTExpr *dispatch = coordinates->u.call.args[0];
+        const ASTOperandProvenance *origin = &dispatch->operand_provenance;
+        CHECK(dispatch->kind == AST_EXPR_EMITTER_OPERAND && !strcmp(dispatch->u.emitter_operand, "dispatchThreadId.xy") &&
+            origin->complete && origin->value_role == AST_OPERAND_VALUE_LOGICAL &&
+            origin->logical_value_id == (UINT64_C(0x100000000) | USIL_COMPUTE_DISPATCH_THREAD_ID) &&
+            origin->natural_components == 3u && origin->result_components == 2u &&
+            origin->selection_role == AST_COMPONENT_SELECTION_SEMANTIC && origin->selected_components[0] == 0u &&
+            origin->selected_components[1] == 1u && origin->bitcast_role == AST_OPERAND_BITCAST_NONE &&
+            !origin->raw_buffer_reconstruction && !origin->synthetic_interface &&
+            origin->instruction_index == 0 && origin->source_instruction_index == 4u &&
+            origin->operand_index == 1 && origin->destination_lanes == 3u);
+        const ASTExpr *value = entry->expressions[2];
+        CHECK(value->kind == AST_EXPR_LITERAL && value->u.literal.scalar_type == AST_SCALAR_UINT32 &&
+            value->u.literal.components == 1 && value->u.literal.val[0] == increment && value->logical_origin.complete &&
+            value->logical_origin.scalar_type == AST_SCALAR_UINT32 && value->logical_origin.components == 1u &&
+            value->logical_origin.destination_lanes == 1u && value->logical_origin.instruction_index == 0 &&
+            value->logical_origin.source_instruction_index == 4u);
+        size_t effects = 0;
+        for (size_t event = 0; event < entry->emission_fact_count; ++event) {
+            const HLSLSourceQualityFacts *fact = &entry->emission_facts[event];
+            if (fact->instruction_index < 0) continue;
+            CHECK(effects < 2u && fact->known && fact->logical_operation && !fact->artifacts &&
+                fact->instruction_index == (int)effects && fact->source_instruction_index == (uint32_t)effects + 4u);
+            ++effects;
+        }
+        CHECK(effects == 2u);
+    }
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE];
+    common_sha256(candidate->source.buf, candidate->source.len, digest);
+    CHECK(!memcmp(digest, candidate->source_sha256, sizeof(digest)));
+    return true;
+}
+
+static bool check_dispatch_atomic_candidate(void) {
+    const uint32_t configurations[][5] = {
+        /* value,groupX,groupY,groupZ,binding */
+        {1u, 1u, 1u, 1u, 0u}, {UINT32_MAX, 4u, 2u, 1u, 3u}
+    };
+    for (size_t configuration = 0; configuration < COUNT(configurations); ++configuration) {
+        uint32_t words[COUNT(dispatch_atomic_candidate_words)];
+        memcpy(words, dispatch_atomic_candidate_words, sizeof(words));
+        const uint32_t *values = configurations[configuration];
+        words[16] = values[0]; words[8] = values[1]; words[9] = values[2]; words[10] = values[3];
+        words[3] = words[13] = values[4];
+        Fixture fixture; CHECK(atomic_candidate_fixture_at_group(&fixture, words, COUNT(words), 8u));
+        ComputeSourceCandidate first, second; compute_source_candidate_init(&first); compute_source_candidate_init(&second);
+        ComputeSourceDiagnostic diagnostic;
+        CHECK(compute_source_candidate_build(&fixture.object, &first, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        CHECK(diagnostic.requested_counts_known && diagnostic.requested_kernels == 2u && diagnostic.requested_variants == 8u &&
+            diagnostic.examined_variants == 8u && diagnostic.represented_variants == 8u);
+        CHECK(check_dispatch_atomic_candidate_evidence(&first, values[4], values[0]));
+        CHECK(compute_source_candidate_build(&fixture.object, &second, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        CHECK(first.source.len == second.source.len && !memcmp(first.source.buf, second.source.buf, first.source.len) &&
+            hlsl_source_quality_results_equal(&first.source_quality, &second.source_quality) &&
+            !memcmp(first.modeled_input_sha256, second.modeled_input_sha256, COMMON_SHA256_DIGEST_SIZE));
+        for (size_t row = 0; row < first.variant_count; ++row) CHECK(
+            first.variants[row].expressions[1] != second.variants[row].expressions[1] &&
+            first.variants[row].expressions[1]->u.call.args[0] != second.variants[row].expressions[1]->u.call.args[0] &&
+            hlsl_source_quality_results_equal(&first.variants[row].entry_quality, &second.variants[row].entry_quality));
+        memset(fixture.bytes, 0, sizeof(fixture.bytes));
+        CHECK(check_dispatch_atomic_candidate_evidence(&first, values[4], values[0]));
+        StringBuilder held; sb_init(&held); ast_format_expr(first.variants[7].expressions[1], &held);
+        CHECK(sb_ok(&held) && !strcmp(held.buf, "int2((dispatchThreadId.xy))")); sb_free(&held);
+        compute_source_candidate_dispose(&first); compute_source_candidate_dispose(&second);
+    }
+    Fixture fixture;
+    CHECK(atomic_candidate_fixture_at_group(&fixture, dispatch_atomic_candidate_words, COUNT(dispatch_atomic_candidate_words), 8u));
+    ComputeSourceCandidate baseline, restored; compute_source_candidate_init(&baseline); compute_source_candidate_init(&restored);
+    CHECK(compute_source_candidate_build(&fixture.object, &baseline, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    const uint8_t *original_code = fixture.variants[0][0].code;
+    const size_t original_size = fixture.variants[0][0].code_size;
+    /* Keep seven admitted rows and one rejected final row. Requested coverage
+     * is still eight; partial construction may not modify the held candidate. */
+    uint32_t changed[COUNT(dispatch_atomic_candidate_words)];
+    memcpy(changed, dispatch_atomic_candidate_words, sizeof(changed)); changed[14] = UINT32_C(0x00020016);
+    CHECK(typed_code(&fixture, changed, COUNT(changed)));
+    const uint8_t *changed_code = fixture.variants[0][0].code;
+    const size_t changed_size = fixture.variants[0][0].code_size;
+    for (size_t kernel = 0; kernel < 2; ++kernel) for (size_t variant = 0; variant < 4; ++variant) {
+        fixture.variants[kernel][variant].code = original_code;
+        fixture.variants[kernel][variant].code_size = original_size;
+    }
+    fixture.variants[1][3].code = changed_code; fixture.variants[1][3].code_size = changed_size;
+    const ComputeSourceCandidate before = baseline;
+    ComputeSourceDiagnostic diagnostic;
+    CHECK(compute_source_candidate_build(&fixture.object, &baseline, &diagnostic) == COMPUTE_SOURCE_EMISSION_FAILED);
+    CHECK(!memcmp(&before, &baseline, sizeof(before)) && diagnostic.requested_counts_known &&
+        diagnostic.requested_kernels == 2u && diagnostic.requested_variants == 8u && diagnostic.examined_variants == 8u &&
+        diagnostic.represented_variants == 7u && diagnostic.kernel_index == 1u && diagnostic.variant_index == 3u);
+    CHECK(check_dispatch_atomic_candidate_evidence(&baseline, 0u, 1u));
+    fixture.variants[1][3].code = original_code; fixture.variants[1][3].code_size = original_size;
+    CHECK(compute_source_candidate_build(&fixture.object, &restored, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(restored.source.len == baseline.source.len && !memcmp(restored.source.buf, baseline.source.buf, baseline.source.len) &&
+        hlsl_source_quality_results_equal(&restored.source_quality, &baseline.source_quality));
+    compute_source_candidate_dispose(&restored);
+    /* The shared memory projection rejects undeclared reads before emitter
+     * admission. Other rows have valid decoded operands but lie outside the
+     * deliberately narrow DispatchXY producer contract. */
+    static const ComputeSourceStatus failures[] = {
+        COMPUTE_SOURCE_EMISSION_FAILED, COMPUTE_SOURCE_STAGE_CONTRACT_FAILED,
+        COMPUTE_SOURCE_EMISSION_FAILED, COMPUTE_SOURCE_EMISSION_FAILED,
+        COMPUTE_SOURCE_EMISSION_FAILED, COMPUTE_SOURCE_EMISSION_FAILED,
+        COMPUTE_SOURCE_EMISSION_FAILED, COMPUTE_SOURCE_STAGE_CONTRACT_FAILED
+    };
+    for (unsigned mutation = 0; mutation < 8u; ++mutation) {
+        uint32_t words[COUNT(dispatch_atomic_candidate_words) + 4u];
+        memcpy(words, dispatch_atomic_candidate_words, sizeof(dispatch_atomic_candidate_words));
+        size_t count = COUNT(dispatch_atomic_candidate_words);
+        switch (mutation) {
+            case 0: words[6] = UINT32_C(0x00020072); break; /* Undemanded Z declaration is outside this exact route. */
+            case 1: words[14] = UINT32_C(0x00020086); break; /* XZ is not the declared XY address. */
+            case 2: words[14] = UINT32_C(0x00020006); break; /* Replicated X. */
+            case 3: words[6] = UINT32_C(0x00021032); words[14] = UINT32_C(0x00021046); break; /* A different builtin. */
+            case 4:
+                memmove(words + 9, words + 7, (count - 7u) * sizeof(words[0]));
+                words[7] = INSTRUCTION(95, 2); words[8] = UINT32_C(0x00021032); count += 2u; break;
+            case 5:
+                words[count] = words[count - 1u]; words[count - 1u] = INSTRUCTION(190, 1) | (8u << 11u); ++count; break;
+            case 6:
+                words[11] = INSTRUCTION(173, 10); words[14] = UINT32_C(0x00004002);
+                words[15] = words[16] = words[17] = words[18] = 0u;
+                words[19] = UINT32_C(0x00004001); words[20] = 1u; words[21] = INSTRUCTION(62, 1); count += 4u; break;
+            case 7:
+                memmove(words + 5, words + 7, (count - 7u) * sizeof(words[0]));
+                count -= 2u; break; /* The actual address now lacks its declaration. */
+        }
+        /* Added declarations move numthreads; the remaining authored shapes
+         * retain group words[8..10]. No parser or count-derived fallback is used. */
+        CHECK(atomic_candidate_fixture_at_group(&fixture, words, count,
+            mutation == 4u ? 10u : mutation == 7u ? 6u : 8u));
+        const ComputeSourceCandidate original = baseline;
+        ComputeSourceDiagnostic boundary;
+        const ComputeSourceStatus status = compute_source_candidate_build(&fixture.object, &baseline, &boundary);
+        if (status != failures[mutation]) fprintf(stderr,
+            "dispatch atomic candidate boundary mutation=%u expected=%s actual=%s\n", mutation,
+            compute_source_status_name(failures[mutation]), compute_source_status_name(status));
+        CHECK(status == failures[mutation] && boundary.status == status && !memcmp(&original, &baseline, sizeof(original)));
+        CHECK(boundary.requested_counts_known && boundary.requested_kernels == 2u && boundary.requested_variants == 8u &&
+            boundary.examined_variants == 1u && !boundary.represented_variants &&
+            boundary.kernel_index == 0u && boundary.variant_index == 0u);
+        CHECK(check_dispatch_atomic_candidate_evidence(&baseline, 0u, 1u));
+    }
+    compute_source_candidate_dispose(&baseline);
+    return true;
+}
+
 int main(void) {
-    return check_literal_atomic_candidate() && check_atomic_descriptor_boundary() && check_float_uav_candidate() && check_partial_uav_candidate() && check_replicated_uav_address_lanes() && check_same_uav_address_ownership() && check_uav_read_candidate() && check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_literal_atomic_candidate() && check_dispatch_atomic_candidate() && check_atomic_descriptor_boundary() && check_float_uav_candidate() && check_partial_uav_candidate() && check_replicated_uav_address_lanes() && check_same_uav_address_ownership() && check_uav_read_candidate() && check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }
