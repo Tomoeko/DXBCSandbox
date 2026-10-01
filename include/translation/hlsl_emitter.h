@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 37U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 38U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -143,6 +143,8 @@ typedef enum HLSLEmitMode {
      * and predicate transport reject. Raw float predicates retain asuint.
      * v37 admits natural-width MIN/MAX/DIV within the same owned IF route,
      * retaining actual instruction/lane owners and complete join values.
+     * v38 admits disjoint custom XYZ/W input fields in the same register for
+     * this proved IF route. Every demanded source lane must select one field.
      * Repeated straight-line two-MUL chains with immutable arguments and
      * identity single-use producer lanes may share a float4 value helper;
      * each call result remains named at its original site. No captures or

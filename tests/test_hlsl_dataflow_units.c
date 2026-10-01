@@ -1729,6 +1729,12 @@ typedef enum {
     NATURAL_IF_RIGHT_SCALAR_INPUT
 } NaturalIfRightOperand;
 
+typedef enum {
+    NATURAL_IF_INPUTS_SEPARATE,
+    NATURAL_IF_INPUTS_PACKED_UNION,
+    NATURAL_IF_INPUTS_PACKED_SPLIT
+} NaturalIfInputLayout;
+
 typedef struct {
     USILOpcode then_opcode, else_opcode, join_opcode;
     NaturalIfRightOperand arm_right, join_right;
@@ -1749,14 +1755,17 @@ static uint32_t natural_arithmetic_raw_opcode(USILOpcode opcode) {
     }
 }
 
-static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsigned width,
+static bool natural_if_fixture_init_layout(NaturalIfFixture *fixture, unsigned width,
     uint8_t temp_mask, bool nonzero, bool dead_phi, bool vector_literal, bool temp_condition,
     USILOpcode comparison, uint8_t predicate_mask, uint32_t comparison_bits,
-    const NaturalIfArithmetic *arithmetic) {
+    const NaturalIfArithmetic *arithmetic, NaturalIfInputLayout input_layout) {
     memset(fixture, 0, sizeof(*fixture));
     dxbc_document_init(&fixture->document);
     dxbc_stage_contract_init(&fixture->contract);
     CHECK(width >= 1 && width <= 3);
+    const bool packed_inputs = input_layout != NATURAL_IF_INPUTS_SEPARATE;
+    CHECK(input_layout <= NATURAL_IF_INPUTS_PACKED_SPLIT);
+    CHECK(!packed_inputs || (width == 3 && temp_mask == 7 && !temp_condition));
     CHECK(!arithmetic || (natural_arithmetic_raw_opcode(arithmetic->then_opcode) != UINT32_MAX &&
         natural_arithmetic_raw_opcode(arithmetic->else_opcode) != UINT32_MAX &&
         natural_arithmetic_raw_opcode(arithmetic->join_opcode) != UINT32_MAX &&
@@ -1796,7 +1805,7 @@ static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsign
     } else if ((mode) == NATURAL_IF_RIGHT_VECTOR_INPUT) { \
         NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, (components))); NATURAL_WORD(0); \
     } else if ((mode) == NATURAL_IF_RIGHT_SCALAR_INPUT) { \
-        NATURAL_WORD(UINT32_C(0x0010100a)); NATURAL_WORD(1); \
+        NATURAL_WORD(packed_inputs ? UINT32_C(0x0010103a) : UINT32_C(0x0010100a)); NATURAL_WORD(packed_inputs ? 0 : 1); \
     } else { \
         NATURAL_WORD(UINT32_C(0x00004001)); NATURAL_WORD(bits); \
     } \
@@ -1805,9 +1814,12 @@ static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsign
     const NaturalIfRightOperand join_right = arithmetic ? arithmetic->join_right : NATURAL_IF_RIGHT_VECTOR_INPUT;
     NATURAL_WORD(NATURAL_INST(106, 1) | 1u << 11u);
     NATURAL_WORD(NATURAL_INST(98, 3) | 2u << 11u);
-    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_INPUT, output_mask)); NATURAL_WORD(0);
-    NATURAL_WORD(NATURAL_INST(98, 3) | 2u << 11u);
-    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_INPUT, 1)); NATURAL_WORD(1);
+    NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_INPUT,
+        input_layout == NATURAL_IF_INPUTS_PACKED_UNION ? 15 : output_mask)); NATURAL_WORD(0);
+    if (input_layout != NATURAL_IF_INPUTS_PACKED_UNION) {
+        NATURAL_WORD(NATURAL_INST(98, 3) | 2u << 11u);
+        NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_INPUT, packed_inputs ? 8 : 1)); NATURAL_WORD(packed_inputs ? 0 : 1);
+    }
     NATURAL_WORD(NATURAL_INST(101, 3));
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_OUTPUT, output_mask)); NATURAL_WORD(0);
     NATURAL_WORD(NATURAL_INST(104, 2)); NATURAL_WORD(3);
@@ -1821,14 +1833,14 @@ static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsign
         while (!(predicate_mask & (1u << predicate_lane))) ++predicate_lane;
         NATURAL_WORD(NATURAL_INST(natural_comparison_raw_opcode(comparison), 7));
         NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, predicate_mask)); NATURAL_WORD(2);
-        NATURAL_WORD(UINT32_C(0x0010100a)); NATURAL_WORD(1);
+        NATURAL_WORD(packed_inputs ? UINT32_C(0x0010103a) : UINT32_C(0x0010100a)); NATURAL_WORD(packed_inputs ? 0 : 1);
         NATURAL_WORD(UINT32_C(0x00004001)); NATURAL_WORD(comparison_bits);
     }
     NATURAL_WORD(NATURAL_INST(31, 3) | (nonzero ? UINT32_C(0x40000) : 0));
     NATURAL_WORD(compared ? UINT32_C(0x0010000a) | (uint32_t)predicate_lane << 4u
         : temp_condition ? UINT32_C(0x0010000a) |
-            (uint32_t)physical[width - 1u] << 4u : UINT32_C(0x0010100a));
-    NATURAL_WORD(compared || temp_condition ? 2 : 1);
+            (uint32_t)physical[width - 1u] << 4u : packed_inputs ? UINT32_C(0x0010103a) : UINT32_C(0x0010100a));
+    NATURAL_WORD(compared || temp_condition ? 2 : packed_inputs ? 0 : 1);
     NATURAL_WORD(NATURAL_INST(54, vector_literal ? 8 : 5));
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
     if (vector_literal) {
@@ -1875,8 +1887,8 @@ static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsign
 #undef NATURAL_RIGHT
     const DXBCSignatureElement inputs[2] = {
         {.semantic_name = "TEXCOORD", .component_type = 3, .mask = output_mask, .rw_mask = output_mask},
-        {.semantic_name = "TEXCOORD", .semantic_index = 1, .register_id = 1,
-            .component_type = 3, .mask = 1, .rw_mask = 1}};
+        {.semantic_name = "TEXCOORD", .semantic_index = 1, .register_id = packed_inputs ? 0u : 1u,
+            .component_type = 3, .mask = packed_inputs ? 8 : 1, .rw_mask = packed_inputs ? 8 : 1}};
     const DXBCSignatureElement output = {.semantic_name = "SV_Target", .system_value = 64,
         .component_type = 3, .mask = output_mask, .rw_mask = (uint8_t)(15u & ~output_mask)};
     CHECK(natural_if_fixture_decode_words(fixture, UINT32_C(0x00000050), words, word_count,
@@ -1884,7 +1896,7 @@ static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsign
     CHECK(fixture->program.input_count == 2 && fixture->program.output_count == 1);
     CHECK(fixture->program.inputs[0].mask == output_mask &&
         fixture->program.inputs[0].rw_mask == output_mask &&
-        fixture->program.inputs[1].mask == 1 && fixture->program.inputs[1].rw_mask == 1);
+        fixture->program.inputs[1].mask == (packed_inputs ? 8 : 1) && fixture->program.inputs[1].rw_mask == (packed_inputs ? 8 : 1));
     CHECK(fixture->program.outputs[0].mask == output_mask &&
         fixture->program.outputs[0].rw_mask == (15u & ~output_mask));
     const int prefix = temp_condition || compared ? 1 : 0;
@@ -1896,7 +1908,7 @@ static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsign
     fixture->join_value = 7 + prefix + extra;
     fixture->output = 8 + prefix + extra;
     CHECK(fixture->program.instructions[fixture->condition].source_instruction_index ==
-        (uint32_t)(5 + prefix));
+        (uint32_t)(fixture->program.signature_declaration_count + 2 + prefix));
     CHECK(fixture->program.instructions[fixture->condition].condition_test == (nonzero ?
         DXBC_INSTRUCTION_TEST_NONZERO : DXBC_INSTRUCTION_TEST_ZERO));
     CHECK(usil_operand_destination_lane_mask(
@@ -1905,6 +1917,14 @@ static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsign
         fixture->program.instructions[fixture->else_value].opcode == arithmetic->else_opcode &&
         fixture->program.instructions[fixture->join_value].opcode == arithmetic->join_opcode);
     return true;
+}
+
+static bool natural_if_fixture_init_arithmetic(NaturalIfFixture *fixture, unsigned width,
+    uint8_t temp_mask, bool nonzero, bool dead_phi, bool vector_literal, bool temp_condition,
+    USILOpcode comparison, uint8_t predicate_mask, uint32_t comparison_bits,
+    const NaturalIfArithmetic *arithmetic) {
+    return natural_if_fixture_init_layout(fixture, width, temp_mask, nonzero, dead_phi, vector_literal,
+        temp_condition, comparison, predicate_mask, comparison_bits, arithmetic, NATURAL_IF_INPUTS_SEPARATE);
 }
 
 static bool natural_if_fixture_init_mode(NaturalIfFixture *fixture, unsigned width,
@@ -1932,9 +1952,13 @@ typedef struct {
     StringBuilder *mutable_source;
     HLSLExpressionSourceMap *mutable_map;
     size_t source_offset;
+    size_t signature_observation;
     size_t mutate_at;
     unsigned mutation;
     int arithmetic_instruction, condition_instruction;
+    int packed_xyz_field, packed_scalar_field, packed_source_instruction;
+    bool track_packed;
+    uint8_t packed_fields_seen;
     USILOpcode replacement_opcode;
     bool mutated;
     bool wrong_owner;
@@ -1948,6 +1972,23 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
         observation->entry_point_index != 4 || observation->source_unit_id != 0)
         ledger->wrong_owner = true;
     const HLSLSourceQualityFacts *facts = &observation->facts;
+    if (observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION &&
+        facts->instruction_index < 0 && ledger->mutable_source && ledger->mutable_source->buf &&
+        ledger->mutable_source->len >= sizeof(" output;\n") - 1u &&
+        !strcmp(ledger->mutable_source->buf + ledger->mutable_source->len - (sizeof(" output;\n") - 1u), " output;\n"))
+        ledger->signature_observation = ledger->observations;
+    if (ledger->track_packed && facts->known && facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL) {
+        if (facts->logical_value_id == (HLSL_NATURAL_INPUT_FIELD_LOGICAL_ID_BASE |
+                (uint64_t)(unsigned)ledger->packed_xyz_field)) {
+            ledger->packed_fields_seen |= 1;
+            if (facts->components != 3 && facts->components != 1) ledger->wrong_owner = true;
+        }
+        if (facts->logical_value_id == (HLSL_NATURAL_INPUT_FIELD_LOGICAL_ID_BASE |
+                (uint64_t)(unsigned)ledger->packed_scalar_field)) {
+            ledger->packed_fields_seen |= 2;
+            if (facts->components != 1) ledger->wrong_owner = true;
+        }
+    }
     if (observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION) {
         if (facts->instruction_index < 0) ++ledger->declaration_events;
         else if (facts->instruction_index < ledger->program->instruction_count &&
@@ -1980,7 +2021,11 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
             else ledger->arithmetic_owners |= UINT64_C(1) << (unsigned)facts->instruction_index;
         }
     }
-    if (ledger->mutable_program && ledger->observations == ledger->mutate_at) {
+    const bool early_header = ledger->mutation == 19 && !ledger->mutated &&
+        observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION && facts->instruction_index < 0 &&
+        ledger->mutable_source && ledger->mutable_source->buf &&
+        strstr(ledger->mutable_source->buf, "float");
+    if (ledger->mutable_program && (ledger->observations == ledger->mutate_at || early_header)) {
         USILProgram *program = ledger->mutable_program;
         switch (ledger->mutation) {
         case 0:
@@ -2060,6 +2105,40 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
             if (!ledger->mutable_map || ledger->arithmetic_instruction < 0 ||
                 (size_t)ledger->arithmetic_instruction >= ledger->mutable_map->count) return false;
             ++ledger->mutable_map->origins[ledger->arithmetic_instruction].source_end;
+            break;
+        case 16: {
+            DXBCSignatureElement *field = &program->inputs[ledger->packed_scalar_field];
+            memset(field->semantic_name, 0, sizeof(field->semantic_name));
+            memcpy(field->semantic_name, "COORDGATE", sizeof("COORDGATE"));
+            field->semantic_name_length = sizeof("COORDGATE") - 1u;
+            break;
+        }
+        case 17: {
+            DXBCOperand *source = &program->instructions[ledger->packed_source_instruction].operands[
+                program->instructions[ledger->packed_source_instruction].opcode == USIL_OP_IF ? 0 : 1];
+            memset(source->swizzle, 2, sizeof(source->swizzle));
+            source->raw_token = (source->raw_token & ~UINT32_C(0x30)) | UINT32_C(0x20);
+            break;
+        }
+        case 18:
+            program->inputs[ledger->packed_xyz_field].interpolation_mode = 3;
+            program->inputs[ledger->packed_scalar_field].interpolation_mode = 3;
+            for (int index = 0; index < program->signature_declaration_count; ++index) {
+                USILSignatureDeclaration *declaration = &program->signature_declarations[index];
+                if (declaration->operand_type == OPERAND_TYPE_INPUT && declaration->register_id ==
+                    program->inputs[ledger->packed_scalar_field].register_id)
+                    declaration->interpolation_mode = 3;
+            }
+            break;
+        case 19: {
+            char *type = strstr(ledger->mutable_source->buf, "float");
+            if (!type) return false;
+            *type ^= 1;
+            break;
+        }
+        case 20:
+            if (!ledger->mutable_source) return false;
+            sb_append(ledger->mutable_source, "// injected header bytes\n");
             break;
         }
         ledger->mutated = true;
@@ -2462,11 +2541,13 @@ static bool check_natural_if_callback_drift(void) {
     return true;
 }
 
-static bool natural_if_multiple_outputs_fixture_mode(NaturalIfFixture *fixture, bool vertex,
-    USILOpcode comparison, uint8_t predicate_mask, bool nonzero) {
+static bool natural_if_multiple_outputs_fixture_layout(NaturalIfFixture *fixture, bool vertex,
+    USILOpcode comparison, uint8_t predicate_mask, bool nonzero, NaturalIfInputLayout input_layout) {
     memset(fixture, 0, sizeof(*fixture));
     dxbc_document_init(&fixture->document);
     dxbc_stage_contract_init(&fixture->contract);
+    CHECK(input_layout <= NATURAL_IF_INPUTS_PACKED_SPLIT);
+    const bool packed_inputs = input_layout != NATURAL_IF_INPUTS_SEPARATE;
     const bool compared = comparison != USIL_OP_NOP;
     CHECK(!compared || (predicate_mask && !(predicate_mask & (predicate_mask - 1u)) &&
         predicate_mask <= 8 && natural_comparison_raw_opcode(comparison) != UINT32_MAX));
@@ -2480,9 +2561,12 @@ static bool natural_if_multiple_outputs_fixture_mode(NaturalIfFixture *fixture, 
     MULTI_WORD(MULTI_INST(106, 1) | 1u << 11u);
     const uint8_t masks[3] = {15, 7, 1};
     for (unsigned input = 0; input < 3; ++input) {
+        if (input == 2 && input_layout == NATURAL_IF_INPUTS_PACKED_UNION) continue;
         MULTI_WORD(MULTI_INST(vertex ? 95 : 98, 3) | (vertex ? 0 : 2u << 11u));
-        MULTI_WORD(UINT32_C(0x00101002) | (uint32_t)masks[input] << 4u);
-        MULTI_WORD(input);
+        const uint8_t mask = input == 1 && input_layout == NATURAL_IF_INPUTS_PACKED_UNION ? 15 :
+            input == 2 && packed_inputs ? 8 : masks[input];
+        MULTI_WORD(UINT32_C(0x00101002) | (uint32_t)mask << 4u);
+        MULTI_WORD(input == 2 && packed_inputs ? 1 : input);
     }
     MULTI_WORD(MULTI_INST(vertex ? 103 : 101, vertex ? 4 : 3));
     MULTI_WORD(UINT32_C(0x001020f2)); MULTI_WORD(0);
@@ -2495,12 +2579,12 @@ static bool natural_if_multiple_outputs_fixture_mode(NaturalIfFixture *fixture, 
         while (!(predicate_mask & (1u << predicate_lane))) ++predicate_lane;
         MULTI_WORD(MULTI_INST(natural_comparison_raw_opcode(comparison), 7));
         MULTI_WORD(UINT32_C(0x00100002) | (uint32_t)predicate_mask << 4u); MULTI_WORD(1);
-        MULTI_WORD(UINT32_C(0x0010100a)); MULTI_WORD(2);
+        MULTI_WORD(packed_inputs ? UINT32_C(0x0010103a) : UINT32_C(0x0010100a)); MULTI_WORD(packed_inputs ? 1 : 2);
         MULTI_WORD(UINT32_C(0x00004001)); MULTI_WORD(UINT32_C(0x3ec00000));
     }
     MULTI_WORD(MULTI_INST(31, 3) | (nonzero ? UINT32_C(0x40000) : 0));
     MULTI_WORD(compared ? UINT32_C(0x0010000a) | (uint32_t)predicate_lane << 4u
-        : UINT32_C(0x0010100a)); MULTI_WORD(compared ? 1 : 2);
+        : packed_inputs ? UINT32_C(0x0010103a) : UINT32_C(0x0010100a)); MULTI_WORD(compared ? 1 : packed_inputs ? 1 : 2);
     MULTI_WORD(MULTI_INST(0, 7));
     MULTI_WORD(UINT32_C(0x00100072)); MULTI_WORD(0);
     MULTI_WORD(UINT32_C(0x00101246)); MULTI_WORD(1);
@@ -2525,6 +2609,10 @@ static bool natural_if_multiple_outputs_fixture_mode(NaturalIfFixture *fixture, 
         {.semantic_name = "POSITION", .component_type = 3, .mask = 15, .rw_mask = 15},
         {.semantic_name = "NORMAL", .register_id = 1, .component_type = 3, .mask = 7, .rw_mask = 7},
         {.semantic_name = "TEXCOORD", .register_id = 2, .component_type = 3, .mask = 1, .rw_mask = 1}};
+    if (packed_inputs) {
+        inputs[2].register_id = 1;
+        inputs[2].mask = inputs[2].rw_mask = 8;
+    }
     DXBCSignatureElement outputs[2] = {
         {.semantic_name = "SV_POSITION", .system_value = 1, .component_type = 3, .mask = 15},
         {.semantic_name = "TEXCOORD", .register_id = 1, .component_type = 3, .mask = 7, .rw_mask = 8}};
@@ -2544,10 +2632,10 @@ static bool natural_if_multiple_outputs_fixture_mode(NaturalIfFixture *fixture, 
     CHECK(fixture->program.program_type == (vertex ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL));
     CHECK(fixture->program.input_count == 3 && fixture->program.output_count == 2 &&
         fixture->program.instruction_count == (compared ? 9 : 8) &&
-        fixture->program.signature_declaration_count == 5);
+        fixture->program.signature_declaration_count == (input_layout == NATURAL_IF_INPUTS_PACKED_UNION ? 4 : 5));
     for (unsigned input = 0; input < 3; ++input)
-        CHECK(fixture->program.inputs[input].mask == masks[input] &&
-            fixture->program.inputs[input].rw_mask == masks[input]);
+        CHECK(fixture->program.inputs[input].mask == (input == 2 && packed_inputs ? 8 : masks[input]) &&
+            fixture->program.inputs[input].rw_mask == (input == 2 && packed_inputs ? 8 : masks[input]));
     CHECK(fixture->program.outputs[0].mask == 15 && !fixture->program.outputs[0].rw_mask &&
         fixture->program.outputs[1].mask == 7 && fixture->program.outputs[1].rw_mask == 8);
     const int prefix = compared ? 1 : 0;
@@ -2556,8 +2644,15 @@ static bool natural_if_multiple_outputs_fixture_mode(NaturalIfFixture *fixture, 
     fixture->else_value = 3 + prefix;
     fixture->join_value = 5 + prefix;
     fixture->output = 5 + prefix;
-    CHECK(fixture->program.instructions[0].source_instruction_index == 7);
+    CHECK(fixture->program.instructions[0].source_instruction_index ==
+        (uint32_t)(fixture->program.signature_declaration_count + 2));
     return true;
+}
+
+static bool natural_if_multiple_outputs_fixture_mode(NaturalIfFixture *fixture, bool vertex,
+    USILOpcode comparison, uint8_t predicate_mask, bool nonzero) {
+    return natural_if_multiple_outputs_fixture_layout(fixture, vertex, comparison, predicate_mask,
+        nonzero, NATURAL_IF_INPUTS_SEPARATE);
 }
 
 static bool natural_if_multiple_outputs_fixture(NaturalIfFixture *fixture, bool vertex) {
@@ -3178,6 +3273,292 @@ static bool check_natural_arithmetic_emission(void) {
     return true;
 }
 
+static NaturalIfObservations natural_packed_observer(const NaturalIfFixture *fixture) {
+    const bool vertex = fixture->program.program_type == DXBC_PROGRAM_TYPE_VERTEX;
+    return (NaturalIfObservations){.program = &fixture->program, .track_packed = true,
+        .packed_xyz_field = vertex ? 1 : 0, .packed_scalar_field = vertex ? 2 : 1,
+        .packed_source_instruction = fixture->condition ? 0 : fixture->condition,
+        .condition_instruction = fixture->condition};
+}
+
+static bool natural_packed_fixture(NaturalIfFixture *fixture, bool vertex, bool compared,
+    bool nonzero, NaturalIfInputLayout layout) {
+    if (vertex)
+        return natural_if_multiple_outputs_fixture_layout(fixture, true,
+            compared ? USIL_OP_LT : USIL_OP_NOP, compared ? 8 : 0, nonzero, layout);
+    return natural_if_fixture_init_layout(fixture, 3, 7, nonzero, false, false, false,
+        compared ? USIL_OP_LT : USIL_OP_NOP, compared ? 2 : 0,
+        UINT32_C(0x3ec00000), NULL, layout);
+}
+
+static bool check_natural_packed_projection(const NaturalIfFixture *fixture) {
+    const USILProgram *program = &fixture->program;
+    const bool vertex = program->program_type == DXBC_PROGRAM_TYPE_VERTEX;
+    const int xyz_field = vertex ? 1 : 0, scalar_field = vertex ? 2 : 1;
+    const int vector_instruction = vertex ? fixture->then_value : fixture->then_value - 1;
+    const DXBCOperand *vector = &program->instructions[vector_instruction].operands[1];
+    const USILInstruction *predicate = &program->instructions[fixture->condition ? 0 : fixture->condition];
+    const DXBCOperand *scalar = &predicate->operands[predicate->opcode == USIL_OP_IF ? 0 : 1];
+    const uint8_t scalar_demand = predicate->opcode == USIL_OP_IF ? 1 :
+        usil_operand_destination_lane_mask(&predicate->operands[0]);
+    bool packed = false;
+    CHECK(program->has_parsed_signature_authority && hlsl_natural_input_layout_supported(program, &packed) && packed);
+    CHECK(program->inputs[xyz_field].register_id == program->inputs[scalar_field].register_id &&
+        program->inputs[xyz_field].mask == 7 && program->inputs[xyz_field].rw_mask == 7 &&
+        program->inputs[scalar_field].mask == 8 && program->inputs[scalar_field].rw_mask == 8);
+    HLSLNaturalInputProjection xyz, w;
+    CHECK(hlsl_natural_input_projection(program, vector, 7, &xyz) &&
+        hlsl_natural_input_projection(program, scalar, scalar_demand, &w));
+    CHECK(xyz.packed && xyz.field_index == xyz_field && xyz.field_mask == 7 &&
+        xyz.natural_components == 3 && xyz.result_components == 3 &&
+        xyz.selected_components[0] == 0 && xyz.selected_components[1] == 1 && xyz.selected_components[2] == 2);
+    CHECK(w.packed && w.field_index == scalar_field && w.field_mask == 8 &&
+        w.natural_components == 1 && w.result_components == 1 && !w.selected_components[0]);
+    CHECK(xyz.register_index == w.register_index && xyz.logical_value_id != w.logical_value_id &&
+        xyz.logical_value_id == (HLSL_NATURAL_INPUT_FIELD_LOGICAL_ID_BASE | (uint64_t)(unsigned)xyz_field) &&
+        w.logical_value_id == (HLSL_NATURAL_INPUT_FIELD_LOGICAL_ID_BASE | (uint64_t)(unsigned)scalar_field));
+    CHECK(usil_operand_source_component(scalar, 0) == 3 && scalar->register_index_dim == 1 &&
+        scalar->index_has_immediate[0] && !scalar->index_representations[0]);
+    return true;
+}
+
+static bool check_natural_packed_positive(bool vertex, bool compared, bool nonzero,
+    NaturalIfInputLayout layout) {
+    NaturalIfFixture fixture;
+    CHECK(natural_packed_fixture(&fixture, vertex, compared, nonzero, layout));
+    CHECK(check_natural_packed_projection(&fixture));
+    USILProgram *program = &fixture.program;
+    StringBuilder source, selected;
+    sb_init(&source); sb_init(&selected);
+    HLSLExpressionSourceMap map, selected_map;
+    HLSLSourceQualityResult quality, selected_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations observations = natural_packed_observer(&fixture);
+    const bool emitted = natural_if_emit(program, &source, &map, &quality, &observations, &diagnostic);
+    if (!emitted)
+        fprintf(stderr, "Packed natural IF %s/%s/layout %d: %s at %d, phase %d\n",
+            vertex ? "vertex" : "pixel", compared ? "BOOL" : "raw", (int)layout,
+            hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index, (int)diagnostic.phase);
+    CHECK(emitted && map.complete && map.count == (size_t)program->instruction_count &&
+        hlsl_expression_source_map_matches(&map, program, source.buf));
+    CHECK(quality.stage == program->program_type && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        !quality.reasons && quality.counts.inspected_units == 1 && !quality.counts.incomplete_units &&
+        !quality.counts.residual_total && !quality.counts.unknown_provenance);
+    CHECK(observations.packed_fields_seen == 3 && !observations.wrong_owner &&
+        observations.return_events == 1 && (compared ? observations.comparison_events > 0 :
+            observations.comparison_events == 0));
+    CHECK(strstr(source.buf, vertex ? "float3 normal : NORMAL" : "float3 texcoord0 : TEXCOORD0") &&
+        strstr(source.buf, vertex ? "float texcoord0 : TEXCOORD0" : "float texcoord1 : TEXCOORD1"));
+    CHECK(!strstr(source.buf, vertex ? "texcoord0.w" : "texcoord1.w") &&
+        !strstr(source.buf, "u_xlat") && !strstr(source.buf, "float4 r0"));
+    if (compared) {
+        CHECK(strstr(source.buf, "const bool dxbc_value_i0 = ") &&
+            strstr(source.buf, nonzero ? "[branch] if (dxbc_value_i0)" : "[branch] if (!dxbc_value_i0)"));
+        CHECK(!strstr(source.buf, "asuint("));
+    } else CHECK(strstr(source.buf, nonzero ? "[branch] if (asuint(" : "[branch] if (!asuint("));
+    const uint32_t first_raw = program->instructions[0].source_instruction_index;
+    CHECK(first_raw == (uint32_t)(program->signature_declaration_count + 2));
+    for (size_t index = 0; index < map.count; ++index)
+        CHECK(map.origins[index].instruction_index == (int)index &&
+            map.origins[index].source_instruction_index == first_raw + (uint32_t)index);
+    /* The portable asset-only route need not request public evidence. Its
+     * source must still pass the internal header/body ownership checks. */
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        options.expression_source_map = (outputs & 1u) ? &selected_map : NULL;
+        options.source_quality = (outputs & 2u) ? &selected_quality : NULL;
+        options.source_quality_pass_index = 3;
+        options.source_quality_entry_point_index = 4;
+        sb_free(&selected); sb_init(&selected);
+        CHECK(hlsl_emit_with_options_diagnostic(program, &selected, NULL, NULL, NULL, &options, &diagnostic) &&
+            selected.len == source.len && !strcmp(selected.buf, source.buf));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &selected_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &selected_quality));
+    }
+    const size_t rejection_points[] = {1, observations.observations / 2u, observations.observations};
+    for (size_t point = 0; point < sizeof(rejection_points) / sizeof(*rejection_points); ++point) {
+        NaturalIfObservations rejected = natural_packed_observer(&fixture);
+        rejected.reject_at = rejection_points[point];
+        sb_free(&selected); sb_init(&selected);
+        CHECK(!natural_if_emit(program, &selected, &selected_map, &selected_quality, &rejected, &diagnostic) &&
+            !selected_map.complete && !selected_map.count && selected_quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+    }
+    NaturalIfObservations restored = natural_packed_observer(&fixture);
+    sb_free(&selected); sb_init(&selected);
+    CHECK(natural_if_emit(program, &selected, &selected_map, &selected_quality, &restored, &diagnostic) &&
+        !strcmp(source.buf, selected.buf) && natural_if_maps_equal(&map, &selected_map) &&
+        hlsl_source_quality_results_equal(&quality, &selected_quality));
+    sb_free(&selected); sb_free(&source); natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_packed_callback_drift(bool vertex) {
+    NaturalIfFixture fixture;
+    CHECK(natural_packed_fixture(&fixture, vertex, !vertex, true, NATURAL_IF_INPUTS_PACKED_SPLIT));
+    USILProgram *program = &fixture.program;
+    CHECK(program->instruction_count <= 11 && program->input_count <= 3 && program->signature_declaration_count <= 5);
+    USILInstruction instructions[11];
+    DXBCSignatureElement inputs[3];
+    USILSignatureDeclaration declarations[5];
+    memcpy(instructions, program->instructions, (size_t)program->instruction_count * sizeof(*instructions));
+    memcpy(inputs, program->inputs, (size_t)program->input_count * sizeof(*inputs));
+    memcpy(declarations, program->signature_declarations, (size_t)program->signature_declaration_count * sizeof(*declarations));
+    StringBuilder original, changed;
+    sb_init(&original); sb_init(&changed);
+    /* A caller prefix is outside the owned header range and remains intact. */
+    const char prefix[] = "// caller prefix\n";
+    sb_append(&original, prefix);
+    HLSLExpressionSourceMap original_map, changed_map;
+    HLSLSourceQualityResult original_quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations baseline = natural_packed_observer(&fixture);
+    baseline.mutable_source = &original;
+    CHECK(natural_if_emit(program, &original, &original_map, &original_quality, &baseline, &diagnostic) &&
+        baseline.observations > 2 && baseline.signature_observation &&
+        baseline.signature_observation < baseline.observations);
+    const char *header_type = strstr(original.buf, "float");
+    CHECK(header_type && (size_t)(header_type - original.buf) >= sizeof(prefix) - 1u &&
+        (size_t)(header_type - original.buf) < original_map.origins[0].source_begin);
+    const size_t mutation_points[] = {1, baseline.observations / 2u, baseline.observations};
+    const unsigned mutations[] = {16, 17, 18, 19, 20, 4, 15};
+    for (size_t action = 0; action < sizeof(mutations) / sizeof(*mutations); ++action) {
+        const unsigned mutation = mutations[action];
+        if (vertex && mutation >= 18) continue;
+        const bool external = mutation >= 19 || mutation == 4 || mutation == 15;
+        for (size_t point = external || vertex ? 2u : 0; point < 3; ++point) {
+            NaturalIfObservations drift = natural_packed_observer(&fixture);
+            drift.mutable_program = program; drift.mutable_source = &changed; drift.mutable_map = &changed_map;
+            drift.mutation = mutation;
+            drift.mutate_at = mutation == 19 ? 0 : mutation == 20 ? baseline.signature_observation : mutation_points[point];
+            drift.source_offset = (size_t)(header_type - original.buf);
+            drift.arithmetic_instruction = fixture.then_value;
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(!natural_if_emit(program, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+                drift.mutated && diagnostic.status != HLSL_EMIT_STATUS_OK && !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && !strncmp(changed.buf, prefix, sizeof(prefix) - 1u));
+            if (mutation == 19 || mutation == 20) CHECK(drift.observations < baseline.observations);
+            NaturalIfObservations fresh = natural_packed_observer(&fixture);
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                changed_map.complete && changed_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                hlsl_expression_source_map_matches(&changed_map, program, changed.buf));
+            if (external) CHECK(!strcmp(original.buf, changed.buf));
+            else {
+                CHECK(strcmp(original.buf, changed.buf));
+                if (mutation == 16) CHECK(strstr(changed.buf, "COORDGATE"));
+                if (mutation == 17) CHECK(strstr(changed.buf, vertex ? "normal.z" : "texcoord0.z"));
+                if (mutation == 18) CHECK(strstr(changed.buf, "centroid float3") && strstr(changed.buf, "centroid float "));
+            }
+            memcpy(program->instructions, instructions, (size_t)program->instruction_count * sizeof(*instructions));
+            memcpy(program->inputs, inputs, (size_t)program->input_count * sizeof(*inputs));
+            memcpy(program->signature_declarations, declarations, (size_t)program->signature_declaration_count * sizeof(*declarations));
+            fresh = natural_packed_observer(&fixture);
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                changed.len == original.len && !strcmp(changed.buf, original.buf) &&
+                natural_if_maps_equal(&original_map, &changed_map) &&
+                hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+        }
+    }
+    sb_free(&changed); sb_free(&original); natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_packed_boundaries(void) {
+    NaturalIfFixture fixture;
+    CHECK(natural_packed_fixture(&fixture, false, false, true, NATURAL_IF_INPUTS_PACKED_UNION));
+    USILProgram *program = &fixture.program;
+    CHECK(program->instruction_count == 10 && program->input_count == 2 && program->signature_declaration_count == 2);
+    USILInstruction instructions[10];
+    DXBCSignatureElement inputs[2];
+    USILSignatureDeclaration declarations[2];
+    memcpy(instructions, program->instructions, sizeof(instructions));
+    memcpy(inputs, program->inputs, sizeof(inputs));
+    memcpy(declarations, program->signature_declarations, sizeof(declarations));
+    for (unsigned mutation = 0; mutation < 19; ++mutation) {
+        DXBCOperand *source = &program->instructions[fixture.then_value - 1].operands[1];
+        switch (mutation) {
+        case 0: program->inputs[1].mask = program->inputs[1].rw_mask = 4; break; /* overlap */
+        case 1: program->inputs[0].mask = program->inputs[0].rw_mask = 3; break; /* hole */
+        case 2: /* One vector access crosses the two distinct fields. */
+            source->swizzle[2] = 3;
+            source->raw_token = natural_if_source_token(OPERAND_TYPE_INPUT, source->swizzle); break;
+        case 3: source->index_representations[0] = 2; break;
+        case 4: source->register_index = 1; source->index_values[0] = 1; break;
+        case 5: program->inputs[1].interpolation_mode = 3; break;
+        case 6: program->inputs[1].semantic_index = 0; break; /* ambiguous semantic */
+        case 7: program->inputs[1].component_type = 1; break;
+        case 8: program->inputs[1].system_value = 1; break;
+        case 9: program->inputs[1].min_precision = 1; break;
+        case 10: program->inputs[1].rw_mask = 9; break;
+        case 11: program->signature_declarations[0].mask = 7; break; /* W undeclared */
+        case 12: program->signature_declarations[0].interpolation_mode = 1; break;
+        case 13: program->inputs[1].stream_index = 1; break;
+        case 14: /* No complete natural IF plan may authorize packed straight-line IO. */
+            program->instructions[fixture.condition] = (USILInstruction){.opcode = USIL_OP_NOP,
+                .source_instruction_index = instructions[fixture.condition].source_instruction_index};
+            program->instructions[3] = (USILInstruction){.opcode = USIL_OP_NOP,
+                .source_instruction_index = instructions[3].source_instruction_index};
+            program->instructions[6] = (USILInstruction){.opcode = USIL_OP_NOP,
+                .source_instruction_index = instructions[6].source_instruction_index}; break;
+        case 15: program->inputs[0].rw_mask = 6; break;
+        case 16: program->inputs[1].rw_mask = 0; break;
+        case 17:
+        case 18: {
+            DXBCSignatureElement *field = &program->inputs[1];
+            const char *name = mutation == 17 ? "PACKED1" : "SV_GATE";
+            const size_t length = strlen(name);
+            memset(field->semantic_name, 0, sizeof(field->semantic_name));
+            memcpy(field->semantic_name, name, length + 1u);
+            field->semantic_name_length = length;
+            break;
+        }
+        }
+        if (mutation <= 4) {
+            HLSLNaturalInputProjection rejected;
+            memset(&rejected, 0xa5, sizeof(rejected));
+            CHECK(!hlsl_natural_input_projection(program, source, 7, &rejected));
+            CHECK(!rejected.field_index && !rejected.register_index && !rejected.field_mask &&
+                !rejected.natural_components && !rejected.result_components && !rejected.logical_value_id &&
+                !rejected.packed && !rejected.selected_components[0] && !rejected.selected_components[1] &&
+                !rejected.selected_components[2] && !rejected.selected_components[3]);
+        }
+        CHECK(natural_if_rejected(program, NULL));
+        memcpy(program->instructions, instructions, sizeof(instructions));
+        memcpy(program->inputs, inputs, sizeof(inputs));
+        memcpy(program->signature_declarations, declarations, sizeof(declarations));
+    }
+    CHECK(check_natural_packed_projection(&fixture));
+    StringBuilder restored;
+    sb_init(&restored);
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    NaturalIfObservations observations = natural_packed_observer(&fixture);
+    CHECK(natural_if_emit(program, &restored, &map, &quality, &observations, NULL) &&
+        quality.classification == HLSL_SOURCE_QUALITY_CLEAN && map.complete);
+    sb_free(&restored); natural_if_fixture_dispose(&fixture);
+    /* Existing unshared prefix inputs keep the original register identity. */
+    CHECK(natural_if_fixture_init(&fixture, 3, 7, true, false, false, false));
+    bool packed = true;
+    HLSLNaturalInputProjection unshared;
+    CHECK(hlsl_natural_input_layout_supported(&fixture.program, &packed) && !packed &&
+        hlsl_natural_input_projection(&fixture.program, &fixture.program.instructions[1].operands[1], 7, &unshared) &&
+        !unshared.packed && unshared.field_index == 0 && unshared.logical_value_id == (UINT64_C(1) << 63));
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_packed_inputs(void) {
+    CHECK(check_natural_packed_positive(false, false, true, NATURAL_IF_INPUTS_PACKED_UNION));
+    CHECK(check_natural_packed_positive(false, true, false, NATURAL_IF_INPUTS_PACKED_SPLIT));
+    CHECK(check_natural_packed_positive(true, false, false, NATURAL_IF_INPUTS_PACKED_SPLIT));
+    CHECK(check_natural_packed_positive(true, true, true, NATURAL_IF_INPUTS_PACKED_UNION));
+    CHECK(check_natural_packed_callback_drift(false));
+    CHECK(check_natural_packed_callback_drift(true));
+    CHECK(check_natural_packed_boundaries());
+    return true;
+}
+
 static bool check_natural_conditional_emission(void) {
     const struct {unsigned width; uint8_t mask;} shapes[] = {
         {1, 1}, {2, 3}, {3, 7}, {1, 2}, {2, 12}};
@@ -3198,6 +3579,7 @@ static bool check_natural_conditional_emission(void) {
     CHECK(check_natural_if_multiple_outputs(false));
     CHECK(check_natural_comparison_emission());
     CHECK(check_natural_arithmetic_emission());
+    CHECK(check_natural_packed_inputs());
     /* DXBC IF_Z/NZ compares the raw DWORD, including the float sign bit. A
      * numeric float comparison would take the opposite branch for -0. */
     const struct {uint32_t bits; bool nonzero;} conditions[] = {

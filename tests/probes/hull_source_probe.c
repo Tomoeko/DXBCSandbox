@@ -485,9 +485,9 @@ static bool reconstruct_structured(const DXBCContainerView *target,
            program.input_count, program.output_count, program.instruction_count, program.temp_count);
     for (int index = 0; index < program.input_count; ++index) {
         const DXBCSignatureElement *field = &program.inputs[index];
-        printf("structured_input index=%d semantic=%.64s register=%u mask=%u rw_mask=%u "
+        printf("structured_input index=%d semantic=%.64s semantic_index=%u register=%u mask=%u rw_mask=%u "
                "type=%u interpolation=%u\n", index, dxbc_signature_semantic_name(field),
-               field->register_id, (unsigned)field->mask, (unsigned)field->rw_mask,
+               field->semantic_index, field->register_id, (unsigned)field->mask, (unsigned)field->rw_mask,
                field->component_type, (unsigned)field->interpolation_mode);
     }
     ProbeDecodedLiteral captured = {0};

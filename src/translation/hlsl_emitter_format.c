@@ -982,6 +982,15 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
     sb_init(&reg);
     sb_init(&idx);
     bool formatting_ok = true;
+    HLSLNaturalInputProjection input_projection = {0};
+    const bool packed_input = ctx->high_level_packed_inputs && op->type == OPERAND_TYPE_INPUT;
+    if (packed_input && (((unsigned)write_mask & ~240u) ||
+            !hlsl_natural_input_projection(ctx->program, op,
+                (uint8_t)((unsigned)write_mask >> 4u), &input_projection))) {
+        hlsl_builder_failed(ctx, output);
+        sb_free(&idx); sb_free(&reg);
+        return false;
+    }
     char swiz[16] = "";
     
     if (op->type == OPERAND_TYPE_IMMEDIATE32) {
@@ -1047,8 +1056,11 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
             break;
         case OPERAND_TYPE_INPUT:
             if (ctx->high_level_interface) {
-                const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, op);
-                const char *name = element ? hlsl_high_level_input_name(ctx, (int)element->register_id) : NULL;
+                const DXBCSignatureElement *element = packed_input
+                    ? &ctx->program->inputs[input_projection.field_index]
+                    : hlsl_high_level_input_operand_signature(ctx, op);
+                const char *name = packed_input ? hlsl_high_level_input_field_name(ctx, input_projection.field_index)
+                    : element ? hlsl_high_level_input_name(ctx, (int)element->register_id) : NULL;
                 if (!name) { formatting_ok = false; hlsl_builder_failed(ctx, &reg); }
                 else if (ctx->high_level_geometry)
                     hlsl_builder_format_checked(ctx, &reg, "%s[%u].%s", ctx->high_level_geometry_input_variable,
@@ -1187,7 +1199,9 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
                                    op->type == OPERAND_TYPE_DOMAIN_LOCATION)))) {
         const bool location = ctx->high_level_domain &&
             op->type == OPERAND_TYPE_DOMAIN_LOCATION;
-        const DXBCSignatureElement *element = hlsl_high_level_input_operand_signature(ctx, op);
+        const DXBCSignatureElement *element = packed_input
+            ? &ctx->program->inputs[input_projection.field_index]
+            : hlsl_high_level_input_operand_signature(ctx, op);
         HLSLDomainShape domain_shape = {0};
         if (location && !hlsl_domain_shape(ctx->program->tessellation.domain, &domain_shape)) {
             hlsl_builder_failed(ctx, output); sb_free(&idx); return false;
@@ -1195,7 +1209,8 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
         unsigned width = location ? domain_shape.coordinate_count : 0;
         if (element) for (unsigned component = 0; component < 4; ++component)
             if (element->mask & (1u << component)) ++width;
-        if ((!element && !location) || !format_cb_swizzle(op, width, 0, write_mask, preserve_vector,
+        const uint32_t input_offset = packed_input && input_projection.field_mask == 8 ? 12u : 0u;
+        if ((!element && !location) || !format_cb_swizzle(op, width, input_offset, write_mask, preserve_vector,
                                            swiz, sizeof(swiz))) {
             hlsl_builder_failed(ctx, output);
             sb_free(&idx);

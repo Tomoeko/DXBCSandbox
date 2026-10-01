@@ -306,6 +306,15 @@ typedef struct HLSLEmitterContext {
     bool source_quality_interface_required;
     bool source_quality_cbuffer_required;
     uint32_t high_level_input_parameters_emitted;
+    /* The packed natural IF route owns each actual signature field, even
+     * when two parameter declarations share one physical input register. */
+    bool high_level_packed_inputs;
+    uint32_t high_level_input_fields_emitted;
+    /* Only the packed IF route retains this callback-free interface replay.
+     * Disposal shares the existing natural body inventory lifecycle. */
+    StringBuilder natural_packed_header_source;
+    size_t natural_packed_header_begin;
+    bool natural_packed_header_replay;
     uint32_t high_level_output_fields_emitted;
     uint32_t high_level_output_statements_emitted;
     bool high_level_output_struct_emitted;
@@ -319,7 +328,7 @@ typedef struct HLSLEmitterContext {
     uint64_t high_level_geometry_statements_emitted;
     size_t high_level_statement_expression_begin;
     int high_level_statement_instruction;
-    char high_level_input_names[HLSL_SM5_IO_REGISTER_COUNT][96];
+    char high_level_input_names[HLSL_SM5_IO_REGISTER_COUNT][96]; /* Signature ordinal. */
     char high_level_output_names[HLSL_SM5_IO_REGISTER_COUNT][96];
     char high_level_output_type[96];
     char high_level_output_variable[96];
@@ -465,6 +474,23 @@ bool hlsl_append_high_level_output(HLSLEmitterContext *ctx, const DXBCOperand *d
 const DXBCSignatureElement *hlsl_high_level_input_signature(
     const HLSLEmitterContext *ctx, int register_index);
 const char *hlsl_high_level_input_name(const HLSLEmitterContext *ctx, int register_index);
+const char *hlsl_high_level_input_field_name(const HLSLEmitterContext *ctx, int field_index);
+#define HLSL_NATURAL_INPUT_FIELD_LOGICAL_ID_BASE UINT64_C(0x8000000000070000)
+typedef struct {
+    int field_index;
+    uint32_t register_index;
+    uint8_t field_mask, natural_components, result_components;
+    uint8_t selected_components[4];
+    uint64_t logical_value_id;
+    bool packed;
+} HLSLNaturalInputProjection;
+/* Pure authority/projection helpers, independent of allocated names. The
+ * additional shape is one parsed V/F XYZ+W pair; existing unique prefix
+ * fields retain their names and identities. Outputs are zero on failure. */
+bool hlsl_natural_input_layout_supported(const USILProgram *program, bool *has_packed);
+bool hlsl_natural_input_projection(const USILProgram *program, const DXBCOperand *operand,
+    uint8_t demanded_lanes, HLSLNaturalInputProjection *projection);
+bool hlsl_natural_packed_header_matches(const HLSLEmitterContext *ctx);
 bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
     const DXBCOperand *operand, uint8_t demanded_lanes, ASTOperandProvenance *provenance);
 

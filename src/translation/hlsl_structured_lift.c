@@ -150,19 +150,17 @@ static bool natural_program_features_supported(const USILProgram *program) {
 }
 
 static bool natural_signature_layout_supported(const USILProgram *program) {
-    for (int direction = 0; direction < 2; ++direction) {
-        const DXBCSignatureElement *fields = direction ? program->outputs : program->inputs;
-        const int count = direction ? program->output_count : program->input_count;
-        for (int index = 0; index < count; ++index) {
-            if (!hlsl_signature_semantic_storage_valid(&fields[index]) ||
-                !fields[index].mask || fields[index].mask > 15 ||
-                (fields[index].mask & (fields[index].mask + 1u)) ||
-                fields[index].register_id >= HLSL_SM5_IO_REGISTER_COUNT)
+    if (!hlsl_natural_input_layout_supported(program, NULL)) return false;
+    const DXBCSignatureElement *fields = program->outputs;
+    for (int index = 0; index < program->output_count; ++index) {
+        if (!hlsl_signature_semantic_storage_valid(&fields[index]) ||
+            !fields[index].mask || fields[index].mask > 15 ||
+            (fields[index].mask & (fields[index].mask + 1u)) ||
+            fields[index].register_id >= HLSL_SM5_IO_REGISTER_COUNT)
+            return false;
+        for (int previous = 0; previous < index; ++previous)
+            if (fields[previous].register_id == fields[index].register_id)
                 return false;
-            for (int previous = 0; previous < index; ++previous)
-                if (fields[previous].register_id == fields[index].register_id)
-                    return false;
-        }
     }
     return true;
 }
@@ -454,6 +452,9 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
     if (!(plan->natural_width ? natural_program_supported(ctx) : hlsl_float4_program_supported(ctx)))
         return false;
     const USILProgram *program = ctx->program;
+    bool packed_inputs = false;
+    if (plan->natural_width && !hlsl_natural_input_layout_supported(program, &packed_inputs))
+        return reject(ctx, -1, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
     if (!ctx->ssa.operand_ssa_vars || !ctx->ssa.block_phis || ctx->ssa.ssa_var_count < 0 ||
         ctx->cfg.block_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT ||
         dxbc_size_multiply_overflows((size_t)ctx->ssa.ssa_var_count, sizeof(int)))
@@ -530,6 +531,12 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
             if ((condition->type != OPERAND_TYPE_INPUT && condition->type != OPERAND_TYPE_TEMP) ||
                 !hlsl_lift_operand_is_plain(condition))
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+            if (packed_inputs && condition->type == OPERAND_TYPE_INPUT) {
+                HLSLNaturalInputProjection projection;
+                if (!hlsl_natural_input_projection(program, condition,
+                    demanded_lanes(ctx, index, 0), &projection))
+                    return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+            }
             continue;
         }
         const bool comparison = plan->natural_width && scalar_comparison_opcode(inst->opcode);
@@ -547,6 +554,13 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
         } else if (!(plan->natural_width ? hlsl_natural_float_instruction_supported(ctx, index)
                                         : hlsl_float4_instruction_supported(ctx, index)))
             return false;
+        if (packed_inputs) for (int operand = 1; operand < inst->operand_count; ++operand) {
+            if (inst->operands[operand].type != OPERAND_TYPE_INPUT) continue;
+            HLSLNaturalInputProjection projection;
+            if (!hlsl_natural_input_projection(program, &inst->operands[operand],
+                demanded_lanes(ctx, index, operand), &projection))
+                return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+        }
         const DXBCOperand *dest = &inst->operands[0];
         const int block = ctx->cfg.instruction_block[index];
         if (dest->type == OPERAND_TYPE_OUTPUT) {
@@ -652,6 +666,9 @@ bool hlsl_natural_structured_preflight(HLSLEmitterContext *ctx) {
     HLSLEmitterContext *scratch = malloc(sizeof(*scratch));
     if (!scratch) return false;
     *scratch = *ctx;
+    bool packed_inputs = false;
+    if (hlsl_natural_input_layout_supported(ctx->program, &packed_inputs) && packed_inputs)
+        scratch->high_level_interface = false; /* The pure plan must not depend on prepared names. */
     HLSLEmitDiagnostic diagnostic;
     hlsl_emit_diagnostic_init(&diagnostic);
     StringBuilder output;
@@ -1192,11 +1209,18 @@ cleanup:
     return success;
 }
 
+static bool packed_header_ends_at(const HLSLEmitterContext *ctx, size_t offset) {
+    return !ctx->high_level_packed_inputs ||
+        (hlsl_natural_packed_header_matches(ctx) && offset >= ctx->natural_packed_header_begin &&
+         ctx->natural_packed_header_source.len == offset - ctx->natural_packed_header_begin);
+}
+
 bool emit_high_level_structured(HLSLEmitterContext *ctx) {
     StructuredPlan plan = {0};
     HLSLNaturalStructuredBodyInventory *inventory = NULL;
     bool success = false;
-    if (!natural_model_stable(ctx) || !build_plan(ctx, &plan)) goto cleanup;
+    if (!natural_model_stable(ctx) || !packed_header_ends_at(ctx, ctx->sb->len) ||
+        !build_plan(ctx, &plan)) goto cleanup;
     if (plan.natural_width) {
         if (!ctx->natural_structured_owners_guarded || ctx->natural_structured_body_inventory)
             goto cleanup;
@@ -1327,10 +1351,12 @@ static bool body_replay(HLSLEmitterContext *ctx,
 }
 
 bool hlsl_natural_structured_body_inventory_complete(HLSLEmitterContext *ctx) {
-    if (!ctx || !ctx->natural_structured_owners_guarded || !natural_model_stable(ctx)) return false;
+    if (!ctx || !ctx->natural_structured_owners_guarded || !natural_model_stable(ctx) ||
+        !hlsl_natural_packed_header_matches(ctx)) return false;
     HLSLNaturalStructuredBodyInventory *inventory = ctx->natural_structured_body_inventory;
     if (!inventory || !inventory->source || !ctx->expression_source_map ||
-        !body_prefix_matches(ctx, inventory) || inventory->body_end < inventory->source_begin ||
+        !body_prefix_matches(ctx, inventory) || !packed_header_ends_at(ctx, inventory->source_begin) ||
+        inventory->body_end < inventory->source_begin ||
         ctx->sb->len <= inventory->body_end ||
         ctx->sb->len - inventory->source_begin > (size_t)NATURAL_BODY_BYTE_LIMIT) return false;
     if (inventory->sealed) return hlsl_natural_structured_body_inventory_matches(ctx);
@@ -1367,11 +1393,16 @@ bool hlsl_natural_structured_body_inventory_matches(HLSLEmitterContext *ctx) {
         ctx->sb->len == inventory->source_end && body_prefix_matches(ctx, inventory) &&
         !memcmp(ctx->sb->buf + inventory->source_begin, inventory->source,
             inventory->source_end - inventory->source_begin) &&
-        body_map_equal(ctx->expression_source_map, &inventory->map) && natural_model_stable(ctx);
+        body_map_equal(ctx->expression_source_map, &inventory->map) && natural_model_stable(ctx) &&
+        packed_header_ends_at(ctx, inventory->source_begin);
 }
 
 void hlsl_natural_structured_body_inventory_dispose(HLSLEmitterContext *ctx) {
-    if (!ctx || !ctx->natural_structured_body_inventory) return;
+    if (!ctx) return;
+    sb_free(&ctx->natural_packed_header_source);
+    ctx->natural_packed_header_begin = 0;
+    ctx->natural_packed_header_replay = false;
+    if (!ctx->natural_structured_body_inventory) return;
     HLSLNaturalStructuredBodyInventory *inventory = ctx->natural_structured_body_inventory;
     if (ctx->expression_source_map == &inventory->internal_map)
         ctx->expression_source_map = inventory->caller_map;
