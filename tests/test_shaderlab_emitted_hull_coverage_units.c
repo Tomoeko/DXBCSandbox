@@ -3,6 +3,7 @@
 #include "translation/shaderlab_emitted_hull_coverage.h"
 #include "translation/shaderlab_emitted_hull_coverage_internal.h"
 #include "translation/hlsl_source_quality_internal.h"
+#include "translation/shaderlab_emitter_internal.h"
 #include "common/file_io.h"
 #include "dxbc/usbd.h"
 #include "test_geometry_fixture.h"
@@ -17,7 +18,16 @@
     fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #condition); \
     return false; } } while (0)
 
-enum { HULL_STAGE = 3, DOMAIN_STAGE = 4, FIXTURE_BLOB_LIMIT = 9 };
+enum { HULL_STAGE = 3, DOMAIN_STAGE = 4, FIXTURE_VARIANT_COUNT = 9, FIXTURE_BLOB_LIMIT = 11 };
+
+typedef enum {
+    EMPTY_ROUTE_ABSENT,
+    EMPTY_ROUTE_COMMON,
+    EMPTY_ROUTE_EXPLICIT_ABSENCE,
+    EMPTY_ROUTE_PARSED_ZERO,
+    EMPTY_ROUTE_PARSED_GLOBALS,
+    EMPTY_ROUTE_MIXED_PARSED
+} EmptyRoute;
 
 typedef struct {
     SerializedShader shader;
@@ -30,6 +40,7 @@ typedef struct {
     BlobEntry entries[FIXTURE_BLOB_LIMIT];
     uint8_t *segments[FIXTURE_BLOB_LIMIT];
     int lengths[FIXTURE_BLOB_LIMIT], platform, keyword_index;
+    int parameter_indices[2];
     char *keyword_name;
     uint8_t keyword_flag;
     uint16_t keyword_mask;
@@ -181,7 +192,42 @@ static bool fixture_second_state(Fixture *fixture, bool unsupported_hull) {
         fixture->identities[stage][1].local_keyword_indices = &fixture->keyword_index;
         fixture->pass.subprogram_count[stage] = 2;
     }
-    fixture->archive.entry_count = fixture->archive.segment_count = FIXTURE_BLOB_LIMIT;
+    fixture->archive.entry_count = fixture->archive.segment_count = FIXTURE_VARIANT_COUNT;
+    return true;
+}
+
+static bool fixture_empty_route(Fixture *fixture, EmptyRoute route) {
+    if (route == EMPTY_ROUTE_ABSENT) return true;
+    SerializedConstantBuffer shell = {.name = "$Globals", .role = SERIALIZED_CBUFFER_LOOSE_PARAMETERS};
+    SerializedProgramParameters common = {.cb_count = 1, .constant_buffers = &shell};
+    CHECK(serialized_program_parameters_copy(&fixture->pass.common_parameters[HULL_STAGE], &common));
+    if (route == EMPTY_ROUTE_COMMON) return true;
+    fixture->parameter_indices[0] = fixture->parameter_indices[1] = -1;
+    fixture->pass.subprogram_param_blob_indices[HULL_STAGE] = fixture->parameter_indices;
+    if (route == EMPTY_ROUTE_EXPLICIT_ABSENCE) return true;
+    for (int state = 0; state < fixture->pass.subprogram_count[HULL_STAGE]; ++state) {
+        const int index = FIXTURE_VARIANT_COUNT + state;
+        const bool globals = route == EMPTY_ROUTE_PARSED_GLOBALS ||
+            (route == EMPTY_ROUTE_MIXED_PARSED && state == 1);
+        size_t size = 0;
+        fixture->segments[index] = test_shaderlab_empty_parameters_blob(globals, &size);
+        CHECK(fixture->segments[index] && size <= INT32_MAX);
+        fixture->lengths[index] = (int)size;
+        fixture->entries[index] = (BlobEntry){0, (int32_t)size, index};
+        fixture->parameter_indices[state] = index;
+        fixture->archive.entry_count = fixture->archive.segment_count = index + 1;
+        ByteStream stream;
+        stream_init(&stream, fixture->segments[index], size); stream_set_endian(&stream, false);
+        SerializedProgramParameters parsed = {0};
+        CHECK(subprogram_metadata_parse_parameters(&stream, &parsed));
+        CHECK(!stream_remaining(&stream) && parsed.is_binary &&
+              parsed.version == UNITY_2021_3_PLAYER_BLOB_VERSION &&
+              parsed.dialect == PLAYER_BLOB_DIALECT_UNITY_2021_3_35F1 &&
+              parsed.cb_count == (globals ? 1 : 0) && !parsed.res_count);
+        if (globals) CHECK(parsed.constant_buffers[0].role == SERIALIZED_CBUFFER_LOOSE_PARAMETERS &&
+                           !strcmp(parsed.constant_buffers[0].name, "$Globals"));
+        serialized_program_parameters_free(&parsed);
+    }
     return true;
 }
 
@@ -284,9 +330,14 @@ static bool owned_mutations(const ShaderLabSourceQualityRequest *request,
     }
     if (entry->inputs.common.cb_count) {
         CHECK(entry->inputs.common.cb_count == 1);
-        CHECK(entry->inputs.common.constant_buffers[0].var_count == 1);
-        REJECT_RESTORE(entry->inputs.common.constant_buffers[0].variables[0].layout[0] += 4,
-                       entry->inputs.common.constant_buffers[0].variables[0].layout[0] -= 4);
+        if (entry->inputs.common.constant_buffers[0].var_count) {
+            CHECK(entry->inputs.common.constant_buffers[0].var_count == 1);
+            REJECT_RESTORE(entry->inputs.common.constant_buffers[0].variables[0].layout[0] += 4,
+                           entry->inputs.common.constant_buffers[0].variables[0].layout[0] -= 4);
+        } else {
+            REJECT_RESTORE(entry->inputs.common.constant_buffers[0].size = 16,
+                           entry->inputs.common.constant_buffers[0].size = 0);
+        }
     }
     const size_t inventory_ordinal = entry->observation.entry_record_index;
     REJECT_RESTORE(entry->observation.entry_record_index = 0,
@@ -370,10 +421,14 @@ static bool current_mutations(Fixture *fixture, const ShaderLabSourceQualityRequ
     CHECK(replay_restored(request, owned));
     if (parameters->cb_count) {
         CHECK(parameters->cb_count == 1);
-        CHECK(parameters->constant_buffers[0].var_count == 1);
-        ++parameters->constant_buffers[0].variables[0].layout[0];
+        const bool has_field = parameters->constant_buffers[0].var_count != 0;
+        if (has_field) {
+            CHECK(parameters->constant_buffers[0].var_count == 1);
+            ++parameters->constant_buffers[0].variables[0].layout[0];
+        } else parameters->constant_buffers[0].size = 16;
         CHECK(!shaderlab_emitted_hull_coverage_replay(request, owned));
-        --parameters->constant_buffers[0].variables[0].layout[0];
+        if (has_field) --parameters->constant_buffers[0].variables[0].layout[0];
+        else parameters->constant_buffers[0].size = 0;
         CHECK(replay_restored(request, owned));
     }
     fixture->segments[HULL_STAGE][8] ^= 1;
@@ -388,10 +443,40 @@ static bool current_mutations(Fixture *fixture, const ShaderLabSourceQualityRequ
     return true;
 }
 
-static bool positive_capture(bool control_point, bool scalar, bool two_states, bool icb) {
+static bool check_selected_stage(const Fixture *fixture, const ShaderLabEmittedHullCoverage *owned) {
+    ShaderLabVariantPlan plan;
+    shaderlab_variant_plan_init(&plan);
+    CHECK(shaderlab_variant_plan_build(&fixture->shader, &fixture->pass, &plan, NULL) == SHADERLAB_VARIANT_PLAN_OK);
+    StringBuilder source;
+    sb_init(&source);
+    ShaderLabExpressionSourceMap map = {0};
+    ShaderLabExpressionMapContext trace = {.map = &map};
+    ShaderLabStageDiagnostic diagnostic;
+    CHECK(emit_stage_hlsl_with_variant_plan_mode(&plan, HULL_STAGE,
+        fixture->entries, fixture->archive.entry_count, (uint8_t **)fixture->segments,
+        fixture->lengths, fixture->archive.segment_count, true, &trace, &source, &diagnostic));
+    CHECK(diagnostic.status == SHADERLAB_STAGE_OK && sb_ok(&source) && source.len && map.count == owned->entry_count);
+    for (size_t index = 0; index < map.count; ++index) {
+        const ShaderLabExpressionSourceRecord *record = &map.records[index];
+        const ShaderLabEmittedHullEntry *entry = &owned->entries[index].observation;
+        CHECK(record->stage_index == HULL_STAGE && record->subprogram_index == entry->subprogram_index &&
+              record->serialized_state == entry->serialized_state && record->has_source_quality &&
+              !memcmp(record->target_digest, entry->target_digest, sizeof(entry->target_digest)) &&
+              hlsl_source_quality_results_equal(&record->source_quality, &entry->base_quality));
+        CHECK(record->instructions.complete && record->instructions.count == owned->entries[index].raw_map.count);
+        for (size_t instruction = 0; instruction < record->instructions.count; ++instruction)
+            CHECK(hlsl_expression_origin_ranges_valid(&record->instructions.origins[instruction], source.len));
+    }
+    shaderlab_expression_source_map_free(&map); sb_free(&source); shaderlab_variant_plan_free(&plan);
+    return true;
+}
+
+static bool positive_capture(bool control_point, bool scalar, bool two_states, bool icb, EmptyRoute route) {
     Fixture fixture, replacement;
     CHECK(icb ? fixture_init_icb(&fixture, scalar) : fixture_init(&fixture, control_point, scalar));
     if (two_states) CHECK(fixture_second_state(&fixture, false));
+    CHECK(route == EMPTY_ROUTE_ABSENT || (!scalar && two_states));
+    CHECK(fixture_empty_route(&fixture, route));
     ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
     ShaderLabEmittedHullCoverage *owned = NULL, *independent = NULL;
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &owned) == SHADERLAB_HULL_COVERAGE_OK && owned);
@@ -422,6 +507,7 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
           normal_result.classification == owned_result.classification &&
           normal_result.observed_stage_incomplete_units == owned_result.observed_stage_incomplete_units);
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &independent) == SHADERLAB_HULL_COVERAGE_OK);
+    if (route != EMPTY_ROUTE_ABSENT) CHECK(check_selected_stage(&fixture, owned));
     for (size_t index = 0; index < owned->entry_count; ++index) {
         HLSLHullCoverageCapture *entry = &owned->entries[index];
         ShaderLabEmittedHullEntry observation;
@@ -435,10 +521,26 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
         CHECK(hlsl_stage_coverage_equal(&entry->coverage, &independent->entries[index].coverage));
         CHECK(entry->inputs.target != independent->entries[index].inputs.target &&
               entry->inputs.player_payload != independent->entries[index].inputs.player_payload);
-        CHECK(entry->inputs.current.cb_count == (scalar ? 1 : 0) &&
-              entry->inputs.common.cb_count == (scalar ? 1 : 0));
-        if (scalar)
+        const bool parsed = route >= EMPTY_ROUTE_PARSED_ZERO;
+        const bool current_shell = route == EMPTY_ROUTE_COMMON || route == EMPTY_ROUTE_EXPLICIT_ABSENCE ||
+            route == EMPTY_ROUTE_PARSED_GLOBALS ||
+            (route == EMPTY_ROUTE_MIXED_PARSED && observation.subprogram_index == 1);
+        CHECK(entry->inputs.current.cb_count == ((scalar || current_shell) ? 1 : 0) &&
+              entry->inputs.common.cb_count == ((scalar || route != EMPTY_ROUTE_ABSENT) ? 1 : 0));
+        if (entry->inputs.current.cb_count)
             CHECK(entry->inputs.current.constant_buffers != entry->inputs.common.constant_buffers);
+        if (route != EMPTY_ROUTE_ABSENT) {
+            CHECK(entry->inputs.current.is_binary == parsed && !entry->inputs.common.is_binary &&
+                  entry->inputs.current.version == (parsed ? UNITY_2021_3_PLAYER_BLOB_VERSION : 0) &&
+                  entry->inputs.current.dialect == (parsed ? PLAYER_BLOB_DIALECT_UNITY_2021_3_35F1 : PLAYER_BLOB_DIALECT_INVALID));
+            const SerializedConstantBuffer *common = entry->inputs.common.constant_buffers;
+            CHECK(common != fixture.pass.common_parameters[HULL_STAGE].constant_buffers &&
+                  common->name != fixture.pass.common_parameters[HULL_STAGE].constant_buffers[0].name &&
+                  common->role == SERIALIZED_CBUFFER_LOOSE_PARAMETERS && !strcmp(common->name, "$Globals") &&
+                  !common->size && !common->var_count && !common->struct_count);
+            if (current_shell) CHECK(entry->inputs.current.constant_buffers[0].name != common->name &&
+                                    entry->inputs.current.constant_buffers[0].role == SERIALIZED_CBUFFER_LOOSE_PARAMETERS);
+        }
         CHECK(entry->coverage.hull_icb.plan.present == icb);
         if (icb) {
             CHECK(entry->coverage.hull_icb.plan.row_count == 3 &&
@@ -458,7 +560,7 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
     }
     /* The mutation helper deliberately targets the first ordinary selected
      * row; the multi-state fixture separately exercises complete denominators. */
-    if (!two_states) CHECK(owned_mutations(&request, owned));
+    if (!two_states || route != EMPTY_ROUTE_ABSENT) CHECK(owned_mutations(&request, owned));
     CHECK(current_mutations(&fixture, &request, owned));
     ShaderLabEmittedHullCoverage *same = owned;
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &same) == SHADERLAB_HULL_COVERAGE_INVALID_ARGUMENT && same == owned);
@@ -466,6 +568,7 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
 
     CHECK(icb ? fixture_init_icb(&replacement, scalar) : fixture_init(&replacement, control_point, scalar));
     if (two_states) CHECK(fixture_second_state(&replacement, false));
+    CHECK(fixture_empty_route(&replacement, route));
     fixture_dispose(&fixture);
     request.shader = &replacement.shader;
     request.archive = &replacement.archive;
@@ -489,15 +592,98 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
 typedef struct {
     Fixture *fixture;
     ShaderLabSourceSyntaxKind rejected_kind;
-    bool mutate, changed;
+    bool mutate, mutate_parameters, changed;
 } Observer;
 
 static bool observe_receipt(void *context, const ShaderLabSourceSyntaxReceipt *receipt) {
     Observer *observer = context;
     if (receipt->stage_index != HULL_STAGE || receipt->kind != observer->rejected_kind) return true;
     if (!observer->mutate) return false;
-    observer->fixture->pass.state.culling.val += 1;
+    if (observer->mutate_parameters)
+        observer->fixture->pass.common_parameters[HULL_STAGE].constant_buffers[0].size += 16;
+    else observer->fixture->pass.state.culling.val += 1;
     observer->changed = true;
+    return true;
+}
+
+static bool route_rejected(Fixture *fixture, ShaderLabStageStatus expected) {
+    ShaderLabVariantPlan plan;
+    shaderlab_variant_plan_init(&plan);
+    CHECK(shaderlab_variant_plan_build(&fixture->shader, &fixture->pass, &plan, NULL) == SHADERLAB_VARIANT_PLAN_OK);
+    StringBuilder stage;
+    sb_init(&stage);
+    ShaderLabStageDiagnostic diagnostic;
+    CHECK(!emit_stage_hlsl_with_variant_plan_mode(&plan, HULL_STAGE,
+        fixture->entries, fixture->archive.entry_count, fixture->segments,
+        fixture->lengths, fixture->archive.segment_count, true, NULL, &stage, &diagnostic));
+    CHECK(diagnostic.status == expected && !stage.len);
+    sb_free(&stage); shaderlab_variant_plan_free(&plan);
+    ShaderLabSourceQualityRequest request = {.shader = &fixture->shader, .archive = &fixture->archive};
+    StringBuilder source;
+    sb_init(&source);
+    ShaderLabSourceQualityInventory inventory = {0};
+    CHECK(shaderlab_source_quality_emit(&request, &source, &inventory, NULL) != SHADERLAB_SOURCE_QUALITY_OK);
+    CHECK(!inventory.complete && !source.len);
+    shaderlab_source_quality_inventory_dispose(&inventory); sb_free(&source);
+    ShaderLabEmittedHullCoverage *rejected = NULL;
+    CHECK(shaderlab_emitted_hull_coverage_capture(&request, &rejected) != SHADERLAB_HULL_COVERAGE_OK && !rejected);
+    return true;
+}
+
+static bool empty_route_rejections(bool icb) {
+    Fixture fixture;
+    CHECK(icb ? fixture_init_icb(&fixture, false) : fixture_init(&fixture, false, false));
+    CHECK(fixture_second_state(&fixture, false));
+    CHECK(fixture_empty_route(&fixture, EMPTY_ROUTE_MIXED_PARSED));
+    ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
+    ShaderLabEmittedHullCoverage *owned = NULL;
+    CHECK(shaderlab_emitted_hull_coverage_capture(&request, &owned) == SHADERLAB_HULL_COVERAGE_OK);
+    for (unsigned state = 0; state < 2; ++state) {
+        const int index = fixture.parameter_indices[state];
+        fixture.parameter_indices[state] = -2;
+        CHECK(route_rejected(&fixture, SHADERLAB_STAGE_INVALID_PARAMETER_BLOB));
+        fixture.parameter_indices[state] = index;
+        CHECK(replay_restored(&request, owned));
+        fixture.segments[index][0] ^= 1; /* A present malformed blob cannot select common metadata. */
+        CHECK(route_rejected(&fixture, SHADERLAB_STAGE_INVALID_PARAMETER_BLOB));
+        fixture.segments[index][0] ^= 1;
+        CHECK(replay_restored(&request, owned));
+        const int32_t length = fixture.entries[index].length;
+        fixture.entries[index].length = 8; /* Valid version and count, missing collection tail. */
+        CHECK(route_rejected(&fixture, SHADERLAB_STAGE_INVALID_PARAMETER_BLOB));
+        fixture.entries[index].length = length;
+        CHECK(replay_restored(&request, owned));
+    }
+    const int sibling = fixture.parameter_indices[1];
+    CHECK(fixture.lengths[sibling] == 28);
+    fixture.segments[sibling][12] = 16; /* Well-formed but nonempty sibling loose shell. */
+    CHECK(route_rejected(&fixture, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH));
+    fixture.segments[sibling][12] = 0;
+    CHECK(replay_restored(&request, owned));
+    /* The no-blob selected row and its explicit parsed sibling still share
+     * authority; the sibling conflict must not disappear behind a NULL residual. */
+    fixture.parameter_indices[0] = -1;
+    CHECK(shaderlab_emitted_hull_coverage_replay(&request, owned) == false);
+    ShaderLabEmittedHullCoverage *common_route = NULL;
+    CHECK(shaderlab_emitted_hull_coverage_capture(&request, &common_route) == SHADERLAB_HULL_COVERAGE_OK);
+    CHECK(!common_route->entries[0].inputs.current.is_binary && common_route->entries[0].inputs.current.cb_count == 1);
+    fixture.segments[sibling][12] = 16;
+    CHECK(route_rejected(&fixture, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH));
+    fixture.segments[sibling][12] = 0;
+    CHECK(replay_restored(&request, common_route));
+    shaderlab_emitted_hull_coverage_free(common_route);
+    fixture.parameter_indices[0] = FIXTURE_VARIANT_COUNT;
+    CHECK(replay_restored(&request, owned));
+    Observer observer = {.fixture = &fixture, .rejected_kind = SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY,
+        .mutate = true, .mutate_parameters = true};
+    request.observer = observe_receipt; request.observer_context = &observer;
+    ShaderLabEmittedHullCoverage *rejected = NULL;
+    CHECK(shaderlab_emitted_hull_coverage_capture(&request, &rejected) != SHADERLAB_HULL_COVERAGE_OK &&
+          !rejected && observer.changed);
+    fixture.pass.common_parameters[HULL_STAGE].constant_buffers[0].size = 0;
+    request.observer = NULL; request.observer_context = NULL;
+    CHECK(replay_restored(&request, owned));
+    shaderlab_emitted_hull_coverage_free(owned); fixture_dispose(&fixture);
     return true;
 }
 
@@ -557,11 +743,19 @@ static bool rejection_and_restore(bool icb) {
 
 int main(void) {
     const size_t allocations = g_allocations_count, bytes = g_allocated_bytes;
-    if (!positive_capture(false, false, false, false) || !positive_capture(true, false, false, false) ||
-        !positive_capture(false, true, false, false) || !positive_capture(false, false, true, false) ||
-        !positive_capture(false, false, false, true) || !positive_capture(false, true, false, true) ||
-        !positive_capture(false, false, true, true) ||
+    if (!positive_capture(false, false, false, false, EMPTY_ROUTE_ABSENT) ||
+        !positive_capture(true, false, false, false, EMPTY_ROUTE_ABSENT) ||
+        !positive_capture(false, true, false, false, EMPTY_ROUTE_ABSENT) ||
+        !positive_capture(false, false, true, false, EMPTY_ROUTE_ABSENT) ||
+        !positive_capture(false, false, false, true, EMPTY_ROUTE_ABSENT) ||
+        !positive_capture(false, true, false, true, EMPTY_ROUTE_ABSENT) ||
+        !positive_capture(false, false, true, true, EMPTY_ROUTE_ABSENT) ||
         !rejection_and_restore(false) || !rejection_and_restore(true)) return 1;
+    for (unsigned icb = 0; icb < 2; ++icb) {
+        for (EmptyRoute route = EMPTY_ROUTE_COMMON; route <= EMPTY_ROUTE_MIXED_PARSED; ++route)
+            if (!positive_capture(false, false, true, icb, route)) return 1;
+        if (!empty_route_rejections(icb)) return 1;
+    }
     if (g_allocations_count != allocations || g_allocated_bytes != bytes) {
         fprintf(stderr, "allocation leak: %zu/%zu -> %zu/%zu\n",
             allocations, bytes, g_allocations_count, g_allocated_bytes);

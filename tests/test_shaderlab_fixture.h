@@ -13,6 +13,9 @@ uint8_t *test_shaderlab_variant_blob(const uint8_t *dxbc, size_t dxbc_size, int3
 /* Same wrapper with an ordered keyword list for exhaustive bounded domains. */
 uint8_t *test_shaderlab_variant_blob_keywords(const uint8_t *dxbc, size_t dxbc_size,
     int32_t program_type, const char *const *keywords, size_t keyword_count, size_t *out_size);
+/* Exact selected player parameter dialect, with either no collections or one
+ * empty loose $Globals shell. The caller owns the returned malloc buffer. */
+uint8_t *test_shaderlab_empty_parameters_blob(bool globals_shell, size_t *out_size);
 
 /* Authored single-matrix vertex tokens; no captured private byte array. */
 uint8_t *test_shaderlab_matrix_vertex_dxbc(size_t *out_size);

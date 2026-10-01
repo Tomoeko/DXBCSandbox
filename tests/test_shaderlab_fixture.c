@@ -13,6 +13,27 @@ static void write_u32_le(uint8_t *bytes, size_t *cursor, uint32_t value) {
         bytes[(*cursor)++] = (uint8_t)(value >> (i * 8));
 }
 
+uint8_t *test_shaderlab_empty_parameters_blob(bool globals_shell, size_t *out_size) {
+    if (!out_size) return NULL;
+    *out_size = 0;
+    const size_t size = globals_shell ? 28u : 12u;
+    uint8_t *bytes = calloc(size, 1);
+    if (!bytes) return NULL;
+    size_t cursor = 0;
+    write_u32_le(bytes, &cursor, UNITY_2021_3_PLAYER_BLOB_VERSION);
+    write_u32_le(bytes, &cursor, globals_shell ? 1u : 0u);
+    if (globals_shell) {
+        write_u32_le(bytes, &cursor, 0u); /* Empty loose name projects to $Globals. */
+        write_u32_le(bytes, &cursor, 0u); /* Shell size. */
+        write_u32_le(bytes, &cursor, 0u); /* Variables. */
+        write_u32_le(bytes, &cursor, 0u); /* Structures. */
+    }
+    write_u32_le(bytes, &cursor, 0u); /* Resources. */
+    if (cursor != size) { free(bytes); return NULL; }
+    *out_size = size;
+    return bytes;
+}
+
 uint8_t *test_shaderlab_variant_blob(const uint8_t *dxbc, size_t dxbc_size, int32_t program_type,
                                      const char *keyword, size_t *out_size) {
     return test_shaderlab_variant_blob_keywords(dxbc, dxbc_size, program_type,

@@ -559,6 +559,17 @@ static bool blob_entry_is_available(const BlobEntry *entries, int entry_count,
   return offset <= segment_length && length <= segment_length - offset;
 }
 
+/* A present parameter blob is the current authority even when its parsed
+ * collections are empty. The no-blob route retains the non-NULL common model
+ * passed into the actual emitter; declaration witnesses use the same choice. */
+static const SerializedProgramParameters *select_stage_parameters(
+    const SerializedProgramParameters *common,
+    const SerializedProgramParameters *parsed, int parameter_index) {
+  if (!common || parameter_index < -1 || (parameter_index >= 0 && !parsed))
+    return NULL;
+  return parameter_index >= 0 ? parsed : common;
+}
+
 /* Declaration witnesses come from the same archived player blobs used for the
  * target. Runtime parameter authorities are never rewritten by this union. */
 static bool build_global_declarations(
@@ -568,6 +579,11 @@ static bool build_global_declarations(
     const int *lengths, int segment_count, HLSLGlobalDeclarationUnion **output,
     ShaderLabStageDiagnostic *diagnostic) {
   *output = NULL;
+  if (!selected_parameters) {
+    set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
+                   stage, current, -1);
+    return false;
+  }
   HLSLGlobalDeclarationStatus status = hlsl_global_declarations_scope_status(
       selected_parameters, &pass->common_parameters[stage]);
   if (status == HLSL_GLOBAL_DECLARATIONS_NOT_APPLICABLE) return true;
@@ -626,8 +642,16 @@ static bool build_global_declarations(
         goto cleanup;
       }
     }
+    const SerializedProgramParameters *witness_parameters = select_stage_parameters(
+        &pass->common_parameters[stage], &parameters[slot], parameter_index);
+    if (!witness_parameters || (index == current &&
+        !serialized_program_parameters_equal(selected_parameters, witness_parameters))) {
+      set_diagnostic(diagnostic, SHADERLAB_STAGE_VARIANT_METADATA_MISMATCH,
+                     stage, current, index);
+      goto cleanup;
+    }
     witnesses[slot] = (HLSLGlobalDeclarationWitness){
-        index, &players[slot], parameter_index >= 0 ? &parameters[slot] : NULL};
+        index, &players[slot], witness_parameters};
   }
   HLSLGlobalDeclarationDiagnostic union_diagnostic;
   status = hlsl_global_declarations_build(pass, stage, current, witnesses, count,
@@ -682,8 +706,6 @@ static bool translate_stage_to_hlsl(
 
   SerializedProgramParameters parameters;
   serialized_program_parameters_init(&parameters);
-  const SerializedProgramParameters *selected_parameters =
-      &pass->common_parameters[stage_index];
   const int parameter_blob_index =
       pass->subprogram_param_blob_indices[stage_index]
           ? pass->subprogram_param_blob_indices[stage_index][subprogram_index]
@@ -714,8 +736,9 @@ static bool translate_stage_to_hlsl(
                      stage_index, subprogram_index, -1);
       return false;
     }
-    selected_parameters = &parameters;
   }
+  const SerializedProgramParameters *selected_parameters = select_stage_parameters(
+      &pass->common_parameters[stage_index], &parameters, parameter_blob_index);
 
   ByteStream subprogram_stream;
   stream_init(&subprogram_stream, payload, payload_length);
