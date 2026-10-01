@@ -16,7 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096 };
+enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096,
+       PROBE_COMPILE_SLOTS = 7 };
 
 typedef struct {
     size_t begin, end;
@@ -506,6 +507,47 @@ static bool static_factor_calibration(const StringBuilder *hull,
     return built;
 }
 
+static bool no_packoffset_calibration(const StringBuilder *hull,
+                                     StringBuilder *calibration) {
+    /* This one controlled declaration experiment is independent of the
+     * static-factor experiment and never changes the ordinary inverse. */
+    const char *declaration = "float _Factor : packoffset(c0);";
+    if (!sb_ok(hull) || !hull->buf || hull->len > PROBE_SOURCE_LIMIT ||
+        !sb_ok(calibration) || calibration->len) return false;
+    const char *match = strstr(hull->buf, declaration);
+    if (!match || strstr(match + strlen(declaration), declaration)) return false;
+    sb_append_len(calibration, hull->buf, (size_t)(match - hull->buf));
+    sb_append(calibration, "float _Factor;");
+    sb_append(calibration, match + strlen(declaration));
+    if (!sb_ok(calibration)) return false;
+    puts("source_shape_calibration=omit-only-scalar-packoffset "
+         "inverse_source_map=not-retained quality=not-classified");
+    print_hash("calibration_hull_sha256", calibration->buf, calibration->len);
+    return true;
+}
+
+static bool inner_factor_brace_calibration(const StringBuilder *hull,
+                                          StringBuilder *calibration) {
+    /* Start from the untouched inverse, retaining its cbuffer declaration,
+     * outer-factor loop and every other scope and identifier. */
+    const char *block =
+        "    {\n"
+        "        factors.inner = (_Factor);\n"
+        "    }\n";
+    if (!sb_ok(hull) || !hull->buf || hull->len > PROBE_SOURCE_LIMIT ||
+        !sb_ok(calibration) || calibration->len) return false;
+    const char *match = strstr(hull->buf, block);
+    if (!match || strstr(match + strlen(block), block)) return false;
+    sb_append_len(calibration, hull->buf, (size_t)(match - hull->buf));
+    sb_append(calibration, "    factors.inner = (_Factor);\n");
+    sb_append(calibration, match + strlen(block));
+    if (!sb_ok(calibration)) return false;
+    puts("source_shape_calibration=omit-only-singleton-inner-factor-brace "
+         "inverse_source_map=not-retained quality=not-classified");
+    print_hash("calibration_hull_sha256", calibration->buf, calibration->len);
+    return true;
+}
+
 static bool string_arrays_equal(char *const *left, int left_count,
                                 char *const *right, int right_count) {
     if (left_count != right_count || left_count < 0 ||
@@ -595,7 +637,8 @@ static void usage(const char *name) {
     fprintf(
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
-        "--scalar-fixture [--static-factor-calibration]]\n"
+        "--scalar-fixture [--static-factor-calibration | --no-packoffset-calibration | "
+        "--inner-factor-brace-calibration]]\n"
         "Use '-' for no additional includes. Selected-native HULL comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -603,7 +646,10 @@ static void usage(const char *name) {
         "--icb-fixture requires an actual parsed scalar table; its configuration "
         "gap remains MIXED.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
-        "does not repair the normal inverse-source comparison.\n",
+        "does not repair the normal inverse-source comparison.\n"
+        "No-packoffset and inner-factor-brace calibrations each change only one "
+        "fragment of the original inverse in an independent cold process; warm "
+        "mutation/restoration runs only after their exact cold match.\n",
         name);
 }
 
@@ -616,8 +662,14 @@ int main(int argc, char **argv) {
     const bool icb_fixture = argc == 5 && !strcmp(argv[4], "--icb-fixture");
     const bool calibrate_static_factors = argc == 6 && scalar_fixture &&
         !strcmp(argv[5], "--static-factor-calibration");
+    const bool calibrate_no_packoffset = argc == 6 && scalar_fixture &&
+        !strcmp(argv[5], "--no-packoffset-calibration");
+    const bool calibrate_inner_factor_brace = argc == 6 && scalar_fixture &&
+        !strcmp(argv[5], "--inner-factor-brace-calibration");
+    const bool calibrate_source_shape = calibrate_static_factors ||
+        calibrate_no_packoffset || calibrate_inner_factor_brace;
     if (argc != 4 && !icb_fixture &&
-        !(scalar_fixture && (argc == 5 || calibrate_static_factors))) {
+        !(scalar_fixture && (argc == 5 || calibrate_source_shape))) {
         usage(argv[0]);
         return 2;
     }
@@ -633,16 +685,16 @@ int main(int argc, char **argv) {
     SerializedProgramParameters parameters = {.constant_buffers = &buffer,
         .cb_count = 1, .resources = &binding, .res_count = 1};
     UnityCompilerChannel channel = {.socket_fd = -1};
-    UnityCompilerPreprocessResponse preprocessing[5];
-    UnityCompilerBinaryResponse compiled[5];
-    UnityCompilerSnippetCompileRequest requests[5] = {0};
-    UnityCompilerToolchainProvenance provenance[5];
+    UnityCompilerPreprocessResponse preprocessing[PROBE_COMPILE_SLOTS];
+    UnityCompilerBinaryResponse compiled[PROBE_COMPILE_SLOTS];
+    UnityCompilerSnippetCompileRequest requests[PROBE_COMPILE_SLOTS] = {0};
+    UnityCompilerToolchainProvenance provenance[PROBE_COMPILE_SLOTS];
     StringBuilder hull, wrapper, changed_wrapper, calibration_wrapper;
     sb_init(&hull);
     sb_init(&wrapper);
     sb_init(&changed_wrapper);
     sb_init(&calibration_wrapper);
-    for (unsigned index = 0; index < 5; ++index) {
+    for (unsigned index = 0; index < PROBE_COMPILE_SLOTS; ++index) {
         unity_compiler_preprocess_response_init(&preprocessing[index]);
         unity_compiler_binary_response_init(&compiled[index]);
     }
@@ -812,14 +864,28 @@ int main(int argc, char **argv) {
                      repeated_authority
                  ? 0
                  : 1;
-    if (calibrate_static_factors) {
+    if (calibrate_source_shape) {
         /* The held target bytes survive a third independent cold process.
          * This optional result cannot change the normal candidate's failure. */
         const int normal_candidate_result = result;
         result = 1;
         DXBCContainerView calibration = {0};
-        if (!static_factor_calibration(&hull, &calibration_wrapper, shader_name))
-            goto done;
+        const char *calibration_name = calibrate_static_factors ? "static" :
+            calibrate_no_packoffset ? "no_packoffset" : "inner_factor_brace";
+        const char *calibration_role = calibrate_static_factors ? "cold-static-factor-calibration" :
+            calibrate_no_packoffset ? "cold-no-packoffset-calibration" : "cold-inner-factor-brace-calibration";
+        if (calibrate_static_factors) {
+            if (!static_factor_calibration(&hull, &calibration_wrapper, shader_name)) goto done;
+        } else {
+            /* The normal mutation wrapper is no longer needed. Reuse its
+             * builder for one transformed ORIGINAL hull, without a source bank. */
+            sb_clear(&changed_wrapper);
+            const bool transformed = calibrate_no_packoffset
+                ? no_packoffset_calibration(&hull, &changed_wrapper)
+                : inner_factor_brace_calibration(&hull, &changed_wrapper);
+            if (!transformed || !candidate_wrapper(&changed_wrapper, &calibration_wrapper, shader_name))
+                goto done;
+        }
         unity_compiler_shutdown(&channel);
         channel = (UnityCompilerChannel){.socket_fd = -1};
         UnityCompilerSessionCapabilities calibration_capabilities;
@@ -834,7 +900,7 @@ int main(int argc, char **argv) {
             !unity_compiler_session_capabilities_equal(&capabilities,
                 &calibration_capabilities) ||
             !unity_compiler_set_expected_valid_apis(&channel, valid_apis) ||
-            !compile_source(&channel, "cold-static-factor-calibration",
+            !compile_source(&channel, calibration_role,
                 calibration_wrapper.buf, directory, shader_name, valid_apis,
                 &preprocessing[4], &requests[4], &compiled[4], &provenance[4]) ||
             !scalar_fixture_reflection(&compiled[4]) ||
@@ -849,23 +915,91 @@ int main(int argc, char **argv) {
             selected_controls_equal(&requests[0], &requests[4]);
         const bool calibration_environment =
             compiler_environment_equal(&provenance[0], &provenance[4]);
-        printf("static_calibration_comparison=%s cold_process=3 "
+        printf("%s_calibration_comparison=%s cold_process=3 "
                "selected_controls_equal=%d compiler_environment_equal=%d "
                "normal_candidate_result=%d\n",
-               dxbc_compare_status_name(calibration_status),
+               calibration_name, dxbc_compare_status_name(calibration_status),
                calibration_controls, calibration_environment,
                normal_candidate_result);
-        printf("static_calibration_difference chunk=%u instruction=%u token=%u "
+        printf("%s_calibration_difference chunk=%u instruction=%u token=%u "
                "expected=0x%" PRIx64 " actual=0x%" PRIx64 "\n",
-               comparison.chunk_index, comparison.instruction_index,
+               calibration_name, comparison.chunk_index, comparison.instruction_index,
                comparison.token_index, comparison.expected_value,
                comparison.actual_value);
-        result = !normal_candidate_result &&
-            calibration_status == DXBC_COMPARE_EQUAL &&
-            calibration_controls && calibration_environment ? 0 : 1;
+        const bool calibration_exact = calibration_status == DXBC_COMPARE_EQUAL &&
+            calibration_controls && calibration_environment;
+        if (calibrate_static_factors) {
+            /* Preserve the original static calibration's cold-only behavior. */
+            result = !normal_candidate_result && calibration_exact ? 0 : 1;
+        } else if (!calibration_exact) {
+            printf("%s_calibration_warm=not-run cold_exact=0 normal_candidate_result=%d\n",
+                   calibration_name, normal_candidate_result);
+        } else {
+            const pid_t calibration_process = channel.process_id;
+            DXBCContainerView calibration_changed = {0}, calibration_repeated = {0};
+            sb_clear(&wrapper);
+            if (!calibration_process ||
+                !changed_factor_wrapper(&changed_wrapper, &wrapper, shader_name, true, NULL) ||
+                !compile_source(&channel, "warm-mutated-calibration", wrapper.buf,
+                    directory, shader_name, valid_apis, &preprocessing[5], &requests[5],
+                    &compiled[5], &provenance[5]) ||
+                !scalar_fixture_reflection(&compiled[5]) ||
+                !dxbc_container_view_first(compiled[5].data, compiled[5].size,
+                    &calibration_changed)) goto done;
+            const DXBCCompareStatus calibration_mutation_status = dxbc_compare_exact(
+                calibration.data, calibration.size, calibration_changed.data,
+                calibration_changed.size, &comparison);
+            const bool calibration_mutation_diff =
+                calibration_mutation_status != DXBC_COMPARE_EQUAL &&
+                calibration_mutation_status != DXBC_COMPARE_INVALID_ARGUMENT &&
+                calibration_mutation_status != DXBC_COMPARE_EXPECTED_INVALID &&
+                calibration_mutation_status != DXBC_COMPARE_ACTUAL_INVALID;
+            const bool calibration_mutation_authority =
+                selected_controls_equal(&requests[4], &requests[5]) &&
+                compiler_environment_equal(&provenance[4], &provenance[5]) &&
+                provenance[4].source_authority_revision == provenance[5].source_authority_revision &&
+                calibration_process == channel.process_id;
+            print_hash("calibration_warm_mutation_complete_dxbc_sha256",
+                       calibration_changed.data, calibration_changed.size);
+            printf("%s_calibration_warm_mutation_diff=%d comparison=%s authority_equal=%d "
+                   "same_process=%d\n", calibration_name, calibration_mutation_diff,
+                   dxbc_compare_status_name(calibration_mutation_status),
+                   calibration_mutation_authority, calibration_process == channel.process_id);
+            if (!calibration_mutation_diff || !calibration_mutation_authority) goto done;
+            if (!compile_source(&channel, "warm-original-calibration", calibration_wrapper.buf,
+                    directory, shader_name, valid_apis, &preprocessing[6], &requests[6],
+                    &compiled[6], &provenance[6]) ||
+                !scalar_fixture_reflection(&compiled[6]) ||
+                !dxbc_container_view_first(compiled[6].data, compiled[6].size,
+                    &calibration_repeated)) goto done;
+            const DXBCCompareStatus calibration_repeated_status = dxbc_compare_exact(
+                target.data, target.size, calibration_repeated.data,
+                calibration_repeated.size, &comparison);
+            const bool calibration_repeated_identity =
+                !memcmp(compiled[4].request_digest, compiled[6].request_digest, 32) &&
+                !memcmp(compiled[4].controls_digest, compiled[6].controls_digest, 32);
+            const bool calibration_repeated_authority =
+                selected_controls_equal(&requests[4], &requests[6]) &&
+                compiler_environment_equal(&provenance[4], &provenance[6]) &&
+                provenance[4].source_authority_revision == provenance[6].source_authority_revision &&
+                calibration_process == channel.process_id;
+            print_hash("calibration_warm_original_complete_dxbc_sha256",
+                       calibration_repeated.data, calibration_repeated.size);
+            printf("%s_calibration_warm_original_equal=%d comparison=%s reference=original-target "
+                   "canonical_identity_equal=%d authority_equal=%d same_process=%d\n",
+                   calibration_name, calibration_repeated_status == DXBC_COMPARE_EQUAL,
+                   dxbc_compare_status_name(calibration_repeated_status), calibration_repeated_identity,
+                   calibration_repeated_authority, calibration_process == channel.process_id);
+            const bool calibration_warm_qualified = calibration_repeated_status == DXBC_COMPARE_EQUAL &&
+                calibration_repeated_identity && calibration_repeated_authority;
+            printf("%s_calibration_qualified=%d normal_candidate_result=%d "
+                   "inverse_source_map=not-retained quality=not-classified\n",
+                   calibration_name, calibration_warm_qualified, normal_candidate_result);
+            result = !normal_candidate_result && calibration_warm_qualified ? 0 : 1;
+        }
     }
 done:
-    for (unsigned index = 0; index < 5; ++index) {
+    for (unsigned index = 0; index < PROBE_COMPILE_SLOTS; ++index) {
         unity_compiler_binary_response_free(&compiled[index]);
         unity_compiler_preprocess_response_free(&preprocessing[index]);
     }
