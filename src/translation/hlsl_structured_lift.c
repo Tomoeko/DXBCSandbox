@@ -117,6 +117,11 @@ static bool scalar_comparison_opcode(USILOpcode opcode) {
         opcode == USIL_OP_EQ || opcode == USIL_OP_NE;
 }
 
+static bool natural_arithmetic_opcode(USILOpcode opcode) {
+    return opcode == USIL_OP_MOV || opcode == USIL_OP_ADD || opcode == USIL_OP_MUL ||
+        opcode == USIL_OP_MIN || opcode == USIL_OP_MAX || opcode == USIL_OP_DIV;
+}
+
 /* A loop's scalar induction values belong to the old FLOAT4 route. Select
  * natural mode only for a new width in a loop-free instruction stream; the
  * subsequent closed gate still rejects every unsupported opcode or shape. */
@@ -131,8 +136,7 @@ static bool natural_width_requested(const USILProgram *program) {
     }
     for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *instruction = &program->instructions[index];
-        if ((instruction->opcode == USIL_OP_MOV || instruction->opcode == USIL_OP_ADD ||
-             instruction->opcode == USIL_OP_MUL || scalar_comparison_opcode(instruction->opcode)) && instruction->operand_count &&
+        if ((natural_arithmetic_opcode(instruction->opcode) || scalar_comparison_opcode(instruction->opcode)) && instruction->operand_count &&
             usil_operand_destination_lane_mask(&instruction->operands[0]) != 15) return true;
     }
     return false;
@@ -530,7 +534,7 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
         }
         const bool comparison = plan->natural_width && scalar_comparison_opcode(inst->opcode);
         if (plan->natural_width &&
-            ((inst->opcode != USIL_OP_MOV && inst->opcode != USIL_OP_ADD && inst->opcode != USIL_OP_MUL && !comparison) ||
+            ((!natural_arithmetic_opcode(inst->opcode) && !comparison) ||
              !plain_instruction(inst)))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         int predicate_if = -1;
@@ -1127,7 +1131,8 @@ static bool emit_structured_plan(HLSLEmitterContext *ctx, StructuredPlan *plan,
             const bool comparison = plan->natural_width && scalar_comparison_opcode(inst->opcode);
             ASTExpr *expression = comparison
                 ? hlsl_scalar_comparison_expression(ctx, index, left, right)
-                : hlsl_float4_operation(ctx, index, left, right);
+                : plan->natural_width ? hlsl_natural_float_binary_operation(ctx, index, left, right)
+                    : hlsl_float4_operation(ctx, index, left, right);
             if (!expression)
                 goto cleanup;
             sb_append_spaces(ctx->sb, ctx->indent);
