@@ -479,6 +479,12 @@ static bool float_dot(USILOpcode opcode) {
     return opcode == USIL_OP_DP2 || opcode == USIL_OP_DP3 || opcode == USIL_OP_DP4;
 }
 
+static bool natural_float_operation_opcode(USILOpcode opcode) {
+    return opcode == USIL_OP_MOV || opcode == USIL_OP_ADD || opcode == USIL_OP_MUL ||
+        opcode == USIL_OP_MIN || opcode == USIL_OP_MAX || opcode == USIL_OP_DIV ||
+        opcode == USIL_OP_MAD || float_dot(opcode);
+}
+
 bool hlsl_float_source_modifier_supported(const DXBCOperand *operand) {
     if (!operand) return false;
     if (!operand->extended_token_count) return operand->extended_tokens == NULL;
@@ -486,6 +492,27 @@ bool hlsl_float_source_modifier_supported(const DXBCOperand *operand) {
         return false;
     const uint32_t modifier = (operand->has_neg ? 1u : 0u) | (operand->has_abs ? 2u : 0u);
     return operand->extended_tokens[0] == (1u | (modifier << 6));
+}
+
+bool hlsl_natural_float_source_view(const DXBCOperand *original, DXBCOperand *plain_view) {
+    if (!plain_view || plain_view == original) return false;
+    memset(plain_view, 0, sizeof(*plain_view));
+    if (!original || original->min_precision) return false;
+    const bool modified = original->has_abs || original->has_neg;
+    const bool extended = (original->raw_token & UINT32_C(0x80000000)) != 0;
+    if (modified) {
+        if (!extended || original->extended_token_count != 1 ||
+            !hlsl_float_source_modifier_supported(original)) return false;
+    } else if (extended || original->extended_token_count || original->extended_tokens) return false;
+    DXBCOperand result = *original;
+    result.has_abs = result.has_neg = false;
+    result.extended_tokens = NULL;
+    result.extended_token_count = 0;
+    if (!hlsl_lift_operand_is_plain(&result)) return false;
+    /* Keep the real raw token in this borrowed formatting view. Only the
+     * original decoded owner, including its extension, enters source proof. */
+    *plain_view = result;
+    return true;
 }
 
 bool hlsl_material_source_supported(HLSLEmitterContext *ctx, const DXBCOperand *source,
@@ -736,6 +763,70 @@ bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
     return validate_float_expressions(ctx, uses, true, NULL, NULL);
 }
 
+/* Shared by the existing straight-line source builder and the new natural
+ * arithmetic boundary. ABS precedes NEG; raw literal children stay intact.
+ * These are FLOAT32 source operations, not extra destination writes. */
+static ASTExpr *float_source_modifier_expression(HLSLEmitterContext *ctx,
+    const DXBCOperand *original, int instruction, uint8_t lanes, ASTExpr *expression) {
+    if (expression && original->has_abs) {
+        const unsigned width = expression_width(expression);
+        ASTExpr *call = ast_create_call("abs", &expression, 1);
+        if (!call) ast_free_expr(expression);
+        expression = logical_expression(ctx, call, instruction, lanes,
+                                         width ? width : (unsigned)lane_count(lanes));
+    }
+    if (expression && original->has_neg) {
+        const unsigned width = expression_width(expression);
+        /* The AST unary spelling is shared with integer negation; its owned
+         * float origin preserves the actual source arithmetic domain. */
+        ASTExpr *negative = ast_create_unary(USIL_OP_INEG, expression);
+        if (!negative) ast_free_expr(expression);
+        expression = logical_expression(ctx, negative, instruction, lanes,
+                                         width ? width : (unsigned)lane_count(lanes));
+    }
+    return expression;
+}
+
+ASTExpr *hlsl_natural_float_source_modifiers(HLSLEmitterContext *ctx,
+    int instruction, int operand, uint8_t lanes, ASTExpr *expression) {
+    if (!expression || !ctx || !ctx->program || !ctx->program->instructions || instruction < 0 ||
+        instruction >= ctx->program->instruction_count || instruction >= ctx->program->instruction_alloc ||
+        ctx->program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT || operand < 0 ||
+        operand >= DXBC_MAX_OPERANDS || operand >= ctx->program->instructions[instruction].operand_count ||
+        !lanes || (lanes & ~15u) || (lanes & ~source_lanes(ctx, instruction, operand))) {
+        ast_free_expr(expression);
+        return NULL;
+    }
+    const USILInstruction *owner = &ctx->program->instructions[instruction];
+    const DXBCOperand *original = &owner->operands[operand];
+    DXBCOperand plain_view;
+    if (!hlsl_natural_float_source_view(original, &plain_view)) {
+        ast_free_expr(expression);
+        return NULL;
+    }
+    if (!original->has_abs && !original->has_neg) return expression;
+    const unsigned width = expression_width(expression);
+    const bool floating = expression->logical_origin.complete
+        ? expression->logical_origin.scalar_type == AST_SCALAR_FLOAT32
+        : expression->kind == AST_EXPR_LITERAL
+            ? expression->u.literal.scalar_type == AST_SCALAR_FLOAT32
+            : expression->kind == AST_EXPR_EMITTER_OPERAND && expression->operand_provenance.complete &&
+                expression->operand_provenance.value_role == AST_OPERAND_VALUE_LOGICAL &&
+                expression->operand_provenance.bitcast_role == AST_OPERAND_BITCAST_NONE &&
+                !expression->operand_provenance.raw_buffer_reconstruction &&
+                !expression->operand_provenance.synthetic_interface;
+    if ((ctx->program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
+         ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
+        !natural_float_operation_opcode(owner->opcode) || operand == 0 || !width || width > 4 || !floating ||
+        (original->type != OPERAND_TYPE_INPUT && original->type != OPERAND_TYPE_TEMP &&
+         original->type != OPERAND_TYPE_IMMEDIATE32) ||
+        !hlsl_natural_float_instruction_supported(ctx, instruction)) {
+        ast_free_expr(expression);
+        return NULL;
+    }
+    return float_source_modifier_expression(ctx, original, instruction, lanes, expression);
+}
+
 static ASTExpr *formatted_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *source,
                                        uint8_t mask, bool preserve_vector,
                                        int instruction, int operand) {
@@ -909,12 +1000,16 @@ static ASTExpr *vector_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *s
 ASTExpr *hlsl_natural_source_atom(HLSLEmitterContext *ctx, int instruction,
                                  int operand, uint8_t mask) {
     if (!ctx || !ctx->program || !ctx->program->instructions || instruction < 0 ||
-        instruction >= ctx->program->instruction_count || operand < 0 ||
+        instruction >= ctx->program->instruction_count || instruction >= ctx->program->instruction_alloc ||
+        ctx->program->instruction_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT || operand < 0 ||
         operand >= ctx->program->instructions[instruction].operand_count ||
         operand >= DXBC_MAX_OPERANDS || !mask || (mask & ~15u) ||
         (mask & ~source_lanes(ctx, instruction, operand))) return NULL;
-    return vector_source_atom(ctx, &ctx->program->instructions[instruction].operands[operand],
-        mask, instruction, operand);
+    DXBCOperand plain_view;
+    if (!hlsl_natural_float_source_view(&ctx->program->instructions[instruction].operands[operand],
+        &plain_view)) return NULL;
+    ASTExpr *expression = vector_source_atom(ctx, &plain_view, mask, instruction, operand);
+    return hlsl_natural_float_source_modifiers(ctx, instruction, operand, mask, expression);
 }
 
 static ASTExpr *project_logical_temp(HLSLEmitterContext *ctx, ASTExpr *value,
@@ -1093,23 +1188,7 @@ static ASTExpr *source_expression(HLSLEmitterContext *ctx, int instruction, int 
         : source_expression_unmodified(ctx, instruction, operand, uses,
             pending, pending_owners, owners, &unmodified, logical_widths,
             scope && scope->compose_disjoint_temp_lanes);
-    if (expression && original->has_abs) {
-        const unsigned width = expression_width(expression);
-        ASTExpr *call = ast_create_call("abs", &expression, 1);
-        if (!call) ast_free_expr(expression);
-        expression = logical_expression(ctx, call, instruction, lanes,
-                                         width ? width : (unsigned)lane_count(lanes));
-    }
-    if (expression && original->has_neg) {
-        const unsigned width = expression_width(expression);
-        /* The AST unary spelling is shared with integer negation; its owned
-         * float origin preserves the actual source arithmetic domain. */
-        ASTExpr *negative = ast_create_unary(USIL_OP_INEG, expression);
-        if (!negative) ast_free_expr(expression);
-        expression = logical_expression(ctx, negative, instruction, lanes,
-                                         width ? width : (unsigned)lane_count(lanes));
-    }
-    return expression;
+    return float_source_modifier_expression(ctx, original, instruction, lanes, expression);
 }
 
 ASTExpr *hlsl_float4_source_atom(HLSLEmitterContext *ctx, const DXBCOperand *source) {
@@ -1349,9 +1428,7 @@ ASTExpr *hlsl_natural_float_operation(HLSLEmitterContext *ctx,
         const int operand_count = moved ? 2 : multiply_add ? 4 : 3;
         const bool children_match = moved ? !right && !third
             : right && (multiply_add ? third != NULL : third == NULL);
-        supported = (moved || multiply_add || owner->opcode == USIL_OP_ADD || owner->opcode == USIL_OP_MUL ||
-            owner->opcode == USIL_OP_MIN || owner->opcode == USIL_OP_MAX || owner->opcode == USIL_OP_DIV ||
-            float_dot(owner->opcode)) &&
+        supported = natural_float_operation_opcode(owner->opcode) &&
             owner->operand_count == operand_count && children_match &&
             usil_instruction_shape_valid(ctx->program, owner) &&
             hlsl_natural_float_instruction_supported(ctx, instruction);

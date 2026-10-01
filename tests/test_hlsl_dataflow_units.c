@@ -1981,7 +1981,7 @@ typedef struct {
     size_t first_preheader_observation;
     size_t mutate_at;
     unsigned mutation;
-    int arithmetic_instruction, condition_instruction;
+    int arithmetic_instruction, condition_instruction, modifier_operand;
     int packed_xyz_field, packed_scalar_field, packed_source_instruction;
     bool track_packed;
     uint8_t packed_fields_seen;
@@ -2235,6 +2235,13 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
             const uint8_t selected = source->swizzle[0] == 2 ? 3 : 1;
             memset(source->swizzle, selected, sizeof(source->swizzle));
             source->raw_token = natural_if_source_token(OPERAND_TYPE_INPUT, source->swizzle);
+            break;
+        }
+        case 31: {
+            DXBCOperand *source = &program->instructions[ledger->arithmetic_instruction].operands[ledger->modifier_operand];
+            if (!source->extended_tokens || source->extended_token_count != 1 || !source->has_abs) return false;
+            source->has_neg = !source->has_neg;
+            source->extended_tokens[0] = UINT32_C(1) | (source->has_neg ? UINT32_C(0xc0) : UINT32_C(0x80));
             break;
         }
         }
@@ -4009,10 +4016,17 @@ typedef struct {
     bool compared, nonzero, broadcast;
 } NaturalDotShape;
 
+typedef struct {
+    uint8_t then_input, add_input, add_literal, else_temp, output_temp;
+    uint8_t comparison_input, condition_source, then_destination;
+    bool exceptional_literals;
+} NaturalDotModifiers;
+
 /* DPn reduces a fixed source tuple into one real physical TEMP lane. Its
  * input width, scalar result and final FLOAT3 output are independent. Keep
  * this author separate so previous arithmetic fixtures retain their bytes. */
-static bool natural_dot_fixture(NaturalIfFixture *fixture, NaturalDotShape shape) {
+static bool natural_dot_fixture_modifiers(NaturalIfFixture *fixture, NaturalDotShape shape,
+    const NaturalDotModifiers *modifiers) {
     memset(fixture, 0, sizeof(*fixture));
     dxbc_document_init(&fixture->document); dxbc_stage_contract_init(&fixture->contract);
     CHECK(shape.width >= 2 && shape.width <= 4 && shape.result_lane < 4 &&
@@ -4024,6 +4038,11 @@ static bool natural_dot_fixture(NaturalIfFixture *fixture, NaturalDotShape shape
     const uint8_t add_mask = shape.width == 2 ? 6 : shape.width == 3 ? 14 : 15;
     const uint32_t right_register = packed ? 0u : 1u, gate_register = packed ? 1u : 2u;
     const uint32_t add_register = shape.width == 4 ? 1u : 0u;
+    const NaturalDotModifiers plain = {0};
+    const NaturalDotModifiers *mods = modifiers ? modifiers : &plain;
+    CHECK(mods->then_input <= 3 && mods->add_input <= 3 && mods->add_literal <= 3 &&
+        mods->else_temp <= 3 && mods->output_temp <= 3 && mods->comparison_input <= 3 &&
+        mods->condition_source <= 3 && mods->then_destination <= 3);
     const uint8_t left[] = {0, 1, 2, (uint8_t)(shape.width == 4 ? 3 : 0)};
     const uint8_t right[] = {(uint8_t)(packed ? 2 : 0), (uint8_t)(packed ? 3 : 1),
         (uint8_t)(shape.width >= 3 ? 2 : packed ? 2 : 0), (uint8_t)(shape.width == 4 ? 3 : packed ? 2 : 0)};
@@ -4042,6 +4061,10 @@ static bool natural_dot_fixture(NaturalIfFixture *fixture, NaturalDotShape shape
 #define DOT_WORD(value) do { CHECK(count < sizeof(words) / sizeof(*words)); words[count++] = (value); } while (0)
 #define DOT_INST(opcode, length) ((uint32_t)(opcode) | (uint32_t)(length) << 24u)
 #define DOT_DEST(type, mask) (UINT32_C(0x00100002) | (uint32_t)(type) << 12u | (uint32_t)(mask) << 4u)
+#define DOT_OPERAND(token, modifier) do { \
+    DOT_WORD((token) | ((modifier) ? UINT32_C(0x80000000) : 0)); \
+    if (modifier) DOT_WORD(UINT32_C(1) | (uint32_t)(modifier) << 6u); \
+} while (0)
     DOT_WORD(DOT_INST(106, 1) | 1u << 11u);
     DOT_WORD(DOT_INST(98, 3) | 2u << 11u);
     DOT_WORD(DOT_DEST(OPERAND_TYPE_INPUT, shape.layout == NATURAL_IF_INPUTS_PACKED_UNION ? 15 : width_mask)); DOT_WORD(0);
@@ -4053,30 +4076,37 @@ static bool natural_dot_fixture(NaturalIfFixture *fixture, NaturalDotShape shape
     DOT_WORD(DOT_INST(101, 3)); DOT_WORD(DOT_DEST(OPERAND_TYPE_OUTPUT, 7)); DOT_WORD(0);
     DOT_WORD(DOT_INST(104, 2)); DOT_WORD(shape.width == 4 ? 2 : 1);
     if (shape.compared) {
-        DOT_WORD(DOT_INST(49, 7)); DOT_WORD(DOT_DEST(OPERAND_TYPE_TEMP, 1)); DOT_WORD(0);
-        DOT_WORD(UINT32_C(0x0010100a)); DOT_WORD(gate_register);
+        DOT_WORD(DOT_INST(49, 7u + (mods->comparison_input != 0))); DOT_WORD(DOT_DEST(OPERAND_TYPE_TEMP, 1)); DOT_WORD(0);
+        DOT_OPERAND(UINT32_C(0x0010100a), mods->comparison_input); DOT_WORD(gate_register);
         DOT_WORD(UINT32_C(0x00004001)); DOT_WORD(UINT32_C(0x3ec00000));
     }
-    DOT_WORD(DOT_INST(31, 3) | (shape.nonzero ? UINT32_C(0x40000) : 0));
-    DOT_WORD(shape.compared ? UINT32_C(0x0010000a) : UINT32_C(0x0010100a)); DOT_WORD(shape.compared ? 0u : gate_register);
-    DOT_WORD(DOT_INST(13u + shape.width, 7)); DOT_WORD(DOT_DEST(OPERAND_TYPE_TEMP, result_mask)); DOT_WORD(0);
-    DOT_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, left)); DOT_WORD(0);
+    DOT_WORD(DOT_INST(31, 3u + (mods->condition_source != 0)) | (shape.nonzero ? UINT32_C(0x40000) : 0));
+    DOT_OPERAND(shape.compared ? UINT32_C(0x0010000a) : UINT32_C(0x0010100a), mods->condition_source);
+    DOT_WORD(shape.compared ? 0u : gate_register);
+    DOT_WORD(DOT_INST(13u + shape.width, 7u + (mods->then_input != 0) + (mods->then_destination != 0)));
+    DOT_OPERAND(DOT_DEST(OPERAND_TYPE_TEMP, result_mask), mods->then_destination); DOT_WORD(0);
+    DOT_OPERAND(natural_if_source_token(OPERAND_TYPE_INPUT, left), mods->then_input); DOT_WORD(0);
     DOT_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, right_dot)); DOT_WORD(right_register);
     DOT_WORD(DOT_INST(18, 1));
-    DOT_WORD(DOT_INST(0, 10)); DOT_WORD(DOT_DEST(OPERAND_TYPE_TEMP, add_mask)); DOT_WORD(add_register);
-    DOT_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, add_input)); DOT_WORD(right_register);
-    DOT_WORD(UINT32_C(0x00004002));
-    for (unsigned lane = 0; lane < 4; ++lane) DOT_WORD(add_mask & (1u << lane) ? UINT32_C(0x3e800000) : 0);
-    DOT_WORD(DOT_INST(13u + shape.width, 7)); DOT_WORD(DOT_DEST(OPERAND_TYPE_TEMP, result_mask)); DOT_WORD(0);
+    DOT_WORD(DOT_INST(0, 10u + (mods->add_input != 0) + (mods->add_literal != 0)));
+    DOT_WORD(DOT_DEST(OPERAND_TYPE_TEMP, add_mask)); DOT_WORD(add_register);
+    DOT_OPERAND(natural_if_source_token(OPERAND_TYPE_INPUT, add_input), mods->add_input); DOT_WORD(right_register);
+    DOT_OPERAND(UINT32_C(0x00004002), mods->add_literal);
+    const uint32_t exceptional[] = {UINT32_C(0x7fc12345), UINT32_C(0x80000000), 1, UINT32_C(0xffc12345)};
+    for (unsigned lane = 0; lane < 4; ++lane)
+        DOT_WORD(mods->exceptional_literals ? exceptional[lane] : add_mask & (1u << lane) ? UINT32_C(0x3e800000) : 0);
+    DOT_WORD(DOT_INST(13u + shape.width, 7u + (mods->else_temp != 0)));
+    DOT_WORD(DOT_DEST(OPERAND_TYPE_TEMP, result_mask)); DOT_WORD(0);
     DOT_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, left)); DOT_WORD(0);
-    DOT_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, temp_dot)); DOT_WORD(add_register);
+    DOT_OPERAND(natural_if_source_token(OPERAND_TYPE_TEMP, temp_dot), mods->else_temp); DOT_WORD(add_register);
     DOT_WORD(DOT_INST(21, 1));
-    DOT_WORD(DOT_INST(54, 5)); DOT_WORD(DOT_DEST(OPERAND_TYPE_OUTPUT, 7)); DOT_WORD(0);
-    DOT_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, result)); DOT_WORD(0);
+    DOT_WORD(DOT_INST(54, 5u + (mods->output_temp != 0))); DOT_WORD(DOT_DEST(OPERAND_TYPE_OUTPUT, 7)); DOT_WORD(0);
+    DOT_OPERAND(natural_if_source_token(OPERAND_TYPE_TEMP, result), mods->output_temp); DOT_WORD(0);
     DOT_WORD(DOT_INST(62, 1));
 #undef DOT_DEST
 #undef DOT_INST
 #undef DOT_WORD
+#undef DOT_OPERAND
     const DXBCSignatureElement inputs[] = {
         {.semantic_name = "TEXCOORD", .component_type = 3, .mask = width_mask, .rw_mask = width_mask},
         {.semantic_name = "TEXCOORD", .semantic_index = 1, .register_id = right_register,
@@ -4092,6 +4122,10 @@ static bool natural_dot_fixture(NaturalIfFixture *fixture, NaturalDotShape shape
     CHECK(fixture->program.instruction_count == fixture->condition + 8 &&
         fixture->program.signature_declaration_count == (shape.layout == NATURAL_IF_INPUTS_PACKED_UNION ? 3 : 4));
     return true;
+}
+
+static bool natural_dot_fixture(NaturalIfFixture *fixture, NaturalDotShape shape) {
+    return natural_dot_fixture_modifiers(fixture, shape, NULL);
 }
 
 static bool check_natural_dot_owners(NaturalIfFixture *fixture, NaturalDotShape shape) {
@@ -4564,6 +4598,356 @@ static bool check_natural_dot_emission(void) {
     return true;
 }
 
+static bool natural_modifier_chain(const ASTExpr *root, uint8_t modifier, int instruction,
+    uint32_t raw_instruction, uint8_t lanes, unsigned width, const ASTExpr **leaf) {
+    const ASTExpr *node = root;
+    for (unsigned layer = 0; layer < 2; ++layer) {
+        const bool present = layer ? (modifier & 2u) != 0 : (modifier & 1u) != 0;
+        if (!present) continue;
+        CHECK(node && node->logical_origin.complete && node->logical_origin.scalar_type == AST_SCALAR_FLOAT32 &&
+            node->logical_origin.components == width && node->logical_origin.instruction_index == instruction &&
+            node->logical_origin.source_instruction_index == raw_instruction && node->logical_origin.destination_lanes == lanes);
+        if (!layer) {
+            CHECK(node->kind == AST_EXPR_UNARY && node->u.unary.op == USIL_OP_INEG);
+            node = node->u.unary.sub;
+        } else {
+            CHECK(node->kind == AST_EXPR_CALL && !strcmp(node->u.call.name, "abs") && node->u.call.arg_count == 1);
+            node = node->u.call.args[0];
+        }
+    }
+    CHECK(node); *leaf = node;
+    return true;
+}
+
+static bool natural_modifier_owned_roots(NaturalIfFixture *fixture, NaturalDotShape shape,
+    const NaturalDotModifiers *mods, ASTExpr *roots[3]) {
+    HLSLEmitterContext ctx; StringBuilder source; HLSLEmitDiagnostic diagnostic;
+    CHECK(analyze(&ctx, &fixture->program)); sb_init(&source); hlsl_emit_diagnostic_init(&diagnostic);
+    ctx.emit_mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE; ctx.sb = &source; ctx.diagnostic = &diagnostic;
+    ctx.entry_point_name = "main"; ctx.preferred_input_struct_name = "appdata"; ctx.preferred_output_struct_name = "v2f";
+    CHECK(hlsl_natural_structured_preflight(&ctx)); ctx.high_level_interface = true;
+    CHECK(hlsl_prepare_high_level_interface(&ctx));
+    USILProgram *program = &fixture->program;
+    const int add = fixture->else_value - 1;
+    const int indices[] = {fixture->then_value, add, fixture->else_value};
+    const int operands[] = {1, 2, 2};
+    const uint8_t modifiers[] = {mods->then_input, mods->add_literal, mods->else_temp};
+    for (unsigned item = 0; item < 3; ++item) {
+        const int index = indices[item], operand = operands[item];
+        const DXBCOperand *original = &program->instructions[index].operands[operand];
+        DXBCOperand plain;
+        USILOperandUseInfo use;
+        CHECK(hlsl_natural_float_source_view(original, &plain) &&
+            usil_instruction_operand_use(program, &program->instructions[index], operand, &use) &&
+            use.use == USIL_OPERAND_USE_SOURCE && !plain.has_abs && !plain.has_neg && !plain.extended_tokens &&
+            !plain.extended_token_count && plain.raw_token == original->raw_token &&
+            plain.type == original->type && plain.register_index == original->register_index &&
+            !memcmp(plain.swizzle, original->swizzle, sizeof(plain.swizzle)) &&
+            !memcmp(plain.imm_values, original->imm_values, sizeof(plain.imm_values)) &&
+            original->extended_token_count == 1 && original->extended_tokens &&
+            original->extended_tokens[0] == (UINT32_C(1) | (uint32_t)modifiers[item] << 6u) &&
+            original->has_abs == ((modifiers[item] & 2u) != 0) && original->has_neg == ((modifiers[item] & 1u) != 0) &&
+            (original->raw_token & UINT32_C(0x80000000)));
+        const DXBCInstruction *raw = NULL;
+        for (int token = 0; token < fixture->semantic.instruction_count; ++token)
+            if (fixture->semantic.instructions[token].has_raw_instruction_index &&
+                fixture->semantic.instructions[token].raw_instruction_index == program->instructions[index].source_instruction_index)
+                raw = &fixture->semantic.instructions[token];
+        CHECK(raw && raw->operands[operand].raw_token == original->raw_token &&
+            raw->operands[operand].extended_token_count == 1 &&
+            raw->operands[operand].extended_tokens != original->extended_tokens &&
+            raw->operands[operand].extended_tokens[0] == original->extended_tokens[0]);
+        ctx.current_instruction_index = index;
+        if (item < 2) roots[item] = hlsl_natural_source_atom(&ctx, index, operand, use.source_lane_mask);
+        else {
+            const DXBCOperand *destination = &program->instructions[add].operands[0];
+            const uint8_t producer_mask = usil_operand_destination_lane_mask(destination);
+            for (int lane = 0; lane < 4; ++lane) if (use.source_lane_mask & (1u << lane)) {
+                const int value = variable(&ctx, index, operand, lane);
+                CHECK(value >= 0 && value < ctx.ssa.ssa_var_count && ctx.ssa.ssa_var_defs[value] == add);
+            }
+            ASTExpr *value = ast_create_var(add, destination->register_index, OPERAND_TYPE_TEMP, "ownedVector");
+            value = hlsl_instruction_logical_expression(&ctx, value, add, producer_mask, shape.width);
+            value = hlsl_project_logical_temp(&ctx, value, producer_mask, shape.width, &plain, use.source_lane_mask, index);
+            roots[item] = hlsl_natural_float_source_modifiers(&ctx, index, operand, use.source_lane_mask, value);
+        }
+        const ASTExpr *leaf = NULL;
+        CHECK(roots[item] && natural_modifier_chain(roots[item], modifiers[item], index,
+            program->instructions[index].source_instruction_index, use.source_lane_mask, shape.width, &leaf));
+        if (!item) {
+            CHECK(leaf->kind == AST_EXPR_EMITTER_OPERAND && leaf->operand_provenance.complete &&
+                leaf->operand_provenance.instruction_index == index && leaf->operand_provenance.operand_index == operand &&
+                leaf->operand_provenance.destination_lanes == use.source_lane_mask &&
+                leaf->operand_provenance.natural_components == shape.width && leaf->operand_provenance.result_components == shape.width);
+        } else if (item == 1) {
+            CHECK(leaf->kind == AST_EXPR_LITERAL && leaf->u.literal.scalar_type == AST_SCALAR_FLOAT32 &&
+                leaf->u.literal.components == (int)shape.width);
+            unsigned component = 0;
+            for (unsigned lane = 0; lane < 4; ++lane) if (use.source_lane_mask & (1u << lane))
+                CHECK(leaf->u.literal.val[component++] == original->immediate_words[lane]);
+            CHECK(component == shape.width); /* ABS/NEG never rewrite -0, subnormal or NaN leaf bits. */
+        } else CHECK(leaf->kind == AST_EXPR_VAR && leaf->logical_origin.complete &&
+            leaf->logical_origin.instruction_index == add && leaf->logical_origin.components == shape.width &&
+            !strcmp(leaf->u.var.name, "ownedVector"));
+    }
+    dispose(&ctx); sb_free(&source);
+    return true;
+}
+
+typedef struct {
+    NaturalIfObservations common;
+    int output_instruction;
+    size_t output_scalar_modifiers;
+} NaturalModifierObservations;
+
+static bool observe_natural_modifier(void *context, const HLSLSourceQualityObservation *observation) {
+    NaturalModifierObservations *ledger = context;
+    if (!observe_natural_if(&ledger->common, observation)) return false;
+    const HLSLSourceQualityFacts *facts = &observation->facts;
+    /* The source-owned ABS CALL at DP3 has width3/lanes7; the dot CALL has
+     * result width1/lanes1. They are independent typed operations. */
+    if (facts->instruction_index == ledger->output_instruction && facts->known &&
+        facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL &&
+        (observation->ast_kind == AST_EXPR_UNARY || observation->ast_kind == AST_EXPR_CALL)) {
+        ++ledger->output_scalar_modifiers;
+        if (facts->components != 1 || facts->lanes != 7) ledger->common.wrong_owner = true;
+    }
+    return true;
+}
+
+static NaturalModifierObservations natural_modifier_observer(NaturalIfFixture *fixture) {
+    NaturalModifierObservations result = {.common = {.program = &fixture->program}, .output_instruction = fixture->output};
+    return result;
+}
+
+static bool natural_modifier_emit(NaturalIfFixture *fixture, StringBuilder *source, HLSLExpressionSourceMap *map,
+    HLSLSourceQualityResult *quality, NaturalModifierObservations *observations, HLSLEmitDiagnostic *diagnostic) {
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    options.expression_source_map = map; options.source_quality = quality;
+    options.source_quality_pass_index = 3; options.source_quality_entry_point_index = 4;
+    options.source_quality_observer = observe_natural_modifier; options.source_quality_observer_context = observations;
+    return hlsl_emit_with_options_diagnostic(&fixture->program, source, NULL, NULL, NULL, &options, diagnostic);
+}
+
+static bool check_natural_modifier_positive(NaturalDotShape shape, NaturalDotModifiers mods) {
+    NaturalIfFixture fixture; CHECK(natural_dot_fixture_modifiers(&fixture, shape, &mods));
+    ASTExpr *roots[3] = {0}; CHECK(natural_modifier_owned_roots(&fixture, shape, &mods, roots));
+    StringBuilder original, changed; sb_init(&original); sb_init(&changed);
+    HLSLExpressionSourceMap original_map, changed_map; HLSLSourceQualityResult original_quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic; NaturalModifierObservations baseline = natural_modifier_observer(&fixture);
+    const bool emitted = natural_modifier_emit(&fixture, &original, &original_map, &original_quality, &baseline, &diagnostic);
+    if (!emitted) fprintf(stderr, "Natural modifier DP%u status=%s reason=%s instruction=%d\n", shape.width,
+        hlsl_emit_status_name(diagnostic.status), hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index);
+    CHECK(emitted && original_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !original_quality.reasons &&
+        !original_quality.counts.incomplete_units && !original_quality.counts.residual_total &&
+        !original_quality.counts.unknown_provenance && original_map.complete &&
+        hlsl_expression_source_map_matches(&original_map, &fixture.program, original.buf) && !baseline.common.wrong_owner &&
+        baseline.output_scalar_modifiers && strstr(original.buf, "abs(") && baseline.common.observations > 2);
+    const HLSLExpressionOrigin *output = &original_map.origins[fixture.output];
+    CHECK(output->destination_lanes == 7 && output->source_begin < output->source_end &&
+        !memchr(original.buf + output->source_begin, '.', output->source_end - output->source_begin));
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        options.expression_source_map = outputs & 1u ? &changed_map : NULL;
+        options.source_quality = outputs & 2u ? &changed_quality : NULL;
+        options.source_quality_pass_index = 3; options.source_quality_entry_point_index = 4;
+        sb_free(&changed); sb_init(&changed);
+        CHECK(hlsl_emit_with_options_diagnostic(&fixture.program, &changed, NULL, NULL, NULL, &options, &diagnostic) &&
+            changed.len == original.len && !memcmp(changed.buf, original.buf, original.len));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&original_map, &changed_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+    }
+    const size_t points[] = {1, baseline.common.observations / 2u, baseline.common.observations};
+    for (unsigned point = 0; point < sizeof(points) / sizeof(*points); ++point) {
+        NaturalModifierObservations veto = natural_modifier_observer(&fixture); veto.common.reject_at = points[point];
+        sb_free(&changed); sb_init(&changed);
+        CHECK(!natural_modifier_emit(&fixture, &changed, &changed_map, &changed_quality, &veto, &diagnostic) &&
+            veto.common.observations == points[point] && !changed_map.complete && !changed_map.count &&
+            changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+    }
+    NaturalModifierObservations restored = natural_modifier_observer(&fixture); sb_free(&changed); sb_init(&changed);
+    CHECK(natural_modifier_emit(&fixture, &changed, &changed_map, &changed_quality, &restored, &diagnostic) &&
+        changed.len == original.len && !memcmp(changed.buf, original.buf, original.len) &&
+        natural_if_maps_equal(&original_map, &changed_map) && hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+    const int indices[] = {fixture.then_value, fixture.else_value - 1, fixture.else_value};
+    const uint32_t raw_indices[] = {fixture.program.instructions[indices[0]].source_instruction_index,
+        fixture.program.instructions[indices[1]].source_instruction_index, fixture.program.instructions[indices[2]].source_instruction_index};
+    const uint8_t demands[] = {(uint8_t)((1u << shape.width) - 1u), (uint8_t)(shape.width == 2 ? 6 : shape.width == 3 ? 14 : 15),
+        (uint8_t)((1u << shape.width) - 1u)};
+    const uint8_t modifiers[] = {mods.then_input, mods.add_literal, mods.else_temp};
+    sb_free(&changed); sb_free(&original); natural_if_fixture_dispose(&fixture);
+    for (unsigned item = 0; item < 3; ++item) {
+        const ASTExpr *leaf = NULL;
+        CHECK(natural_modifier_chain(roots[item], modifiers[item], indices[item], raw_indices[item], demands[item], shape.width, &leaf));
+        if (!item) CHECK(leaf->kind == AST_EXPR_EMITTER_OPERAND && leaf->u.emitter_operand[0]);
+        else if (item == 1) CHECK(leaf->kind == AST_EXPR_LITERAL && leaf->u.literal.scalar_type == AST_SCALAR_FLOAT32);
+        else CHECK(leaf->kind == AST_EXPR_VAR && !strcmp(leaf->u.var.name, "ownedVector"));
+        ast_free_expr(roots[item]);
+    }
+    return true;
+}
+
+static bool check_natural_modifier_rejections(void) {
+    const NaturalDotShape shape = {.width = 3, .compared = true, .nonzero = true};
+    const NaturalDotModifiers mods = {.then_input = 2, .add_input = 2, .add_literal = 2, .else_temp = 2, .output_temp = 2};
+    NaturalIfFixture fixture; CHECK(natural_dot_fixture_modifiers(&fixture, shape, &mods));
+    USILProgram *program = &fixture.program; CHECK(program->instruction_count == 9);
+    USILInstruction saved[9]; memcpy(saved, program->instructions, sizeof(saved));
+    DXBCOperand *source = &program->instructions[fixture.then_value].operands[1];
+    const uint32_t extension = source->extended_tokens[0];
+    DXBCOperand empty; memset(&empty, 0, sizeof(empty));
+    for (unsigned mutation = 0; mutation < 11; ++mutation) {
+        uint32_t extra[] = {UINT32_C(0x80000081), UINT32_C(0)};
+        switch (mutation) {
+        case 0: source->has_neg = true; break; /* Flags disagree with the retained ABS word. */
+        case 1: source->raw_token &= ~UINT32_C(0x80000000); break;
+        case 2: source->extended_tokens = NULL; source->extended_token_count = 0; break;
+        case 3: source->extended_token_count = 0; break;
+        case 4: source->extended_tokens[0] = UINT32_C(0x82); break;
+        case 5: source->extended_tokens[0] |= UINT32_C(0x80000000); break;
+        case 6: source->extended_tokens = extra; source->extended_token_count = 2; break;
+        case 7: source->min_precision = 1; source->extended_tokens[0] |= UINT32_C(0x4000); break;
+        case 8: source->extended_tokens[0] |= UINT32_C(0x20000); break;
+        case 9: /* A raw continuation bit cannot claim an absent neutral extension. */
+            source->has_abs = false; source->extended_tokens = NULL; source->extended_token_count = 0; break;
+        case 10: /* MOD_NONE is outside the three measured canonical source forms. */
+            source->has_abs = false; source->extended_tokens[0] = UINT32_C(1); break;
+        }
+        DXBCOperand view; memset(&view, 0xa5, sizeof(view));
+        const bool view_rejected = !hlsl_natural_float_source_view(source, &view) && !memcmp(&view, &empty, sizeof(view));
+        const bool emission_rejected = natural_if_rejected(program, NULL);
+        saved[fixture.then_value].operands[1].extended_tokens[0] = extension;
+        memcpy(program->instructions, saved, sizeof(saved));
+        source = &program->instructions[fixture.then_value].operands[1];
+        if (!view_rejected || !emission_rejected) fprintf(stderr, "Natural modifier malformed mutation=%u view=%d emission=%d\n",
+            mutation, (int)view_rejected, (int)emission_rejected);
+        CHECK(view_rejected && emission_rejected);
+    }
+    /* Canonical modifier words do not authorize arithmetic on a comparison's
+     * BOOL mask, dynamic reads, or a different resource operand class. */
+    for (unsigned mutation = 0; mutation < 3; ++mutation) {
+        DXBCOperand relative = program->instructions[fixture.condition].operands[0];
+        if (!mutation) {
+            source->type = OPERAND_TYPE_TEMP; source->register_index = 0; source->index_values[0] = 0;
+            memset(source->swizzle, 0, sizeof(source->swizzle));
+            source->raw_token = natural_if_source_token(OPERAND_TYPE_TEMP, source->swizzle) | UINT32_C(0x80000000);
+        } else if (mutation == 1) {
+            source->index_has_immediate[0] = false; source->index_representations[0] = 2; source->rel_op0 = &relative;
+            source->raw_token = (source->raw_token & ~UINT32_C(0x01c00000)) | UINT32_C(0x00800000);
+        } else {
+            source->type = OPERAND_TYPE_RESOURCE;
+            source->raw_token = (source->raw_token & ~UINT32_C(0x000ff000)) | (uint32_t)OPERAND_TYPE_RESOURCE << 12u;
+        }
+        const bool rejected = natural_if_rejected(program, NULL);
+        memcpy(program->instructions, saved, sizeof(saved)); source = &program->instructions[fixture.then_value].operands[1];
+        CHECK(rejected); /* Borrowed relative nodes are detached before disposal. */
+    }
+    natural_if_fixture_dispose(&fixture);
+    const NaturalDotModifiers prohibited[] = {{.comparison_input = 1}, {.condition_source = 2}, {.then_destination = 1}};
+    for (unsigned item = 0; item < sizeof(prohibited) / sizeof(*prohibited); ++item) {
+        CHECK(natural_dot_fixture_modifiers(&fixture, shape, &prohibited[item]));
+        CHECK(natural_if_rejected(&fixture.program, NULL));
+        natural_if_fixture_dispose(&fixture);
+    }
+    return true;
+}
+
+static bool check_natural_modifier_callbacks(void) {
+    const NaturalDotShape shape = {.width = 3, .compared = true, .nonzero = true};
+    const NaturalDotModifiers mods = {.then_input = 2, .add_input = 2, .add_literal = 2, .else_temp = 2, .output_temp = 2};
+    NaturalIfFixture fixture; CHECK(natural_dot_fixture_modifiers(&fixture, shape, &mods));
+    USILProgram *program = &fixture.program; CHECK(program->instruction_count == 9);
+    USILInstruction saved[9]; memcpy(saved, program->instructions, sizeof(saved));
+    const int owners[] = {fixture.then_value, fixture.else_value - 1, fixture.else_value, fixture.output};
+    const int operands[] = {1, 2, 2, 1};
+    uint32_t extensions[4];
+    for (unsigned owner = 0; owner < 4; ++owner) {
+        CHECK(saved[owners[owner]].operands[operands[owner]].extended_token_count == 1);
+        extensions[owner] = saved[owners[owner]].operands[operands[owner]].extended_tokens[0];
+    }
+    const char *prefix = "// modifier caller prefix\n";
+    StringBuilder original, changed; sb_init(&original); sb_init(&changed); sb_append(&original, prefix);
+    HLSLExpressionSourceMap original_map, changed_map; HLSLSourceQualityResult original_quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic; NaturalModifierObservations baseline = natural_modifier_observer(&fixture);
+    baseline.common.mutable_source = &original;
+    CHECK(natural_modifier_emit(&fixture, &original, &original_map, &original_quality, &baseline, &diagnostic) &&
+        original_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && baseline.common.observations > 2 &&
+        baseline.common.first_header_observation && baseline.common.signature_observation);
+    const size_t points[] = {1, baseline.common.observations / 2u, baseline.common.observations};
+    for (unsigned owner = 0; owner < 4; ++owner) {
+        for (unsigned point = 0; point < sizeof(points) / sizeof(*points); ++point) {
+            NaturalModifierObservations drift = natural_modifier_observer(&fixture);
+            drift.common.mutable_program = program; drift.common.mutation = 31; drift.common.mutate_at = points[point];
+            drift.common.arithmetic_instruction = owners[owner]; drift.common.modifier_operand = operands[owner];
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            const bool rejected = !natural_modifier_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic);
+            if (!rejected) fprintf(stderr, "Natural modifier drift owner=%d operand=%d observation=%zu admitted\n",
+                owners[owner], operands[owner], points[point]);
+            CHECK(rejected && drift.common.mutated && !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && diagnostic.status != HLSL_EMIT_STATUS_OK);
+            DXBCOperand *current = &program->instructions[owners[owner]].operands[operands[owner]];
+            CHECK(current->has_abs && current->has_neg && current->extended_tokens[0] == UINT32_C(0xc1));
+            NaturalModifierObservations fresh = natural_modifier_observer(&fixture);
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(natural_modifier_emit(&fixture, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && changed_map.complete &&
+                hlsl_expression_source_map_matches(&changed_map, program, changed.buf) && strcmp(original.buf, changed.buf));
+            /* Instruction snapshots borrow extension allocations. Restore
+             * their pointed words independently before restoring the model. */
+            for (unsigned restored = 0; restored < 4; ++restored)
+                saved[owners[restored]].operands[operands[restored]].extended_tokens[0] = extensions[restored];
+            memcpy(program->instructions, saved, sizeof(saved));
+            fresh = natural_modifier_observer(&fixture); sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(natural_modifier_emit(&fixture, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                changed.len == original.len && !memcmp(changed.buf, original.buf, original.len) &&
+                natural_if_maps_equal(&original_map, &changed_map) && hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+        }
+    }
+    const struct {unsigned mutation; size_t point, offset;} attacks[] = {
+        {4, baseline.common.observations, original_map.origins[fixture.else_value].source_begin},
+        {15, baseline.common.observations, 0}, {19, baseline.common.first_header_observation, 0},
+        {20, baseline.common.signature_observation, 0}};
+    for (unsigned attack = 0; attack < sizeof(attacks) / sizeof(*attacks); ++attack) {
+        NaturalModifierObservations drift = natural_modifier_observer(&fixture);
+        drift.common.mutable_program = program; drift.common.mutable_source = &changed; drift.common.mutable_map = &changed_map;
+        drift.common.mutation = attacks[attack].mutation; drift.common.mutate_at = attacks[attack].point;
+        drift.common.source_offset = attacks[attack].offset; drift.common.arithmetic_instruction = fixture.else_value;
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(!natural_modifier_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+            drift.common.mutated && !changed_map.complete && !changed_map.count &&
+            changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && !memcmp(saved, program->instructions, sizeof(saved)));
+        for (unsigned owner = 0; owner < 4; ++owner)
+            CHECK(saved[owners[owner]].operands[operands[owner]].extended_tokens[0] == extensions[owner]);
+        NaturalModifierObservations fresh = natural_modifier_observer(&fixture); sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(natural_modifier_emit(&fixture, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+            changed.len == original.len && !memcmp(changed.buf, original.buf, original.len) &&
+            natural_if_maps_equal(&original_map, &changed_map) && hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+    }
+    sb_free(&changed); sb_free(&original); natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_source_modifiers(void) {
+    const NaturalDotShape shape = {.width = 3, .compared = true, .nonzero = true};
+    NaturalIfFixture original, plain; const NaturalDotModifiers no_modifiers = {0};
+    CHECK(natural_dot_fixture(&original, shape) && natural_dot_fixture_modifiers(&plain, shape, &no_modifiers) &&
+        original.document.owned_size == plain.document.owned_size &&
+        !memcmp(original.document.owned_bytes, plain.document.owned_bytes, original.document.owned_size));
+    natural_if_fixture_dispose(&plain); natural_if_fixture_dispose(&original);
+    const struct {NaturalDotShape shape; NaturalDotModifiers mods;} cases[] = {
+        {{.width = 2, .layout = NATURAL_IF_INPUTS_PACKED_SPLIT, .compared = true, .nonzero = true},
+            {.then_input = 1, .add_input = 2, .add_literal = 2, .else_temp = 3, .output_temp = 1}},
+        {{.width = 3, .compared = true, .nonzero = false},
+            {.then_input = 3, .add_input = 1, .add_literal = 3, .else_temp = 2, .output_temp = 3, .exceptional_literals = true}},
+        {{.width = 4, .nonzero = true},
+            {.then_input = 2, .add_input = 3, .add_literal = 1, .else_temp = 1, .output_temp = 2}}};
+    for (unsigned item = 0; item < sizeof(cases) / sizeof(*cases); ++item)
+        CHECK(check_natural_modifier_positive(cases[item].shape, cases[item].mods));
+    CHECK(check_natural_modifier_rejections());
+    CHECK(check_natural_modifier_callbacks());
+    return true;
+}
+
 static bool check_natural_conditional_emission(void) {
     const struct {unsigned width; uint8_t mask;} shapes[] = {
         {1, 1}, {2, 3}, {3, 7}, {1, 2}, {2, 12}};
@@ -4588,6 +4972,7 @@ static bool check_natural_conditional_emission(void) {
     CHECK(check_natural_mad_emission());
     CHECK(check_natural_unique_header_callbacks());
     CHECK(check_natural_dot_emission());
+    CHECK(check_natural_source_modifiers());
     /* DXBC IF_Z/NZ compares the raw DWORD, including the float sign bit. A
      * numeric float comparison would take the opposite branch for -0. */
     const struct {uint32_t bits; bool nonzero;} conditions[] = {

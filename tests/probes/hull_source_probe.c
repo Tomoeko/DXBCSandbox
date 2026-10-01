@@ -402,7 +402,7 @@ static bool print_domain_signature(const char *role,
 static bool print_domain_operand(const DXBCOperand *operand, int instruction,
                                  int operand_index, unsigned path, unsigned depth,
                                  size_t *remaining) {
-    if (!*remaining || depth > PROBE_DOMAIN_OPERAND_DEPTH_LIMIT)
+    if (!operand || !remaining || !*remaining || depth > PROBE_DOMAIN_OPERAND_DEPTH_LIMIT)
         return false;
     --*remaining;
     printf("domain_operand instruction=%d operand=%d path=%u depth=%u type=%u "
@@ -416,6 +416,25 @@ static bool print_domain_operand(const DXBCOperand *operand, int instruction,
            (unsigned)operand->swizzle[2], (unsigned)operand->swizzle[3],
            operand->has_neg, operand->has_abs, (unsigned)operand->min_precision,
            operand->extended_token_count);
+    if ((operand->extended_token_count != 0) != (operand->extended_tokens != NULL)) {
+        printf("domain_operand_extensions instruction=%d operand=%d path=%u depth=%u "
+               "state=count-pointer-mismatch count=%zu present=%d\n", instruction,
+               operand_index, path, depth, operand->extended_token_count,
+               operand->extended_tokens != NULL);
+        return false;
+    }
+    if (operand->extended_token_count > *remaining) {
+        printf("domain_operand_extensions instruction=%d operand=%d path=%u depth=%u "
+               "state=owner-budget-exceeded count=%zu remaining=%zu\n", instruction,
+               operand_index, path, depth, operand->extended_token_count, *remaining);
+        return false;
+    }
+    for (size_t index = 0; index < operand->extended_token_count; ++index) {
+        --*remaining;
+        printf("domain_operand_extension instruction=%d operand=%d path=%u depth=%u "
+               "index=%zu bits=0x%08" PRIx32 "\n", instruction, operand_index,
+               path, depth, index, operand->extended_tokens[index]);
+    }
     for (int dimension = 0; dimension < operand->register_index_dim && dimension < 3;
          ++dimension)
         printf("domain_operand_index instruction=%d operand=%d path=%u dimension=%d "

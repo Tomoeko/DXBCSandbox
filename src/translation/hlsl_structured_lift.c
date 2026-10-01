@@ -398,6 +398,17 @@ static bool plain_instruction(const USILInstruction *instruction) {
     return true;
 }
 
+static bool natural_arithmetic_instruction_plain(const USILInstruction *instruction) {
+    if (instruction->precise_mask || instruction->saturate || instruction->operand_count < 2 ||
+        instruction->operand_count > DXBC_MAX_OPERANDS ||
+        !hlsl_lift_operand_is_plain(&instruction->operands[0])) return false;
+    for (int operand = 1; operand < instruction->operand_count; ++operand) {
+        DXBCOperand plain_view;
+        if (!hlsl_natural_float_source_view(&instruction->operands[operand], &plain_view)) return false;
+    }
+    return true;
+}
+
 /* An unsigned unit-step induction with an immutable input-bit bound. UGE
  * returns a mask; only its exact BREAKC_NZ consumes it. While counter < bound,
  * counter <= UINT_MAX-1, so the increment cannot wrap. No float comparison or
@@ -622,7 +633,7 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
         const bool comparison = plan->natural_width && scalar_comparison_opcode(inst->opcode);
         if (plan->natural_width &&
             ((!natural_arithmetic_opcode(inst->opcode) && !comparison) ||
-             !plain_instruction(inst)))
+             !(comparison ? plain_instruction(inst) : natural_arithmetic_instruction_plain(inst))))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
         int predicate_if = -1;
         if (comparison) {
@@ -637,7 +648,9 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
         if (packed_inputs) for (int operand = 1; operand < inst->operand_count; ++operand) {
             if (inst->operands[operand].type != OPERAND_TYPE_INPUT) continue;
             HLSLNaturalInputProjection projection;
-            if (!hlsl_natural_input_projection(program, &inst->operands[operand],
+            DXBCOperand plain_view;
+            if (!hlsl_natural_float_source_view(&inst->operands[operand], &plain_view) ||
+                !hlsl_natural_input_projection(program, &plain_view,
                 demanded_lanes(ctx, index, operand), &projection))
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
         }
@@ -988,10 +1001,14 @@ static ASTExpr *source_expression(HLSLEmitterContext *ctx, StructuredPlan *plan,
     if (value_index < 0)
         return NULL;
     if (plan->natural_width) {
+        DXBCOperand plain_view;
+        if (!hlsl_natural_float_source_view(source, &plain_view)) return NULL;
         ASTExpr *value = planned_value_expression(ctx, plan, value_index);
         if (plan->values[value_index].predicate) return value;
-        return hlsl_project_logical_temp(ctx, value, plan->values[value_index].mask,
-            plan->values[value_index].width, source, demanded_lanes(ctx, index, operand), index);
+        const uint8_t mask = demanded_lanes(ctx, index, operand);
+        value = hlsl_project_logical_temp(ctx, value, plan->values[value_index].mask,
+            plan->values[value_index].width, &plain_view, mask, index);
+        return hlsl_natural_float_source_modifiers(ctx, index, operand, mask, value);
     }
     ASTExpr *value = ast_create_var(-1, source->register_index, OPERAND_TYPE_TEMP,
                                     plan->values[value_index].name);

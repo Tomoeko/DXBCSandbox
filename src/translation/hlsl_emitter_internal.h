@@ -692,6 +692,17 @@ ASTExpr *hlsl_natural_float_operation(HLSLEmitterContext *ctx,
     int instruction, ASTExpr *owned_left, ASTExpr *owned_right, ASTExpr *owned_third);
 ASTExpr *hlsl_natural_source_atom(HLSLEmitterContext *ctx, int instruction,
                                  int operand, uint8_t demanded_lanes);
+/* A temporary formatting/projection view, never a replacement decoded owner.
+ * Original raw continuation, one modifier extension and ABS/NEG flags must
+ * agree before their fields are cleared. The nonalias output is zero on
+ * failure; an output aliasing the immutable original is rejected untouched. */
+bool hlsl_natural_float_source_view(const DXBCOperand *original, DXBCOperand *plain_view);
+/* Consumes the unmodified FLOAT32 child on every outcome. Natural arithmetic
+ * sources apply ABS then NEG exactly once after actual input/TEMP projection;
+ * IF controls, comparisons and BOOL values do not gain modifier admission.
+ * hlsl_natural_source_atom applies this wrapper to its own returned atom. */
+ASTExpr *hlsl_natural_float_source_modifiers(HLSLEmitterContext *ctx,
+    int instruction, int operand, uint8_t demanded_lanes, ASTExpr *owned_expression);
 ASTExpr *hlsl_project_logical_temp(HLSLEmitterContext *ctx, ASTExpr *owned_expression,
     uint8_t producer_mask, unsigned natural_width, const DXBCOperand *source,
     uint8_t demanded_lanes, int consumer_instruction);
