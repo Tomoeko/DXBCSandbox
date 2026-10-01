@@ -634,6 +634,10 @@ static bool rejected_projection_is_empty(DXBCContainer* semantic,
     CHECK(!usil_translate_with_stage_contract(&rejected, semantic, contract));
     CHECK(rejected.instructions == NULL && rejected.instruction_count == 0);
     CHECK(rejected.signature_declarations == NULL && rejected.icb_values == NULL);
+    CHECK(!rejected.has_icb_declaration && rejected.icb_declaration_owner == NULL);
+    CHECK(rejected.icb_source_instruction_index == 0u &&
+          rejected.icb_declaration_token == 0u &&
+          rejected.icb_declaration_word_count == 0u);
     CHECK(rejected.compute.shared_memory == NULL && rejected.tessellation.phases == NULL);
     usil_free(&rejected);
     return true;
@@ -670,6 +674,11 @@ static bool verify_icb_raw_geometry_owners(void) {
     CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
     CHECK(program.icb_value_count == 8 && program.icb_values[0] == UINT32_C(0x80000000) &&
           program.icb_values[1] == UINT32_C(0x7fc12345));
+    CHECK(program.has_icb_declaration && program.icb_source_instruction_index == 0u &&
+          program.icb_declaration_token == words[0] &&
+          program.icb_declaration_word_count == 10u &&
+          program.icb_declaration_owner != NULL);
+    CHECK(usil_icb_declaration_is_valid(&program));
     CHECK(program.instruction_count == 3 &&
           program.instructions[0].opcode == USIL_OP_GEOMETRY_APPEND &&
           program.instructions[0].source_instruction_index == 4u &&
@@ -694,11 +703,31 @@ static bool verify_icb_raw_geometry_owners(void) {
     semantic.instructions[1].is_customdata_continuation = false;
     CHECK(rejected_projection_is_empty(&semantic, &contract));
     semantic.instructions[1].is_customdata_continuation = true;
+    semantic.icb_value_count = 4;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.icb_value_count = 8;
+    semantic.instructions[0].token ^= 1u;
+    semantic.instructions[1].token ^= 1u;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.instructions[0].token ^= 1u;
+    semantic.instructions[1].token ^= 1u;
+    semantic.instructions[0].token ^= 1u << 11u;
+    semantic.instructions[1].token ^= 1u << 11u;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.instructions[0].token ^= 1u << 11u;
+    semantic.instructions[1].token ^= 1u << 11u;
+    ++semantic.instructions[1].file_offset;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    --semantic.instructions[1].file_offset;
+    semantic.instructions[1].byte_length += 16u;
+    CHECK(rejected_projection_is_empty(&semantic, &contract));
+    semantic.instructions[1].byte_length -= 16u;
     CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
-    usil_free(&program);
     dxbc_stage_contract_free(&contract);
     dxbc_free(&semantic);
     dxbc_document_free(&document);
+    CHECK(usil_icb_declaration_is_valid(&program));
+    usil_free(&program);
     return true;
 }
 
@@ -720,6 +749,11 @@ static bool verify_icb_raw_compute_owners(void) {
                             UINT32_C(0x00050050), &document, &semantic, &contract));
     CHECK(document.instruction_count == 6u && semantic.instruction_count == 7);
     CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    CHECK(program.has_icb_declaration && program.icb_source_instruction_index == 0u &&
+          program.icb_declaration_token == words[0] &&
+          program.icb_declaration_word_count == 10u &&
+          program.icb_declaration_owner != NULL);
+    CHECK(usil_icb_declaration_is_valid(&program));
     CHECK(program.compute.declaration_source_instruction_index == 1u &&
           program.compute.shared_memory_count == 1u &&
           program.compute.shared_memory[0].instruction_index == 2u);
@@ -738,9 +772,12 @@ static bool verify_icb_raw_compute_owners(void) {
     ++contract.memory_barriers[0].instruction_index;
     CHECK(rejected_projection_is_empty(&semantic, &contract));
     --contract.memory_barriers[0].instruction_index;
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
     dxbc_stage_contract_free(&contract);
     dxbc_free(&semantic);
     dxbc_document_free(&document);
+    CHECK(usil_icb_declaration_is_valid(&program));
+    usil_free(&program);
     return true;
 }
 
@@ -763,6 +800,11 @@ static bool verify_icb_raw_hull_owners(void) {
                             UINT32_C(0x00030050), &document, &semantic, &contract));
     CHECK(document.instruction_count == 13u && semantic.instruction_count == 14);
     CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    CHECK(program.has_icb_declaration && program.icb_source_instruction_index == 1u &&
+          program.icb_declaration_token == words[1] &&
+          program.icb_declaration_word_count == 10u &&
+          program.icb_declaration_owner != NULL);
+    CHECK(usil_icb_declaration_is_valid(&program));
     CHECK(program.tessellation.phase_count == 2u &&
           program.tessellation.phases[0].marker_source_instruction_index == 7u &&
           program.tessellation.phases[0].first_source_instruction_index == 8u &&

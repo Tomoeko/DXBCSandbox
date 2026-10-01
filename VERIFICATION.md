@@ -101,6 +101,12 @@ and warm cache checks, toolchain drift, cancellation, budget and malformed-input
 tests. Source readability and byte-match coverage are reported independently.
 No stage/backend is admitted by changing a label or dropping an unavailable plane.
 
+Parsed immediate constant buffers retain their raw declaration identity and a
+separate copy of every payload DWORD. `usil_icb_declaration_is_valid()` checks
+that mutable projection against its retained owner, including parsed absence.
+It does not authenticate an original target or admit high-level indexed arrays.
+Generic caller-built constant-buffer presentation remains a separate path.
+
 A high-level candidate may establish independent generated-domain compiler
 evidence when ordinary source emission is unsupported. It still requires a
 complete instruction source map, pinned compiler/include/profile authority,

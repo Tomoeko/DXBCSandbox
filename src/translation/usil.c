@@ -10,6 +10,72 @@
 
 static void free_usil_operand(DXBCOperand* op);
 
+struct USILICBDeclarationOwner {
+    uint32_t source_instruction_index;
+    uint32_t token;
+    uint32_t word_count;
+    int value_count;
+    uint32_t values[];
+};
+
+bool usil_icb_declaration_is_valid(const USILProgram* program) {
+    if (!program || !program->has_parsed_signature_authority ||
+        program->icb_value_count < 0 ||
+        program->icb_value_alloc < program->icb_value_count ||
+        (program->icb_value_alloc == 0) != (program->icb_values == NULL) ||
+        program->icb_value_count % 4 != 0) {
+        return false;
+    }
+    if (!program->has_icb_declaration) {
+        return !program->icb_declaration_owner &&
+            program->icb_source_instruction_index == 0u &&
+            program->icb_declaration_token == 0u &&
+            program->icb_declaration_word_count == 0u &&
+            program->icb_value_count == 0 && program->icb_value_alloc == 0;
+    }
+    const USILICBDeclarationOwner* owner = program->icb_declaration_owner;
+    if (!owner || program->icb_value_count == 0 ||
+        owner->value_count != program->icb_value_count ||
+        owner->word_count != (uint32_t)program->icb_value_count + 2u ||
+        program->icb_source_instruction_index != owner->source_instruction_index ||
+        program->icb_declaration_token != owner->token ||
+        program->icb_declaration_word_count != owner->word_count ||
+        dxbc_size_multiply_overflows((size_t)program->icb_value_count,
+                                    sizeof(*program->icb_values))) {
+        return false;
+    }
+    return memcmp(program->icb_values, owner->values,
+                  (size_t)program->icb_value_count *
+                      sizeof(*program->icb_values)) == 0;
+}
+
+static bool retain_icb_declaration(USILProgram* program,
+                                   const DXBCInstruction* declaration) {
+    if (!declaration) return true;
+    if (program->icb_value_count <= 0 ||
+        dxbc_size_multiply_overflows((size_t)program->icb_value_count,
+                                    sizeof(*program->icb_values))) {
+        return false;
+    }
+    const size_t payload_size = (size_t)program->icb_value_count *
+        sizeof(*program->icb_values);
+    if (payload_size > SIZE_MAX - sizeof(USILICBDeclarationOwner)) return false;
+    USILICBDeclarationOwner* owner =
+        mem_alloc(sizeof(*owner) + payload_size);
+    if (!owner) return false;
+    owner->source_instruction_index = declaration->raw_instruction_index;
+    owner->token = declaration->token;
+    owner->word_count = declaration->byte_length / 4u;
+    owner->value_count = program->icb_value_count;
+    memcpy(owner->values, program->icb_values, payload_size);
+    program->has_icb_declaration = true;
+    program->icb_source_instruction_index = owner->source_instruction_index;
+    program->icb_declaration_token = owner->token;
+    program->icb_declaration_word_count = owner->word_count;
+    program->icb_declaration_owner = owner;
+    return true;
+}
+
 static void free_signature_elements(DXBCSignatureElement* elements,
                                     int count) {
     if (!elements || count <= 0) return;
@@ -1369,10 +1435,13 @@ static bool geometry_effect_matches(
 
 /* The semantic decoder keeps one presentation record per ICB row. Validate
  * the repeated owner independently of that array position before using raw
- * contract indices. Missing or altered authority in parsed input must not
- * silently fall back to presentation indices. */
+ * contract indices. The single actual declaration also owns the complete
+ * payload count. Missing or altered authority in parsed input must not silently
+ * fall back to presentation indices. */
 static bool raw_instruction_authority_valid(
-    const DXBCContainer* container, const DXBCStageContract* contract) {
+    const DXBCContainer* container, const DXBCStageContract* contract,
+    const DXBCInstruction** declaration_owner) {
+    *declaration_owner = NULL;
     if (!container->parsed_signature_authority) return true;
     uint32_t next_raw_index = 0u;
     uint32_t remaining_icb_rows = 0u;
@@ -1395,15 +1464,21 @@ static bool raw_instruction_authority_valid(
         ++next_raw_index;
         icb_owner = NULL;
         if (instruction->opcode == 53u) {
-            if (instruction->operand_count != 0 || instruction->byte_length < 24u ||
+            if (*declaration_owner || instruction->operand_count != 0 ||
+                (instruction->token & UINT32_C(0x000007ff)) != 53u ||
+                instruction->byte_length < 24u ||
                 (instruction->byte_length - 8u) % 16u != 0u ||
-                ((instruction->token >> 11u) & UINT32_C(0x001fffff)) != 3u)
+                ((instruction->token >> 11u) & UINT32_C(0x001fffff)) != 3u ||
+                (instruction->byte_length - 8u) / 4u !=
+                    (uint32_t)container->icb_value_count)
                 return false;
             remaining_icb_rows = (instruction->byte_length - 8u) / 16u - 1u;
             icb_owner = instruction;
+            *declaration_owner = instruction;
         }
     }
     return remaining_icb_rows == 0u &&
+        (*declaration_owner || container->icb_value_count == 0) &&
         (!contract || (contract->first_instruction_index == 0u &&
                        contract->end_instruction_index == next_raw_index));
 }
@@ -1444,7 +1519,9 @@ static bool usil_translate_internal(
         LOG_ERROR("Invalid DXBC container passed to USIL translation");
         return false;
     }
-    if (!raw_instruction_authority_valid(container, stage_contract)) {
+    const DXBCInstruction* icb_declaration = NULL;
+    if (!raw_instruction_authority_valid(container, stage_contract,
+                                         &icb_declaration)) {
         LOG_ERROR("Invalid raw instruction identity in DXBC semantic projection");
         return false;
     }
@@ -1640,9 +1717,8 @@ static bool usil_translate_internal(
                     goto declaration_fail;
                 break;
             case 53: /* CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER */
-                /* The decoder copies the exact DWORD payload into
-                 * container->icb_values; the rows themselves carry no
-                 * additional semantic authority. */
+                /* Parsed ownership was checked with the raw instruction
+                 * sequence above. Presentation rows cannot replace its owner. */
                 if (src_inst->operand_count != 0) goto declaration_fail;
                 break;
             case 88:  /* DCL_RESOURCE */
@@ -2007,6 +2083,12 @@ declaration_fail:
                (size_t)program->icb_value_count *
                    sizeof(*program->icb_values));
     }
+    if (!retain_icb_declaration(program, icb_declaration) ||
+        (program->has_parsed_signature_authority &&
+         !usil_icb_declaration_is_valid(program))) {
+        LOG_ERROR("Immediate constant buffer declaration/payload ownership disagrees");
+        goto fail;
+    }
 
     if (!usil_signature_authority_is_valid(program)) {
         if (getenv("DXBC_DEBUG_STAGE")) {
@@ -2136,6 +2218,11 @@ void usil_free(USILProgram* program) {
                  sizeof(*program->compute.shared_memory));
     mem_free(program->icb_values,
              (size_t)program->icb_value_alloc * sizeof(*program->icb_values));
+    if (program->icb_declaration_owner) {
+        USILICBDeclarationOwner* owner = program->icb_declaration_owner;
+        mem_free(owner, sizeof(*owner) +
+                 (size_t)owner->value_count * sizeof(*owner->values));
+    }
     memset(program, 0, sizeof(USILProgram));
 }
 

@@ -880,7 +880,25 @@ static int verify_dynamic_capacity_boundaries(void) {
     CHECK(usil_translate(&program, &container));
     CHECK(program.icb_value_count == (int)icb_dword_count);
     CHECK(program.icb_values[1027] == 1027u);
+    CHECK(program.has_parsed_signature_authority && program.has_icb_declaration);
+    CHECK(program.icb_source_instruction_index == 0u &&
+          program.icb_declaration_token == icb_words[0] &&
+          program.icb_declaration_word_count == 2u + icb_dword_count &&
+          program.icb_declaration_owner != NULL);
+    CHECK(usil_icb_declaration_is_valid(&program));
+    program.icb_values[1027] ^= UINT32_C(0x80000000);
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_values[1027] ^= UINT32_C(0x80000000);
+    CHECK(usil_icb_declaration_is_valid(&program));
+    program.icb_value_count -= 4;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_value_count += 4;
+    CHECK(usil_icb_declaration_is_valid(&program));
     CHECK(program.instruction_count == 1 && program.instructions[0].source_instruction_index == 1u);
+    dxbc_free(&container);
+    free(icb_shader);
+    free(icb_words);
+    CHECK(usil_icb_declaration_is_valid(&program));
     StringBuilder icb_hlsl;
     sb_init(&icb_hlsl);
     CHECK(hlsl_emit(&program, &icb_hlsl, NULL, NULL, NULL));
@@ -888,9 +906,6 @@ static int verify_dynamic_capacity_boundaries(void) {
     CHECK(strstr(icb_hlsl.buf, "asfloat(0x00000403u)") != NULL);
     sb_free(&icb_hlsl);
     usil_free(&program);
-    dxbc_free(&container);
-    free(icb_shader);
-    free(icb_words);
 
     const uint32_t resource_operand =
         operand_token(OPERAND_TYPE_RESOURCE, 1, 1, 0, 0, 0);
@@ -978,6 +993,184 @@ static int verify_dynamic_capacity_boundaries(void) {
     malformed.resource_alloc = 2;
     CHECK(!usil_translate(&program, &malformed));
 
+    CHECK(g_allocations_count == allocation_count);
+    CHECK(g_allocated_bytes == allocated_bytes);
+    return 0;
+}
+
+static int verify_parsed_icb_declaration_contract(void) {
+    const size_t allocation_count = g_allocations_count;
+    const size_t allocated_bytes = g_allocated_bytes;
+    const uint32_t zero_words[] = {
+        instruction_token(104u, 2u), 1u,
+        instruction_token(53u, 0u) | (3u << 11u), 6u,
+        0u, 0u, 0u, 0u,
+        instruction_token(62u, 1u)
+    };
+    const uint32_t peer_words[] = {
+        instruction_token(104u, 2u), 1u,
+        instruction_token(53u, 0u) | (3u << 11u), 6u,
+        UINT32_C(0x80000000), UINT32_C(0x7fc12345), 1u, 0u,
+        instruction_token(62u, 1u)
+    };
+    uint8_t bytes[512];
+    DXBCContainer container;
+    USILProgram program;
+    USILProgram peer;
+    size_t byte_count = build_test_shader_container(
+        zero_words, sizeof(zero_words) / sizeof(zero_words[0]), 11u,
+        bytes, sizeof(bytes));
+    CHECK(byte_count > 0u && dxbc_parse(&container, bytes, byte_count));
+    CHECK(container.instruction_count == 3 && container.icb_value_count == 4);
+    CHECK(usil_translate(&program, &container));
+    CHECK(program.has_parsed_signature_authority && program.has_icb_declaration);
+    CHECK(program.icb_source_instruction_index == 1u &&
+          program.icb_declaration_token == zero_words[2] &&
+          program.icb_declaration_word_count == 6u &&
+          program.icb_value_count == 4 && program.icb_declaration_owner != NULL);
+    for (int value = 0; value < program.icb_value_count; ++value)
+        CHECK(program.icb_values[value] == 0u);
+    CHECK(usil_icb_declaration_is_valid(&program));
+
+    /* Reject altered semantic authority before retaining an owner. */
+    container.icb_value_count = 0;
+    CHECK(!usil_translate(&peer, &container));
+    CHECK(peer.icb_declaration_owner == NULL && peer.icb_values == NULL);
+    usil_free(&peer);
+    container.icb_value_count = 4;
+    container.instructions[1].token ^= 1u;
+    CHECK(!usil_translate(&peer, &container));
+    usil_free(&peer);
+    container.instructions[1].token ^= 1u;
+    container.instructions[1].is_customdata_continuation = true;
+    CHECK(!usil_translate(&peer, &container));
+    usil_free(&peer);
+    container.instructions[1].is_customdata_continuation = false;
+    const DXBCInstruction return_instruction = container.instructions[2];
+    container.instructions[2] = container.instructions[1];
+    container.instructions[2].raw_instruction_index = 2u;
+    container.instructions[2].file_offset = return_instruction.file_offset;
+    CHECK(!usil_translate(&peer, &container));
+    CHECK(peer.icb_declaration_owner == NULL && peer.icb_values == NULL);
+    usil_free(&peer);
+    container.instructions[2] = return_instruction;
+    dxbc_free(&container);
+
+    byte_count = build_test_shader_container(
+        peer_words, sizeof(peer_words) / sizeof(peer_words[0]), 11u,
+        bytes, sizeof(bytes));
+    CHECK(byte_count > 0u && dxbc_parse(&container, bytes, byte_count));
+    CHECK(usil_translate(&peer, &container));
+    dxbc_free(&container);
+    CHECK(usil_icb_declaration_is_valid(&program));
+    CHECK(usil_icb_declaration_is_valid(&peer));
+    CHECK(program.icb_declaration_owner != peer.icb_declaration_owner);
+    /* Borrowed projections preserve the same retained declaration; payload
+     * integrity depends on every bit, not on the presentation array address. */
+    USILProgram borrowed = program;
+    uint32_t equal_values[4] = {0u, 0u, 0u, 0u};
+    borrowed.icb_values = equal_values;
+    borrowed.icb_value_alloc = 4;
+    CHECK(usil_icb_declaration_is_valid(&borrowed));
+    borrowed.has_parsed_signature_authority = false;
+    CHECK(!usil_icb_declaration_is_valid(&borrowed));
+
+    USILICBDeclarationOwner* owner = program.icb_declaration_owner;
+    program.icb_declaration_owner = NULL;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_declaration_owner = peer.icb_declaration_owner;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_declaration_owner = owner;
+    program.has_icb_declaration = false;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.has_icb_declaration = true;
+    ++program.icb_source_instruction_index;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    --program.icb_source_instruction_index;
+    program.icb_declaration_token ^= 1u;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_declaration_token ^= 1u;
+    --program.icb_declaration_word_count;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    ++program.icb_declaration_word_count;
+    program.icb_value_count = 0;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_value_count = 4;
+    const int value_alloc = program.icb_value_alloc;
+    program.icb_value_alloc = 3;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_value_alloc = value_alloc;
+    uint32_t* values = program.icb_values;
+    program.icb_values = NULL;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_values = values;
+    program.icb_values[0] = 1u;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_values[0] = 0u;
+    program.icb_values[3] = UINT32_C(0x80000000);
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.icb_values[3] = 0u;
+    program.has_parsed_signature_authority = false;
+    CHECK(!usil_icb_declaration_is_valid(&program));
+    program.has_parsed_signature_authority = true;
+    CHECK(usil_icb_declaration_is_valid(&program));
+
+    const uint32_t absent_words[] = {instruction_token(62u, 1u)};
+    byte_count = build_test_shader_container(
+        absent_words, 1u, 3u, bytes, sizeof(bytes));
+    CHECK(byte_count > 0u && dxbc_parse(&container, bytes, byte_count));
+    USILProgram absent;
+    CHECK(usil_translate(&absent, &container));
+    CHECK(absent.has_parsed_signature_authority && !absent.has_icb_declaration);
+    CHECK(absent.icb_source_instruction_index == 0u &&
+          absent.icb_declaration_token == 0u &&
+          absent.icb_declaration_word_count == 0u &&
+          absent.icb_declaration_owner == NULL && absent.icb_values == NULL &&
+          absent.icb_value_count == 0 && absent.icb_value_alloc == 0);
+    container.icb_values = values;
+    container.icb_value_count = 4;
+    container.icb_value_alloc = value_alloc;
+    USILProgram rejected;
+    CHECK(!usil_translate(&rejected, &container));
+    CHECK(rejected.icb_declaration_owner == NULL && rejected.icb_values == NULL);
+    usil_free(&rejected);
+    container.icb_values = NULL;
+    container.icb_value_count = 0;
+    container.icb_value_alloc = 0;
+    dxbc_free(&container);
+    CHECK(usil_icb_declaration_is_valid(&absent));
+    absent.has_icb_declaration = true;
+    CHECK(!usil_icb_declaration_is_valid(&absent));
+    absent.has_icb_declaration = false;
+    absent.icb_source_instruction_index = 1u;
+    CHECK(!usil_icb_declaration_is_valid(&absent));
+    absent.icb_source_instruction_index = 0u;
+    absent.icb_declaration_token = zero_words[2];
+    CHECK(!usil_icb_declaration_is_valid(&absent));
+    absent.icb_declaration_token = 0u;
+    absent.icb_declaration_word_count = 6u;
+    CHECK(!usil_icb_declaration_is_valid(&absent));
+    absent.icb_declaration_word_count = 0u;
+    absent.icb_declaration_owner = owner;
+    CHECK(!usil_icb_declaration_is_valid(&absent));
+    absent.icb_declaration_owner = NULL;
+    absent.icb_values = values;
+    absent.icb_value_alloc = value_alloc;
+    CHECK(!usil_icb_declaration_is_valid(&absent));
+    absent.icb_value_count = 4;
+    CHECK(!usil_icb_declaration_is_valid(&absent));
+    absent.icb_values = NULL;
+    absent.icb_value_count = 0;
+    absent.icb_value_alloc = 0;
+    CHECK(usil_icb_declaration_is_valid(&absent));
+    CHECK(!usil_icb_declaration_is_valid(NULL));
+    usil_free(&absent);
+    usil_free(&peer);
+    usil_free(&program);
+    CHECK(program.icb_declaration_owner == NULL && !program.has_icb_declaration &&
+          program.icb_source_instruction_index == 0u &&
+          program.icb_declaration_token == 0u &&
+          program.icb_declaration_word_count == 0u);
     CHECK(g_allocations_count == allocation_count);
     CHECK(g_allocated_bytes == allocated_bytes);
     return 0;
@@ -5895,6 +6088,7 @@ int main(void) {
     CHECK(verify_precision_and_instruction_controls() == 0);
     CHECK(verify_signature_parser_authority() == 0);
     CHECK(verify_dynamic_capacity_boundaries() == 0);
+    CHECK(verify_parsed_icb_declaration_contract() == 0);
     CHECK(verify_dynamic_signature_semantics() == 0);
     CHECK(verify_instruction_fail_closed() == 0);
     CHECK(verify_condition_test_authority() == 0);

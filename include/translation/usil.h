@@ -292,6 +292,8 @@ typedef struct {
     size_t barrier_count;
 } USILComputeContract;
 
+typedef struct USILICBDeclarationOwner USILICBDeclarationOwner;
+
 typedef struct {
     char shader_type_model[32];
     
@@ -347,6 +349,15 @@ typedef struct {
     uint32_t* icb_values;
     int icb_value_count;
     int icb_value_alloc;
+    /* Parsed CUSTOMDATA declaration identity; the word count includes both
+     * header words. The opaque owner independently retains every payload bit
+     * and belongs to this program. Borrowed program views borrow that owner.
+     * These facts preserve a parsed projection, not an original-target receipt. */
+    bool has_icb_declaration;
+    uint32_t icb_source_instruction_index;
+    uint32_t icb_declaration_token;
+    uint32_t icb_declaration_word_count;
+    USILICBDeclarationOwner* icb_declaration_owner;
     bool has_global_flags;
     uint32_t global_flags;
     bool has_stage_contract;
@@ -366,6 +377,10 @@ bool usil_translate_with_stage_contract(
     USILProgram* program, const DXBCContainer* container,
     const DXBCStageContract* stage_contract);
 bool usil_signature_authority_is_valid(const USILProgram* program);
+/* Strict parsed declaration/payload integrity, including parsed absence.
+ * Caller-built ICB presentation input has no retained owner and returns false;
+ * generic presentation/recompile emission does not require this check. */
+bool usil_icb_declaration_is_valid(const USILProgram* program);
 void usil_free(USILProgram* program);
 
 #endif // USIL_H
