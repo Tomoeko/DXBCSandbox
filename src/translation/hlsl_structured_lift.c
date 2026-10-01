@@ -23,6 +23,8 @@ typedef struct {
     uint8_t mask, width;
     const HLSLPhiNode *lanes[4];
     int incoming[2];
+    bool predicate;
+    int predicate_if;
     unsigned resolution; /* 0 unseen, 1 visiting, 2 proven/live. */
     char name[48];
 } StructuredValue;
@@ -71,6 +73,7 @@ typedef struct {
     int instruction, value, incoming, edge;
     uint32_t source_instruction;
     uint8_t mask, width;
+    ASTScalarType scalar_type;
     size_t begin, end, expression_begin, expression_end;
 } NaturalBodySyntax;
 
@@ -109,6 +112,11 @@ static unsigned mask_width(uint8_t mask) {
     return width;
 }
 
+static bool scalar_comparison_opcode(USILOpcode opcode) {
+    return opcode == USIL_OP_LT || opcode == USIL_OP_GE ||
+        opcode == USIL_OP_EQ || opcode == USIL_OP_NE;
+}
+
 /* A loop's scalar induction values belong to the old FLOAT4 route. Select
  * natural mode only for a new width in a loop-free instruction stream; the
  * subsequent closed gate still rejects every unsupported opcode or shape. */
@@ -124,7 +132,7 @@ static bool natural_width_requested(const USILProgram *program) {
     for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *instruction = &program->instructions[index];
         if ((instruction->opcode == USIL_OP_MOV || instruction->opcode == USIL_OP_ADD ||
-             instruction->opcode == USIL_OP_MUL) && instruction->operand_count &&
+             instruction->opcode == USIL_OP_MUL || scalar_comparison_opcode(instruction->opcode)) && instruction->operand_count &&
             usil_operand_destination_lane_mask(&instruction->operands[0]) != 15) return true;
     }
     return false;
@@ -256,7 +264,7 @@ static bool resolve_value(HLSLEmitterContext *ctx, StructuredPlan *plan, int ind
              * supply a complete typed phi, even if its consumed lane exists. */
             if (plan->natural_width && (!value->mask || !value->width ||
                 plan->values[incoming].mask != value->mask ||
-                plan->values[incoming].width != value->width))
+                plan->values[incoming].width != value->width || plan->values[incoming].predicate))
                 return false;
             value->incoming[edge] = incoming;
         }
@@ -279,6 +287,9 @@ static int source_value(HLSLEmitterContext *ctx, StructuredPlan *plan, int instr
             plan->ssa_lane[variable] != usil_operand_source_component(source, lane))
             return -1;
         int value = plan->ssa_value[variable];
+        if (plan->natural_width && plan->values[value].predicate &&
+            (ctx->program->instructions[instruction].opcode != USIL_OP_IF || operand != 0 ||
+             instruction != plan->values[value].predicate_if)) return -1;
         if ((result >= 0 && result != value) ||
             !hlsl_cfg_dominates(&ctx->cfg, plan->values[value].block,
                                 ctx->cfg.instruction_block[instruction]))
@@ -517,12 +528,20 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             continue;
         }
+        const bool comparison = plan->natural_width && scalar_comparison_opcode(inst->opcode);
         if (plan->natural_width &&
-            ((inst->opcode != USIL_OP_MOV && inst->opcode != USIL_OP_ADD && inst->opcode != USIL_OP_MUL) ||
+            ((inst->opcode != USIL_OP_MOV && inst->opcode != USIL_OP_ADD && inst->opcode != USIL_OP_MUL && !comparison) ||
              !plain_instruction(inst)))
             return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
-        if (!(plan->natural_width ? hlsl_natural_float_instruction_supported(ctx, index)
-                                  : hlsl_float4_instruction_supported(ctx, index)))
+        int predicate_if = -1;
+        if (comparison) {
+            /* A mask-valued comparison is represented as BOOL only after its
+             * exact SSA writer is proved to have one direct control use. No
+             * numeric mask, transport or predicate phi receives this type. */
+            if (!hlsl_scalar_comparison_predicate_supported(ctx, index, &predicate_if))
+                return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+        } else if (!(plan->natural_width ? hlsl_natural_float_instruction_supported(ctx, index)
+                                        : hlsl_float4_instruction_supported(ctx, index)))
             return false;
         const DXBCOperand *dest = &inst->operands[0];
         const int block = ctx->cfg.instruction_block[index];
@@ -552,6 +571,8 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
         value->register_index = dest->register_index;
         value->mask = usil_operand_destination_lane_mask(dest);
         value->width = (uint8_t)mask_width(value->mask);
+        value->predicate = comparison;
+        value->predicate_if = predicate_if;
         snprintf(value->name, sizeof(value->name), "dxbc_value_i%d", index);
         plan->instruction_value[index] = value_index;
         for (int lane = 0; lane < 4; ++lane) {
@@ -660,6 +681,29 @@ static ASTExpr *planned_value_expression(HLSLEmitterContext *ctx,
     ASTExpr *value = ast_create_var(planned->instruction, planned->register_index,
         OPERAND_TYPE_TEMP, planned->name);
     if (!value) return NULL;
+    if (planned->predicate) {
+        if (planned->instruction < 0 || planned->instruction >= ctx->program->instruction_count ||
+            planned->width != 1 || mask_width(planned->mask) != 1 ||
+            planned->predicate_if < 0 || planned->predicate_if >= ctx->program->instruction_count ||
+            !scalar_comparison_opcode(ctx->program->instructions[planned->instruction].opcode)) {
+            ast_free_expr(value);
+            return NULL;
+        }
+        ASTLogicalValueOrigin origin;
+        ast_logical_value_origin_init(&origin);
+        origin.complete = true;
+        origin.scalar_type = AST_SCALAR_BOOL;
+        origin.components = 1;
+        origin.logical_value_id = (uint64_t)planned->instruction;
+        origin.instruction_index = planned->instruction;
+        origin.source_instruction_index = ctx->program->instructions[planned->instruction].source_instruction_index;
+        origin.destination_lanes = planned->mask;
+        if (!ast_set_logical_value_origin(value, &origin)) {
+            ast_free_expr(value);
+            return NULL;
+        }
+        return value;
+    }
     if (planned->instruction >= 0)
         return hlsl_instruction_logical_expression(ctx, value, planned->instruction,
             planned->mask, planned->width);
@@ -714,6 +758,9 @@ static NaturalBodySyntax body_syntax(const HLSLEmitterContext *ctx,
     result.edge = edge;
     result.mask = mask;
     result.width = width;
+    result.scalar_type = kind == NATURAL_BODY_TEMP_ASSIGNMENT &&
+        scalar_comparison_opcode(ctx->program->instructions[instruction].opcode)
+        ? AST_SCALAR_BOOL : AST_SCALAR_FLOAT32;
     return result;
 }
 
@@ -721,7 +768,7 @@ static bool body_syntax_owners_equal(const NaturalBodySyntax *a, const NaturalBo
     return a->kind == b->kind && a->instruction == b->instruction &&
         a->source_instruction == b->source_instruction && a->value == b->value &&
         a->incoming == b->incoming && a->edge == b->edge &&
-        a->mask == b->mask && a->width == b->width;
+        a->mask == b->mask && a->width == b->width && a->scalar_type == b->scalar_type;
 }
 
 static bool body_expect(HLSLNaturalStructuredBodyInventory *inventory, NaturalBodySyntax syntax) {
@@ -833,6 +880,7 @@ static ASTExpr *source_expression(HLSLEmitterContext *ctx, StructuredPlan *plan,
         return NULL;
     if (plan->natural_width) {
         ASTExpr *value = planned_value_expression(ctx, plan, value_index);
+        if (plan->values[value_index].predicate) return value;
         return hlsl_project_logical_temp(ctx, value, plan->values[value_index].mask,
             plan->values[value_index].width, source, demanded_lanes(ctx, index, operand), index);
     }
@@ -988,13 +1036,22 @@ static bool emit_structured_plan(HLSLEmitterContext *ctx, StructuredPlan *plan,
                 }
             }
             const size_t control_begin = ctx->sb->len;
+            bool predicate = false;
+            if (plan->natural_width && inst->operands[0].type == OPERAND_TYPE_TEMP) {
+                const int value = source_value(ctx, plan, index, 0, 1);
+                if (value < 0) goto cleanup;
+                predicate = plan->values[value].predicate;
+            }
             ASTExpr *condition = source_expression(ctx, plan, index, 0, 1);
-            ASTExpr *bits = ast_create_bitcast(AST_SCALAR_UINT32, condition);
+            /* IF_Z negates the BOOL itself. Replacing LT with GE would change
+             * unordered float/NaN behavior. Raw float
+             * conditions retain the existing bit-test spelling. */
+            ASTExpr *bits = predicate ? condition : ast_create_bitcast(AST_SCALAR_UINT32, condition);
             if (!bits) {
                 ast_free_expr(condition);
                 goto cleanup;
             }
-            if (plan->natural_width) {
+            if (plan->natural_width && !predicate) {
                 ASTLogicalValueOrigin origin;
                 ast_logical_value_origin_init(&origin);
                 origin.complete = true;
@@ -1067,14 +1124,18 @@ static bool emit_structured_plan(HLSLEmitterContext *ctx, StructuredPlan *plan,
             ASTExpr *left = source_expression(ctx, plan, index, 1, 4);
             ASTExpr *right =
                 inst->opcode == USIL_OP_MOV ? NULL : source_expression(ctx, plan, index, 2, 4);
-            ASTExpr *expression = hlsl_float4_operation(ctx, index, left, right);
+            const bool comparison = plan->natural_width && scalar_comparison_opcode(inst->opcode);
+            ASTExpr *expression = comparison
+                ? hlsl_scalar_comparison_expression(ctx, index, left, right)
+                : hlsl_float4_operation(ctx, index, left, right);
             if (!expression)
                 goto cleanup;
             sb_append_spaces(ctx->sb, ctx->indent);
             const DXBCOperand *destination = &inst->operands[0];
             if (destination->type == OPERAND_TYPE_TEMP) {
                 sb_appendf(ctx->sb, "const %s %s",
-                           plan->natural_width ? natural_type(plan->values[plan->instruction_value[index]].width) : "float4",
+                           comparison ? "bool" : plan->natural_width
+                               ? natural_type(plan->values[plan->instruction_value[index]].width) : "float4",
                            plan->values[plan->instruction_value[index]].name);
             } else if (!hlsl_float4_append_output(ctx, destination)) {
                 ast_free_expr(expression);

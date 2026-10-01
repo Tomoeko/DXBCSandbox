@@ -658,6 +658,20 @@ ASTExpr *hlsl_project_logical_temp(HLSLEmitterContext *ctx, ASTExpr *owned_expre
 ASTExpr *hlsl_instruction_logical_expression(HLSLEmitterContext *ctx,
     ASTExpr *owned_expression, int instruction, uint8_t lanes, unsigned width);
 
+/* Reuse the existing geometry control-use/dominance proof. The legacy policy
+ * permits its established multiple IF/BREAKC nonzero uses. The scalar float
+ * comparison wrapper instead proves one IF NZ/Z use and no phi, relative,
+ * transport or numeric uses of the actual singleton TEMP SSA definition. */
+bool hlsl_predicate_control_only(const HLSLEmitterContext *ctx,
+    int definition, int ssa);
+bool hlsl_scalar_comparison_predicate_supported(const HLSLEmitterContext *ctx,
+    int definition, int *if_instruction);
+/* Consumes both children on every outcome. The structured planner supplies
+ * scalar FLOAT32 atoms/projections from its closed natural source contract;
+ * this helper owns the actual LT/GE/EQ/NE BOOL writer and physical lane. */
+ASTExpr *hlsl_scalar_comparison_expression(HLSLEmitterContext *ctx,
+    int definition, ASTExpr *owned_left, ASTExpr *owned_right);
+
 bool hlsl_expression_identifiers_available(HLSLEmitterContext* ctx, size_t source_start);
 void emit_return_block(HLSLEmitterContext* ctx);
 

@@ -457,9 +457,21 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                instruction->source_instruction_index, (unsigned)instruction->opcode,
                hlsl_emit_opcode_name(instruction->opcode), instruction->operand_count,
                instruction->operand_count && (instruction->opcode == USIL_OP_MOV ||
-               instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MUL)
+               instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MUL ||
+               instruction->opcode == USIL_OP_LT || instruction->opcode == USIL_OP_GE ||
+               instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE)
                    ? (unsigned)usil_operand_destination_lane_mask(&instruction->operands[0]) : 0u);
-        if (captured.valid || (instruction->opcode != USIL_OP_MUL && instruction->opcode != USIL_OP_ADD) ||
+        if (instruction->opcode == USIL_OP_LT || instruction->opcode == USIL_OP_GE ||
+            instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE ||
+            instruction->opcode == USIL_OP_IF) {
+            size_t remaining = PROBE_DOMAIN_OPERAND_LIMIT;
+            for (int operand_index = 0; operand_index < instruction->operand_count; ++operand_index)
+                if (!print_domain_operand(&instruction->operands[operand_index], index,
+                    operand_index, 0, 0, &remaining)) goto done;
+        }
+        const bool comparison = instruction->opcode == USIL_OP_LT || instruction->opcode == USIL_OP_GE ||
+            instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE;
+        if (captured.valid || (!comparison && instruction->opcode != USIL_OP_MUL && instruction->opcode != USIL_OP_ADD) ||
             instruction->operand_count != 3) continue;
         for (int operand_index = 1; operand_index < 3 && !captured.valid; ++operand_index) {
             DXBCOperand *operand = &instruction->operands[operand_index];
@@ -470,8 +482,8 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                 use.use != USIL_OPERAND_USE_SOURCE || !use.source_lane_mask) continue;
             uint8_t component_mask = 0;
             bool broadcast = true;
-            const uint32_t expected_bits = instruction->opcode == USIL_OP_MUL
-                ? UINT32_C(0x40000000) : UINT32_C(0x3f800000);
+            const uint32_t expected_bits = comparison ? UINT32_C(0x3ec00000)
+                : instruction->opcode == USIL_OP_MUL ? UINT32_C(0x40000000) : UINT32_C(0x3f800000);
             for (int lane = 0; lane < 4; ++lane) {
                 if (!(use.source_lane_mask & (1u << lane))) continue;
                 const int selected = operand->imm_value_count == 1 ? 0 :

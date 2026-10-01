@@ -151,36 +151,6 @@ static SignedRange source_range(const HLSLEmitterContext *ctx, int instruction,
                           depth + 1);
 }
 
-static bool predicate_control_only(const HLSLEmitterContext *ctx,
-                                   int definition, int ssa) {
-  bool used = false;
-  for (int i = 0; i < ctx->program->instruction_count; ++i) {
-    const USILInstruction *owner = &ctx->program->instructions[i];
-    for (int op = 0; op < owner->operand_count; ++op) {
-      USILOperandUseInfo use;
-      if (!usil_instruction_operand_use(ctx->program, owner, op, &use))
-        return false;
-      if (use.use != USIL_OPERAND_USE_SOURCE ||
-          owner->operands[op].type != OPERAND_TYPE_TEMP)
-        continue;
-      for (int lane = 0; lane < 4; ++lane)
-        if ((use.source_lane_mask & (1u << lane)) &&
-            variable(ctx, i, op, lane) == ssa) {
-          if (op != 0 || lane != 0 ||
-              (owner->opcode != USIL_OP_IF &&
-               owner->opcode != USIL_OP_BREAKC) ||
-              owner->condition_test != DXBC_INSTRUCTION_TEST_NONZERO ||
-              !hlsl_cfg_dominates(&ctx->cfg,
-                                  ctx->cfg.instruction_block[definition],
-                                  ctx->cfg.instruction_block[i]))
-            return false;
-          used = true;
-        }
-    }
-  }
-  return used;
-}
-
 static bool match_loop(HLSLEmitterContext *ctx, Plan *plan, int index,
                        bool prove_bound) {
   const USILProgram *program = ctx->program;
@@ -215,7 +185,7 @@ static bool match_loop(HLSLEmitterContext *ctx, Plan *plan, int index,
   if (plan->counter_phi < 0 ||
       variable(ctx, plan->increment, 1, counter_lane) != plan->counter_phi ||
       variable(ctx, plan->test, 0, 0) != predicate_ssa ||
-      !predicate_control_only(ctx, plan->compare, predicate_ssa))
+      !hlsl_predicate_control_only(ctx, plan->compare, predicate_ssa))
     return false;
   plan->body_block = ctx->cfg.instruction_block[plan->compare];
   plan->latch_block = ctx->cfg.instruction_block[plan->end];
@@ -497,7 +467,7 @@ static bool build_plan(HLSLEmitterContext *ctx, Plan *plan) {
                                                   : AST_SCALAR_FLOAT32;
     if (owner->opcode == USIL_OP_GE || owner->opcode == USIL_OP_IGE) {
       if (value->width != 1 ||
-          !predicate_control_only(ctx, i,
+          !hlsl_predicate_control_only(ctx, i,
                                   variable(ctx, i, 0, single_lane(mask))))
         return false;
       value->type = AST_SCALAR_BOOL;

@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 34U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 35U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -137,6 +137,10 @@ typedef enum HLSLEmitMode {
      * Owned body/return bytes and typed spans replay through the same planner;
      * callbacks cannot publish changed decoded owners or retained body receipts.
      * Nested control, loops, modifiers, resources and partial live joins reject.
+     * v35 admits a scalar LT/GE/EQ/NE TEMP only when its actual SSA value
+     * solely controls one IF. It becomes an owned bool; IF_Z negates that
+     * Boolean without changing the comparison. Numeric mask uses, phi inputs
+     * and predicate transport reject. Raw float predicates retain asuint.
      * Repeated straight-line two-MUL chains with immutable arguments and
      * identity single-use producer lanes may share a float4 value helper;
      * each call result remains named at its original site. No captures or

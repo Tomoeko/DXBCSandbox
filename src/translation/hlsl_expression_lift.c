@@ -225,6 +225,208 @@ bool hlsl_lift_operand_is_plain(const DXBCOperand *value) {
            !value->rel_op0 && !value->rel_op1 && !value->rel_op2 && !value->extended_token_count;
 }
 
+static int predicate_variable(const HLSLEmitterContext *ctx, int instruction,
+                              int operand, int lane) {
+    return ctx->ssa.operand_ssa_vars[((size_t)instruction * DXBC_MAX_OPERANDS +
+        (unsigned)operand) * 4u + (unsigned)lane];
+}
+
+/* Keep geometry's established control-only policy in this common scan. The
+ * stricter natural comparison policy admits exactly one IF and both raw test
+ * controls; it never converts a numeric mask use into a Boolean value. */
+static bool predicate_control_uses(const HLSLEmitterContext *ctx, int definition,
+    int ssa, bool single_if, int *if_instruction) {
+    if (if_instruction) *if_instruction = -1;
+    if (!ctx || !ctx->program || !ctx->program->instructions ||
+        ctx->program->instruction_count < 1 ||
+        ctx->program->instruction_count > EXPRESSION_INSTRUCTION_LIMIT ||
+        definition < 0 || definition >= ctx->program->instruction_count ||
+        !ctx->cfg.instruction_block || !ctx->ssa.operand_ssa_vars ||
+        ssa < 0 || ssa >= ctx->ssa.ssa_var_count)
+        return false;
+    bool used = false;
+    int consumer = -1;
+    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+        const USILInstruction *owner = &ctx->program->instructions[index];
+        if (owner->operand_count < 0 || owner->operand_count > DXBC_MAX_OPERANDS)
+            return false;
+        for (int operand = 0; operand < owner->operand_count; ++operand) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(ctx->program, owner, operand, &use))
+                return false;
+            if (use.use != USIL_OPERAND_USE_SOURCE ||
+                owner->operands[operand].type != OPERAND_TYPE_TEMP)
+                continue;
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!(use.source_lane_mask & (1u << lane)) ||
+                    predicate_variable(ctx, index, operand, lane) != ssa)
+                    continue;
+                const bool control = single_if ? owner->opcode == USIL_OP_IF
+                    : owner->opcode == USIL_OP_IF || owner->opcode == USIL_OP_BREAKC;
+                const bool test = owner->condition_test == DXBC_INSTRUCTION_TEST_NONZERO ||
+                    (single_if && owner->condition_test == DXBC_INSTRUCTION_TEST_ZERO);
+                if (operand != 0 || lane != 0 || !control || !test ||
+                    (single_if && (used || index <= definition ||
+                        !hlsl_lift_operand_is_plain(&owner->operands[operand]))) ||
+                    !hlsl_cfg_dominates(&ctx->cfg, ctx->cfg.instruction_block[definition],
+                        ctx->cfg.instruction_block[index]))
+                    return false;
+                used = true;
+                consumer = index;
+            }
+        }
+    }
+    if (used && if_instruction) *if_instruction = consumer;
+    return used;
+}
+
+bool hlsl_predicate_control_only(const HLSLEmitterContext *ctx, int definition, int ssa) {
+    return predicate_control_uses(ctx, definition, ssa, false, NULL);
+}
+
+static bool scalar_comparison_opcode(USILOpcode opcode) {
+    return opcode == USIL_OP_LT || opcode == USIL_OP_GE ||
+           opcode == USIL_OP_EQ || opcode == USIL_OP_NE;
+}
+
+static bool predicate_has_no_phi_or_relative_use(const HLSLEmitterContext *ctx, int ssa) {
+    for (int block = 0; block < ctx->cfg.block_count; ++block) {
+        const HLSLBlockPhis *phis = &ctx->ssa.block_phis[block];
+        const HLSLBasicBlock *owner = &ctx->cfg.blocks[block];
+        if (phis->phi_count < 0 || phis->phi_count > ctx->program->temp_count * 4 ||
+            (phis->phi_count && !phis->phis) || owner->predecessor_count < 0 ||
+            owner->predecessor_count > ctx->cfg.block_count ||
+            (owner->predecessor_count && !owner->predecessors))
+            return false;
+        for (int index = 0; index < phis->phi_count; ++index) {
+            const HLSLPhiNode *phi = &phis->phis[index];
+            if (phi->ssa_var == ssa ||
+                (owner->predecessor_count && (!phi->incoming_vars || !phi->incoming_blocks)))
+                return false;
+            for (int edge = 0; edge < owner->predecessor_count; ++edge)
+                if (phi->incoming_vars[edge] == ssa ||
+                    phi->incoming_blocks[edge] != owner->predecessors[edge])
+                    return false;
+        }
+    }
+    for (int instruction = 0; instruction < ctx->program->instruction_count; ++instruction) {
+        const USILInstruction *owner = &ctx->program->instructions[instruction];
+        if (owner->operand_count < 0 || owner->operand_count > DXBC_MAX_OPERANDS)
+            return false;
+        for (int operand = 0; operand < owner->operand_count; ++operand)
+            for (int dimension = 0; dimension < 3; ++dimension)
+                if (ctx->ssa.relative_operand_ssa_vars[
+                    ((size_t)instruction * DXBC_MAX_OPERANDS + (unsigned)operand) * 4u +
+                        (unsigned)dimension] == ssa)
+                    return false;
+    }
+    return true;
+}
+
+bool hlsl_scalar_comparison_predicate_supported(const HLSLEmitterContext *ctx,
+    int definition, int *if_instruction) {
+    if (if_instruction) *if_instruction = -1;
+    if (!ctx || !ctx->program || !ctx->program->instructions ||
+        ctx->program->instruction_count < 1 ||
+        ctx->program->instruction_count > EXPRESSION_INSTRUCTION_LIMIT ||
+        ctx->program->instruction_alloc < ctx->program->instruction_count ||
+        definition < 0 || definition >= ctx->program->instruction_count ||
+        (ctx->program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
+         ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
+        ctx->program->temp_count < 1 || ctx->program->temp_count > HLSL_SM5_TEMP_REGISTER_COUNT ||
+        ctx->cfg.instruction_count != ctx->program->instruction_count ||
+        ctx->cfg.block_count < 1 || ctx->cfg.block_count > EXPRESSION_INSTRUCTION_LIMIT ||
+        !ctx->cfg.blocks || !ctx->cfg.instruction_block || !ctx->cfg.idom ||
+        ctx->ssa.instruction_count != ctx->program->instruction_count ||
+        !ctx->ssa.operand_ssa_vars || !ctx->ssa.relative_operand_ssa_vars ||
+        !ctx->ssa.ssa_var_defs || !ctx->ssa.block_phis)
+        return false;
+    const USILInstruction *instruction = &ctx->program->instructions[definition];
+    USILEffectFlags effects;
+    if (!scalar_comparison_opcode(instruction->opcode) || instruction->operand_count != 3 ||
+        instruction->saturate || instruction->precise_mask ||
+        instruction->condition_test != DXBC_INSTRUCTION_TEST_NONE ||
+        instruction->source_instruction_index == UINT32_MAX ||
+        instruction->has_resource_dimension || instruction->resource_dimension[0] ||
+        instruction->resource_stride || instruction->has_texel_offset ||
+        instruction->has_resource_return_types || instruction->resource_info_return_type ||
+        instruction->sample_info_return_type || instruction->geometry_effect != USIL_GEOMETRY_EFFECT_NONE ||
+        instruction->geometry_stream_id || instruction->geometry_stream_explicit || instruction->sync_flags ||
+        !usil_instruction_shape_valid(ctx->program, instruction) ||
+        !usil_instruction_effects(ctx->program, instruction, &effects) || effects != USIL_EFFECT_NONE)
+        return false;
+    const DXBCOperand *destination = &instruction->operands[0];
+    const uint8_t mask = usil_operand_destination_lane_mask(destination);
+    if (destination->type != OPERAND_TYPE_TEMP || destination->register_index < 0 ||
+        destination->register_index >= ctx->program->temp_count || !mask ||
+        (mask & (mask - 1u)) || !hlsl_lift_operand_is_plain(destination))
+        return false;
+    for (int operand = 1; operand < instruction->operand_count; ++operand) {
+        const DXBCOperand *source = &instruction->operands[operand];
+        if (!hlsl_lift_operand_is_plain(source) ||
+            (source->type != OPERAND_TYPE_TEMP && source->type != OPERAND_TYPE_INPUT &&
+             source->type != OPERAND_TYPE_IMMEDIATE32) ||
+            source_lanes(ctx, definition, operand) != mask)
+            return false;
+    }
+    int lane = 0;
+    while (!(mask & (1u << lane))) ++lane;
+    const int ssa = predicate_variable(ctx, definition, 0, lane);
+    int consumer = -1;
+    if (ssa < 0 || ssa >= ctx->ssa.ssa_var_count || ctx->ssa.ssa_var_defs[ssa] != definition ||
+        !predicate_has_no_phi_or_relative_use(ctx, ssa) ||
+        !predicate_control_uses(ctx, definition, ssa, true, &consumer))
+        return false;
+    if (if_instruction) *if_instruction = consumer;
+    return true;
+}
+
+static bool scalar_float_child(const ASTExpr *expression) {
+    if (!expression || expression_width(expression) != 1) return false;
+    if (expression->logical_origin.complete)
+        return expression->logical_origin.scalar_type == AST_SCALAR_FLOAT32;
+    if (expression->kind == AST_EXPR_LITERAL)
+        return expression->u.literal.scalar_type == AST_SCALAR_FLOAT32;
+    if (expression->kind != AST_EXPR_EMITTER_OPERAND) return false;
+    /* Natural interface atoms have FLOAT32 authority from the caller's parsed
+     * signature contract; operand provenance retains their selected width. */
+    const ASTOperandProvenance *origin = &expression->operand_provenance;
+    return origin->complete && origin->value_role == AST_OPERAND_VALUE_LOGICAL &&
+        origin->bitcast_role == AST_OPERAND_BITCAST_NONE &&
+        !origin->raw_buffer_reconstruction && !origin->synthetic_interface;
+}
+
+ASTExpr *hlsl_scalar_comparison_expression(HLSLEmitterContext *ctx, int definition,
+    ASTExpr *left, ASTExpr *right) {
+    if (left == right || !scalar_float_child(left) || !scalar_float_child(right) ||
+        !hlsl_scalar_comparison_predicate_supported(ctx, definition, NULL)) {
+        if (left != right) ast_free_expr(right);
+        ast_free_expr(left);
+        return NULL;
+    }
+    const USILInstruction *instruction = &ctx->program->instructions[definition];
+    ASTExpr *comparison = ast_create_comparison(instruction->opcode, left, right);
+    if (!comparison) {
+        ast_free_expr(left);
+        ast_free_expr(right);
+        return NULL;
+    }
+    ASTLogicalValueOrigin origin;
+    ast_logical_value_origin_init(&origin);
+    origin.complete = true;
+    origin.scalar_type = AST_SCALAR_BOOL;
+    origin.components = 1;
+    origin.logical_value_id = (uint64_t)definition;
+    origin.instruction_index = definition;
+    origin.source_instruction_index = instruction->source_instruction_index;
+    origin.destination_lanes = usil_operand_destination_lane_mask(&instruction->operands[0]);
+    if (!ast_set_logical_value_origin(comparison, &origin)) {
+        ast_free_expr(comparison);
+        return NULL;
+    }
+    return comparison;
+}
+
 static const char *float_intrinsic(USILOpcode opcode) {
     switch (opcode) {
     case USIL_OP_DP2: case USIL_OP_DP3: case USIL_OP_DP4: return "dot";
@@ -1465,6 +1667,9 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                                 inst->opcode == USIL_OP_MAX || float_intrinsic(inst->opcode) ||
                                 hlsl_texture_sample_opcode(inst->opcode);
         const uint8_t lanes = instruction_destination_lanes(program, inst);
+        const bool scalar_comparison = scalar_comparison_opcode(inst->opcode) &&
+            inst->operand_count == 3 && inst->operands[0].type == OPERAND_TYPE_TEMP &&
+            lanes && !(lanes & (lanes - 1u));
         if (origin->destination_lanes != lanes)
             return false;
         switch (origin->kind) {
@@ -1482,7 +1687,7 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
-            if (!expression || !lanes)
+            if ((!expression && !scalar_comparison) || !lanes)
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_EFFECT:
