@@ -1593,7 +1593,12 @@ bool hlsl_source_quality_inventory_supported(HLSLEmitterContext *ctx) {
 }
 
 bool hlsl_source_quality_begin_entry(HLSLEmitterContext *ctx, bool complete) {
-  if (!hlsl_stage_coverage_begin(ctx)) return false;
+  if (!hlsl_stage_coverage_begin(ctx) || (ctx->domain_output_plan.present &&
+      !hlsl_stage_coverage_domain_output_plan(ctx, &ctx->domain_output_plan))) {
+    hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_CONTEXT_ALLOCATION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    return false;
+  }
   if (!ctx->source_quality_analysis) return true;
   ctx->source_quality_interface_required = complete && ctx->high_level_interface;
   ctx->source_quality_cbuffer_required = complete && ctx->program->cbuffer_count > 0;
@@ -1988,6 +1993,15 @@ static bool hlsl_emit_with_options_impl(
       !(options && options->unity_uv_helper);
   ctx.high_level_geometry = hlsl_high_level_geometry_interface_supported(program, emit_mode);
   ctx.high_level_domain = hlsl_high_level_domain_interface_supported(program, emit_mode);
+  if (ctx.high_level_domain && !hlsl_domain_owned_contract_digest(program, ctx.domain_owner_digest)) {
+    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                   HLSL_EMIT_PHASE_PROGRAM_VALIDATION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
+  if (ctx.high_level_domain && hlsl_domain_output_plan_prepare(program, &ctx.domain_output_plan))
+    ctx.high_level_direct_return = true;
   ctx.high_level_interface = ctx.high_level_direct_return ||
       ctx.high_level_geometry || ctx.high_level_domain ||
       (hlsl_high_level_struct_interface_supported(program, emit_mode) &&
@@ -2242,7 +2256,8 @@ static bool hlsl_emit_with_options_impl(
   if (ctx.expression_source_map && ctx.expression_source_map->count) {
     HLSLExpressionOrigin* origin = &ctx.expression_source_map->origins[
         ctx.expression_source_map->count - 1];
-    origin->source_begin = return_begin;
+    origin->source_begin = ctx.domain_output_plan.present
+        ? ctx.domain_output_return_begin + (size_t)ctx.indent : return_begin;
     origin->source_end = sb->len;
   }
   if (!sb_ok(sb)) {
@@ -2262,6 +2277,23 @@ cleanup:
     if (!sb_ok(sb)) memset(ctx.expression_source_map, 0, sizeof(*ctx.expression_source_map));
   }
   free_emitter_context(&ctx);
+  /* The final quality callbacks can still touch caller-owned input. Keep the
+   * complete admitted decoded model stable through every callback, including
+   * unit completion, before returning source or an owned capture. */
+  if (ctx.high_level_domain) {
+    uint8_t current[32];
+    if (!hlsl_domain_owned_contract_digest(program, current) ||
+        memcmp(current, ctx.domain_owner_digest, sizeof(current))) {
+      hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+      if (ctx.expression_source_map) memset(ctx.expression_source_map, 0, sizeof(*ctx.expression_source_map));
+      if (options && options->source_quality) {
+        options->source_quality->classification = HLSL_SOURCE_QUALITY_FAILED;
+        options->source_quality->emission_status = HLSL_EMIT_STATUS_ANALYSIS_FAILED;
+        options->source_quality->reasons |= HLSL_SOURCE_QUALITY_REASON_EMISSION_FAILED;
+      }
+    }
+  }
   bool success = sb_ok(sb);
   if (!success && diagnostic && diagnostic->status == HLSL_EMIT_STATUS_OK) {
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_OUTPUT_FAILED,
@@ -2336,8 +2368,11 @@ bool hlsl_emit_with_stage_coverage(const USILProgram *program, StringBuilder *ou
       coverage->hull_contract.signature_declaration_count || coverage->recorded_hull_contract.signature_declaration_count ||
       coverage->hull_contract.cbuffer_count || coverage->recorded_hull_contract.cbuffer_count ||
       !hlsl_stage_coverage_hull_icb_empty(&coverage->hull_icb) ||
+      !hlsl_stage_coverage_domain_output_empty(&coverage->domain_output) ||
+      !hlsl_stage_coverage_domain_owners_empty(coverage) ||
       !output || !sb_ok(output) || output->len || !options || options->mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
-      !hlsl_hull_owned_contract_digest(program, digest)) {
+      (!hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) &&
+       !hlsl_hull_owned_contract_digest(program, digest))) {
     hlsl_emit_diagnostic_init(diagnostic);
     hlsl_emit_set_failure(diagnostic, HLSL_EMIT_STATUS_INVALID_ARGUMENT,
         HLSL_EMIT_PHASE_ARGUMENT_VALIDATION, HLSL_EMIT_REASON_INVALID_ARGUMENT);
@@ -2348,7 +2383,8 @@ bool hlsl_emit_with_stage_coverage(const USILProgram *program, StringBuilder *ou
   HLSLEmitDiagnostic *failure = diagnostic ? diagnostic : &local_diagnostic;
   HLSLEmitOptions owned_options = *options;
   if (!owned_options.source_quality) owned_options.source_quality = &local_quality;
-  coverage->schema = HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT;
+  if (program->program_type == DXBC_PROGRAM_TYPE_HULL)
+    coverage->schema = HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT;
   bool emitted = emit_with_diagnostic_and_capture(program, output, current, common,
       names, &owned_options, NULL, coverage, failure);
   if (!emitted || !hlsl_stage_coverage_validate(coverage, output)) {

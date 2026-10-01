@@ -468,12 +468,13 @@ fail:
 }
 
 /* Authored token grammar and signatures, with no captured byte array. */
-static size_t write_domain_signature(uint8_t *bytes, unsigned role, unsigned domain) {
+static size_t write_domain_signature_shape(uint8_t *bytes, unsigned role, unsigned domain,
+                                          const char *point_semantic, bool float3) {
     const bool patch = role == 2;
     const unsigned outer = domain == 2 ? 3 : domain == 3 ? 4 : 2;
     const unsigned inner = domain == 2 ? 1 : domain == 3 ? 2 : 0;
     const unsigned count = patch ? outer + inner : 1;
-    const char *semantic = patch ? "SV_TessFactor" : "SV_POSITION";
+    const char *semantic = patch ? "SV_TessFactor" : !role && float3 ? point_semantic : "SV_POSITION";
     const size_t name_offset = 8 + count * 24;
     const size_t size = name_offset + strlen(semantic) + 1 +
         (patch ? sizeof("SV_InsideTessFactor") : 0);
@@ -489,16 +490,20 @@ static size_t write_domain_signature(uint8_t *bytes, unsigned role, unsigned dom
         write_u32(element + 4, patch ? (field < outer ? field : field - outer) : 0);
         const unsigned system = domain == 2 ? (field < outer ? 13 : 14) :
             domain == 3 ? (field < outer ? 11 : 12) : (field ? 15 : 16);
-        write_u32(element + 8, patch ? system : 1);
+        write_u32(element + 8, patch ? system : !role && float3 ? 0 : 1);
         write_u32(element + 12, 3);
         write_u32(element + 16, patch ? field : 0);
-        write_u32(element + 20, patch ? 1 : role ? 15 : 0x0f0f);
+        write_u32(element + 20, patch ? 1 : role ? 15 : float3 ? 0x0707 : 0x0f0f);
     }
     memcpy(bytes + name_offset, semantic, strlen(semantic) + 1);
     if (patch)
         memcpy(bytes + name_offset + strlen(semantic) + 1,
                "SV_InsideTessFactor", sizeof("SV_InsideTessFactor"));
     return size + 8;
+}
+
+static size_t write_domain_signature(uint8_t *bytes, unsigned role, unsigned domain) {
+    return write_domain_signature_shape(bytes, role, domain, NULL, false);
 }
 
 uint8_t *test_tessellation_domain_dxbc(unsigned domain, uint32_t points, uint8_t location_mask,
@@ -539,6 +544,68 @@ uint8_t *test_tessellation_domain_dxbc(unsigned domain, uint32_t points, uint8_t
     for (unsigned word = 0; word < sizeof(words) / 4; ++word)
         write_u32(bytes + offset + 16 + 4 * word, words[word]);
     *size = offset + 16 + sizeof(words);
+    write_u32(bytes + 24, (uint32_t)*size);
+    if (!dxbc_compute_hash(bytes, *size, bytes + 4)) return NULL;
+    uint8_t *result = malloc(*size);
+    if (result) memcpy(result, bytes, *size);
+    return result;
+}
+
+uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points, const char *semantic,
+                                             unsigned scenario, size_t *size) {
+    if (!size || !semantic || !semantic[0] || strlen(semantic) > 128 ||
+        scenario > TEST_DOMAIN_FLOAT3_REORDERED_WRITES) return NULL;
+    const uint32_t declarations[] = {
+        INSTRUCTION(147, 1) | (points << 11), INSTRUCTION(149, 1) | (2u << 11),
+        INSTRUCTION(106, 1) | (1u << 11),
+        INSTRUCTION(95, 2), 0x0001c072,
+        INSTRUCTION(95, 4), 0x00219072, points, 0,
+        INSTRUCTION(103, 4), 0x001020f2, 0, 1,
+        INSTRUCTION(104, 2), 1
+    };
+    uint32_t xyz[] = {
+        INSTRUCTION(56, 7), 0x00100072, 0, 0x0001c556, 0x00219246, 1, 0,
+        INSTRUCTION(50, 9), 0x00100072, 0, 0x00219246, 0, 0,
+            0x0001c006, 0x00100246, 0,
+        INSTRUCTION(50, 9), 0x00102072, 0, 0x00219246, 2, 0,
+            0x0001caa6, 0x00100246, 0
+    };
+    uint32_t w[] = {INSTRUCTION(54, 5), 0x00102082, 0, 0x00004001, 0x3f800000};
+    if (scenario == TEST_DOMAIN_FLOAT3_OVERLAPPING_W) w[1] = 0x00102012;
+    if (scenario == TEST_DOMAIN_FLOAT3_MISSING_Z) xyz[17] = 0x00102032;
+    if (scenario == TEST_DOMAIN_FLOAT3_FOREIGN_OUTPUT) w[2] = 1;
+    if (scenario == TEST_DOMAIN_FLOAT3_UNDECLARED_POINT_W) xyz[4] = 0x00219346;
+    uint32_t words[64];
+    size_t count = 0;
+    memcpy(words, declarations, sizeof(declarations));
+    count += sizeof(declarations) / sizeof(declarations[0]);
+    if (scenario == TEST_DOMAIN_FLOAT3_REORDERED_WRITES) {
+        memcpy(words + count, xyz, 16 * sizeof(xyz[0])); count += 16;
+        memcpy(words + count, w, sizeof(w)); count += sizeof(w) / sizeof(w[0]);
+        memcpy(words + count, xyz + 16, 9 * sizeof(xyz[0])); count += 9;
+    } else {
+        memcpy(words + count, xyz, sizeof(xyz)); count += sizeof(xyz) / sizeof(xyz[0]);
+        if (scenario != TEST_DOMAIN_FLOAT3_MISSING_W) {
+            memcpy(words + count, w, sizeof(w)); count += sizeof(w) / sizeof(w[0]);
+        }
+    }
+    words[count++] = INSTRUCTION(62, 1);
+    uint8_t bytes[1024] = {0};
+    memcpy(bytes, "DXBC", 4);
+    write_u32(bytes + 20, 1); write_u32(bytes + 28, 4);
+    size_t offset = 48;
+    for (unsigned role = 0; role < 3; ++role) {
+        write_u32(bytes + 32 + 4 * role, (uint32_t)offset);
+        offset += write_domain_signature_shape(bytes + offset, role, 2, semantic, true);
+        offset = (offset + 3) & ~(size_t)3;
+    }
+    write_u32(bytes + 44, (uint32_t)offset);
+    memcpy(bytes + offset, "SHEX", 4);
+    write_u32(bytes + offset + 4, (uint32_t)(count * 4 + 8));
+    write_u32(bytes + offset + 8, 0x00040050);
+    write_u32(bytes + offset + 12, (uint32_t)(count + 2));
+    for (size_t word = 0; word < count; ++word) write_u32(bytes + offset + 16 + 4 * word, words[word]);
+    *size = offset + 16 + count * 4;
     write_u32(bytes + 24, (uint32_t)*size);
     if (!dxbc_compute_hash(bytes, *size, bytes + 4)) return NULL;
     uint8_t *result = malloc(*size);

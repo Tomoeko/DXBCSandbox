@@ -1113,6 +1113,8 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
     ASTExpr *roots[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     uint8_t logical_widths[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     HLSLInstructionOwners pending_owners[EXPRESSION_INSTRUCTION_LIMIT] = {0};
+    ASTExpr *domain_vector = NULL;
+    HLSLInstructionOwners domain_vector_owners = {0};
     HLSLMatrixLiftPlan matrix_plans[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     int matrix_starts[EXPRESSION_INSTRUCTION_LIMIT];
     for (int index = 0; index < EXPRESSION_INSTRUCTION_LIMIT; ++index)
@@ -1230,6 +1232,58 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
             logical_widths[index] = (uint8_t)lane_count(
                 usil_operand_destination_lane_mask(&inst->operands[0]));
         roots[index] = expression;
+        bool domain_construction = false;
+        if (!scope && ctx->domain_output_plan.present &&
+            inst->operands[0].type == OPERAND_TYPE_OUTPUT) {
+            const HLSLDomainOutputPlan *plan = &ctx->domain_output_plan;
+            if (index == plan->pieces[0].instruction_index) {
+                if (domain_vector || expression_width(expression) != 3) {
+                    ast_free_expr(expression);
+                    goto cleanup;
+                }
+                domain_vector = expression;
+                domain_vector_owners = owners;
+                continue;
+            }
+            if (index != plan->pieces[1].instruction_index || !domain_vector ||
+                expression->kind != AST_EXPR_LITERAL || expression_width(expression) != 1 ||
+                expression->u.literal.components != 1 ||
+                expression->u.literal.scalar_type != AST_SCALAR_FLOAT32 ||
+                expression->u.literal.val[0] != plan->pieces[1].immediate_bits) {
+                ast_free_expr(expression);
+                goto cleanup;
+            }
+            ASTExpr *scalar = logical_expression(ctx, expression, index, 8, 1);
+            if (!scalar) goto cleanup;
+            roots[index] = scalar;
+            if (!hlsl_stage_coverage_root(ctx, domain_vector, plan->pieces[0].instruction_index) ||
+                !hlsl_stage_coverage_root(ctx, scalar, index)) {
+                ast_free_expr(scalar);
+                goto cleanup;
+            }
+            ASTExpr *arguments[] = {domain_vector, scalar};
+            ASTExpr *construction = ast_create_call("float4", arguments, HLSL_DOMAIN_OUTPUT_PIECE_COUNT);
+            if (!construction) {
+                ast_free_expr(scalar);
+                goto cleanup;
+            }
+            domain_vector = NULL; /* The constructor now owns both actual pieces. */
+            ASTLogicalValueOrigin assembly;
+            ast_logical_value_origin_init(&assembly);
+            assembly.complete = true;
+            assembly.scalar_type = AST_SCALAR_FLOAT32;
+            assembly.components = 4;
+            assembly.logical_value_id = HLSL_DOMAIN_OUTPUT_LOGICAL_ID;
+            /* Canonical interface assembly has no fabricated opcode owner.
+             * The private receipt retains the two real XYZ/W write owners. */
+            if (!ast_set_logical_value_origin(construction, &assembly)) {
+                ast_free_expr(construction);
+                goto cleanup;
+            }
+            expression = construction;
+            hlsl_instruction_owners_union(&owners, &domain_vector_owners);
+            domain_construction = true;
+        }
         ExpressionSpanContext trace = {
             .map = map, .roots = roots, .owners = owners, .function = group >= 0,
             .matrix_capture = ctx->matrix_use_capture, .stage_coverage = ctx->stage_coverage};
@@ -1262,6 +1316,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
             sb_appendf(ctx->sb, "const %s %s", type, name);
             sb_append(ctx->sb, " = ");
         } else if (ctx->high_level_direct_return) {
+            if (domain_construction) ctx->domain_output_return_begin = assignment_begin;
             sb_append(ctx->sb, "return ");
         } else {
             if (!(scope ? scope->append_destination(ctx, index, scope->context)
@@ -1273,7 +1328,11 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
             }
             sb_append(ctx->sb, " = ");
         }
-        if (!hlsl_source_quality_observe_expression(ctx, expression, index))
+        if (domain_construction)
+            hlsl_source_quality_interface_expression_begin(ctx, index);
+        if (!(domain_construction
+                ? hlsl_stage_coverage_domain_output_construction(ctx, expression)
+                : hlsl_source_quality_observe_expression(ctx, expression, index)))
             ctx->sb->failed = true;
         ast_format_expr_traced(expression, ctx->sb, map || ctx->matrix_use_capture || ctx->stage_coverage ? record_expression_span : NULL, &trace);
         if (!finish_expression_origins(&trace, false))
@@ -1290,6 +1349,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
     }
     success = sb_ok(ctx->sb);
 cleanup:
+    ast_free_expr(domain_vector);
     for (int index = 0; index < EXPRESSION_INSTRUCTION_LIMIT; ++index) {
         ast_free_expr(pending[index]);
         hlsl_matrix_lift_plan_free(&matrix_plans[index]);

@@ -31,6 +31,20 @@ uint8_t *test_tessellation_hull_icb_dxbc(unsigned rows, unsigned column,
     bool scalar, bool float3, const uint32_t *values, size_t *size);
 uint8_t *test_tessellation_domain_dxbc(unsigned domain, uint32_t points,
     uint8_t location_mask, size_t *size);
+enum {
+    TEST_DOMAIN_FLOAT3_VALID = 0,
+    TEST_DOMAIN_FLOAT3_MISSING_W,
+    TEST_DOMAIN_FLOAT3_OVERLAPPING_W,
+    TEST_DOMAIN_FLOAT3_MISSING_Z,
+    TEST_DOMAIN_FLOAT3_FOREIGN_OUTPUT,
+    TEST_DOMAIN_FLOAT3_UNDECLARED_POINT_W,
+    TEST_DOMAIN_FLOAT3_REORDERED_WRITES
+};
+/* Triangle custom FLOAT3 points with the measured MUL/MAD/MAD XYZ and scalar
+ * MOV W/RET grammar. Scenarios author independently decoded boundary cases;
+ * no compiler target bytes or serialized parameter authority are copied. */
+uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points,
+    const char *semantic, unsigned scenario, size_t *size);
 /* Writes the existing fixed signature grammar into a sufficiently sized test
  * buffer; this helper is also used by hull quad/isoline token authors. */
 size_t test_tessellation_hull_signature(uint8_t *bytes, unsigned role, bool inner_first);

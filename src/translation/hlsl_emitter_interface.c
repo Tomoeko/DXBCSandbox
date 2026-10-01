@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/hlsl_source_identifier.h"
 #include "hlsl_geometry_flow.h"
 #include "translation/usil_validation.h"
 #include <stdio.h>
@@ -195,6 +196,111 @@ const DXBCSignatureElement *hlsl_high_level_domain_point_signature(
   return match;
 }
 
+bool hlsl_custom_zero_index_semantic_supported(const char *semantic) {
+  if (!hlsl_source_identifier_valid(semantic) ||
+      ((semantic[0] == 'S' || semantic[0] == 's') &&
+       (semantic[1] == 'V' || semantic[1] == 'v') && semantic[2] == '_')) return false;
+  const size_t length = strlen(semantic);
+  /* HLSL splits a decimal suffix into an index. Retain the actual index-zero
+   * custom field instead of silently changing its parsed name/index pair. */
+  return !(semantic[length - 1] >= '0' && semantic[length - 1] <= '9');
+}
+
+/* This is an interface construction, not a fabricated full-width instruction.
+ * The two consecutive output writes retain independent decoded owners. */
+static bool domain_output_shape(const USILProgram *program, HLSLDomainOutputPlan *plan) {
+  if (!plan) return false;
+  memset(plan, 0, sizeof(*plan));
+  if (!program || program->program_type != DXBC_PROGRAM_TYPE_DOMAIN ||
+      program->tessellation.domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE ||
+      !program->inputs || program->input_count != 1 || program->input_alloc < 1 ||
+      program->inputs[0].mask != 7 || program->inputs[0].rw_mask != 7 ||
+      !hlsl_custom_zero_index_semantic_supported(dxbc_signature_semantic_name(&program->inputs[0])) ||
+      program->inputs[0].system_value || !program->outputs || program->output_count != 1 ||
+      program->output_alloc < 1 || program->outputs[0].mask != 15 ||
+      program->outputs[0].rw_mask || program->outputs[0].system_value != 1 ||
+      program->outputs[0].semantic_name_extended ||
+      !memchr(program->outputs[0].semantic_name, 0, sizeof(program->outputs[0].semantic_name)) ||
+      !program->instructions || program->instruction_count < 3 ||
+      program->instruction_count > HLSL_DOMAIN_SOURCE_INSTRUCTION_LIMIT ||
+      program->instruction_alloc < program->instruction_count) return false;
+  const int first = program->instruction_count - 3;
+  const USILInstruction *vector = &program->instructions[first];
+  const USILInstruction *scalar = &program->instructions[first + 1];
+  const USILInstruction *returned = &program->instructions[first + 2];
+  if (vector->opcode != USIL_OP_MAD || vector->operand_count != 4 ||
+      scalar->opcode != USIL_OP_MOV || scalar->operand_count != 2 ||
+      returned->opcode != USIL_OP_RET || returned->operand_count ||
+      scalar->operands[1].type != OPERAND_TYPE_IMMEDIATE32 ||
+      scalar->operands[1].imm_value_count != 1 ||
+      !hlsl_lift_operand_is_plain(&scalar->operands[1])) return false;
+  HLSLDomainOutputPlan candidate = {0};
+  candidate.present = true;
+  candidate.output = program->outputs[0];
+  candidate.return_instruction_index = first + 2;
+  candidate.return_source_instruction_index = returned->source_instruction_index;
+  for (unsigned piece = 0; piece < HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
+    const USILInstruction *instruction = &program->instructions[first + (int)piece];
+    const DXBCOperand *destination = &instruction->operands[0];
+    const uint8_t mask = piece ? 8 : 7;
+    if (!usil_instruction_shape_valid(program, instruction) ||
+        destination->type != OPERAND_TYPE_OUTPUT ||
+        !hlsl_lift_operand_is_plain(destination) ||
+        destination->register_index != (int)candidate.output.register_id ||
+        usil_operand_destination_lane_mask(destination) != mask) return false;
+    candidate.pieces[piece] = (HLSLDomainOutputPiece){
+        .instruction_index = first + (int)piece,
+        .source_instruction_index = instruction->source_instruction_index,
+        .opcode = instruction->opcode,
+        .destination_register = candidate.output.register_id,
+        .destination_raw_token = destination->raw_token,
+        .mask = mask, .width = piece ? 1 : 3,
+        .scalar_immediate = piece != 0,
+        .immediate_bits = piece ? scalar->operands[1].imm_values[0] : 0};
+  }
+  for (int index = 0; index < first; ++index) {
+    const USILInstruction *instruction = &program->instructions[index];
+    if (!usil_instruction_shape_valid(program, instruction)) return false;
+    for (int operand = 0; operand < instruction->operand_count; ++operand)
+      if (instruction->operands[operand].type == OPERAND_TYPE_OUTPUT) return false;
+  }
+  *plan = candidate;
+  return true;
+}
+
+bool hlsl_domain_output_plan_prepare(const USILProgram *program, HLSLDomainOutputPlan *plan) {
+  if (!plan) return false;
+  memset(plan, 0, sizeof(*plan));
+  return hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE) &&
+      domain_output_shape(program, plan);
+}
+
+bool hlsl_domain_output_plans_equal(const HLSLDomainOutputPlan *left,
+                                  const HLSLDomainOutputPlan *right) {
+  if (!left || !right || left->present != right->present ||
+      left->output_signature_index != right->output_signature_index ||
+      left->return_instruction_index != right->return_instruction_index ||
+      left->return_source_instruction_index != right->return_source_instruction_index) return false;
+  const DXBCSignatureElement *a = &left->output, *b = &right->output;
+  if (a->semantic_name_extended || b->semantic_name_extended ||
+      memcmp(a->semantic_name, b->semantic_name, sizeof(a->semantic_name)) ||
+      a->semantic_name_length != b->semantic_name_length ||
+      a->semantic_index != b->semantic_index || a->system_value != b->system_value ||
+      a->component_type != b->component_type || a->register_id != b->register_id ||
+      a->mask != b->mask || a->rw_mask != b->rw_mask ||
+      a->stream_index != b->stream_index || a->min_precision != b->min_precision ||
+      a->interpolation_mode != b->interpolation_mode) return false;
+  for (unsigned piece = 0; piece < HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
+    const HLSLDomainOutputPiece *x = &left->pieces[piece], *y = &right->pieces[piece];
+    if (x->instruction_index != y->instruction_index ||
+        x->source_instruction_index != y->source_instruction_index || x->opcode != y->opcode ||
+        x->destination_register != y->destination_register || x->destination_raw_token != y->destination_raw_token ||
+        x->mask != y->mask || x->width != y->width || x->scalar_immediate != y->scalar_immediate ||
+        x->immediate_bits != y->immediate_bits) return false;
+  }
+  return true;
+}
+
 bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSLEmitMode mode) {
   HLSLDomainShape shape;
   if (!program || !hlsl_domain_shape(program->tessellation.domain, &shape)) return false;
@@ -220,9 +326,13 @@ bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSL
       program->instruction_count < 2 || program->instruction_count > HLSL_DOMAIN_SOURCE_INSTRUCTION_LIMIT ||
       program->instruction_alloc < program->instruction_count || !program->instructions ||
       !usil_signature_authority_is_valid(program)) return false;
+  const bool constructed_output = program->inputs[0].mask == 7;
+  HLSLDomainOutputPlan output_plan;
+  if (constructed_output && !domain_output_shape(program, &output_plan)) return false;
   for (int direction = 0; direction < 2; ++direction) {
     const DXBCSignatureElement *field = direction ? program->outputs : program->inputs;
-    if (field->component_type != 3 || field->mask != 15 || field->system_value != 1 ||
+    if (field->component_type != 3 || field->mask != (!direction && constructed_output ? 7 : 15) ||
+        field->system_value != (!direction && constructed_output ? 0u : 1u) ||
         field->register_id >= HLSL_SM5_IO_REGISTER_COUNT || field->min_precision ||
         field->stream_index || field->semantic_index || field->interpolation_mode) return false;
   }
@@ -238,7 +348,7 @@ bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSL
       location = true; location_mask = d->mask;
     } else if (d->operand_type == OPERAND_TYPE_INPUT_CONTROL_POINT) {
       if (points || d->kind != USIL_SIGNATURE_DECL_INPUT || !d->has_array_element_count ||
-          d->array_element_count != program->tessellation.input_control_point_count || d->register_id != program->inputs[0].register_id || d->mask != 15)
+          d->array_element_count != program->tessellation.input_control_point_count || d->register_id != program->inputs[0].register_id || d->mask != program->inputs[0].mask)
         return false;
       points = true;
     } else if (d->operand_type == OPERAND_TYPE_OUTPUT) {
@@ -267,9 +377,10 @@ bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSL
       if (!hlsl_lift_operand_is_plain(&unmodified)) return false;
       if (!operand) {
         if (value->type == OPERAND_TYPE_OUTPUT) {
-          if (++writes != 1 || index != program->instruction_count - 2 ||
+          ++writes;
+          if (!constructed_output && (writes != 1 || index != program->instruction_count - 2 ||
               value->register_index != (int)program->outputs[0].register_id ||
-              usil_operand_destination_lane_mask(value) != 15) return false;
+              usil_operand_destination_lane_mask(value) != 15)) return false;
         } else if (value->type != OPERAND_TYPE_TEMP) return false;
       } else if (value->type == OPERAND_TYPE_INPUT_CONTROL_POINT) {
         if (!hlsl_high_level_domain_point_signature(program, value)) return false;
@@ -284,7 +395,7 @@ bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSL
       } else if (value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_IMMEDIATE32) return false;
     }
   }
-  return writes == 1;
+  return writes == (constructed_output ? HLSL_DOMAIN_OUTPUT_PIECE_COUNT : 1);
 }
 
 static bool geometry_effect_supported(const USILProgram *program,
@@ -516,10 +627,16 @@ void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, in
         element->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
         !usil_operand_destination_lane_mask(&owner->operands[0]) ||
         (usil_operand_destination_lane_mask(&owner->operands[0]) & ~element->mask)) continue;
-    /* Only the independently planned flow route admits partial field updates.
-     * Its CFG proof requires the complete persistent tuple at every Append. */
+    /* Partial writes need an independently planned complete value: the flow
+     * route proves every Append; DOMAIN assembles its exact XYZ/W suffix. */
     if (usil_operand_destination_lane_mask(&owner->operands[0]) != element->mask &&
-        !hlsl_geometry_control_flow_admission(ctx->program, ctx->emit_mode)) continue;
+        !hlsl_geometry_control_flow_admission(ctx->program, ctx->emit_mode)) {
+      HLSLDomainOutputPlan current;
+      if (!ctx->domain_output_plan.present ||
+          instruction != ctx->domain_output_plan.pieces[1].instruction_index ||
+          !hlsl_domain_output_plan_prepare(ctx->program, &current) ||
+          !hlsl_domain_output_plans_equal(&current, &ctx->domain_output_plan)) continue;
+    }
     ctx->high_level_output_statements_emitted |= UINT32_C(1) << element->register_id;
     if (ctx->high_level_geometry)
       ctx->high_level_geometry_statements_emitted |= UINT64_C(1) << instruction;

@@ -73,14 +73,8 @@ static bool point_signatures(const USILProgram *program, HullSourcePlan *plan,
      * Explicit phase expressions retain their separate FLOAT4 contract. */
     if (explicit_phase) return false;
     const char *semantic = dxbc_signature_semantic_name(input);
-    if (!hlsl_source_identifier_valid(semantic) ||
-        ((semantic[0] == 'S' || semantic[0] == 's') &&
-         (semantic[1] == 'V' || semantic[1] == 'v') && semantic[2] == '_') ||
+    if (!hlsl_custom_zero_index_semantic_supported(semantic) ||
         strcmp(semantic, dxbc_signature_semantic_name(output))) return false;
-    const size_t length = strlen(semantic);
-    /* HLSL splits a trailing decimal suffix into the semantic index. The
-     * scoped signature below owns index zero, not a rewritten suffix. */
-    if (semantic[length - 1] >= '0' && semantic[length - 1] <= '9') return false;
     const DXBCSignatureElement *elements[] = {input, output};
     for (unsigned index = 0; index < 2; ++index) {
         const DXBCSignatureElement *element = elements[index];
@@ -387,13 +381,17 @@ static bool hash_owner_operand(CommonSha256Context *hash, const DXBCOperand *ope
     return true;
 }
 
-static bool decoded_owner_digest(const USILProgram *program, uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
+static bool decoded_tessellation_owner_digest(const USILProgram *program,
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE], bool domain_stage) {
     HullSourcePlan checked = {0};
-    if (!hull_contract(program, &checked)) return false;
+    if (domain_stage ? !hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE)
+                     : !hull_contract(program, &checked)) return false;
     CommonSha256Context hash;
     common_sha256_init(&hash);
     static const char domain[] = "dxbc-hull-final-factor-owner-v1";
-    common_sha256_update(&hash, domain, sizeof(domain));
+    static const char domain_output[] = "dxbc-domain-output-owner-v1";
+    common_sha256_update(&hash, domain_stage ? domain_output : domain,
+        domain_stage ? sizeof(domain_output) : sizeof(domain));
     const USILTessellationContract *tessellation = &program->tessellation;
     const uint64_t fields[] = {program->program_type, program->shader_model_major,
         program->shader_model_minor, program->has_parsed_signature_authority,
@@ -482,8 +480,17 @@ static bool decoded_owner_digest(const USILProgram *program, uint8_t digest[COMM
     return true;
 }
 
+static bool decoded_owner_digest(const USILProgram *program,
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE]) {
+    return decoded_tessellation_owner_digest(program, digest, false);
+}
+
 bool hlsl_hull_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
     return digest && decoded_owner_digest(program, digest);
+}
+
+bool hlsl_domain_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
+    return digest && decoded_tessellation_owner_digest(program, digest, true);
 }
 
 static bool instance_operand(const DXBCOperand *operand, bool control_point) {

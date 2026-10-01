@@ -278,6 +278,9 @@ typedef struct HLSLEmitterContext {
     bool high_level_interface;
     bool high_level_geometry;
     bool high_level_domain;
+    HLSLDomainOutputPlan domain_output_plan;
+    size_t domain_output_return_begin;
+    uint8_t domain_owner_digest[32];
     char high_level_domain_point_type[96];
     char high_level_domain_factors_type[96];
     char high_level_domain_factors_variable[96];
@@ -442,6 +445,7 @@ bool hlsl_domain_shape(DXBCTessellatorDomain domain, HLSLDomainShape *shape);
 bool hlsl_domain_factor_order(const USILProgram *program, bool *inner_first);
 bool hlsl_float_source_modifier_supported(const DXBCOperand *operand);
 bool hlsl_high_level_domain_interface_supported(const USILProgram *program, HLSLEmitMode mode);
+bool hlsl_custom_zero_index_semantic_supported(const char *semantic);
 const DXBCSignatureElement *hlsl_high_level_domain_point_signature(
     const USILProgram *program, const DXBCOperand *operand);
 bool hlsl_high_level_geometry_interface_supported(const USILProgram *program,

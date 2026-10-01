@@ -4,6 +4,7 @@
 
 #include "translation/hlsl_source_quality.h"
 #include "translation/hlsl_hull_icb_internal.h"
+#include "translation/hlsl_domain_output_internal.h"
 
 enum {
     HLSL_STAGE_COVERAGE_BODY = 1u << 0,
@@ -33,7 +34,8 @@ typedef enum {
     HLSL_STAGE_ROOT_HULL_IMPLICIT_COPY,
     HLSL_STAGE_ROOT_HULL_POINT_RETURN,
     HLSL_STAGE_ROOT_HULL_ICB_LITERAL,
-    HLSL_STAGE_ROOT_HULL_ICB_ACCESS
+    HLSL_STAGE_ROOT_HULL_ICB_ACCESS,
+    HLSL_STAGE_ROOT_DOMAIN_OUTPUT_CONSTRUCTION
 } HLSLStageRootOwnerKind;
 
 typedef struct {
@@ -108,6 +110,17 @@ typedef struct {
     bool plan_captured, recorded_plan_captured, declaration_emitted, recorded_declaration_emitted;
 } HLSLStageHullICB;
 
+/* The structural return owns a separate frozen plan. Its children retain
+ * the actual XYZ/W instruction roots; no instruction gains a wider mask. */
+typedef struct {
+    HLSLDomainOutputPlan plan, recorded_plan;
+    size_t root_index, recorded_root_index;
+    size_t return_begin, return_end, recorded_return_begin, recorded_return_end;
+    bool plan_captured, recorded_plan_captured;
+    bool root_captured, recorded_root_captured;
+    bool return_emitted, recorded_return_emitted;
+} HLSLStageDomainOutput;
+
 typedef struct HLSLStageCoverage {
     uint32_t obligations, required_binding_mask;
     DXBCProgramType stage;
@@ -139,7 +152,11 @@ typedef struct HLSLStageCoverage {
     size_t unit_count, recorded_unit_count;
     HLSLStageHullContract hull_contract, recorded_hull_contract;
     HLSLStageHullICB hull_icb;
+    HLSLStageDomainOutput domain_output;
     uint8_t hull_owner_digest[32];
+    /* All admitted DOMAIN programs freeze complete decoded owners before
+     * callbacks, including ordinary FLOAT4 output with no assembly receipt. */
+    uint8_t domain_owner_digest[32], recorded_domain_owner_digest[32];
     bool began, finished;
 } HLSLStageCoverage;
 
@@ -151,11 +168,22 @@ bool hlsl_stage_coverage_root(struct HLSLEmitterContext *ctx, const ASTExpr *roo
 bool hlsl_stage_coverage_owned_root(struct HLSLEmitterContext *ctx,
     const ASTExpr *root, int instruction, const HLSLStageRootOwner *owner);
 bool hlsl_hull_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+bool hlsl_domain_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+bool hlsl_stage_coverage_domain_owners_empty(const HLSLStageCoverage *coverage);
 bool hlsl_stage_coverage_hull_icb_plan(struct HLSLEmitterContext *ctx, const HLSLHullICBPlan *plan);
 bool hlsl_stage_coverage_hull_icb_declaration(struct HLSLEmitterContext *ctx, size_t begin, size_t end);
 bool hlsl_stage_coverage_hull_icb_literal(struct HLSLEmitterContext *ctx, const ASTExpr *root, size_t row);
 bool hlsl_stage_coverage_hull_icb_access(struct HLSLEmitterContext *ctx, const ASTExpr *root, size_t consumer);
 bool hlsl_stage_coverage_hull_icb_empty(const HLSLStageHullICB *icb);
+bool hlsl_stage_coverage_domain_output_empty(const HLSLStageDomainOutput *output);
+bool hlsl_stage_coverage_domain_output_plan(struct HLSLEmitterContext *ctx,
+    const HLSLDomainOutputPlan *plan);
+/* Registers and observes the complete constructor once. Real child roots
+ * must already be registered when an owned capture is active. */
+bool hlsl_stage_coverage_domain_output_construction(struct HLSLEmitterContext *ctx,
+    const ASTExpr *root);
+bool hlsl_stage_coverage_domain_output_return(struct HLSLEmitterContext *ctx,
+    size_t begin, size_t end);
 bool hlsl_stage_coverage_observation(struct HLSLEmitterContext *ctx,
     const HLSLSourceQualityObservation *observation);
 bool hlsl_stage_coverage_span(HLSLStageCoverage *coverage,
@@ -164,8 +192,9 @@ void hlsl_stage_coverage_finish(struct HLSLEmitterContext *ctx);
 bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const StringBuilder *source);
 bool hlsl_stage_coverage_equal(const HLSLStageCoverage *a, const HLSLStageCoverage *b);
 void hlsl_stage_coverage_dispose(HLSLStageCoverage *coverage);
-/* Private stage-local capture only. Existing bounded parsed FORK HULL scope,
- * with no JOIN admission. Source quality and retained gaps are unchanged.
+/* Private stage-local capture for bounded parsed FORK HULL and admitted
+ * triangle/quad/isoline DOMAIN stages. HULL JOIN admission and retained HULL
+ * quality gaps are unchanged. DOMAIN assembly owns its separate frozen receipt.
  * The initially empty destination owns trees/contracts after success. A failed
  * new capture disposes partial ownership; argument rejection preserves previous
  * results and nonempty output. This is not an original-target receipt. */

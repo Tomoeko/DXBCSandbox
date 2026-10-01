@@ -2425,6 +2425,10 @@ void emit_return_block(HLSLEmitterContext* ctx) {
   if (ctx->high_level_direct_return) {
     size_t return_begin = ctx->sb->len;
     sb_append(ctx->sb, "}\n");
+    if (ctx->domain_output_plan.present &&
+        !hlsl_stage_coverage_domain_output_return(ctx, ctx->domain_output_return_begin, ctx->sb->len))
+      hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+                     HLSL_EMIT_PHASE_RETURN_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
     hlsl_source_quality_emission(ctx, 0, false,
                                  ctx->program->instruction_count - 1);
     ctx->high_level_return_block_emitted = sb_ok(ctx->sb) && ctx->sb->len > return_begin;

@@ -17,7 +17,9 @@
 #include <string.h>
 
 enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096,
-       PROBE_COMPILE_SLOTS = 7 };
+       PROBE_COMPILE_SLOTS = 7, PROBE_DOMAIN_INSTRUCTION_LIMIT = 64,
+       PROBE_DOMAIN_DECLARATION_LIMIT = 32, PROBE_DOMAIN_SIGNATURE_LIMIT = 16,
+       PROBE_DOMAIN_OPERAND_LIMIT = 128, PROBE_DOMAIN_OPERAND_DEPTH_LIMIT = 4 };
 
 typedef struct {
     size_t begin, end;
@@ -25,8 +27,8 @@ typedef struct {
     bool valid;
 } OwnedLiteralMutation;
 
-/* Manual selected-native HULL comparison. V/D/F are authored compilation
- * stubs. It grants no Editor, import, linked-stage or runtime certificate. */
+/* Manual selected-native isolated HULL or DOMAIN comparison. Other stages are
+ * authored compilation stubs. No Editor, import, linked or runtime certificate. */
 static const char *const default_shader_name =
     "Fixture/HighLevel/HullFloat3Implicit";
 
@@ -71,11 +73,14 @@ static void print_hash(const char *role, const void *bytes, size_t size) {
     printf("%s_bytes=%zu\n", role, size);
 }
 
-static void print_status(const char *role,
-                         const UnityCompilerResponseStatus *status) {
+static void print_status_selected(const char *role,
+                                  const UnityCompilerResponseStatus *status,
+                                  bool summary_only) {
     printf("%s success=%d diagnostics=%zu actionable=%zu\n", role,
            status->compiler_success, status->diagnostic_count,
            unity_compiler_response_status_actionable_diagnostic_count(status));
+    if (summary_only)
+        return;
     for (size_t index = 0; index < status->diagnostic_count; ++index) {
         const UnityCompilerDiagnostic *diagnostic = &status->diagnostics[index];
         fprintf(stderr, "%s diagnostic=%d,%d,%d message=%s\n", role,
@@ -164,9 +169,10 @@ verify_compile_identity(UnityCompilerChannel *channel,
     return matches;
 }
 
-static bool compile_source(UnityCompilerChannel *channel, const char *role,
+static bool compile_selected(UnityCompilerChannel *channel, const char *role,
                            const char *source, const char *directory, const char *shader_name,
-                           uint32_t valid_apis,
+                           uint32_t valid_apis, UnityCompilerProgramStage stage,
+                           bool summary_only,
                            UnityCompilerPreprocessResponse *preprocess,
                            UnityCompilerSnippetCompileRequest *request,
                            UnityCompilerBinaryResponse *compiled,
@@ -182,7 +188,7 @@ static bool compile_source(UnityCompilerChannel *channel, const char *role,
     if (!unity_compiler_preprocess_contract_response(channel, &preprocessing,
                                                      preprocess))
         return false;
-    print_status("preprocess", &preprocess->status);
+    print_status_selected("preprocess", &preprocess->status, summary_only);
     if (!unity_compiler_response_status_is_clean_success(&preprocess->status) ||
         !verify_preprocess_identity(channel, &preprocessing, preprocess) ||
         preprocess->result.snippet_count != 1 || !preprocess->result.snippets ||
@@ -202,7 +208,7 @@ static bool compile_source(UnityCompilerChannel *channel, const char *role,
          */
         .build_platform = 1,
         .compiler_flags = UINT32_C(0x9000),
-        .shader_type = UNITY_COMPILER_PROGRAM_HULL,
+        .shader_type = stage,
         .platform = 4,
         .requirements = unity_compiler_variant_requirements(snippet, NULL, 0),
         .program_mask = (int32_t)snippet->contract.program_types_mask,
@@ -220,9 +226,285 @@ static bool compile_source(UnityCompilerChannel *channel, const char *role,
            snippet->contract.never_use_dxc_apis);
     if (!unity_compiler_compile_contract_response(channel, request, compiled))
         return false;
-    print_status("compile", &compiled->status);
+    print_status_selected("compile", &compiled->status, summary_only);
     return unity_compiler_response_status_is_clean_success(&compiled->status) &&
            verify_compile_identity(channel, request, compiled, provenance);
+}
+
+static bool compile_source(UnityCompilerChannel *channel, const char *role,
+                           const char *source, const char *directory, const char *shader_name,
+                           uint32_t valid_apis,
+                           UnityCompilerPreprocessResponse *preprocess,
+                           UnityCompilerSnippetCompileRequest *request,
+                           UnityCompilerBinaryResponse *compiled,
+                           UnityCompilerToolchainProvenance *provenance) {
+    return compile_selected(channel, role, source, directory, shader_name,
+                            valid_apis, UNITY_COMPILER_PROGRAM_HULL, false,
+                            preprocess, request, compiled, provenance);
+}
+
+static bool print_domain_signature(const char *role,
+                                   const DXBCSignatureElement *elements,
+                                   int count) {
+    const int retained = count < PROBE_DOMAIN_SIGNATURE_LIMIT
+        ? count : PROBE_DOMAIN_SIGNATURE_LIMIT;
+    for (int index = 0; index < retained; ++index) {
+        const DXBCSignatureElement *element = &elements[index];
+        const char *name = dxbc_signature_semantic_name(element);
+        printf("domain_signature role=%s index=%d semantic=%.64s semantic_index=%u "
+               "system=%u component_type=%u register=%u mask=%u rw_mask=%u "
+               "stream=%u precision=%u name_bytes=%zu\n", role, index, name,
+               element->semantic_index, element->system_value, element->component_type,
+               element->register_id, (unsigned)element->mask,
+               (unsigned)element->rw_mask, element->stream_index,
+               element->min_precision, element->semantic_name_length);
+    }
+    return retained == count;
+}
+
+static bool print_domain_operand(const DXBCOperand *operand, int instruction,
+                                 int operand_index, unsigned path, unsigned depth,
+                                 size_t *remaining) {
+    if (!*remaining || depth > PROBE_DOMAIN_OPERAND_DEPTH_LIMIT)
+        return false;
+    --*remaining;
+    printf("domain_operand instruction=%d operand=%d path=%u depth=%u type=%u "
+           "register=%d dimensions=%d mode=%u mask=%u components=%u,%u,%u,%u "
+           "neg=%d abs=%d precision=%u extended_tokens=%zu\n",
+           instruction, operand_index, path, depth, (unsigned)operand->type,
+           operand->register_index, operand->register_index_dim,
+           (unsigned)operand->swizzle_mode,
+           (unsigned)usil_operand_destination_lane_mask(operand),
+           (unsigned)operand->swizzle[0], (unsigned)operand->swizzle[1],
+           (unsigned)operand->swizzle[2], (unsigned)operand->swizzle[3],
+           operand->has_neg, operand->has_abs, (unsigned)operand->min_precision,
+           operand->extended_token_count);
+    for (int dimension = 0; dimension < operand->register_index_dim && dimension < 3;
+         ++dimension)
+        printf("domain_operand_index instruction=%d operand=%d path=%u dimension=%d "
+               "representation=%u immediate=%d value=%" PRIu64 " exceeds_int=%d\n",
+               instruction, operand_index, path, dimension,
+               (unsigned)operand->index_representations[dimension],
+               operand->index_has_immediate[dimension], operand->index_values[dimension],
+               operand->index_value_exceeds_int[dimension]);
+    for (int word = 0; word < operand->immediate_word_count && word < 8; ++word)
+        printf("domain_operand_literal instruction=%d operand=%d path=%u word=%d "
+               "bits=0x%08" PRIx32 "\n", instruction, operand_index, path, word,
+               operand->immediate_words[word]);
+    const DXBCOperand *relative[] = {operand->rel_op0, operand->rel_op1,
+                                    operand->rel_op2};
+    bool complete = true;
+    for (unsigned dimension = 0; dimension < 3; ++dimension)
+        if (relative[dimension] &&
+            !print_domain_operand(relative[dimension], instruction, operand_index,
+                                  path * 4 + dimension + 1, depth + 1, remaining))
+            complete = false;
+    return complete;
+}
+
+/* Inspect the compiler's actual DOMAIN target, then attempt the normal inverse.
+ * Authored fixture text and preprocessing controls are not inverse inputs. This
+ * mode prints bounded facts only and supplies no substitute DOMAIN or metadata.
+ */
+static bool inspect_domain(const DXBCContainerView *target, StringBuilder *source,
+                           OwnedLiteralMutation *mutation) {
+    DXBCDocument document;
+    dxbc_document_init(&document);
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract;
+    dxbc_stage_contract_init(&contract);
+    USILProgram program = {0};
+    StringBuilder owned_source;
+    sb_init(&owned_source);
+    HLSLStageCoverage coverage = {0};
+    HLSLExpressionSourceMap map = {0};
+    HLSLSourceQualityResult quality = {0};
+    HLSLEmitDiagnostic diagnostic;
+    bool accepted = false;
+    if (!dxbc_document_parse(&document, target->data, target->size, NULL) ||
+        !dxbc_document_decode_semantic(&document, &semantic) ||
+        !dxbc_stage_contract_decode(&document, &semantic, &contract, NULL) ||
+        !usil_translate_with_stage_contract(&program, &semantic, &contract) ||
+        program.program_type != DXBC_PROGRAM_TYPE_DOMAIN) {
+        puts("domain_decode=failed domain_source_result=not-attempted");
+        goto done;
+    }
+    printf("domain_decode=complete stage=%u model=%u.%u signature_authority=%d "
+           "stage_contract=%d domain=%u input_control_points=%u "
+           "inputs=%d outputs=%d patch_constants=%d declarations=%d "
+           "instructions=%d temps=%d cbuffers=%d textures=%d samplers=%d "
+           "uavs=%d icb_words=%d global_flags=0x%x\n",
+           (unsigned)program.program_type, (unsigned)program.shader_model_major,
+           (unsigned)program.shader_model_minor, program.has_parsed_signature_authority,
+           program.has_stage_contract, (unsigned)program.tessellation.domain,
+           program.tessellation.input_control_point_count, program.input_count,
+           program.output_count, program.patch_constant_count,
+           program.signature_declaration_count, program.instruction_count,
+           program.temp_count, program.cbuffer_count, program.texture_count,
+           program.sampler_count, program.uav_count, program.icb_value_count,
+           program.global_flags);
+    bool complete = print_domain_signature("input", program.inputs, program.input_count);
+    if (!print_domain_signature("output", program.outputs, program.output_count))
+        complete = false;
+    if (!print_domain_signature("patch", program.patch_constants,
+                                 program.patch_constant_count))
+        complete = false;
+    const int declaration_count = program.signature_declaration_count <
+        PROBE_DOMAIN_DECLARATION_LIMIT ? program.signature_declaration_count
+        : PROBE_DOMAIN_DECLARATION_LIMIT;
+    for (int index = 0; index < declaration_count; ++index) {
+        const USILSignatureDeclaration *declaration = &program.signature_declarations[index];
+        printf("domain_declaration index=%d raw_instruction=%u kind=%u type=%u "
+               "has_register=%d register=%u mask=%u stream=%u has_array=%d "
+               "array_count=%u has_system=%d system=%u has_interpolation=%d "
+               "interpolation=%u\n", index, declaration->source_instruction_index,
+               (unsigned)declaration->kind, (unsigned)declaration->operand_type,
+               declaration->has_signature_register, declaration->register_id,
+               (unsigned)declaration->mask, (unsigned)declaration->stream_index,
+               declaration->has_array_element_count,
+               (unsigned)declaration->array_element_count, declaration->has_system_value,
+               declaration->system_value_name, declaration->has_interpolation,
+               (unsigned)declaration->interpolation_mode);
+    }
+    if (declaration_count != program.signature_declaration_count)
+        complete = false;
+    const int instruction_count = program.instruction_count < PROBE_DOMAIN_INSTRUCTION_LIMIT
+        ? program.instruction_count : PROBE_DOMAIN_INSTRUCTION_LIMIT;
+    size_t operands_remaining = PROBE_DOMAIN_OPERAND_LIMIT;
+    for (int index = 0; index < instruction_count; ++index) {
+        const USILInstruction *instruction = &program.instructions[index];
+        printf("domain_instruction index=%d raw_instruction=%u opcode=%u name=%s "
+               "operands=%d saturate=%d precise=%u shape_valid=%d\n", index,
+               instruction->source_instruction_index, (unsigned)instruction->opcode,
+               hlsl_emit_opcode_name(instruction->opcode), instruction->operand_count,
+               instruction->saturate, (unsigned)instruction->precise_mask,
+               usil_instruction_shape_valid(&program, instruction));
+        for (int operand = 0; operand < instruction->operand_count && operand < DXBC_MAX_OPERANDS;
+             ++operand) {
+            USILOperandUseInfo use = {0};
+            const bool valid = usil_instruction_operand_use(&program, instruction, operand, &use);
+            printf("domain_operand_use instruction=%d operand=%d valid=%d use=%u "
+                   "demanded_lanes=%u\n", index, operand, valid, (unsigned)use.use,
+                   (unsigned)use.source_lane_mask);
+            if (!print_domain_operand(&instruction->operands[operand], index, operand,
+                                      0, 0, &operands_remaining))
+                complete = false;
+        }
+    }
+    if (instruction_count != program.instruction_count)
+        complete = false;
+    printf("domain_summary_complete=%d instruction_limit=%d declaration_limit=%d "
+           "signature_limit=%d operand_limit=%d operand_depth_limit=%d\n", complete,
+           PROBE_DOMAIN_INSTRUCTION_LIMIT, PROBE_DOMAIN_DECLARATION_LIMIT,
+           PROBE_DOMAIN_SIGNATURE_LIMIT, PROBE_DOMAIN_OPERAND_LIMIT,
+           PROBE_DOMAIN_OPERAND_DEPTH_LIMIT);
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    options.expression_source_map = &map;
+    options.source_quality = &quality;
+    const HLSLEmitNames names = {.entry_point = "domain", .input_struct = "DomainPoint"};
+    const bool emitted = hlsl_emit_with_options_diagnostic(&program, source,
+        NULL, NULL, &names, &options, &diagnostic);
+    printf("domain_source_result=%s status=%s phase=%s reason=%s instruction=%d "
+           "raw_instruction=%u opcode=%d operand=%d bytes=%zu\n",
+           emitted ? "generated" : diagnostic.status == HLSL_EMIT_STATUS_UNSUPPORTED
+               ? "unavailable" : "failed",
+           hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase),
+           hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index,
+           diagnostic.source_instruction_index, diagnostic.opcode,
+           diagnostic.operand_index, source->len);
+    if (emitted) {
+        const bool map_valid = hlsl_expression_source_map_matches(&map, &program, source->buf);
+        print_hash("reconstructed_domain_sha256", source->buf, source->len);
+        printf("domain_quality=%s reasons=0x%x units=%zu incomplete=%zu residual=%zu "
+               "unknown_provenance=%zu map_complete=%d map_count=%zu map_valid=%d\n",
+               hlsl_source_quality_class_name(quality.classification), quality.reasons,
+               quality.counts.inspected_units, quality.counts.incomplete_units,
+               quality.counts.residual_total, quality.counts.unknown_provenance,
+               map.complete, map.count, map_valid);
+        HLSLExpressionSourceMap owned_map = {0};
+        HLSLSourceQualityResult owned_quality = {0};
+        HLSLEmitOptions owned_options = options;
+        owned_options.expression_source_map = &owned_map;
+        owned_options.source_quality = &owned_quality;
+        const bool captured = hlsl_emit_with_stage_coverage(&program, &owned_source,
+            NULL, NULL, &names, &owned_options, &coverage, &diagnostic);
+        const bool coverage_valid = captured &&
+            hlsl_stage_coverage_validate(&coverage, &owned_source);
+        bool unchanged = captured && owned_source.len == source->len &&
+            !memcmp(owned_source.buf, source->buf, source->len) &&
+            hlsl_source_quality_results_equal(&owned_quality, &quality) &&
+            owned_map.complete == map.complete && owned_map.count == map.count &&
+            hlsl_expression_source_map_matches(&owned_map, &program, owned_source.buf);
+        for (size_t index = 0; unchanged && index < map.count; ++index)
+            unchanged = hlsl_expression_origins_equal(&map.origins[index], &owned_map.origins[index]);
+        printf("domain_private_stage_capture=%d quality=%s units=%zu roots=%zu syntax=%zu "
+               "obligations=0x%x source_and_classification_unchanged=%d "
+               "original_target_receipt=not-supplied\n", coverage_valid,
+               captured ? hlsl_source_quality_class_name(owned_quality.classification) : "unavailable",
+               coverage.unit_count, coverage.root_count, coverage.syntax_count,
+               coverage.obligations, unchanged);
+        /* This isolated fixture wrapper supplies exactly three FLOAT3 points.
+         * A generated source outside that fixture shape is not replaced with
+         * authored DOMAIN text to make the experiment compile. */
+        accepted = map_valid && coverage_valid && unchanged && mutation &&
+            program.tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE &&
+            program.tessellation.input_control_point_count == 3 &&
+            program.input_count == 1 && program.inputs[0].mask == 7 &&
+            program.inputs[0].component_type == 3 && !program.inputs[0].system_value &&
+            !strcmp(dxbc_signature_semantic_name(&program.inputs[0]), "POINTVALUE") &&
+            program.output_count == 1 && program.outputs[0].mask == 15 &&
+            program.outputs[0].system_value == 1;
+        size_t matches = 0;
+        for (size_t index = 0; accepted && index < coverage.root_count; ++index) {
+            const HLSLStageOwnedRoot *root = &coverage.roots[index];
+            if (root->owner.kind != HLSL_STAGE_ROOT_INSTRUCTION || root->instruction < 0 ||
+                root->instruction >= program.instruction_count)
+                continue;
+            const USILInstruction *instruction = &program.instructions[root->instruction];
+            if (instruction->opcode != USIL_OP_MOV || instruction->operand_count != 2 ||
+                instruction->operands[0].type != OPERAND_TYPE_OUTPUT ||
+                usil_operand_destination_lane_mask(&instruction->operands[0]) != 8)
+                continue;
+            const DXBCOperand *literal = &instruction->operands[1];
+            const int component = literal->imm_value_count == 1 ? 0 :
+                usil_operand_source_component(literal, 3);
+            if (root->owner.source_instruction_index != instruction->source_instruction_index ||
+                literal->type != OPERAND_TYPE_IMMEDIATE32 || component < 0 ||
+                component >= literal->imm_value_count ||
+                literal->imm_values[component] != UINT32_C(0x3f800000) ||
+                !root->tree || root->tree->kind != AST_EXPR_LITERAL ||
+                root->tree->u.literal.scalar_type != AST_SCALAR_FLOAT32 ||
+                root->tree->u.literal.components != 1 ||
+                root->tree->u.literal.val[0] != UINT32_C(0x3f800000) ||
+                root->begin >= root->end || root->end > source->len) {
+                accepted = false;
+                break;
+            }
+            *mutation = (OwnedLiteralMutation){root->begin, root->end,
+                root->tree->u.literal.val[0], true};
+            ++matches;
+            printf("domain_mutation_owner instruction=%d raw_instruction=%u "
+                   "destination_lanes=8 begin=%zu end=%zu bits=0x%08" PRIx32 "\n",
+                   root->instruction, root->owner.source_instruction_index,
+                   root->begin, root->end, root->tree->u.literal.val[0]);
+        }
+        accepted = accepted && matches == 1;
+        printf("domain_isolated_wrapper_shape_and_mutation_owned=%d\n", accepted);
+    } else {
+        puts("domain_quality=unavailable domain_map=unavailable");
+    }
+done:
+    if (!accepted)
+        puts("domain_candidate_comparison=not-run domain_warm_mutation=not-run "
+             "domain_warm_restore=not-run");
+    puts("linked_hull_domain_reconstruction=not-run linked_stage_certificate=not-run");
+    hlsl_stage_coverage_dispose(&coverage);
+    sb_free(&owned_source);
+    usil_free(&program);
+    dxbc_stage_contract_free(&contract);
+    dxbc_free(&semantic);
+    dxbc_document_free(&document);
+    return accepted;
 }
 
 /* The source inverse consumes the complete target and, in the explicit scalar
@@ -388,8 +670,9 @@ done:
     return accepted;
 }
 
-static bool candidate_wrapper(const StringBuilder *hull,
-                              StringBuilder *wrapper, const char *shader_name) {
+static bool candidate_wrapper(const StringBuilder *stage,
+                              StringBuilder *wrapper, const char *shader_name,
+                              bool domain_fixture) {
     sb_appendf(
         wrapper,
         "// SPDX-License-Identifier: GPL-3.0-only\n"
@@ -398,7 +681,24 @@ static bool candidate_wrapper(const StringBuilder *hull,
         "HLSLPROGRAM\n"
         "#pragma target 5.0\n#pragma only_renderers d3d11\n#pragma vertex "
         "vert\n"
-        "#pragma hull hull\n#pragma domain domain\n#pragma fragment frag\n%s\n"
+        "#pragma hull hull\n#pragma domain domain\n#pragma fragment frag\n%s\n",
+        shader_name, stage->buf);
+    if (domain_fixture) {
+        sb_append(wrapper,
+        "DomainPoint vert(float4 input : POSITION) {\n"
+        "    DomainPoint result = { input.xyz }; return result;\n}\n"
+        "DomainFactors ProbePatchFactors(InputPatch<DomainPoint, 3> patch,\n"
+        "                                uint id : SV_PrimitiveID) {\n"
+        "    DomainFactors result;\n"
+        "    result.outer[0] = 3.0f; result.outer[1] = 3.0f; result.outer[2] = 3.0f;\n"
+        "    result.inner = 4.0f; return result;\n}\n"
+        "[domain(\"tri\")]\n[partitioning(\"integer\")]\n"
+        "[outputtopology(\"triangle_cw\")]\n[outputcontrolpoints(3)]\n"
+        "[patchconstantfunc(\"ProbePatchFactors\")]\n[maxtessfactor(32.0f)]\n"
+        "DomainPoint hull(InputPatch<DomainPoint, 3> patch,\n"
+        "                 uint index : SV_OutputControlPointID) { return patch[index]; }\n");
+    } else {
+        sb_append(wrapper,
         "HullPoint vert(float4 input : POSITION) {\n"
         "    HullPoint result; result.pointValue = input.xyz; return "
         "result;\n}\n"
@@ -409,25 +709,32 @@ static bool candidate_wrapper(const StringBuilder *hull,
         "    float3 value = patch[0].pointValue * weights.x + "
         "patch[1].pointValue * weights.y\n"
         "                 + patch[2].pointValue * weights.z;\n    return "
-        "float4(value, 1.0f);\n}\n"
+        "float4(value, 1.0f);\n}\n");
+    }
+    sb_append(wrapper,
         "float4 frag() : SV_Target { return float4(0.25f, 0.5f, 0.75f, 1.0f); "
         "}\n"
-        "ENDHLSL\n        }\n    }\n}\n",
-        shader_name, hull->buf);
+        "ENDHLSL\n        }\n    }\n}\n");
     return sb_ok(wrapper);
 }
 
 static bool changed_factor_wrapper(const StringBuilder *hull,
                                    StringBuilder *wrapper, const char *shader_name,
-                                   bool scalar_fixture, const OwnedLiteralMutation *icb_mutation) {
-    /* Match exactly one owned factor assignment in either controlled fixture.
+                                   bool scalar_fixture, const OwnedLiteralMutation *icb_mutation,
+                                   bool domain_fixture) {
+    /* Match one owned factor assignment or use an independently captured literal.
      * A failed cold comparison remains a failure after this replay check. */
     if (!sb_ok(hull) || !hull->buf || hull->len > PROBE_SOURCE_LIMIT)
+        return false;
+    if (domain_fixture && !icb_mutation)
         return false;
     if (icb_mutation) {
         if (!icb_mutation->valid || icb_mutation->begin >= icb_mutation->end ||
             icb_mutation->end > hull->len) return false;
-        const uint32_t changed_bits = icb_mutation->original_bits == UINT32_C(0x40200000)
+        if (domain_fixture && icb_mutation->original_bits != UINT32_C(0x3f800000))
+            return false;
+        const uint32_t changed_bits = domain_fixture ? UINT32_C(0x40000000)
+            : icb_mutation->original_bits == UINT32_C(0x40200000)
             ? UINT32_C(0x40700000) : UINT32_C(0x40200000);
         ASTExpr *literal = ast_create_literal_bits(&changed_bits, 1, AST_SCALAR_FLOAT32);
         if (!literal) return false;
@@ -437,10 +744,14 @@ static bool changed_factor_wrapper(const StringBuilder *hull,
         ast_format_expr(literal, &mutated);
         sb_append_len(&mutated, hull->buf + icb_mutation->end, hull->len - icb_mutation->end);
         ast_free_expr(literal);
-        const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name);
+        const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name,
+                                                                domain_fixture);
         if (built) {
-            puts("warm_mutation owned_icb_literal_span=1 classification=not-promoted");
-            print_hash("mutated_hull_sha256", mutated.buf, mutated.len);
+            puts(domain_fixture
+                ? "warm_mutation owned_domain_w_literal_span=1 classification=not-promoted"
+                : "warm_mutation owned_icb_literal_span=1 classification=not-promoted");
+            print_hash(domain_fixture ? "mutated_domain_sha256" : "mutated_hull_sha256",
+                       mutated.buf, mutated.len);
         }
         sb_free(&mutated);
         return built;
@@ -464,7 +775,7 @@ static bool changed_factor_wrapper(const StringBuilder *hull,
     sb_append_len(&mutated, hull->buf, (size_t)(match - hull->buf));
     sb_append(&mutated, changed);
     sb_append(&mutated, match + original_length);
-    const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name);
+    const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name, false);
     if (built) {
         printf("warm_mutation matched_owned_inverse_occurrences=1 scalar_fixture=%d\n",
                scalar_fixture);
@@ -497,7 +808,7 @@ static bool static_factor_calibration(const StringBuilder *hull,
     sb_append(&calibration, assignments);
     sb_append(&calibration, match + strlen(loop));
     const bool built = sb_ok(&calibration) &&
-        candidate_wrapper(&calibration, wrapper, shader_name);
+        candidate_wrapper(&calibration, wrapper, shader_name, false);
     if (built) {
         puts("source_shape_calibration=three-authored-static-assignments "
              "inverse_source_map=not-retained quality=not-classified");
@@ -638,13 +949,19 @@ static void usage(const char *name) {
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]]\n"
-        "Use '-' for no additional includes. Selected-native HULL comparison "
+        "--inner-factor-brace-calibration]] [--domain-fixture]\n"
+        "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
         "validated against native reflection; no player metadata authority.\n"
         "--icb-fixture requires an actual parsed scalar table; its configuration "
         "gap remains MIXED.\n"
+        "--domain-fixture instead compiles the supplied fixture's actual DOMAIN "
+        "target, prints bounded decoded facts, and attempts the high-level inverse. "
+        "Generated source is compared in a separate cold process; an exact result "
+        "enables an owned W-literal mutation and exact warm restoration. "
+        "It prints no source and grants no linked HULL/DOMAIN certificate. "
+        "It cannot be combined with a HULL source calibration.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -659,7 +976,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     const bool scalar_fixture = argc >= 5 && !strcmp(argv[4], "--scalar-fixture");
-    const bool icb_fixture = argc == 5 && !strcmp(argv[4], "--icb-fixture");
+    const bool icb_fixture = argc >= 5 && !strcmp(argv[4], "--icb-fixture");
+    const bool domain_fixture =
+        (argc == 5 && !strcmp(argv[4], "--domain-fixture")) ||
+        (argc == 6 && (scalar_fixture || icb_fixture) &&
+         !strcmp(argv[5], "--domain-fixture"));
     const bool calibrate_static_factors = argc == 6 && scalar_fixture &&
         !strcmp(argv[5], "--static-factor-calibration");
     const bool calibrate_explicit_packoffset = argc == 6 && scalar_fixture &&
@@ -668,7 +989,7 @@ int main(int argc, char **argv) {
         !strcmp(argv[5], "--inner-factor-brace-calibration");
     const bool calibrate_source_shape = calibrate_static_factors ||
         calibrate_explicit_packoffset || calibrate_inner_factor_brace;
-    if (argc != 4 && !icb_fixture &&
+    if (argc != 4 && !domain_fixture && !(icb_fixture && argc == 5) &&
         !(scalar_fixture && (argc == 5 || calibrate_source_shape))) {
         usage(argv[0]);
         return 2;
@@ -677,6 +998,7 @@ int main(int argc, char **argv) {
     const char *shader_name = scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
         : icb_fixture ? "Fixture/HighLevel/HullFloat3ICB" : default_shader_name;
     OwnedLiteralMutation icb_mutation = {0};
+    OwnedLiteralMutation domain_mutation = {0};
     SerializedVariable field = {.name = "_Factor", .layout = {0, 0, 0, 1, 0, 0}};
     SerializedConstantBuffer buffer = {.name = "FactorInputs", .size = 16,
         .role = SERIALIZED_CBUFFER_NAMED, .variables = &field, .var_count = 1};
@@ -715,33 +1037,49 @@ int main(int argc, char **argv) {
         !(valid_apis & (UINT32_C(1) << 4)) ||
         !unity_compiler_set_expected_valid_apis(&channel, valid_apis))
         goto done;
-    printf("scope=selected-native-hull authored_stubs=vertex,domain,fragment "
+    printf("scope=%s authored_stubs=%s "
            "editor=not-run "
            "import=not-run semantic_certificate=not-run native_D3D11=not-run\n"
            "session raw_mask=0x%08" PRIx32 " valid_apis=0x%08" PRIx32 "\n",
+           domain_fixture ? "selected-native-domain" : "selected-native-hull",
+           domain_fixture ? "vertex,hull,fragment" : "vertex,domain,fragment",
            capabilities.raw_available_platform_mask, valid_apis);
     print_hash("authored_source_sha256", authored.data, authored.size);
     printf("metadata_authority=%s player_metadata=not-supplied\n",
-           scalar_fixture ? "controlled-API-fixture" : "none-required");
-    if (!compile_source(&channel, "authored-target", (char *)authored.data,
-                        directory, shader_name, valid_apis, &preprocessing[0], &requests[0],
-                        &compiled[0], &provenance[0]))
+           scalar_fixture && !domain_fixture ? "controlled-API-fixture" : "none-required");
+    if (!compile_selected(&channel, domain_fixture ? "authored-domain-target" : "authored-target",
+                          (char *)authored.data, directory, shader_name, valid_apis,
+                          domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
+                          domain_fixture, &preprocessing[0], &requests[0],
+                          &compiled[0], &provenance[0]))
         goto done;
     DXBCContainerView target = {0}, candidate = {0};
-    if (scalar_fixture && !scalar_fixture_reflection(&compiled[0])) {
+    if (domain_fixture) {
+        if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
+            goto done;
+        print_hash("target_complete_dxbc_sha256", target.data, target.size);
+        if (!inspect_domain(&target, &hull, &domain_mutation) ||
+            !candidate_wrapper(&hull, &wrapper, shader_name, true))
+            goto done;
+        puts("stage_comparison=isolated-domain authored_stubs=vertex,hull,fragment "
+             "linked_hull_domain_reconstruction=not-run linked_stage_certificate=not-run");
+    }
+    if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[0])) {
         fputs("Controlled scalar fixture reflection mismatch.\n", stderr);
         goto done;
     }
-    if (scalar_fixture) printf("controlled_API_layout_native_reflection_checked=1\n");
-    if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
-        goto done;
-    print_hash("target_complete_dxbc_sha256", target.data, target.size);
-    if (!reconstruct_hull(&target, scalar_fixture ? &parameters : NULL, &hull,
+    if (!domain_fixture) {
+        if (scalar_fixture) printf("controlled_API_layout_native_reflection_checked=1\n");
+        if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
+            goto done;
+        print_hash("target_complete_dxbc_sha256", target.data, target.size);
+        if (!reconstruct_hull(&target, scalar_fixture ? &parameters : NULL, &hull,
                           icb_fixture, icb_fixture ? &icb_mutation : NULL) ||
-        !candidate_wrapper(&hull, &wrapper, shader_name))
-        goto done;
-    print_hash("reconstructed_hull_sha256", hull.buf, hull.len);
-    printf("generated_hull_begin\n%s\ngenerated_hull_end\n", hull.buf);
+            !candidate_wrapper(&hull, &wrapper, shader_name, false))
+            goto done;
+        print_hash("reconstructed_hull_sha256", hull.buf, hull.len);
+        printf("generated_hull_begin\n%s\ngenerated_hull_end\n", hull.buf);
+    }
     /* Retain the owned target response and contract, but remove all native
      * resident source before the candidate is independently preprocessed. */
     unity_compiler_shutdown(&channel);
@@ -761,13 +1099,15 @@ int main(int argc, char **argv) {
         goto done;
     printf(
         "process_count=2 candidate_cold=1 session_capabilities_identical=1\n");
-    if (!compile_source(&channel, "target-only-hull-candidate", wrapper.buf,
-                        directory, shader_name, valid_apis, &preprocessing[1], &requests[1],
+    if (!compile_selected(&channel, domain_fixture ? "target-only-domain-candidate" : "target-only-hull-candidate",
+                        wrapper.buf, directory, shader_name, valid_apis,
+                        domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
+                        domain_fixture, &preprocessing[1], &requests[1],
                         &compiled[1], &provenance[1]) ||
         !dxbc_container_view_first(compiled[1].data, compiled[1].size,
                                    &candidate))
         goto done;
-    if (scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
+    if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
     const bool controls_equal =
         selected_controls_equal(&requests[0], &requests[1]);
     const bool toolchain_equal =
@@ -797,8 +1137,15 @@ int main(int argc, char **argv) {
            comparison.instruction_index, comparison.token_index,
            comparison.expected_value, comparison.actual_value);
     const bool cold_equal = status == DXBC_COMPARE_EQUAL;
-    if (!controls_equal || !toolchain_equal || (!cold_equal && !scalar_fixture && !icb_fixture))
+    if (domain_fixture)
+        printf("domain_candidate_comparison=%s source_quality=not-promoted "
+               "linked_stage_certificate=not-run\n", dxbc_compare_status_name(status));
+    if (!controls_equal || !toolchain_equal ||
+        (!cold_equal && (domain_fixture || (!scalar_fixture && !icb_fixture)))) {
+        if (domain_fixture)
+            puts("domain_warm_mutation=not-run domain_warm_restore=not-run cold_exact=0");
         goto done;
+    }
 
     /* A changed source must affect a warm compiler, and returning to the
      * original source must restore both exact bytes and canonical identity. */
@@ -806,14 +1153,17 @@ int main(int argc, char **argv) {
     DXBCContainerView changed = {0}, repeated = {0};
     if (!candidate_process ||
         !changed_factor_wrapper(&hull, &changed_wrapper, shader_name, scalar_fixture,
-                                icb_fixture ? &icb_mutation : NULL) ||
-        !compile_source(&channel, "warm-mutated-hull", changed_wrapper.buf,
-                        directory, shader_name, valid_apis, &preprocessing[2], &requests[2],
+                                domain_fixture ? &domain_mutation : icb_fixture ? &icb_mutation : NULL,
+                                domain_fixture) ||
+        !compile_selected(&channel, domain_fixture ? "warm-mutated-domain" : "warm-mutated-hull",
+                        changed_wrapper.buf, directory, shader_name, valid_apis,
+                        domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
+                        domain_fixture, &preprocessing[2], &requests[2],
                         &compiled[2], &provenance[2]) ||
         !dxbc_container_view_first(compiled[2].data, compiled[2].size,
                                    &changed))
         goto done;
-    if (scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
+    if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
     const DXBCCompareStatus mutation_status = dxbc_compare_exact(
         candidate.data, candidate.size, changed.data, changed.size, &comparison);
     const bool mutation_diff =
@@ -835,15 +1185,19 @@ int main(int argc, char **argv) {
            mutation_authority, candidate_process == channel.process_id);
     if (!mutation_diff || !mutation_authority)
         goto done;
-    if (!compile_source(&channel, "warm-original-hull", wrapper.buf, directory,
-                        shader_name, valid_apis, &preprocessing[3], &requests[3],
+    if (!compile_selected(&channel, domain_fixture ? "warm-original-domain" : "warm-original-hull",
+                        wrapper.buf, directory, shader_name, valid_apis,
+                        domain_fixture ? UNITY_COMPILER_PROGRAM_DOMAIN : UNITY_COMPILER_PROGRAM_HULL,
+                        domain_fixture, &preprocessing[3], &requests[3],
                         &compiled[3], &provenance[3]) ||
         !dxbc_container_view_first(compiled[3].data, compiled[3].size,
                                    &repeated))
         goto done;
-    if (scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
+    if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
     const DXBCCompareStatus repeated_status = dxbc_compare_exact(
-        candidate.data, candidate.size, repeated.data, repeated.size, &comparison);
+        domain_fixture ? target.data : candidate.data,
+        domain_fixture ? target.size : candidate.size,
+        repeated.data, repeated.size, &comparison);
     const bool repeated_identity =
         !memcmp(compiled[1].request_digest, compiled[3].request_digest, 32) &&
         !memcmp(compiled[1].controls_digest, compiled[3].controls_digest, 32);
@@ -855,15 +1209,22 @@ int main(int argc, char **argv) {
         candidate_process == channel.process_id;
     print_hash("warm_original_complete_dxbc_sha256", repeated.data,
                repeated.size);
-    printf("warm_original_equal=%d comparison=%s reference=cold-candidate canonical_identity_equal=%d "
+    printf("warm_original_equal=%d comparison=%s reference=%s canonical_identity_equal=%d "
            "authority_equal=%d same_process=%d\n",
            repeated_status == DXBC_COMPARE_EQUAL,
-           dxbc_compare_status_name(repeated_status), repeated_identity,
+           dxbc_compare_status_name(repeated_status),
+           domain_fixture ? "original-target" : "cold-candidate", repeated_identity,
            repeated_authority, candidate_process == channel.process_id);
     result = cold_equal && repeated_status == DXBC_COMPARE_EQUAL && repeated_identity &&
                      repeated_authority
                  ? 0
                  : 1;
+    if (domain_fixture)
+        printf("domain_isolated_stage_qualified=%d domain_warm_mutation=%s "
+               "domain_warm_restore=%s linked_hull_domain_reconstruction=not-run "
+               "linked_stage_certificate=not-run\n", !result,
+               mutation_diff && mutation_authority ? "different" : "failed",
+               !result ? "exact" : "failed");
     if (calibrate_source_shape) {
         /* The held target bytes survive a third independent cold process.
          * This optional result cannot change the normal candidate's failure. */
@@ -883,7 +1244,7 @@ int main(int argc, char **argv) {
             const bool transformed = calibrate_explicit_packoffset
                 ? explicit_packoffset_calibration(&hull, &changed_wrapper)
                 : inner_factor_brace_calibration(&hull, &changed_wrapper);
-            if (!transformed || !candidate_wrapper(&changed_wrapper, &calibration_wrapper, shader_name))
+            if (!transformed || !candidate_wrapper(&changed_wrapper, &calibration_wrapper, shader_name, false))
                 goto done;
         }
         unity_compiler_shutdown(&channel);
@@ -939,7 +1300,7 @@ int main(int argc, char **argv) {
             DXBCContainerView calibration_changed = {0}, calibration_repeated = {0};
             sb_clear(&wrapper);
             if (!calibration_process ||
-                !changed_factor_wrapper(&changed_wrapper, &wrapper, shader_name, true, NULL) ||
+                !changed_factor_wrapper(&changed_wrapper, &wrapper, shader_name, true, NULL, false) ||
                 !compile_source(&channel, "warm-mutated-calibration", wrapper.buf,
                     directory, shader_name, valid_apis, &preprocessing[5], &requests[5],
                     &compiled[5], &provenance[5]) ||
