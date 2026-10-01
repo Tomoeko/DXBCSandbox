@@ -116,7 +116,7 @@ bool hlsl_natural_input_layout_supported(const USILProgram *program, bool *has_p
       if (field->mask & (field->mask + 1u)) return false;
       continue;
     }
-    if (field->mask != 7 && field->mask != 8) return false;
+    if (field->mask != 7 && field->mask != 8 && field->mask != 3 && field->mask != 12) return false;
     if (field->system_value || field->stream_index || field->rw_mask != field->mask || field->interpolation_mode > 7 ||
         !hlsl_custom_zero_index_semantic_supported(dxbc_signature_semantic_name(field))) return false;
     for (int other = 0; other < index; ++other) {

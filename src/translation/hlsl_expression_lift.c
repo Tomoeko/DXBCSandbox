@@ -589,9 +589,19 @@ bool hlsl_float4_instruction_supported(HLSLEmitterContext *ctx, int index) {
 }
 
 bool hlsl_natural_float_instruction_supported(HLSLEmitterContext *ctx, int index) {
-    return ctx && ctx->program && ctx->program->instructions && index >= 0 &&
-        index < ctx->program->instruction_count &&
-        float_instruction_supported(ctx, index, false, NULL);
+    if (!ctx || !ctx->program || !ctx->program->instructions || index < 0 ||
+        index >= ctx->program->instruction_count) return false;
+    const USILInstruction *instruction = &ctx->program->instructions[index];
+    if (float_dot(instruction->opcode)) {
+        const uint8_t mask = instruction->operand_count
+            ? usil_operand_destination_lane_mask(&instruction->operands[0]) : 0;
+        /* A natural reduction owns one actual TEMP lane. Its vector source
+         * demand remains the DP opcode's width, rather than the result mask. */
+        if (instruction->operand_count != 3 || instruction->operands[0].type != OPERAND_TYPE_TEMP ||
+            !mask || (mask & (uint8_t)(mask - 1u)))
+            return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+    }
+    return float_instruction_supported(ctx, index, false, NULL);
 }
 
 /* The straight-line planner can represent a partial register definition as a
@@ -1340,7 +1350,8 @@ ASTExpr *hlsl_natural_float_operation(HLSLEmitterContext *ctx,
         const bool children_match = moved ? !right && !third
             : right && (multiply_add ? third != NULL : third == NULL);
         supported = (moved || multiply_add || owner->opcode == USIL_OP_ADD || owner->opcode == USIL_OP_MUL ||
-            owner->opcode == USIL_OP_MIN || owner->opcode == USIL_OP_MAX || owner->opcode == USIL_OP_DIV) &&
+            owner->opcode == USIL_OP_MIN || owner->opcode == USIL_OP_MAX || owner->opcode == USIL_OP_DIV ||
+            float_dot(owner->opcode)) &&
             owner->operand_count == operand_count && children_match &&
             usil_instruction_shape_valid(ctx->program, owner) &&
             hlsl_natural_float_instruction_supported(ctx, instruction);

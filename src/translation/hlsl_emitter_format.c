@@ -1209,7 +1209,9 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
         unsigned width = location ? domain_shape.coordinate_count : 0;
         if (element) for (unsigned component = 0; component < 4; ++component)
             if (element->mask & (1u << component)) ++width;
-        const uint32_t input_offset = packed_input && input_projection.field_mask == 8 ? 12u : 0u;
+        const uint32_t input_offset = !packed_input ? 0u
+            : input_projection.field_mask == 8 ? 12u
+            : input_projection.field_mask == 12 ? 8u : 0u;
         if ((!element && !location) || !format_cb_swizzle(op, width, input_offset, write_mask, preserve_vector,
                                            swiz, sizeof(swiz))) {
             hlsl_builder_failed(ctx, output);

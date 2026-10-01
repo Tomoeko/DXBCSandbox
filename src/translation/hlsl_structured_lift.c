@@ -24,6 +24,7 @@ typedef struct {
     const HLSLPhiNode *lanes[4];
     int incoming[2];
     bool predicate;
+    bool dot_scalar_phi;
     int predicate_if;
     unsigned resolution; /* 0 unseen, 1 visiting, 2 proven/live. */
     char name[48];
@@ -117,9 +118,14 @@ static bool scalar_comparison_opcode(USILOpcode opcode) {
         opcode == USIL_OP_EQ || opcode == USIL_OP_NE;
 }
 
+static bool scalar_dot_opcode(USILOpcode opcode) {
+    return opcode == USIL_OP_DP2 || opcode == USIL_OP_DP3 || opcode == USIL_OP_DP4;
+}
+
 static bool natural_arithmetic_opcode(USILOpcode opcode) {
     return opcode == USIL_OP_MOV || opcode == USIL_OP_ADD || opcode == USIL_OP_MUL ||
-        opcode == USIL_OP_MIN || opcode == USIL_OP_MAX || opcode == USIL_OP_DIV || opcode == USIL_OP_MAD;
+        opcode == USIL_OP_MIN || opcode == USIL_OP_MAX || opcode == USIL_OP_DIV || opcode == USIL_OP_MAD ||
+        scalar_dot_opcode(opcode);
 }
 
 /* A loop's scalar induction values belong to the old FLOAT4 route. Select
@@ -222,6 +228,80 @@ static bool map_variable(const HLSLEmitterContext *ctx, StructuredPlan *plan, in
         return false;
     plan->ssa_value[variable] = value;
     plan->ssa_lane[variable] = lane;
+    return true;
+}
+
+/* Unpruned lane SSA can add undefined sibling phis beside a scalar dot
+ * result. Isolate that result only when no actual source, relative index or
+ * phi edge consumes any sibling. The ordinary whole-value closure remains
+ * responsible for every live merge. */
+static bool ssa_variable_unused(const HLSLEmitterContext *ctx, int variable) {
+    if (variable < 0 || variable >= ctx->ssa.ssa_var_count ||
+        ctx->ssa.instruction_count != ctx->program->instruction_count ||
+        !ctx->ssa.relative_operand_ssa_vars) return false;
+    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+        const USILInstruction *instruction = &ctx->program->instructions[index];
+        for (int operand = 0; operand < instruction->operand_count; ++operand) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(ctx->program, instruction, operand, &use)) return false;
+            if (use.use == USIL_OPERAND_USE_SOURCE &&
+                instruction->operands[operand].type == OPERAND_TYPE_TEMP) {
+                for (int lane = 0; lane < 4; ++lane)
+                    if ((use.source_lane_mask & (1u << lane)) &&
+                        operand_variable(ctx, index, operand, lane) == variable) return false;
+            }
+            const size_t offset = ((size_t)index * DXBC_MAX_OPERANDS + (size_t)operand) * 4u;
+            for (int dimension = 0; dimension < 3; ++dimension)
+                if (ctx->ssa.relative_operand_ssa_vars[offset + (size_t)dimension] == variable) return false;
+        }
+    }
+    for (int block = 0; block < ctx->cfg.block_count; ++block) {
+        const HLSLBlockPhis *phis = &ctx->ssa.block_phis[block];
+        const HLSLBasicBlock *owner = &ctx->cfg.blocks[block];
+        if (phis->phi_count < 0 || phis->phi_count > ctx->ssa.ssa_var_count ||
+            (phis->phi_count && !phis->phis) || owner->predecessor_count < 0 ||
+            owner->predecessor_count > ctx->cfg.block_count) return false;
+        for (int item = 0; item < phis->phi_count; ++item) {
+            const HLSLPhiNode *phi = &phis->phis[item];
+            if (owner->predecessor_count && (!phi->incoming_vars || !phi->incoming_blocks)) return false;
+            for (int edge = 0; edge < owner->predecessor_count; ++edge)
+                if (phi->incoming_vars[edge] == variable) return false;
+        }
+    }
+    return true;
+}
+
+static bool scalar_dot_phi_supported(const HLSLEmitterContext *ctx, const StructuredPlan *plan,
+    int block, const HLSLPhiNode *phi) {
+    const HLSLBasicBlock *owner = &ctx->cfg.blocks[block];
+    if (!plan->natural_width || plan->loop.instruction >= 0 || plan->join_if[block] < 0 ||
+        owner->predecessor_count != 2 || !owner->predecessors ||
+        phi->component < 0 || phi->component >= 4 || phi->ssa_var < 0 ||
+        phi->ssa_var >= ctx->ssa.ssa_var_count || !phi->incoming_vars || !phi->incoming_blocks)
+        return false;
+    const uint8_t mask = (uint8_t)(1u << phi->component);
+    for (int edge = 0; edge < 2; ++edge) {
+        const int variable = phi->incoming_vars[edge];
+        if (phi->incoming_blocks[edge] != owner->predecessors[edge] ||
+            variable < 0 || variable >= ctx->ssa.ssa_var_count ||
+            plan->ssa_lane[variable] != phi->component) return false;
+        const int source = plan->ssa_value[variable];
+        if (source < 0 || source >= plan->value_count) return false;
+        const StructuredValue *value = &plan->values[source];
+        if (value->instruction < 0 || value->instruction >= ctx->program->instruction_count ||
+            !scalar_dot_opcode(ctx->program->instructions[value->instruction].opcode) ||
+            value->register_index != phi->register_index || value->mask != mask ||
+            value->width != 1 || value->predicate ||
+            !hlsl_cfg_dominates(&ctx->cfg, value->block, owner->predecessors[edge])) return false;
+    }
+    const HLSLBlockPhis *siblings = &ctx->ssa.block_phis[block];
+    if (siblings->phi_count < 0 || siblings->phi_count > ctx->ssa.ssa_var_count ||
+        (siblings->phi_count && !siblings->phis)) return false;
+    for (int item = 0; item < siblings->phi_count; ++item) {
+        const HLSLPhiNode *sibling = &siblings->phis[item];
+        if (sibling != phi && sibling->register_index == phi->register_index &&
+            !ssa_variable_unused(ctx, sibling->ssa_var)) return false;
+    }
     return true;
 }
 
@@ -613,9 +693,12 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
             if (plan->loop.instruction >= 0 && (phi->ssa_var == plan->loop.counter_phi ||
                                                 phi->ssa_var == plan->loop.predicate_phi))
                 continue;
+            const bool dot_scalar_phi = scalar_dot_phi_supported(ctx, plan, block, phi);
             int value_index = first_value;
             while (value_index < plan->value_count &&
-                   plan->values[value_index].register_index != phi->register_index)
+                   (plan->values[value_index].register_index != phi->register_index ||
+                    plan->values[value_index].dot_scalar_phi != dot_scalar_phi ||
+                    (dot_scalar_phi && plan->values[value_index].mask != (uint8_t)(1u << phi->component))))
                 ++value_index;
             if (value_index == plan->value_count) {
                 if (value_index == STRUCTURED_VALUE_LIMIT)
@@ -625,8 +708,13 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
                 value->instruction = -1;
                 value->block = block;
                 value->register_index = phi->register_index;
-                snprintf(value->name, sizeof(value->name), "dxbc_merge_i%d_r%d",
-                         ctx->cfg.blocks[block].first_instruction, phi->register_index);
+                value->dot_scalar_phi = dot_scalar_phi;
+                if (dot_scalar_phi)
+                    snprintf(value->name, sizeof(value->name), "dxbc_merge_i%d_r%d_c%d",
+                             ctx->cfg.blocks[block].first_instruction, phi->register_index, phi->component);
+                else
+                    snprintf(value->name, sizeof(value->name), "dxbc_merge_i%d_r%d",
+                             ctx->cfg.blocks[block].first_instruction, phi->register_index);
             }
             StructuredValue *value = &plan->values[value_index];
             if (phi->component < 0 || phi->component >= 4 || value->lanes[phi->component] ||
