@@ -5,6 +5,8 @@
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
 #include "translation/hlsl_global_declarations.h"
+#include "translation/hlsl_source_quality_internal.h"
+#include "translation/hlsl_stage_coverage_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -357,6 +359,126 @@ static bool other_domains_and_control_point_counts(void) {
         CHECK(source_rejected(&fixture.program));
         hull_fixture_dispose(&fixture);
     }
+    return true;
+}
+
+typedef struct {
+    HullLedger owners;
+    HullFixture *fixture;
+    size_t events, inner_value_event, reject_event, mutate_event;
+    bool rejected, mutated;
+} QuadScopeLedger;
+
+static bool observe_quad_scopes(void *context, const HLSLSourceQualityObservation *observation) {
+    QuadScopeLedger *ledger = context;
+    if (!observe_hull(&ledger->owners, observation)) return false;
+    const size_t event = ++ledger->events;
+    if (observation->kind == HLSL_SOURCE_OBSERVATION_EXPRESSION &&
+        observation->facts.instruction_index == 4 && !ledger->inner_value_event)
+        ledger->inner_value_event = event;
+    if (ledger->mutate_event == event) {
+        DXBCOperand *value = &ledger->fixture->program.instructions[4].operands[1];
+        value->imm_values[0] = value->immediate_words[0] = UINT32_C(0x40a00000);
+        ledger->mutated = true;
+    }
+    if (ledger->reject_event == event) { ledger->rejected = true; return false; }
+    return true;
+}
+
+/* FXC scopes a for-loop variable in its enclosing block. Keep the two quad
+ * phase loops in independent lexical blocks while retaining their raw owners. */
+static bool quad_factor_lexical_scopes(void) {
+    size_t size = 0;
+    uint8_t *bytes = test_tessellation_hull_shape_dxbc(false, &size);
+    HullFixture fixture;
+    CHECK(hull_fixture_parse(&fixture, bytes, size));
+    CHECK(fixture.program.instruction_count == 6 && fixture.program.tessellation.phase_count == 2 &&
+          fixture.program.instructions[4].opcode == USIL_OP_MOV && fixture.program.instructions[4].operands[1].imm_value_count == 1);
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLSourceQualityResult normal_quality, captured_quality, independent_quality;
+    HLSLExpressionSourceMap normal_map = {0}, captured_map = {0};
+    options.source_quality = &normal_quality; options.expression_source_map = &normal_map;
+    options.source_quality_pass_index = 4; options.source_quality_entry_point_index = 3;
+    QuadScopeLedger ledger = {.owners = {.program = &fixture.program}};
+    options.source_quality_observer = observe_quad_scopes; options.source_quality_observer_context = &ledger;
+    StringBuilder normal, source, independent_source;
+    sb_init(&normal); sb_init(&source); sb_init(&independent_source);
+    CHECK(hlsl_emit_with_options(&fixture.program, &normal, NULL, NULL, NULL, &options));
+    static const char scoped_loops[] =
+        "    {\n"
+        "        for (uint factorIndex = 0; factorIndex < 4; ++factorIndex) {\n"
+        "            factors.outer[factorIndex] = 2.0f;\n"
+        "        }\n"
+        "    }\n"
+        "    {\n"
+        "        for (uint factorIndex = 0; factorIndex < 2; ++factorIndex) {\n"
+        "            factors.inner[factorIndex] = 3.0f;\n"
+        "        }\n"
+        "    }\n"
+        "    return factors;\n";
+    CHECK(strstr(normal.buf, scoped_loops) && !strstr(normal.buf, "\n    for (uint factorIndex") &&
+          normal_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !normal_quality.counts.incomplete_units &&
+          !ledger.owners.bad_owner && ledger.owners.units == 7 && ledger.inner_value_event && ledger.events > ledger.inner_value_event &&
+          hlsl_expression_source_map_matches(&normal_map, &fixture.program, normal.buf));
+    HLSLStageCoverage retained = {0}, independent = {0};
+    options.source_quality = &captured_quality; options.expression_source_map = &captured_map;
+    ledger = (QuadScopeLedger){.owners = {.program = &fixture.program}};
+    CHECK(hlsl_emit_with_stage_coverage(&fixture.program, &source, NULL, NULL, NULL, &options, &retained, NULL));
+    CHECK(source.len == normal.len && !memcmp(source.buf, normal.buf, source.len + 1) &&
+          hlsl_source_quality_results_equal(&normal_quality, &captured_quality) &&
+          normal_map.count == captured_map.count && captured_map.complete && retained.unit_count == 3 &&
+          hlsl_stage_coverage_validate(&retained, &source));
+    for (size_t index = 0; index < normal_map.count; ++index)
+        CHECK(hlsl_expression_origins_equal(&normal_map.origins[index], &captured_map.origins[index]));
+    for (size_t phase = 0; phase < fixture.program.tessellation.phase_count; ++phase) {
+        const USILHullPhase *scope = &fixture.program.tessellation.phases[phase];
+        const HLSLExpressionOrigin *closing = &captured_map.origins[scope->end_instruction_index - 1];
+        static const char two_closings[] = "        }\n    }\n";
+        CHECK(closing->source_end - closing->source_begin == sizeof(two_closings) - 1 &&
+              !memcmp(source.buf + closing->source_begin, two_closings, sizeof(two_closings) - 1));
+        const HLSLExpressionOrigin *index = &captured_map.origins[scope->first_instruction_index];
+        CHECK(index->source_end - index->source_begin == strlen("factorIndex") &&
+              !memcmp(source.buf + index->source_begin, "factorIndex", strlen("factorIndex")) &&
+              index->source_begin >= strlen("        for (uint ") &&
+              !memcmp(source.buf + index->source_begin - strlen("        for (uint "), "        for (uint ", strlen("        for (uint ")));
+    }
+    const size_t value_event = ledger.inner_value_event, final_event = ledger.events;
+    options.source_quality = &independent_quality; options.expression_source_map = NULL;
+    options.source_quality_observer = NULL; options.source_quality_observer_context = NULL;
+    CHECK(hlsl_emit_with_stage_coverage(&fixture.program, &independent_source, NULL, NULL, NULL, &options, &independent, NULL));
+    CHECK(source.len == independent_source.len && !memcmp(source.buf, independent_source.buf, source.len + 1) &&
+          hlsl_source_quality_results_equal(&captured_quality, &independent_quality) &&
+          hlsl_stage_coverage_equal(&retained, &independent));
+    const DXBCOperand original_value = fixture.program.instructions[4].operands[1];
+    for (unsigned action = 0; action < 5; ++action) {
+        QuadScopeLedger failure = {.owners = {.program = &fixture.program}, .fixture = &fixture};
+        if (action < 3) failure.reject_event = action == 0 ? 1 : action == 1 ? value_event : final_event;
+        else failure.mutate_event = action == 3 ? value_event : final_event;
+        options.source_quality = &independent_quality; options.expression_source_map = &captured_map;
+        options.source_quality_observer = observe_quad_scopes;
+        options.source_quality_observer_context = &failure;
+        HLSLStageCoverage rejected = {0};
+        HLSLEmitDiagnostic diagnostic;
+        StringBuilder rejected_source; sb_init(&rejected_source);
+        CHECK(!hlsl_emit_with_stage_coverage(&fixture.program, &rejected_source, NULL, NULL, NULL, &options, &rejected, &diagnostic));
+        CHECK((failure.rejected || failure.mutated) && diagnostic.status != HLSL_EMIT_STATUS_OK &&
+              independent_quality.classification != HLSL_SOURCE_QUALITY_CLEAN && !captured_map.complete && !captured_map.count &&
+              !rejected.began && !rejected.finished && !rejected.source && !rejected.roots && !rejected.unit_count);
+        fixture.program.instructions[4].operands[1] = original_value;
+        sb_free(&rejected_source); sb_init(&rejected_source);
+        options.source_quality_observer = NULL; options.source_quality_observer_context = NULL;
+        CHECK(hlsl_emit_with_stage_coverage(&fixture.program, &rejected_source, NULL, NULL, NULL, &options, &rejected, &diagnostic));
+        CHECK(rejected_source.len == source.len && !memcmp(rejected_source.buf, source.buf, source.len + 1) &&
+              hlsl_source_quality_results_equal(&captured_quality, &independent_quality) &&
+              hlsl_stage_coverage_equal(&retained, &rejected));
+        hlsl_stage_coverage_dispose(&rejected); sb_free(&rejected_source);
+        options.source_quality_observer = observe_quad_scopes;
+    }
+    hull_fixture_dispose(&fixture);
+    CHECK(hlsl_stage_coverage_validate(&retained, &source) && hlsl_stage_coverage_validate(&independent, &independent_source) &&
+          hlsl_stage_coverage_equal(&retained, &independent));
+    hlsl_stage_coverage_dispose(&retained); hlsl_stage_coverage_dispose(&independent);
+    sb_free(&independent_source); sb_free(&source); sb_free(&normal);
     return true;
 }
 
@@ -715,6 +837,6 @@ static bool implicit_float3_points(void) {
 int main(void) {
     return natural_hull_source() && arithmetic_and_phase_ownership() &&
         malformed_contracts() && reordered_phase_roles() && scoped_cfg_ownership() &&
-        other_domains_and_control_point_counts() && explicit_control_point_phase() &&
+        other_domains_and_control_point_counts() && quad_factor_lexical_scopes() && explicit_control_point_phase() &&
         differing_control_point_counts() && owned_empty_hull_metadata() && implicit_float3_points() ? 0 : 1;
 }

@@ -59,6 +59,13 @@ static bool domain_fixture_float3(DomainFixture *fixture, const char *semantic, 
     return domain_fixture_parse(fixture, bytes, size);
 }
 
+static bool domain_fixture_float3_shape(DomainFixture *fixture, unsigned domain,
+    uint32_t points, const char *semantic, unsigned scenario) {
+    size_t size = 0;
+    uint8_t *bytes = test_tessellation_domain_float3_shape_dxbc(domain, points, semantic, scenario, &size);
+    return domain_fixture_parse(fixture, bytes, size);
+}
+
 static bool domain_fixture_init(DomainFixture *fixture, uint32_t points, uint8_t location_mask) {
     return domain_fixture_init_shape(fixture, 2, points, location_mask);
 }
@@ -422,7 +429,7 @@ static bool logical_coordinate_composition(void) {
 
 typedef struct {
     DomainLedger owners;
-    size_t events, mul_event, xyz_event, w_event, constructor_event;
+    size_t events, mul_event, coordinate_event, xyz_event, w_event, constructor_event;
     size_t reject_event, mutate_event;
     DomainFixture *fixture;
     unsigned mutation;
@@ -435,8 +442,13 @@ static bool observe_float3(void *context, const HLSLSourceQualityObservation *ob
     const size_t event = ++ledger->events;
     if (observation->kind == HLSL_SOURCE_OBSERVATION_EXPRESSION) {
         if (observation->facts.instruction_index == 0 && !ledger->mul_event) ledger->mul_event = event;
-        if (observation->facts.instruction_index == 2 && !ledger->xyz_event) ledger->xyz_event = event;
-        if (observation->facts.instruction_index == 3 && !ledger->w_event) ledger->w_event = event;
+        if ((observation->facts.logical_value_id & (UINT64_C(1) << 63)) &&
+            (observation->facts.logical_value_id & (UINT64_C(1) << 62)) && !ledger->coordinate_event)
+            ledger->coordinate_event = event;
+        if (observation->facts.instruction_index == ledger->owners.program->instruction_count - 3 && !ledger->xyz_event)
+            ledger->xyz_event = event;
+        if (observation->facts.instruction_index == ledger->owners.program->instruction_count - 2 && !ledger->w_event)
+            ledger->w_event = event;
         if (observation->facts.logical_value_id == HLSL_DOMAIN_OUTPUT_LOGICAL_ID) {
             if (observation->facts.instruction_index != -1 ||
                 observation->facts.source_instruction_index != UINT32_MAX ||
@@ -531,21 +543,40 @@ static bool float3_owned_mutations(HLSLStageCoverage *coverage,
     return true;
 }
 
-static bool float3_domain_source(const char *semantic, bool colliding_name) {
+static bool float3_domain_shape_source(unsigned domain, uint32_t points,
+    const char *semantic, bool colliding_name) {
     DomainFixture fixture;
-    CHECK(domain_fixture_float3(&fixture, semantic, TEST_DOMAIN_FLOAT3_VALID));
+    CHECK(domain_fixture_float3_shape(&fixture, domain, points, semantic, TEST_DOMAIN_FLOAT3_VALID));
     const USILProgram *program = &fixture.program;
-    CHECK(usil_signature_authority_is_valid(program) && program->instruction_count == 5 &&
+    const int xyz_index = program->instruction_count - 3;
+    const int w_index = xyz_index + 1, return_index = xyz_index + 2;
+    CHECK(usil_signature_authority_is_valid(program) && program->instruction_count == (domain == 3 ? 8 : domain == 1 ? 4 : 5) &&
+          program->tessellation.domain == domain && program->tessellation.input_control_point_count == points &&
           program->inputs[0].mask == 7 && program->inputs[0].rw_mask == 7 && !program->inputs[0].system_value &&
           program->outputs[0].mask == 15 && !program->outputs[0].rw_mask && program->outputs[0].system_value == 1);
     CHECK(!hlsl_high_level_patch_domain_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE));
-    CHECK(program->instructions[0].opcode == USIL_OP_MUL &&
-          program->instructions[1].opcode == USIL_OP_MAD && program->instructions[2].opcode == USIL_OP_MAD &&
-          program->instructions[3].opcode == USIL_OP_MOV && program->instructions[4].opcode == USIL_OP_RET);
+    CHECK(program->instructions[xyz_index].opcode == USIL_OP_MAD &&
+          program->instructions[w_index].opcode == USIL_OP_MOV && program->instructions[return_index].opcode == USIL_OP_RET);
+    if (domain == 2) CHECK(program->instructions[0].opcode == USIL_OP_MUL && program->instructions[1].opcode == USIL_OP_MAD);
+    else CHECK(program->instructions[0].opcode == USIL_OP_ADD &&
+               program->instructions[0].operands[2].has_neg &&
+               program->instructions[0].operands[2].extended_token_count == 1 &&
+               program->instructions[0].operands[2].extended_tokens[0] == 0x41);
     for (int index = 0; index < program->instruction_count; ++index)
         CHECK(program->instructions[index].source_instruction_index == (uint32_t)(7 + index));
-    CHECK(usil_operand_destination_lane_mask(&program->instructions[2].operands[0]) == 7 &&
-          usil_operand_destination_lane_mask(&program->instructions[3].operands[0]) == 8);
+    CHECK(program->signature_declaration_count == 3 && program->signature_declarations[0].mask == (domain == 2 ? 7 : 3) &&
+          program->signature_declarations[1].array_element_count == points &&
+          program->patch_constant_count == (domain == 3 ? 6 : domain == 1 ? 2 : 4));
+    for (int factor = 0; factor < program->patch_constant_count; ++factor) {
+        const unsigned outer = domain == 3 ? 4 : domain == 1 ? 2 : 3;
+        const unsigned system = domain == 3 ? ((unsigned)factor < outer ? 11 : 12) :
+            domain == 1 ? (factor ? 15 : 16) : ((unsigned)factor < outer ? 13 : 14);
+        CHECK(program->patch_constants[factor].system_value == system && program->patch_constants[factor].mask == 1 &&
+              !program->patch_constants[factor].rw_mask && program->patch_constants[factor].register_id == (uint32_t)factor &&
+              program->patch_constants[factor].semantic_index == ((unsigned)factor < outer ? (unsigned)factor : (unsigned)factor - outer));
+    }
+    CHECK(usil_operand_destination_lane_mask(&program->instructions[xyz_index].operands[0]) == 7 &&
+          usil_operand_destination_lane_mask(&program->instructions[w_index].operands[0]) == 8);
     HLSLEmitNames names = {.entry_point = colliding_name ? "attribute0" : "domain", .input_struct = "DomainPoint"};
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
     HLSLSourceQualityResult normal_quality, captured_quality, independent_quality;
@@ -561,15 +592,25 @@ static bool float3_domain_source(const char *semantic, bool colliding_name) {
     CHECK(normal_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !normal_quality.counts.residual_total &&
           !normal_quality.counts.unknown_provenance && !normal_quality.counts.incomplete_units &&
           normal_quality.counts.inspected_units == 1);
-    CHECK(!ledger.owners.bad_owner && ledger.owners.points == 7 && ledger.owners.location &&
+    CHECK(!ledger.owners.bad_owner && ledger.owners.points == (uint8_t)((1u << points) - 1u) && ledger.owners.location &&
           ledger.xyz_event && ledger.w_event && ledger.constructor_event);
     char input_semantic[192];
     const int length = snprintf(input_semantic, sizeof(input_semantic), " : %s;", semantic);
     CHECK(length > 0 && (size_t)length < sizeof(input_semantic) && strstr(normal.buf, input_semantic));
-    CHECK(strstr(normal.buf, "float3 ") && strstr(normal.buf, "OutputPatch<DomainPoint, 3>") &&
+    char patch_argument[64];
+    const int patch_length = snprintf(patch_argument, sizeof(patch_argument), "OutputPatch<DomainPoint, %u>", points);
+    CHECK(patch_length > 0 && (size_t)patch_length < sizeof(patch_argument));
+    CHECK(strstr(normal.buf, "float3 ") && strstr(normal.buf, patch_argument) &&
           strstr(normal.buf, "return float4(") && !strstr(normal.buf, "output.") &&
           !strstr(normal.buf, ".xyzx") && !strstr(normal.buf, ".yyyy") &&
           !strstr(normal.buf, ".zzzz") && !strstr(normal.buf, "asfloat("));
+    CHECK(strstr(normal.buf, domain == 2 ? "[domain(\"tri\")]" : domain == 3 ? "[domain(\"quad\")]" : "[domain(\"isoline\")]"));
+    if (domain == 3) CHECK(strstr(normal.buf, "float outer[4] : SV_TessFactor;") &&
+                          strstr(normal.buf, "float inner[2] : SV_InsideTessFactor;") &&
+                          strstr(normal.buf, "float2 coordinates : SV_DomainLocation"));
+    if (domain == 1) CHECK(strstr(normal.buf, "float outer[2] : SV_TessFactor;") &&
+                          !strstr(normal.buf, "SV_InsideTessFactor") &&
+                          strstr(normal.buf, "float2 coordinates : SV_DomainLocation"));
     CHECK(hlsl_expression_source_map_matches(&normal_map, program, normal.buf));
     HLSLStageCoverage coverage = {0}, independent = {0};
     options.source_quality = &captured_quality; options.expression_source_map = &captured_map;
@@ -595,12 +636,12 @@ static bool float3_domain_source(const char *semantic, bool colliding_name) {
           coverage.domain_output.recorded_root_captured && coverage.domain_output.root_index < coverage.root_count);
     const HLSLDomainOutputPlan *plan = &coverage.domain_output.plan;
     CHECK(plan->output.mask == 15 && !plan->output.rw_mask &&
-          plan->pieces[0].instruction_index == 2 && plan->pieces[0].source_instruction_index == 9 &&
+          plan->pieces[0].instruction_index == xyz_index && plan->pieces[0].source_instruction_index == (uint32_t)(7 + xyz_index) &&
           plan->pieces[0].mask == 7 && plan->pieces[0].width == 3 && !plan->pieces[0].scalar_immediate &&
-          plan->pieces[1].instruction_index == 3 && plan->pieces[1].source_instruction_index == 10 &&
+          plan->pieces[1].instruction_index == w_index && plan->pieces[1].source_instruction_index == (uint32_t)(7 + w_index) &&
           plan->pieces[1].mask == 8 && plan->pieces[1].width == 1 && plan->pieces[1].scalar_immediate &&
           plan->pieces[1].immediate_bits == UINT32_C(0x3f800000) &&
-          plan->return_instruction_index == 4 && plan->return_source_instruction_index == 11);
+          plan->return_instruction_index == return_index && plan->return_source_instruction_index == (uint32_t)(7 + return_index));
     const HLSLStageOwnedRoot *constructor = &coverage.roots[coverage.domain_output.root_index];
     CHECK(coverage.domain_output.return_emitted && coverage.domain_output.recorded_return_emitted &&
           constructor->begin == coverage.domain_output.return_begin + strlen("    return ") &&
@@ -615,11 +656,11 @@ static bool float3_domain_source(const char *semantic, bool colliding_name) {
     unsigned actual_pieces = 0;
     for (size_t root = 0; root < coverage.root_count; ++root) {
         const HLSLStageOwnedRoot *child = &coverage.roots[root];
-        if (child->owner.kind != HLSL_STAGE_ROOT_INSTRUCTION || child->instruction < 2 || child->instruction > 3) continue;
-        const unsigned piece = (unsigned)(child->instruction - 2);
+        if (child->owner.kind != HLSL_STAGE_ROOT_INSTRUCTION || child->instruction < xyz_index || child->instruction > w_index) continue;
+        const unsigned piece = (unsigned)(child->instruction - xyz_index);
         CHECK(!(actual_pieces & (1u << piece)) && child->tree->logical_origin.complete &&
               child->tree->logical_origin.instruction_index == child->instruction &&
-              child->tree->logical_origin.source_instruction_index == (uint32_t)(9 + piece) &&
+              child->tree->logical_origin.source_instruction_index == (uint32_t)(7 + xyz_index + (int)piece) &&
               child->tree->logical_origin.destination_lanes == (piece ? 8 : 7) &&
               child->tree->logical_origin.components == (piece ? 1 : 3) &&
               constructor->begin < child->begin && child->end < constructor->end);
@@ -627,11 +668,12 @@ static bool float3_domain_source(const char *semantic, bool colliding_name) {
                          child->tree->u.literal.val[0] == UINT32_C(0x3f800000));
         actual_pieces |= 1u << piece;
     }
-    CHECK(actual_pieces == 3 && captured_map.origins[2].destination_lanes == 7 &&
-          captured_map.origins[3].destination_lanes == 8 && captured_map.origins[4].kind == HLSL_EXPRESSION_ORIGIN_RETURN &&
-          captured_map.origins[4].source_begin < constructor->begin &&
-          constructor->end < captured_map.origins[4].source_end &&
-          !memcmp(source.buf + captured_map.origins[4].source_begin, "return ", strlen("return ")));
+    CHECK(captured_map.count == (size_t)program->instruction_count);
+    CHECK(actual_pieces == 3 && captured_map.origins[xyz_index].destination_lanes == 7 &&
+          captured_map.origins[w_index].destination_lanes == 8 && captured_map.origins[return_index].kind == HLSL_EXPRESSION_ORIGIN_RETURN &&
+          captured_map.origins[return_index].source_begin < constructor->begin &&
+          constructor->end < captured_map.origins[return_index].source_end &&
+          !memcmp(source.buf + captured_map.origins[return_index].source_begin, "return ", strlen("return ")));
     options.source_quality = &independent_quality; options.expression_source_map = NULL;
     CHECK(hlsl_emit_with_stage_coverage(program, &other_source, NULL, NULL, &names, &options, &independent, &diagnostic));
     CHECK(source.len == other_source.len && !memcmp(source.buf, other_source.buf, source.len + 1) &&
@@ -643,6 +685,10 @@ static bool float3_domain_source(const char *semantic, bool colliding_name) {
     hlsl_stage_coverage_dispose(&independent); hlsl_stage_coverage_dispose(&coverage);
     sb_free(&other_source); sb_free(&source); sb_free(&normal);
     return true;
+}
+
+static bool float3_domain_source(const char *semantic, bool colliding_name) {
+    return float3_domain_shape_source(2, 3, semantic, colliding_name);
 }
 
 static bool float3_rejected(const USILProgram *program) {
@@ -807,6 +853,226 @@ static bool float3_observer_rollback(void) {
     return true;
 }
 
+typedef struct {
+    USILProgram program;
+    USILInstruction instructions[8];
+    USILSignatureDeclaration declarations[3];
+    DXBCSignatureElement input, output, factors[6];
+} DomainShapeSnapshot;
+
+static bool domain_shape_snapshot(const USILProgram *program, DomainShapeSnapshot *snapshot) {
+    CHECK(program->instruction_count > 0 && program->instruction_count <= 8 &&
+          program->signature_declaration_count == 3 && program->patch_constant_count > 0 && program->patch_constant_count <= 6);
+    *snapshot = (DomainShapeSnapshot){.program = *program, .input = program->inputs[0], .output = program->outputs[0]};
+    memcpy(snapshot->instructions, program->instructions, (size_t)program->instruction_count * sizeof(*program->instructions));
+    memcpy(snapshot->declarations, program->signature_declarations, sizeof(snapshot->declarations));
+    memcpy(snapshot->factors, program->patch_constants, (size_t)program->patch_constant_count * sizeof(*program->patch_constants));
+    return true;
+}
+
+static void domain_shape_restore(USILProgram *program, const DomainShapeSnapshot *snapshot) {
+    *program = snapshot->program;
+    program->inputs[0] = snapshot->input; program->outputs[0] = snapshot->output;
+    memcpy(program->instructions, snapshot->instructions, (size_t)program->instruction_count * sizeof(*program->instructions));
+    memcpy(program->signature_declarations, snapshot->declarations, sizeof(snapshot->declarations));
+    memcpy(program->patch_constants, snapshot->factors, (size_t)program->patch_constant_count * sizeof(*program->patch_constants));
+}
+
+static bool domain_shape_source_matches(const USILProgram *program, const HLSLStageCoverage *retained,
+    const StringBuilder *reference, const HLSLSourceQualityResult *reference_quality,
+    const HLSLExpressionSourceMap *reference_map) {
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLSourceQualityResult quality;
+    HLSLExpressionSourceMap map = {0};
+    options.source_quality = &quality; options.expression_source_map = &map;
+    options.source_quality_pass_index = 6; options.source_quality_entry_point_index = 2;
+    HLSLStageCoverage current = {0};
+    StringBuilder source; sb_init(&source);
+    CHECK(hlsl_emit_with_stage_coverage(program, &source, NULL, NULL, NULL, &options, &current, NULL));
+    CHECK(source.len == reference->len && !memcmp(source.buf, reference->buf, source.len + 1) &&
+          hlsl_source_quality_results_equal(&quality, reference_quality) &&
+          map.complete && map.count == reference_map->count &&
+          float3_capture_matches(&current, retained, &source, reference));
+    for (size_t index = 0; index < map.count; ++index)
+        CHECK(hlsl_expression_origins_equal(&map.origins[index], &reference_map->origins[index]));
+    hlsl_stage_coverage_dispose(&current); sb_free(&source);
+    return true;
+}
+
+static bool float3_shape_rejections(unsigned domain, uint32_t points) {
+    for (unsigned scenario = TEST_DOMAIN_FLOAT3_MISSING_W; scenario <= TEST_DOMAIN_FLOAT3_REORDERED_WRITES; ++scenario) {
+        DomainFixture malformed;
+        CHECK(domain_fixture_float3_shape(&malformed, domain, points, "POINTVALUE", scenario));
+        CHECK(float3_rejected(&malformed.program));
+        domain_fixture_dispose(&malformed);
+    }
+    DomainFixture fixture;
+    CHECK(domain_fixture_float3_shape(&fixture, domain, points, "POINTVALUE", TEST_DOMAIN_FLOAT3_VALID));
+    USILProgram *program = &fixture.program;
+    DomainShapeSnapshot saved;
+    CHECK(domain_shape_snapshot(program, &saved));
+    const int xyz = program->instruction_count - 3, w = xyz + 1;
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLSourceQualityResult quality;
+    HLSLExpressionSourceMap map = {0};
+    options.source_quality = &quality; options.expression_source_map = &map;
+    options.source_quality_pass_index = 6; options.source_quality_entry_point_index = 2;
+    HLSLStageCoverage retained = {0};
+    StringBuilder reference; sb_init(&reference);
+    CHECK(hlsl_emit_with_stage_coverage(program, &reference, NULL, NULL, NULL, &options, &retained, NULL));
+    DXBCOperand relative = {.type = OPERAND_TYPE_TEMP, .register_index_dim = 1,
+        .index_has_immediate = {true}, .swizzle_mode = 2};
+    for (unsigned mutation = 0; mutation < 29; ++mutation) {
+        switch (mutation) {
+        case 0: program->tessellation.domain = domain == 3 ? 1 : 3; break;
+        case 1: program->tessellation.valid = false; break;
+        case 2: program->has_stage_contract = false; break;
+        case 3: --program->patch_constant_count; break;
+        case 4: program->patch_constants[0].system_value = domain == 3 ? 12 : 15; break;
+        case 5: program->patch_constants[0].rw_mask = 14; break;
+        case 6: program->patch_constants[0].semantic_index = 1; break;
+        case 7: program->patch_constants[1].register_id = 0; break;
+        case 8: program->signature_declarations[1].array_element_count = points + 1; break;
+        case 9: program->tessellation.input_control_point_count = points + 1; break;
+        case 10: program->instructions[0].operands[1].register_index = (int)points;
+                 program->instructions[0].operands[1].index_values[0] = points; break;
+        case 11: program->instructions[0].operands[1].rel_op0 = &relative;
+                 program->instructions[0].operands[1].index_representations[0] = 2;
+                 program->instructions[0].operands[1].index_has_immediate[0] = false; break;
+        case 12: program->instructions[0].operands[1].swizzle[2] = 3; break;
+        case 13: memset(program->instructions[1].operands[2].swizzle, 2, sizeof(program->instructions[1].operands[2].swizzle));
+                 program->instructions[1].operands[2].raw_token = 0x0001caa6; break;
+        case 14: program->signature_declarations[0].mask = 4; break;
+        case 15: program->signature_declarations[0].mask = 2; break;
+        case 16: program->outputs[0].rw_mask = 1; break;
+        case 17: program->inputs[0].rw_mask = 3; break;
+        case 18: program->instructions[xyz].operands[0].destination_mask = 0x30; break;
+        case 19: program->instructions[w].operands[0].destination_mask = 0x10; break;
+        case 20: program->instructions[w].operands[0].register_index = 1;
+                 program->instructions[w].operands[0].index_values[0] = 1; break;
+        case 21: program->instructions[w].operands[1].imm_value_count = 4; break;
+        case 22: program->instructions[w].operands[1].has_neg = true; break;
+        case 23: program->instructions[xyz].opcode = USIL_OP_MUL;
+                 program->instructions[xyz].operand_count = 3; break;
+        case 24: program->instructions[xyz] = saved.instructions[w];
+                 program->instructions[w] = saved.instructions[xyz];
+                 program->instructions[xyz].source_instruction_index = (uint32_t)(xyz + 7);
+                 program->instructions[w].source_instruction_index = (uint32_t)(w + 7); break;
+        case 25: program->instructions[0].opcode = USIL_OP_DIV; break;
+        case 26: program->instructions[xyz].precise_mask = 7; break;
+        case 27: program->signature_declarations[2].system_value_name = 0; break;
+        case 28: program->instructions[program->instruction_count - 1].opcode = USIL_OP_NOP; break;
+        }
+        /* The interface binds CP indices and declarations; the expression
+         * producer separately rejects a demanded undeclared CP.W component. */
+        const bool interface_supported = hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE);
+        if (interface_supported != (mutation == 12))
+            fprintf(stderr, "DOMAIN shape boundary: domain=%u mutation=%u interface_supported=%d\n",
+                    domain, mutation, interface_supported);
+        CHECK(interface_supported == (mutation == 12));
+        CHECK(float3_rejected(program));
+        domain_shape_restore(program, &saved);
+        CHECK(domain_shape_source_matches(program, &retained, &reference, &quality, &map));
+    }
+    hlsl_stage_coverage_dispose(&retained); sb_free(&reference); domain_fixture_dispose(&fixture);
+    return true;
+}
+
+typedef struct {
+    Float3Ledger observations;
+    DomainFixture *fixture;
+    size_t mutation_event;
+    unsigned mutation;
+    bool mutated, valid_mutation;
+} DomainShapeDrift;
+
+static bool observe_domain_shape_drift(void *context, const HLSLSourceQualityObservation *observation) {
+    DomainShapeDrift *drift = context;
+    if (!observe_float3(&drift->observations, observation)) return false;
+    if (drift->observations.events != drift->mutation_event) return true;
+    USILProgram *program = &drift->fixture->program;
+    const int w = program->instruction_count - 2;
+    switch (drift->mutation) {
+    case 0: program->instructions[w].operands[1].imm_values[0] = UINT32_C(0x40000000);
+            program->instructions[w].operands[1].immediate_words[0] = UINT32_C(0x40000000); break;
+    case 1: program->instructions[0].operands[1].register_index = program->tessellation.domain == 3 ? 3 : 0;
+            program->instructions[0].operands[1].index_values[0] = (uint64_t)program->instructions[0].operands[1].register_index; break;
+    case 2: memset(program->instructions[1].operands[2].swizzle, 1, sizeof(program->instructions[1].operands[2].swizzle));
+            program->instructions[1].operands[2].raw_token = 0x0001c556; break;
+    case 3: memset(program->inputs[0].semantic_name, 0, sizeof(program->inputs[0].semantic_name));
+            memcpy(program->inputs[0].semantic_name, "OBJECTCOORD", sizeof("OBJECTCOORD"));
+            program->inputs[0].semantic_name_length = strlen("OBJECTCOORD"); break;
+    case 4: ++program->instructions[w].source_instruction_index; break;
+    case 5: program->patch_constants[0].rw_mask = 14; break;
+    }
+    drift->mutated = true;
+    drift->valid_mutation = hlsl_high_level_domain_interface_supported(program, HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE);
+    return true;
+}
+
+static bool float3_shape_observer_rollback(unsigned domain, uint32_t points) {
+    DomainFixture fixture;
+    CHECK(domain_fixture_float3_shape(&fixture, domain, points, "POINTVALUE", TEST_DOMAIN_FLOAT3_VALID));
+    DomainShapeSnapshot saved;
+    CHECK(domain_shape_snapshot(&fixture.program, &saved));
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLSourceQualityResult quality;
+    HLSLExpressionSourceMap map = {0};
+    options.source_quality = &quality; options.expression_source_map = &map;
+    options.source_quality_pass_index = 6; options.source_quality_entry_point_index = 2;
+    Float3Ledger baseline = {.owners = {.program = &fixture.program}};
+    options.source_quality_observer = observe_float3; options.source_quality_observer_context = &baseline;
+    HLSLStageCoverage retained = {0};
+    StringBuilder reference; sb_init(&reference);
+    CHECK(hlsl_emit_with_stage_coverage(&fixture.program, &reference, NULL, NULL, NULL, &options, &retained, NULL));
+    CHECK(baseline.mul_event && baseline.coordinate_event && baseline.xyz_event && baseline.w_event &&
+          baseline.constructor_event && baseline.events > baseline.constructor_event && !baseline.owners.bad_owner);
+    const HLSLSourceQualityResult reference_quality = quality;
+    const HLSLExpressionSourceMap reference_map = map;
+    const size_t rejection_events[] = {1, baseline.xyz_event, baseline.w_event, baseline.constructor_event, baseline.events};
+    for (size_t action = 0; action < sizeof(rejection_events) / sizeof(*rejection_events) + 8; ++action) {
+      for (unsigned captured = 0; captured < 2; ++captured) {
+        DomainShapeDrift drift = {.observations = {.owners = {.program = &fixture.program}}, .fixture = &fixture};
+        const bool veto = action < sizeof(rejection_events) / sizeof(*rejection_events);
+        if (veto) drift.observations.reject_event = rejection_events[action];
+        else {
+            const unsigned mutation_action = (unsigned)(action - sizeof(rejection_events) / sizeof(*rejection_events));
+            drift.mutation = mutation_action < 6 ? mutation_action : mutation_action - 6;
+            drift.mutation_event = mutation_action >= 6 ? baseline.events : drift.mutation == 0 ? baseline.w_event :
+                drift.mutation == 1 ? baseline.mul_event : drift.mutation == 2 ? baseline.coordinate_event :
+                drift.mutation == 3 ? baseline.xyz_event : 1;
+        }
+        options.source_quality_observer = observe_domain_shape_drift; options.source_quality_observer_context = &drift;
+        HLSLStageCoverage rejected = {0};
+        HLSLEmitDiagnostic diagnostic;
+        StringBuilder source; sb_init(&source);
+        const bool emitted = captured
+            ? hlsl_emit_with_stage_coverage(&fixture.program, &source, NULL, NULL, NULL, &options, &rejected, &diagnostic)
+            : hlsl_emit_with_options_diagnostic(&fixture.program, &source, NULL, NULL, NULL, &options, &diagnostic);
+        CHECK(!emitted && (drift.observations.rejected || drift.mutated) && diagnostic.status != HLSL_EMIT_STATUS_OK &&
+              quality.classification != HLSL_SOURCE_QUALITY_CLEAN && !map.complete && (!captured || !map.count) &&
+              !rejected.began && !rejected.finished && !rejected.source && !rejected.roots &&
+              hlsl_stage_coverage_domain_output_empty(&rejected.domain_output));
+        options.source_quality_observer = NULL; options.source_quality_observer_context = NULL;
+        sb_free(&source); sb_init(&source);
+        if (drift.mutated && drift.mutation < 4) {
+            CHECK(drift.valid_mutation);
+            CHECK(hlsl_emit_with_stage_coverage(&fixture.program, &source, NULL, NULL, NULL, &options, &rejected, &diagnostic));
+            CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && map.complete &&
+                  hlsl_expression_source_map_matches(&map, &fixture.program, source.buf) &&
+                  hlsl_stage_coverage_validate(&rejected, &source) && !hlsl_stage_coverage_equal(&rejected, &retained) &&
+                  (source.len != reference.len || memcmp(source.buf, reference.buf, source.len)));
+            hlsl_stage_coverage_dispose(&rejected);
+        }
+        domain_shape_restore(&fixture.program, &saved);
+        CHECK(domain_shape_source_matches(&fixture.program, &retained, &reference, &reference_quality, &reference_map));
+        hlsl_stage_coverage_dispose(&rejected); sb_free(&source);
+      }
+    }
+    hlsl_stage_coverage_dispose(&retained); sb_free(&reference); domain_fixture_dispose(&fixture);
+    return true;
+}
+
 static bool unchanged_float4_capture(void) {
     DomainFixture fixture;
     CHECK(domain_fixture_init(&fixture, 3, 7));
@@ -878,6 +1144,9 @@ int main(void) {
         !other_domain_shapes() || !factor_group_order() || !separated_point_and_location_identity() || !logical_coordinate_composition() ||
         !float3_domain_source("POINTVALUE", false) || !float3_domain_source("OBJECTCOORD", false) ||
         !float3_domain_source("COLOR", false) || !float3_domain_source("POINTVALUE", true) ||
+        !float3_domain_shape_source(3, 4, "POINTVALUE", false) || !float3_domain_shape_source(1, 2, "OBJECTCOORD", true) ||
+        !float3_shape_rejections(3, 4) || !float3_shape_rejections(1, 2) ||
+        !float3_shape_observer_rollback(3, 4) || !float3_shape_observer_rollback(1, 2) ||
         !float3_program_rejections() || !float3_observer_rollback() || !unchanged_float4_capture() ||
         !domain_capture_argument_preservation()) return 1;
     puts("Domain source units passed");

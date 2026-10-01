@@ -211,8 +211,9 @@ bool hlsl_custom_zero_index_semantic_supported(const char *semantic) {
 static bool domain_output_shape(const USILProgram *program, HLSLDomainOutputPlan *plan) {
   if (!plan) return false;
   memset(plan, 0, sizeof(*plan));
+  HLSLDomainShape shape;
   if (!program || program->program_type != DXBC_PROGRAM_TYPE_DOMAIN ||
-      program->tessellation.domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE ||
+      !hlsl_domain_shape(program->tessellation.domain, &shape) ||
       !program->inputs || program->input_count != 1 || program->input_alloc < 1 ||
       program->inputs[0].mask != 7 || program->inputs[0].rw_mask != 7 ||
       !hlsl_custom_zero_index_semantic_supported(dxbc_signature_semantic_name(&program->inputs[0])) ||

@@ -1562,16 +1562,23 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
         (unsigned)ctx->program->tessellation.input_control_point_count, plan.names[PATCH_VARIABLE],
         plan.names[FACTOR_TYPE], plan.names[FACTOR_VARIABLE]);
     hlsl_source_quality_emission(ctx, 0, false, -1);
+    /* FXC retains a for-loop variable in its enclosing scope. Quad's two
+     * indexed factor phases therefore need separate lexical phase scopes. */
+    const bool separated_indexed_groups = plan.shape.outer_count > 1 && plan.shape.inner_count > 1;
     for (int phase = 0; phase < (int)ctx->program->tessellation.phase_count; ++phase) {
         if (phase == plan.control_point_phase) continue;
         if (!prepare_phase(ctx, &plan, phase)) goto finish;
         const USILHullPhase *owned = &ctx->program->tessellation.phases[phase];
         const unsigned instances = owned->instance_count;
         if (instances > 1) {
-            sb_append(sb, "    for (uint ");
+            if (separated_indexed_groups) {
+                sb_append(sb, "    {\n");
+                hlsl_source_quality_emission(ctx, 0, false, -1);
+            }
+            sb_append(sb, separated_indexed_groups ? "        for (uint " : "    for (uint ");
             const size_t index_begin = sb->len;
             sb_appendf(sb, "%s = 0; %s < %u; ++%s) {\n", plan.names[FACTOR_INDEX], plan.names[FACTOR_INDEX], instances, plan.names[FACTOR_INDEX]);
-            ctx->indent = 8;
+            ctx->indent = separated_indexed_groups ? 12 : 8;
             hlsl_source_quality_emission(ctx, 0, true, -1);
             for (int instruction = owned->first_instruction_index; instruction < owned->end_instruction_index; ++instruction)
                 if (hlsl_instruction_owners_contains(&plan.index_transports, instruction)) {
@@ -1598,7 +1605,7 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
             .assignment_span = record_factor_assignment, .context = &plan};
         if (!hlsl_emit_pure_expression_scope(ctx, &scope)) goto finish;
         const size_t phase_end_begin = sb->len;
-        sb_append(sb, "    }\n");
+        sb_append(sb, separated_indexed_groups && instances > 1 ? "        }\n    }\n" : "    }\n");
         hlsl_source_quality_emission(ctx, 0, false, owned->end_instruction_index - 1);
         if (ctx->expression_source_map) {
             HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[owned->end_instruction_index - 1];

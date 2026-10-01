@@ -45,6 +45,11 @@ enum {
  * no compiler target bytes or serialized parameter authority are copied. */
 uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points,
     const char *semantic, unsigned scenario, size_t *size);
+/* Shape-specific authored interpolation: triangle barycentric, quad bilinear,
+ * or isoline linear. All retain independent MAD XYZ, scalar MOV W and RET
+ * owners. The triangle wrapper above preserves its existing token bytes. */
+uint8_t *test_tessellation_domain_float3_shape_dxbc(unsigned domain, uint32_t points,
+    const char *semantic, unsigned scenario, size_t *size);
 /* Writes the existing fixed signature grammar into a sufficiently sized test
  * buffer; this helper is also used by hull quad/isoline token authors. */
 size_t test_tessellation_hull_signature(uint8_t *bytes, unsigned role, bool inner_first);

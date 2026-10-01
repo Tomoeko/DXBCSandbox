@@ -16,7 +16,7 @@ typedef struct {
 } HLSLEmitNames;
 
 #define HLSL_HIGH_LEVEL_LIFT_ID "float4-expressions"
-#define HLSL_HIGH_LEVEL_LIFT_VERSION 35U
+#define HLSL_HIGH_LEVEL_LIFT_VERSION 36U
 #define HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT 256
 
 typedef enum {
@@ -172,6 +172,8 @@ typedef enum HLSLEmitMode {
      * Parsed triangle/quad/isoline DOMAIN stages admit one float4 control-point
      * field, static OutputPatch indexing, typed domain coordinates, actual factor
      * interfaces and generic SSA expressions, within their own 64-instruction cap.
+     * v36 extends the owned float3 point/output constructor to all three domains:
+     * a final MAD.xyz and literal MOV.w retain separate writers before RET.
      * HULL candidates admit independent scalar-factor fork phases, implicit
      * control-point passthrough and a pure float4 control-point phase with
      * phase-owned temporary bounds and index provenance, with output counts no

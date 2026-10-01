@@ -6,6 +6,7 @@
 #include "dxbc/dxbc_compare.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_source_quality.h"
 #include "translation/hlsl_source_quality_internal.h"
 #include "translation/hlsl_stage_coverage_internal.h"
@@ -20,7 +21,8 @@ enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096,
        PROBE_COMPILE_SLOTS = 7, PROBE_DOMAIN_INSTRUCTION_LIMIT = 64,
        PROBE_DOMAIN_DECLARATION_LIMIT = 32, PROBE_DOMAIN_SIGNATURE_LIMIT = 16,
        PROBE_DOMAIN_OPERAND_LIMIT = 128, PROBE_DOMAIN_OPERAND_DEPTH_LIMIT = 4,
-       PROBE_LINKED_STAGE_COUNT = 2, PROBE_LINKED_COMPILE_SLOTS = 12 };
+       PROBE_LINKED_STAGE_COUNT = 2, PROBE_LINKED_COMPILE_SLOTS = 12,
+       PROBE_LINKED_FACTOR_LIMIT = 6, PROBE_LINKED_CONTROL_POINT_LIMIT = 32 };
 
 typedef struct {
     size_t begin, end;
@@ -43,7 +45,9 @@ typedef struct {
     DXBCProgramType stage;
     DXBCTessellatorDomain domain;
     uint32_t input_control_points, output_control_points;
-    DXBCSignatureElement input, output, patch_constants[4];
+    uint8_t coordinate_count, outer_count, inner_count;
+    bool inner_first;
+    DXBCSignatureElement input, output, patch_constants[PROBE_LINKED_FACTOR_LIMIT];
     bool valid;
 } ProbeLinkedInterface;
 
@@ -54,32 +58,47 @@ static bool linked_inline_signature(const DXBCSignatureElement *signature) {
 
 static bool linked_interface_freeze(const USILProgram *program,
                                     ProbeLinkedInterface *interface) {
+    HLSLDomainShape shape;
+    bool inner_first;
     if (!program || !interface || interface->valid ||
         (program->program_type != DXBC_PROGRAM_TYPE_HULL &&
          program->program_type != DXBC_PROGRAM_TYPE_DOMAIN) ||
-        program->tessellation.domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE ||
-        program->tessellation.input_control_point_count != 3 ||
+        !program->has_stage_contract || !program->has_parsed_signature_authority ||
+        !program->tessellation.valid ||
+        !hlsl_domain_shape(program->tessellation.domain, &shape) ||
+        (unsigned)shape.outer_count + (unsigned)shape.inner_count > (unsigned)PROBE_LINKED_FACTOR_LIMIT ||
+        !program->tessellation.input_control_point_count ||
+        program->tessellation.input_control_point_count > (unsigned)PROBE_LINKED_CONTROL_POINT_LIMIT ||
         program->tessellation.output_control_point_count !=
-            (program->program_type == DXBC_PROGRAM_TYPE_HULL ? 3u : 0u) ||
+            (program->program_type == DXBC_PROGRAM_TYPE_HULL
+                ? program->tessellation.input_control_point_count : 0u) ||
         program->input_count != 1 || program->output_count != 1 ||
-        program->patch_constant_count != 4 || !program->inputs ||
-        !program->outputs || !program->patch_constants ||
+        program->input_alloc < 1 || program->output_alloc < 1 ||
+        program->patch_constant_count != (int)shape.outer_count + (int)shape.inner_count ||
+        program->patch_constant_alloc < program->patch_constant_count ||
+        !program->inputs || !program->outputs || !program->patch_constants ||
+        !usil_signature_authority_is_valid(program) ||
+        !hlsl_domain_factor_order(program, &inner_first) ||
         !linked_inline_signature(program->inputs) ||
         !linked_inline_signature(program->outputs)) return false;
     ProbeLinkedInterface captured = {
         .stage = program->program_type, .domain = program->tessellation.domain,
         .input_control_points = program->tessellation.input_control_point_count,
         .output_control_points = program->tessellation.output_control_point_count,
+        .coordinate_count = shape.coordinate_count,
+        .outer_count = shape.outer_count, .inner_count = shape.inner_count,
+        .inner_first = inner_first,
         .input = program->inputs[0], .output = program->outputs[0]};
+    const unsigned factor_count = (unsigned)shape.outer_count + (unsigned)shape.inner_count;
     unsigned seen = 0;
-    for (int index = 0; index < 4; ++index) {
+    for (unsigned index = 0; index < factor_count; ++index) {
         const DXBCSignatureElement *signature = &program->patch_constants[index];
-        if (!linked_inline_signature(signature) || signature->register_id >= 4 ||
+        if (!linked_inline_signature(signature) || signature->register_id >= factor_count ||
             (seen & (1u << signature->register_id))) return false;
         seen |= 1u << signature->register_id;
         captured.patch_constants[signature->register_id] = *signature;
     }
-    if (seen != 15) return false;
+    if (seen != (1u << factor_count) - 1u) return false;
     captured.valid = true;
     *interface = captured;
     return true;
@@ -102,10 +121,16 @@ static bool linked_signature_equal(const DXBCSignatureElement *left,
 
 static bool linked_interfaces_match(const ProbeLinkedInterface *hull,
                                     const ProbeLinkedInterface *domain) {
+    HLSLDomainShape shape;
     if (!hull || !domain || !hull->valid || !domain->valid ||
         hull->stage != DXBC_PROGRAM_TYPE_HULL || domain->stage != DXBC_PROGRAM_TYPE_DOMAIN ||
-        hull->domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE || hull->domain != domain->domain ||
-        hull->input_control_points != 3 || hull->output_control_points != 3 ||
+        !hlsl_domain_shape(hull->domain, &shape) || hull->domain != domain->domain ||
+        hull->coordinate_count != shape.coordinate_count || domain->coordinate_count != shape.coordinate_count ||
+        hull->outer_count != shape.outer_count || domain->outer_count != shape.outer_count ||
+        hull->inner_count != shape.inner_count || domain->inner_count != shape.inner_count ||
+        hull->inner_first != domain->inner_first || (!shape.inner_count && hull->inner_first) ||
+        !hull->input_control_points || hull->input_control_points > (unsigned)PROBE_LINKED_CONTROL_POINT_LIMIT ||
+        hull->output_control_points != hull->input_control_points ||
         domain->input_control_points != hull->output_control_points || domain->output_control_points ||
         hull->input.mask != 7 || hull->input.component_type != 3 || hull->input.system_value ||
         hull->input.register_id || hull->input.semantic_index ||
@@ -115,9 +140,18 @@ static bool linked_interfaces_match(const ProbeLinkedInterface *hull,
         domain->output.mask != 15 || domain->output.component_type != 3 ||
         domain->output.system_value != 1 || domain->output.register_id ||
         domain->output.semantic_index || domain->output.rw_mask) return false;
-    for (unsigned index = 0; index < 4; ++index) {
+    const unsigned factor_count = (unsigned)shape.outer_count + (unsigned)shape.inner_count;
+    if (factor_count > (unsigned)PROBE_LINKED_FACTOR_LIMIT) return false;
+    for (unsigned index = 0; index < factor_count; ++index) {
         const DXBCSignatureElement *factor = &hull->patch_constants[index];
+        const bool inner = hull->inner_first ? index < shape.inner_count : index >= shape.outer_count;
+        const unsigned first = inner ? (hull->inner_first ? 0u : (unsigned)shape.outer_count)
+            : (hull->inner_first ? (unsigned)shape.inner_count : 0u);
+        const unsigned semantic = index - first;
+        const uint32_t system = inner ? shape.inner_system_values[semantic]
+            : shape.outer_system_values[semantic];
         if (factor->component_type != 3 || factor->mask != 1 ||
+            factor->system_value != system || factor->semantic_index != semantic ||
             !linked_signature_equal(factor, &domain->patch_constants[index], 14, 0)) return false;
     }
     return true;
@@ -172,14 +206,21 @@ static void print_hash(const char *role, const void *bytes, size_t size) {
 static void print_status_selected(const char *role,
                                   const UnityCompilerResponseStatus *status,
                                   bool summary_only) {
+    enum { SUMMARY_DIAGNOSTIC_LIMIT = 8, SUMMARY_MESSAGE_LIMIT = 384 };
     printf("%s success=%d diagnostics=%zu actionable=%zu\n", role,
            status->compiler_success, status->diagnostic_count,
            unity_compiler_response_status_actionable_diagnostic_count(status));
-    if (summary_only)
+    if (summary_only && unity_compiler_response_status_is_clean_success(status))
         return;
-    for (size_t index = 0; index < status->diagnostic_count; ++index) {
+    const size_t count = summary_only && status->diagnostic_count > (size_t)SUMMARY_DIAGNOSTIC_LIMIT
+        ? (size_t)SUMMARY_DIAGNOSTIC_LIMIT : status->diagnostic_count;
+    for (size_t index = 0; index < count; ++index) {
         const UnityCompilerDiagnostic *diagnostic = &status->diagnostics[index];
-        fprintf(stderr, "%s diagnostic=%d,%d,%d message=%s\n", role,
+        if (summary_only)
+            fprintf(stderr, "%s diagnostic=%d,%d,%d message=%.*s\n", role,
+                diagnostic->fields[0], diagnostic->fields[1], diagnostic->fields[2],
+                SUMMARY_MESSAGE_LIMIT, diagnostic->message ? diagnostic->message : "");
+        else fprintf(stderr, "%s diagnostic=%d,%d,%d message=%s\n", role,
                 diagnostic->fields[0], diagnostic->fields[1],
                 diagnostic->fields[2],
                 diagnostic->message ? diagnostic->message : "");
@@ -719,12 +760,18 @@ static bool inspect_domain(const DXBCContainerView *target, StringBuilder *sourc
                captured ? hlsl_source_quality_class_name(owned_quality.classification) : "unavailable",
                coverage.unit_count, coverage.root_count, coverage.syntax_count,
                coverage.obligations, unchanged);
-        /* This isolated fixture wrapper supplies exactly three FLOAT3 points.
-         * A generated source outside that fixture shape is not replaced with
-         * authored DOMAIN text to make the experiment compile. */
+        /* Isolated authored stubs remain the established triangle shape. The
+         * paired route links the actual decoded domain/counts and appends both
+         * generated stages without replacing their source. */
+        HLSLDomainShape linked_shape;
+        const bool wrapper_shape = linked_interface
+            ? hlsl_domain_shape(program.tessellation.domain, &linked_shape) &&
+                program.tessellation.input_control_point_count > 0u &&
+                program.tessellation.input_control_point_count <= (unsigned)PROBE_LINKED_CONTROL_POINT_LIMIT
+            : program.tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE &&
+                program.tessellation.input_control_point_count == 3u;
         accepted = map_valid && coverage_valid && unchanged && mutation &&
-            program.tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE &&
-            program.tessellation.input_control_point_count == 3 &&
+            wrapper_shape &&
             program.input_count == 1 && program.inputs[0].mask == 7 &&
             program.inputs[0].component_type == 3 && !program.inputs[0].system_value &&
             !strcmp(dxbc_signature_semantic_name(&program.inputs[0]), "POINTVALUE") &&
@@ -809,12 +856,19 @@ static bool reconstruct_hull(const DXBCContainerView *target,
         !dxbc_stage_contract_decode(&document, &semantic, &contract, NULL) ||
         !usil_translate_with_stage_contract(&program, &semantic, &contract))
         goto done;
-    /* The authored wrapper below supplies only this explicit evaluation shape.
-     */
+    /* The isolated authored wrapper remains triangle-only. A paired wrapper
+     * takes domain and patch extent from the actual copied stage interface. */
+    HLSLDomainShape linked_shape;
+    const bool wrapper_shape = linked_interface
+        ? hlsl_domain_shape(program.tessellation.domain, &linked_shape) &&
+            program.tessellation.input_control_point_count > 0u &&
+            program.tessellation.input_control_point_count <= (unsigned)PROBE_LINKED_CONTROL_POINT_LIMIT &&
+            program.tessellation.output_control_point_count == program.tessellation.input_control_point_count
+        : program.tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE &&
+            program.tessellation.input_control_point_count == 3u &&
+            program.tessellation.output_control_point_count == 3u;
     if (program.program_type != DXBC_PROGRAM_TYPE_HULL ||
-        program.tessellation.domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE ||
-        program.tessellation.input_control_point_count != 3 ||
-        program.tessellation.output_control_point_count != 3 ||
+        !wrapper_shape ||
         program.input_count != 1 || program.output_count != 1 ||
         program.inputs[0].mask != 7 || program.outputs[0].mask != 7)
         goto done;
@@ -1378,10 +1432,15 @@ static int run_linked_fixture(char *const argv[], const char *shader_name,
     print_hash("paired_reconstructed_hull_sha256", hull.buf, hull.len);
     print_hash("paired_reconstructed_domain_sha256", domain.buf, domain.len);
     print_hash("paired_candidate_source_sha256", wrapper.buf, wrapper.len);
-    puts("paired_interface_match=1 point_semantic=POINTVALUE point_components=3 "
+    HLSLDomainShape linked_shape;
+    if (!hlsl_domain_shape(interfaces[0].domain, &linked_shape)) goto done;
+    printf("paired_interface_match=1 point_semantic=POINTVALUE point_components=3 "
          "hull_input_rw=7 hull_output_rw=8 domain_input_rw=7 hull_patch_rw=14 domain_patch_rw=0 "
-         "control_points=3 generated_stage_text_unchanged=1 distinct_generated_types=1 "
-         "source_quality=not-promoted");
+         "control_points=%u generated_stage_text_unchanged=1 distinct_generated_types=1 "
+         "source_quality=not-promoted domain=%s coordinates=%u outer_factors=%u inner_factors=%u "
+         "factor_order=%s\n", interfaces[0].output_control_points, linked_shape.attribute,
+         (unsigned)linked_shape.coordinate_count, (unsigned)linked_shape.outer_count,
+         (unsigned)linked_shape.inner_count, interfaces[0].inner_first ? "inner-first" : "outer-first");
     /* Both actual target containers and contracts outlive the original process. */
     unity_compiler_shutdown(&channel);
     channel = (UnityCompilerChannel){.socket_fd = -1};
@@ -1516,7 +1575,7 @@ static void usage(const char *name) {
         "It prints no source and grants no linked HULL/DOMAIN certificate. "
         "It cannot be combined with a HULL source calibration.\n"
         "--linked-fixture reconstructs the actual HULL and DOMAIN targets together; "
-        "only vertex/fragment are authored stubs. Typed triangle/FLOAT3 interfaces "
+        "only vertex/fragment are authored stubs. Typed triangle/quad/isoline FLOAT3 interfaces "
         "must match. Both cold full-container comparisons must be exact before "
         "independent owned maximum/W mutations and exact sibling/restoration checks. "
         "This summary-only experiment grants no runtime or semantic certificate "

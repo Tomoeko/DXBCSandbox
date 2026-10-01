@@ -551,40 +551,71 @@ uint8_t *test_tessellation_domain_dxbc(unsigned domain, uint32_t points, uint8_t
     return result;
 }
 
-uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points, const char *semantic,
-                                             unsigned scenario, size_t *size) {
+uint8_t *test_tessellation_domain_float3_shape_dxbc(unsigned domain, uint32_t points,
+    const char *semantic, unsigned scenario, size_t *size) {
     if (!size || !semantic || !semantic[0] || strlen(semantic) > 128 ||
+        domain < 1 || domain > 3 ||
         scenario > TEST_DOMAIN_FLOAT3_REORDERED_WRITES) return NULL;
     const uint32_t declarations[] = {
-        INSTRUCTION(147, 1) | (points << 11), INSTRUCTION(149, 1) | (2u << 11),
+        INSTRUCTION(147, 1) | (points << 11), INSTRUCTION(149, 1) | (domain << 11),
         INSTRUCTION(106, 1) | (1u << 11),
-        INSTRUCTION(95, 2), 0x0001c072,
+        INSTRUCTION(95, 2), domain == 2 ? 0x0001c072 : 0x0001c032,
         INSTRUCTION(95, 4), 0x00219072, points, 0,
         INSTRUCTION(103, 4), 0x001020f2, 0, 1,
-        INSTRUCTION(104, 2), 1
+        INSTRUCTION(104, 2), domain == 3 ? 2u : 1u
     };
-    uint32_t xyz[] = {
+    const uint32_t triangle[] = {
         INSTRUCTION(56, 7), 0x00100072, 0, 0x0001c556, 0x00219246, 1, 0,
         INSTRUCTION(50, 9), 0x00100072, 0, 0x00219246, 0, 0,
             0x0001c006, 0x00100246, 0,
         INSTRUCTION(50, 9), 0x00102072, 0, 0x00219246, 2, 0,
             0x0001caa6, 0x00100246, 0
     };
+    /* (point1 - point0) * location.x + point0. The negative source owns its
+     * actual extended NEG token; it is not inferred from presentation text. */
+    const uint32_t isoline[] = {
+        INSTRUCTION(0, 10), 0x00100072, 0, 0x00219246, 1, 0,
+            0x80219246, 0x00000041, 0, 0,
+        INSTRUCTION(50, 9), 0x00102072, 0, 0x00100246, 0,
+            0x0001c006, 0x00219246, 0, 0
+    };
+    /* Interpolate each row in X, then interpolate the two results in Y. */
+    const uint32_t quad[] = {
+        INSTRUCTION(0, 10), 0x00100072, 0, 0x00219246, 1, 0,
+            0x80219246, 0x00000041, 0, 0,
+        INSTRUCTION(50, 9), 0x00100072, 0, 0x00100246, 0,
+            0x0001c006, 0x00219246, 0, 0,
+        INSTRUCTION(0, 10), 0x00100072, 1, 0x00219246, 3, 0,
+            0x80219246, 0x00000041, 2, 0,
+        INSTRUCTION(50, 9), 0x00100072, 1, 0x00100246, 1,
+            0x0001c006, 0x00219246, 2, 0,
+        INSTRUCTION(0, 8), 0x00100072, 1, 0x00100246, 1,
+            0x80100246, 0x00000041, 0,
+        INSTRUCTION(50, 8), 0x00102072, 0, 0x00100246, 1,
+            0x0001c556, 0x00100246, 0
+    };
+    uint32_t xyz[sizeof(quad) / sizeof(quad[0])];
+    const uint32_t *body = domain == 2 ? triangle : domain == 3 ? quad : isoline;
+    const size_t body_words = (domain == 2 ? sizeof(triangle) : domain == 3 ? sizeof(quad) : sizeof(isoline)) / 4;
+    const size_t final_words = domain == 3 ? 8 : 9;
+    const size_t final_begin = body_words - final_words;
+    memcpy(xyz, body, body_words * sizeof(*body));
     uint32_t w[] = {INSTRUCTION(54, 5), 0x00102082, 0, 0x00004001, 0x3f800000};
     if (scenario == TEST_DOMAIN_FLOAT3_OVERLAPPING_W) w[1] = 0x00102012;
-    if (scenario == TEST_DOMAIN_FLOAT3_MISSING_Z) xyz[17] = 0x00102032;
+    if (scenario == TEST_DOMAIN_FLOAT3_MISSING_Z) xyz[final_begin + 1] = 0x00102032;
     if (scenario == TEST_DOMAIN_FLOAT3_FOREIGN_OUTPUT) w[2] = 1;
-    if (scenario == TEST_DOMAIN_FLOAT3_UNDECLARED_POINT_W) xyz[4] = 0x00219346;
-    uint32_t words[64];
+    if (scenario == TEST_DOMAIN_FLOAT3_UNDECLARED_POINT_W)
+        xyz[domain == 2 ? 4 : 3] = 0x00219346;
+    uint32_t words[128];
     size_t count = 0;
     memcpy(words, declarations, sizeof(declarations));
     count += sizeof(declarations) / sizeof(declarations[0]);
     if (scenario == TEST_DOMAIN_FLOAT3_REORDERED_WRITES) {
-        memcpy(words + count, xyz, 16 * sizeof(xyz[0])); count += 16;
+        memcpy(words + count, xyz, final_begin * sizeof(xyz[0])); count += final_begin;
         memcpy(words + count, w, sizeof(w)); count += sizeof(w) / sizeof(w[0]);
-        memcpy(words + count, xyz + 16, 9 * sizeof(xyz[0])); count += 9;
+        memcpy(words + count, xyz + final_begin, final_words * sizeof(xyz[0])); count += final_words;
     } else {
-        memcpy(words + count, xyz, sizeof(xyz)); count += sizeof(xyz) / sizeof(xyz[0]);
+        memcpy(words + count, xyz, body_words * sizeof(xyz[0])); count += body_words;
         if (scenario != TEST_DOMAIN_FLOAT3_MISSING_W) {
             memcpy(words + count, w, sizeof(w)); count += sizeof(w) / sizeof(w[0]);
         }
@@ -596,7 +627,7 @@ uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points, const char *seman
     size_t offset = 48;
     for (unsigned role = 0; role < 3; ++role) {
         write_u32(bytes + 32 + 4 * role, (uint32_t)offset);
-        offset += write_domain_signature_shape(bytes + offset, role, 2, semantic, true);
+        offset += write_domain_signature_shape(bytes + offset, role, domain, semantic, true);
         offset = (offset + 3) & ~(size_t)3;
     }
     write_u32(bytes + 44, (uint32_t)offset);
@@ -604,6 +635,7 @@ uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points, const char *seman
     write_u32(bytes + offset + 4, (uint32_t)(count * 4 + 8));
     write_u32(bytes + offset + 8, 0x00040050);
     write_u32(bytes + offset + 12, (uint32_t)(count + 2));
+    if (offset + 16 + count * 4 > sizeof(bytes)) return NULL;
     for (size_t word = 0; word < count; ++word) write_u32(bytes + offset + 16 + 4 * word, words[word]);
     *size = offset + 16 + count * 4;
     write_u32(bytes + 24, (uint32_t)*size);
@@ -611,4 +643,9 @@ uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points, const char *seman
     uint8_t *result = malloc(*size);
     if (result) memcpy(result, bytes, *size);
     return result;
+}
+
+uint8_t *test_tessellation_domain_float3_dxbc(uint32_t points, const char *semantic,
+                                             unsigned scenario, size_t *size) {
+    return test_tessellation_domain_float3_shape_dxbc(2, points, semantic, scenario, size);
 }
