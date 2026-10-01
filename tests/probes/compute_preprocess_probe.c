@@ -727,10 +727,18 @@ done:
 static bool qualify_atomic_inverse(USILProgram* program, ProbeInverseContext* context) {
     puts("inverse_scope=isolated-compute-stage exact-selected-controls; authored-source-text=unknown "
          "Class72=not-certified import=not-run semantic-runtime=not-run physical-Windows=not-run");
-    if (!inverse_native_shape(context->original_binary) || program->instruction_count != 2 ||
-        !program->instructions || program->instructions[0].opcode != USIL_OP_ATOMIC_IADD ||
-        program->instructions[1].opcode != USIL_OP_RET ||
+    if (!inverse_native_shape(context->original_binary) || !program->instructions ||
         context->selected->macro_count > PROBE_DECODE_LIMIT) return false;
+    const bool no_result = program->instruction_count == 2 &&
+        program->instructions[0].opcode == USIL_OP_ATOMIC_IADD &&
+        program->instructions[1].opcode == USIL_OP_RET;
+    const bool returning = program->instruction_count == 3 &&
+        program->instructions[0].opcode == USIL_OP_IMM_ATOMIC_IADD &&
+        program->instructions[1].opcode == USIL_OP_STORE_UAV_TYPED &&
+        program->instructions[2].opcode == USIL_OP_RET;
+    /* This hint selects the measurement shape only. The shared typed producer
+     * still proves every return definition, store consumer and operand owner. */
+    if (!no_result && !returning) return false;
     const UnityComputeKernelBinary* native = &context->original_binary->kernels[0];
     const ComputeShaderResource* resource = &native->data.output_buffers[0];
     if (!inverse_identifier(native->name.bytes, native->name.size) ||
@@ -740,7 +748,7 @@ static bool qualify_atomic_inverse(USILProgram* program, ProbeInverseContext* co
     USILInstruction* atomic = &program->instructions[0];
     USILMemoryAccess access;
     if (!usil_instruction_memory_access(program, atomic, &access) || !access.atomic ||
-        access.destination_operand != -1 || access.value_operand < 0 ||
+        access.destination_operand != (returning ? 0 : -1) || access.value_operand < 0 ||
         access.value_operand >= atomic->operand_count || access.value_lanes != 1U ||
         access.memory_component_lanes != 1U) return false;
     DXBCOperand* value = &atomic->operands[access.value_operand];
@@ -756,9 +764,11 @@ static bool qualify_atomic_inverse(USILProgram* program, ProbeInverseContext* co
     uint8_t target_digest[COMMON_SHA256_DIGEST_SIZE], restored_target_digest[COMMON_SHA256_DIGEST_SIZE];
     common_sha256(native->data.code, native->data.code_size, target_digest);
     printf("inverse_mutation_owner instruction=0 raw_instruction=%" PRIu32 " operand=%d "
-           "demanded_lanes=%u original_bits=0x%08" PRIx32 " changed_bits=0x%08" PRIx32 "\n",
+           "demanded_lanes=%u original_bits=0x%08" PRIx32 " changed_bits=0x%08" PRIx32
+           " opcode=%u name=%s returning=%d\n",
            atomic->source_instruction_index, access.value_operand, (unsigned)access.value_lanes,
-           original_bits, changed_bits);
+           original_bits, changed_bits, (unsigned)atomic->opcode,
+           hlsl_emit_opcode_name((int)atomic->opcode), returning);
     print_hash("inverse_original_value_bits_sha256", saved.immediate_words, sizeof(uint32_t));
     if (!capture_request_provenance(context->channel, context->compile_request->source, &context->lease))
         return false;

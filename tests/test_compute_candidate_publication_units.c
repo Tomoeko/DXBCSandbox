@@ -52,13 +52,14 @@ static void big_endian(Bytes *b, size_t offset, uint64_t value, unsigned size) {
 typedef enum {
     FIXTURE_RETURN_ONLY,
     FIXTURE_LITERAL_ATOMIC,
-    FIXTURE_DISPATCH_ATOMIC
+    FIXTURE_DISPATCH_ATOMIC,
+    FIXTURE_RETURNING_DISPATCH_ATOMIC
 } FixtureCodeKind;
 
 /* These token programs are authored here, not captured native containers.
- * The scalar atomic follows the observed raw173 no-result grammar. The normal
- * production parser supplies all Class72, stage, candidate and publication
- * checks; this fixture carries no compiler-exact or runtime claim. */
+ * The scalar atomics follow the observed raw173 no-result and raw180 returning
+ * grammars. The production parser supplies all Class72, stage, candidate and
+ * publication checks; this fixture carries no compiler-exact or runtime claim. */
 static bool fixture_code(Bytes *code, FixtureCodeKind kind) {
     static const uint8_t zero[16] = {0};
     static const uint32_t return_words[] = {
@@ -80,6 +81,16 @@ static bool fixture_code(Bytes *code, FixtureCodeKind kind) {
         173u | 6u << 24u, 0x0011e000u, 0u, 0x00020046u, 0x4001u, 1u,
         62u | 1u << 24u
     };
+    static const uint32_t returning_words[] = {
+        106u | 1u << 24u | 1u << 11u,
+        156u | 4u << 24u | 3u << 11u, 0x0011e000u, 0u, 0x4444u,
+        95u | 2u << 24u, 0x00020032u,
+        104u | 2u << 24u, 1u,
+        155u | 4u << 24u, 8u, 4u, 1u,
+        180u | 8u << 24u, 0x00100012u, 0u, 0x0011e000u, 0u, 0x00020046u, 0x4001u, 1u,
+        164u | 6u << 24u, 0x0011e0f2u, 0u, 0x00020546u, 0x00100006u, 0u,
+        62u | 1u << 24u
+    };
     const uint32_t *words;
     size_t count;
     switch (kind) {
@@ -89,6 +100,8 @@ static bool fixture_code(Bytes *code, FixtureCodeKind kind) {
             words = atomic_words; count = sizeof(atomic_words) / sizeof(atomic_words[0]); break;
         case FIXTURE_DISPATCH_ATOMIC:
             words = dispatch_words; count = sizeof(dispatch_words) / sizeof(dispatch_words[0]); break;
+        case FIXTURE_RETURNING_DISPATCH_ATOMIC:
+            words = returning_words; count = sizeof(returning_words) / sizeof(returning_words[0]); break;
         default: return false;
     }
     const uint32_t payload_size = ((uint32_t)count + 2u) * 4u;
@@ -287,8 +300,10 @@ static bool check_atomic_publication(const char *input, const char *root, Fixtur
     shader_batch_options_default(&options);
     CommonFileBytes manifest = {0}, source = {0}, evidence = {0}, actual = {0};
     char *directory = NULL, *binary_path = NULL;
-    CHECK(kind == FIXTURE_LITERAL_ATOMIC || kind == FIXTURE_DISPATCH_ATOMIC);
-    const bool dispatch = kind == FIXTURE_DISPATCH_ATOMIC;
+    CHECK(kind == FIXTURE_LITERAL_ATOMIC || kind == FIXTURE_DISPATCH_ATOMIC ||
+        kind == FIXTURE_RETURNING_DISPATCH_ATOMIC);
+    const bool returning = kind == FIXTURE_RETURNING_DISPATCH_ATOMIC;
+    const bool dispatch = kind != FIXTURE_LITERAL_ATOMIC;
     CHECK(released_compute_program(&fixture, 0x4001, kind) && fixture_code(&original_code, kind));
     CHECK(remove(input) == 0);
     CHECK(common_file_write_new_atomic(input, fixture.bytes, fixture.size) == COMMON_FILE_OK);
@@ -338,11 +353,18 @@ static bool check_atomic_publication(const char *input, const char *root, Fixtur
     /* The owned binding expression retains the formatter's parentheses. */
     if (dispatch) {
         CHECK(contains(&source, "uint3 dispatchThreadId : SV_DispatchThreadID"));
-        CHECK(contains(&source, "InterlockedAdd((AtomicCounts)[int2((dispatchThreadId.xy))], 1u);"));
+        if (returning) {
+            CHECK(contains(&source, "uint atomicResult;"));
+            CHECK(contains(&source, "InterlockedAdd((AtomicCounts)[int2((dispatchThreadId.xy))], 1u, atomicResult);"));
+            CHECK(contains(&source, "(AtomicCounts)[int2((dispatchThreadId.xy))] = atomicResult;"));
+        } else {
+            CHECK(contains(&source, "InterlockedAdd((AtomicCounts)[int2((dispatchThreadId.xy))], 1u);"));
+        }
     } else {
         CHECK(!contains(&source, "SV_DispatchThreadID") && !contains(&source, "dispatchThreadId"));
         CHECK(contains(&source, "InterlockedAdd((AtomicCounts)[int2(0, 0)], 1u);"));
     }
+    CHECK(returning || !contains(&source, "atomicResult"));
     CHECK(contains(&source, "[numthreads(8, 4, 1)]") && !contains(&source, "uint4") && !contains(&source, "].x"));
     uint8_t source_digest[COMMON_SHA256_DIGEST_SIZE];
     common_sha256(source.data, source.size, source_digest);
@@ -356,9 +378,14 @@ static bool check_atomic_publication(const char *input, const char *root, Fixtur
         contains(&evidence, "\"binding_register\":0,\"writable\":true") &&
         contains(&evidence, "\"original_element_type_known\":true,\"variant_witnesses\":[0]") &&
         contains(&evidence, "\"classification\":\"clean\"") && !contains(&evidence, "\"classification\":\"mixed\""));
-    char effect[256];
+    char effect[512];
     const uint32_t effects = (uint32_t)(USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_EXTERNAL_WRITE | USIL_EFFECT_ATOMIC);
-    const int effect_size = snprintf(effect, sizeof(effect),
+    const int effect_size = returning ? snprintf(effect, sizeof(effect),
+        "\"memory_effects\":[{\"opcode\":%u,\"effect_flags\":%u,\"instruction_index\":0,"
+        "\"source_instruction_index\":5,\"binding_register\":0},{\"opcode\":%u,\"effect_flags\":%u,"
+        "\"instruction_index\":1,\"source_instruction_index\":6,\"binding_register\":0}]",
+        (unsigned)USIL_OP_IMM_ATOMIC_IADD, effects, (unsigned)USIL_OP_STORE_UAV_TYPED,
+        (unsigned)USIL_EFFECT_EXTERNAL_WRITE) : snprintf(effect, sizeof(effect),
         "\"memory_effects\":[{\"opcode\":%u,\"effect_flags\":%u,\"instruction_index\":0,"
         "\"source_instruction_index\":%u,\"binding_register\":0}]", (unsigned)USIL_OP_ATOMIC_IADD, effects,
         dispatch ? 4u : 3u);
@@ -441,7 +468,8 @@ int main(void) {
         common_file_write_new_atomic(input, fixture.bytes, fixture.size) != COMMON_FILE_OK) return 1;
     const bool passed = check_publication(input, root) && check_unavailable_and_identity(input, root) &&
         check_atomic_publication(input, root, FIXTURE_LITERAL_ATOMIC) &&
-        check_atomic_publication(input, root, FIXTURE_DISPATCH_ATOMIC);
+        check_atomic_publication(input, root, FIXTURE_DISPATCH_ATOMIC) &&
+        check_atomic_publication(input, root, FIXTURE_RETURNING_DISPATCH_ATOMIC);
     (void)remove(input);
     (void)REMOVE_DIRECTORY(root);
     return passed ? 0 : 1;

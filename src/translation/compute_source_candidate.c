@@ -20,7 +20,8 @@
 static const uint64_t compute_stage_feature = UINT64_C(0x4000);
 static const uint64_t required_features = UINT64_C(1) | UINT64_C(0x4000);
 enum { MAX_NAME_BYTES = 255, MAX_KEY_BYTES = 2048, MAX_CODE_BYTES = 1048576,
-       MAX_OBJECT_BYTES = 16 * 1048576, MAX_TOTAL_CODE_BYTES = 64 * 1048576 };
+       MAX_OBJECT_BYTES = 16 * 1048576, MAX_TOTAL_CODE_BYTES = 64 * 1048576,
+       MAX_ENTRY_EXPRESSIONS = 7 };
 
 typedef struct {
     HLSLSourceQualityFacts facts[COMPUTE_SOURCE_MAX_INSTRUCTIONS + 8];
@@ -135,9 +136,9 @@ static bool collect_entry_events(void *context, const HLSLSourceQualityObservati
 static bool retain_entry_expression(void *context, ASTExpr *expression) {
     EntryEvents *events = context;
     ComputeSourceVariant *evidence = events->evidence;
-    if (!evidence || evidence->expression_count >= 3u) return false;
+    if (!evidence || evidence->expression_count >= (size_t)MAX_ENTRY_EXPRESSIONS) return false;
     if (!evidence->expressions) {
-        evidence->expressions = calloc(3u, sizeof(*evidence->expressions));
+        evidence->expressions = calloc(MAX_ENTRY_EXPRESSIONS, sizeof(*evidence->expressions));
         if (!evidence->expressions) return false;
     }
     evidence->expressions[evidence->expression_count++] = expression;
@@ -174,9 +175,12 @@ static bool resource_kind(const USILProgram *program, bool writable, bool struct
         if (formats[lane] != format) return false;
     if (structured && !format) *kind = COMPUTE_SOURCE_STRUCTURED_UINT4_BITS;
     else if (!structured && format == 4u) {
-        const bool scalar_atomic = writable && program->instruction_count == 2 && program->instructions &&
-            program->instructions[0].opcode == USIL_OP_ATOMIC_IADD &&
-            program->instructions[1].opcode == USIL_OP_RET;
+        const bool scalar_atomic = writable && program->instructions &&
+            ((program->instruction_count == 2 && program->instructions[0].opcode == USIL_OP_ATOMIC_IADD &&
+              program->instructions[1].opcode == USIL_OP_RET) ||
+             (program->instruction_count == 3 && program->instructions[0].opcode == USIL_OP_IMM_ATOMIC_IADD &&
+              program->instructions[1].opcode == USIL_OP_STORE_UAV_TYPED &&
+              program->instructions[2].opcode == USIL_OP_RET));
         *kind = scalar_atomic ? COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC : COMPUTE_SOURCE_TEXTURE2D_UINT4;
     }
     else if (!structured && format == 5u && writable && !program->texture_count)
@@ -365,12 +369,13 @@ static ComputeSourceStatus emit_variant(const ComputeShaderObject *object,
             if (instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_UAV_TYPED &&
                 instruction->opcode != USIL_OP_STORE_UAV_TYPED &&
                 instruction->opcode != USIL_OP_LD_STRUCTURED && instruction->opcode != USIL_OP_STORE_STRUCTURED &&
-                instruction->opcode != USIL_OP_ATOMIC_IADD) continue;
+                instruction->opcode != USIL_OP_ATOMIC_IADD && instruction->opcode != USIL_OP_IMM_ATOMIC_IADD) continue;
             USILEffectFlags effects;
             if (evidence->memory_effect_count >= 2u || !usil_instruction_effects(&program, instruction, &effects)) goto cleanup;
             int binding_operand = instruction->opcode == USIL_OP_LD ? 2 : 0;
             if (instruction->opcode == USIL_OP_LD_UAV_TYPED || instruction->opcode == USIL_OP_LD_STRUCTURED ||
-                instruction->opcode == USIL_OP_STORE_STRUCTURED || instruction->opcode == USIL_OP_ATOMIC_IADD) {
+                instruction->opcode == USIL_OP_STORE_STRUCTURED || instruction->opcode == USIL_OP_ATOMIC_IADD ||
+                instruction->opcode == USIL_OP_IMM_ATOMIC_IADD) {
                 USILMemoryAccess memory;
                 if (!usil_instruction_memory_access(&program, instruction, &memory)) goto cleanup;
                 binding_operand = memory.binding_operand;
