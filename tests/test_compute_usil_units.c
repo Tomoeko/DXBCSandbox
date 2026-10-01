@@ -4,7 +4,9 @@
 #include "dxbc/dxbc_hash.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter.h"
+#include "translation/hlsl_compute_source_internal.h"
 #include "translation/hlsl_source_quality.h"
+#include "translation/hlsl_source_quality_internal.h"
 #include "translation/usil_validation.h"
 
 #include <stdio.h>
@@ -667,10 +669,321 @@ static bool memory_access_projection(void) {
     return true;
 }
 
+/* The raw grammar follows the measured no-result typed atomic: no system
+ * input or temporary declaration, one actual effect followed by RET. */
+static const uint32_t atomic_words[] = {
+    INSTRUCTION(106u, 1u) | (1u << 11u),
+    INSTRUCTION(156u, 4u) | (3u << 11u), BINDING(30u, 0u), 0x4444u,
+    INSTRUCTION(155u, 4u), 1u, 1u, 1u,
+    INSTRUCTION(173u, 10u), BINDING(30u, 0u), VECTOR(0u, 0u, 0u, 0u), SCALAR(1u),
+    RETURN
+};
+
+typedef struct {
+    ASTExpr *roots[3];
+    size_t root_count;
+    size_t calls;
+    size_t effect_count;
+    size_t reject_root;
+    size_t trigger;
+    unsigned action;
+    bool triggered;
+    USILProgram *program;
+    HLSLComputeTypedResource *resource;
+    char *resource_name;
+    char *entry_name;
+    StringBuilder *published_source;
+} AtomicObservations;
+
+static void atomic_roots_dispose(AtomicObservations *observations) {
+    for (size_t index = 0; index < observations->root_count; ++index)
+        ast_free_expr(observations->roots[index]);
+    observations->root_count = 0;
+}
+
+static bool atomic_retain_expression(void *context, ASTExpr *expression) {
+    AtomicObservations *observations = context;
+    if (observations->root_count == observations->reject_root ||
+        observations->root_count == COUNT(observations->roots)) return false;
+    /* A true return transfers this root. Inspect it only after emission has
+     * finished; rejected roots remain with the emitter. */
+    observations->roots[observations->root_count++] = expression;
+    return true;
+}
+
+static bool atomic_observe(void *context, const HLSLSourceQualityObservation *observation) {
+    AtomicObservations *observations = context;
+    if (observation->stage != DXBC_PROGRAM_TYPE_COMPUTE || observation->reasons) return false;
+    ++observations->calls;
+    if (observation->kind == HLSL_SOURCE_OBSERVATION_EMISSION &&
+        observation->facts.instruction_index >= 0) {
+        const int index = observation->facts.instruction_index;
+        if (index > 1 || !observation->facts.known || !observation->facts.logical_operation ||
+            observation->facts.source_instruction_index != observations->program->instructions[index].source_instruction_index ||
+            (size_t)index != observations->effect_count) return false;
+        ++observations->effect_count;
+    }
+    if (!observations->trigger || observations->calls != observations->trigger) return true;
+    observations->triggered = true;
+    USILInstruction *atomic = &observations->program->instructions[0];
+    switch (observations->action) {
+        case 0: return false;
+        case 1:
+            atomic->operands[2].imm_values[0] = atomic->operands[2].immediate_words[0] = 7u;
+            break;
+        case 2:
+            atomic->operands[1].imm_values[0] = atomic->operands[1].immediate_words[0] = 5u;
+            break;
+        case 3: observations->resource_name[0] = 'B'; break;
+        case 4: observations->entry_name[0] = 'B'; break;
+        case 5: observations->program->compute.thread_group_size[0] = 2u; break;
+        case 6:
+            observations->program->uavs[0].reg_idx = 3;
+            atomic->operands[0].register_index = 3;
+            atomic->operands[0].index_values[0] = 3u;
+            observations->resource->binding_register = 3u;
+            break;
+        case 7: sb_append(observations->published_source, "/* inserted gap */"); break;
+        default: return false;
+    }
+    return true;
+}
+
+static bool atomic_emit(USILProgram *program, HLSLComputeTypedResource *resource,
+    char *entry_name, AtomicObservations *observations, StringBuilder *source,
+    HLSLSourceQualityResult *quality, bool observe, HLSLEmitDiagnostic *diagnostic) {
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    options.source_quality = quality;
+    options.source_quality_observer = observe ? atomic_observe : NULL;
+    options.source_quality_observer_context = observations;
+    const HLSLEmitNames names = {.entry_point = entry_name};
+    const HLSLComputeTypedSource typed = {.resources = resource, .resource_count = 1u,
+        .retain_expression = atomic_retain_expression, .expression_context = observations};
+    return hlsl_emit_compute_typed_stage(program, source, &names, &options, &typed, diagnostic);
+}
+
+static bool atomic_source_rejected(USILProgram *program, HLSLComputeTypedResource *resource,
+                                   char *entry_name) {
+    AtomicObservations observations = {.reject_root = SIZE_MAX, .program = program};
+    StringBuilder source; sb_init(&source); sb_append(&source, "prefix");
+    HLSLSourceQualityResult quality;
+    HLSLEmitDiagnostic diagnostic;
+    const bool emitted = atomic_emit(program, resource, entry_name, &observations,
+        &source, &quality, false, &diagnostic);
+    atomic_roots_dispose(&observations);
+    CHECK(!emitted && source.failed && source.len == 6u && !strcmp(source.buf, "prefix"));
+    CHECK(diagnostic.status != HLSL_EMIT_STATUS_OK && quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+    sb_free(&source);
+    return true;
+}
+
+static bool check_atomic_roots(const AtomicObservations *observations, uint32_t value) {
+    CHECK(observations->root_count == 3u);
+    const ASTExpr *resource = observations->roots[0];
+    CHECK(resource->kind == AST_EXPR_EMITTER_OPERAND && resource->operand_provenance.complete &&
+        resource->operand_provenance.instruction_index == 0 &&
+        resource->operand_provenance.source_instruction_index == 3u &&
+        resource->operand_provenance.operand_index == 0);
+    for (size_t index = 1; index < observations->root_count; ++index) {
+        const ASTExpr *root = observations->roots[index];
+        CHECK(root->logical_origin.complete &&
+            root->logical_origin.scalar_type == (index == 1u ? AST_SCALAR_SINT32 : AST_SCALAR_UINT32) &&
+            root->logical_origin.components == (index == 1u ? 2u : 1u) &&
+            root->logical_origin.destination_lanes == (index == 1u ? 3u : 1u) &&
+            root->logical_origin.instruction_index == 0 && root->logical_origin.source_instruction_index == 3u);
+    }
+    const ASTExpr *coordinates = observations->roots[1];
+    CHECK(coordinates->kind == AST_EXPR_LITERAL && coordinates->u.literal.scalar_type == AST_SCALAR_SINT32 &&
+        coordinates->u.literal.components == 2 && coordinates->u.literal.val[0] == 0u && coordinates->u.literal.val[1] == 0u);
+    const ASTExpr *increment = observations->roots[2];
+    CHECK(increment->kind == AST_EXPR_LITERAL && increment->u.literal.scalar_type == AST_SCALAR_UINT32 && increment->u.literal.components == 1 &&
+        increment->u.literal.val[0] == value);
+    return true;
+}
+
+static bool literal_atomic_source(void) {
+    DXBCDocument document; dxbc_document_init(&document);
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract; dxbc_stage_contract_init(&contract);
+    DXBCStageContractDiagnostic contract_diagnostic;
+    USILProgram program = {0};
+    CHECK(parse_program(atomic_words, COUNT(atomic_words), 0x00050050u, &document, &semantic));
+    CHECK(document.instruction_count == 5u && document.instructions[3].opcode == 173u &&
+        document.instructions[3].token_count == 10u && document.instructions[4].opcode == 62u);
+    CHECK(dxbc_stage_contract_decode(&document, &semantic, &contract, &contract_diagnostic));
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    CHECK(program.instruction_count == 2 && program.temp_count == 0 && program.compute.system_value_mask == 0u &&
+        program.uav_count == 1 && program.compute.declaration_source_instruction_index == 2u);
+    CHECK(program.instructions[0].opcode == USIL_OP_ATOMIC_IADD && program.instructions[0].operand_count == 3 &&
+        program.instructions[0].source_instruction_index == 3u && program.instructions[1].source_instruction_index == 4u);
+    USILMemoryAccess access; USILEffectFlags effects;
+    CHECK(usil_instruction_memory_access(&program, &program.instructions[0], &access) &&
+        usil_instruction_effects(&program, &program.instructions[0], &effects));
+    CHECK(access.kind == USIL_MEMORY_TYPED && access.space == USIL_MEMORY_UNORDERED_ACCESS &&
+        access.reads && access.writes && access.atomic && access.destination_operand == -1 &&
+        access.binding_operand == 0 && access.address_operand == 1 && access.value_operand == 2 &&
+        access.address_lanes == 3u && access.value_lanes == 1u && access.memory_component_lanes == 1u &&
+        effects == (USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_EXTERNAL_WRITE | USIL_EFFECT_ATOMIC));
+    for (int index = 0; index < 3; ++index) {
+        USILOperandUseInfo use;
+        CHECK(usil_instruction_operand_use(&program, &program.instructions[0], index, &use));
+        CHECK(use.use == (index ? USIL_OPERAND_USE_SOURCE : USIL_OPERAND_USE_RESOURCE_BINDING));
+        CHECK(use.source_lane_mask == (index == 1 ? 3u : index == 2 ? 1u : 0u));
+    }
+    char resource_name[] = "AtomicCounts", entry_name[] = "AtomicKernel";
+    HLSLComputeTypedResource resource = {.name = resource_name, .binding_register = 0u,
+        .writable = true, .scalar_type = AST_SCALAR_UINT32, .scalar_atomic = true};
+    AtomicObservations baseline = {.reject_root = SIZE_MAX, .program = &program};
+    HLSLSourceQualityResult quality, baseline_quality;
+    HLSLEmitDiagnostic diagnostic;
+    StringBuilder source; sb_init(&source);
+    CHECK(atomic_emit(&program, &resource, entry_name, &baseline, &source, &baseline_quality, true, &diagnostic));
+    CHECK(baseline_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !baseline_quality.reasons &&
+        !baseline_quality.counts.incomplete_units && !baseline_quality.counts.residual_total &&
+        !baseline_quality.counts.unknown_provenance && baseline.effect_count == 2u);
+    CHECK(strstr(source.buf, "void AtomicKernel()") && strstr(source.buf, "InterlockedAdd(") &&
+        !strstr(source.buf, "].x") && strstr(source.buf, "return;") && !strstr(source.buf, "dispatchThreadId"));
+    CHECK(check_atomic_roots(&baseline, 1u));
+    const size_t calls = baseline.calls;
+    CHECK(calls >= 3u);
+    /* Optional quality/observation requests do not change the source. The
+     * existing compute contract deliberately has no expression-source map. */
+    for (unsigned option = 0; option < 2; ++option) {
+        StringBuilder plain; sb_init(&plain);
+        AtomicObservations owned = {.reject_root = SIZE_MAX, .program = &program};
+        CHECK(atomic_emit(&program, &resource, entry_name, &owned, &plain,
+            option ? &quality : NULL, false, &diagnostic));
+        CHECK(plain.len == source.len && !memcmp(plain.buf, source.buf, source.len));
+        if (option) CHECK(hlsl_source_quality_results_equal(&baseline_quality, &quality));
+        CHECK(check_atomic_roots(&owned, 1u));
+        atomic_roots_dispose(&owned); sb_free(&plain);
+    }
+    StringBuilder declared; sb_init(&declared);
+    AtomicObservations declared_roots = {.reject_root = SIZE_MAX, .program = &program};
+    HLSLEmitOptions declared_options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT; declared_options.source_quality = &quality;
+    const HLSLEmitNames declared_names = {.entry_point = entry_name};
+    const HLSLComputeTypedSource declared_typed = {.resources = &resource, .resource_count = 1u,
+        .emit_declarations = true, .retain_expression = atomic_retain_expression, .expression_context = &declared_roots};
+    CHECK(hlsl_emit_compute_typed_stage(&program, &declared, &declared_names, &declared_options, &declared_typed, &diagnostic));
+    CHECK(strstr(declared.buf, "RWTexture2D<uint> AtomicCounts : register(u0);\n") &&
+        quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.reasons &&
+        quality.counts.resource_declarations == 1u && !quality.counts.incomplete_units);
+    CHECK(check_atomic_roots(&declared_roots, 1u));
+    atomic_roots_dispose(&declared_roots); sb_free(&declared);
+    const USILInstruction original = program.instructions[0];
+    const USILComputeContract original_compute = program.compute;
+    const USILUav original_uav = program.uavs[0];
+    const HLSLComputeTypedResource original_resource = resource;
+    const size_t triggers[] = {1u, calls / 2u, calls};
+    for (unsigned action = 0; action < 8; ++action) for (size_t timing = 0; timing < COUNT(triggers); ++timing) {
+        AtomicObservations changed = {.reject_root = SIZE_MAX, .trigger = triggers[timing], .action = action,
+            .program = &program, .resource = &resource, .resource_name = resource_name, .entry_name = entry_name};
+        StringBuilder rejected; sb_init(&rejected); sb_append(&rejected, "prefix");
+        changed.published_source = &rejected;
+        const bool emitted = atomic_emit(&program, &resource, entry_name, &changed, &rejected,
+            &quality, true, &diagnostic);
+        CHECK(changed.triggered && !emitted && rejected.failed && rejected.len == 6u && !strcmp(rejected.buf, "prefix"));
+        CHECK(diagnostic.status != HLSL_EMIT_STATUS_OK && quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+        atomic_roots_dispose(&changed); sb_free(&rejected);
+        if (action && action != 7u) {
+            StringBuilder fresh; sb_init(&fresh);
+            AtomicObservations owned = {.reject_root = SIZE_MAX, .program = &program};
+            CHECK(atomic_emit(&program, &resource, entry_name, &owned, &fresh, &quality, false, &diagnostic));
+            CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                (action == 6u || fresh.len != source.len || memcmp(fresh.buf, source.buf, source.len)));
+            atomic_roots_dispose(&owned); sb_free(&fresh);
+        }
+        program.instructions[0] = original; program.compute = original_compute; program.uavs[0] = original_uav;
+        resource = original_resource; resource_name[0] = 'A'; entry_name[0] = 'A';
+        StringBuilder restored; sb_init(&restored);
+        AtomicObservations owned = {.reject_root = SIZE_MAX, .program = &program};
+        CHECK(atomic_emit(&program, &resource, entry_name, &owned, &restored, &quality, false, &diagnostic));
+        CHECK(restored.len == source.len && !memcmp(restored.buf, source.buf, source.len) &&
+            hlsl_source_quality_results_equal(&quality, &baseline_quality));
+        atomic_roots_dispose(&owned); sb_free(&restored);
+    }
+    for (size_t reject = 0; reject < 3; ++reject) {
+        AtomicObservations owned = {.reject_root = reject, .program = &program};
+        StringBuilder rejected; sb_init(&rejected); sb_append(&rejected, "prefix");
+        CHECK(!atomic_emit(&program, &resource, entry_name, &owned, &rejected, &quality, false, &diagnostic));
+        CHECK(owned.root_count == reject && rejected.failed && rejected.len == 6u && !strcmp(rejected.buf, "prefix"));
+        CHECK(quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+        atomic_roots_dispose(&owned); sb_free(&rejected);
+    }
+    /* The actual final closing-syntax observation still precedes publication.
+     * Its append allocates an initially empty caller builder; rollback must
+     * remove the inserted bytes and terminate it even with an empty prefix. */
+    StringBuilder empty; sb_init(&empty);
+    AtomicObservations empty_gap = {.reject_root = SIZE_MAX, .trigger = calls, .action = 7u,
+        .program = &program, .published_source = &empty};
+    CHECK(!atomic_emit(&program, &resource, entry_name, &empty_gap, &empty, &quality, true, &diagnostic));
+    CHECK(empty_gap.triggered && empty.failed && !empty.len && (!empty.buf || empty.buf[0] == '\0') &&
+        quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+    atomic_roots_dispose(&empty_gap); sb_free(&empty);
+    StringBuilder fresh_after_gap; sb_init(&fresh_after_gap);
+    AtomicObservations after_gap = {.reject_root = SIZE_MAX, .program = &program};
+    CHECK(atomic_emit(&program, &resource, entry_name, &after_gap, &fresh_after_gap, &quality, false, &diagnostic));
+    CHECK(fresh_after_gap.len == source.len && !memcmp(fresh_after_gap.buf, source.buf, source.len) &&
+        hlsl_source_quality_results_equal(&quality, &baseline_quality));
+    atomic_roots_dispose(&after_gap); sb_free(&fresh_after_gap);
+    /* Mutations are made to the actual decoded owner, without synthesizing
+     * parsed authority or deriving scalar width from the return formats alone. */
+    for (unsigned mutation = 0; mutation < 20; ++mutation) {
+        USILInstruction *atomic = &program.instructions[0];
+        switch (mutation) {
+            case 0: atomic->operand_count = 2; break;
+            case 1: atomic->saturate = true; break;
+            case 2: atomic->precise_mask = 1u; break;
+            case 3: atomic->operands[2].has_neg = true; break;
+            case 4: atomic->operands[1].has_abs = true; break;
+            case 5: atomic->operands[2].min_precision = 1u; break;
+            case 6: atomic->operands[0].register_index = 1; atomic->operands[0].index_values[0] = 1u; break;
+            case 7: atomic->operands[1].imm_values[2] = atomic->operands[1].immediate_words[2] = 1u; break;
+            case 8: atomic->operands[2].imm_value_count = atomic->operands[2].immediate_word_count = 4; break;
+            case 9: atomic->operands[2].immediate_words[0] ^= 1u; break;
+            case 10: program.uavs[0].return_types[0] = 3u; break;
+            case 11: strcpy(program.uavs[0].dimension, "3d"); break;
+            case 12: program.uavs[0].globally_coherent = true; break;
+            case 13: program.uavs[0].has_order_preserving_counter = true; break;
+            case 14: program.compute.system_value_mask = USIL_COMPUTE_DISPATCH_THREAD_ID; break;
+            case 15: program.temp_count = 1; break;
+            case 16: resource.scalar_type = AST_SCALAR_FLOAT32; break;
+            case 17: resource.writable = false; break;
+            case 18: program.compute.thread_group_size[0] = 0u; break;
+            case 19: resource.scalar_atomic = false; break;
+        }
+        const bool rejected = atomic_source_rejected(&program, &resource, entry_name);
+        program.instructions[0] = original; program.compute = original_compute; program.uavs[0] = original_uav;
+        resource = original_resource; program.temp_count = 0;
+        if (!rejected) fprintf(stderr, "literal atomic boundary mutation=%u\n", mutation);
+        CHECK(rejected);
+    }
+    /* The roots own their names, raw literal words and decoded origins after
+     * all original decoder storage has been released. */
+    usil_free(&program); dxbc_stage_contract_free(&contract); dxbc_free(&semantic); dxbc_document_free(&document);
+    resource_name[0] = 'Z'; entry_name[0] = 'Z';
+    CHECK(check_atomic_roots(&baseline, 1u));
+    StringBuilder retained; sb_init(&retained); ast_format_expr(baseline.roots[0], &retained);
+    CHECK(sb_ok(&retained) && strstr(retained.buf, "AtomicCounts"));
+    atomic_roots_dispose(&baseline); sb_free(&retained); sb_free(&source);
+    /* Malformed raw instruction extents fail the actual document parser;
+     * they never acquire the semantic authority used by the source tests. */
+    uint32_t malformed[COUNT(atomic_words)]; memcpy(malformed, atomic_words, sizeof(malformed));
+    malformed[9] = 173u;
+    dxbc_document_init(&document);
+    CHECK(!parse_program(malformed, COUNT(malformed), 0x00050050u, &document, NULL));
+    dxbc_document_free(&document);
+    memcpy(malformed, atomic_words, sizeof(malformed)); malformed[9] = INSTRUCTION(173u, 12u);
+    dxbc_document_init(&document);
+    CHECK(!parse_program(malformed, COUNT(malformed), 0x00050050u, &document, NULL));
+    dxbc_document_free(&document);
+    return true;
+}
+
 int main(void) {
     if (!execution_metadata_and_barriers() || !system_values_and_source_gate() ||
         !declaration_rejections() || !shader_model_group_bounds() || !memory_access_projection() ||
-        !unsigned_compute_source() || !barrier_intrinsic_source()) return 1;
+        !unsigned_compute_source() || !barrier_intrinsic_source() || !literal_atomic_source()) return 1;
     puts("compute execution-contract projection tests passed");
     return 0;
 }

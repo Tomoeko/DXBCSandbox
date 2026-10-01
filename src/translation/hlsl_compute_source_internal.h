@@ -15,6 +15,9 @@ typedef struct {
     bool writable;
     bool structured; /* Explicit uint4-bit representation, original type unknown. */
     ASTScalarType scalar_type; /* Current decoded declaration, never a sibling guess. */
+    /* Scalar UINT view requires the complete admitted SM5 typed atomic use;
+     * repeated declaration return formats alone cannot establish its width. */
+    bool scalar_atomic;
 } HLSLComputeTypedResource;
 
 typedef struct {

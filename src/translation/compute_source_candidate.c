@@ -173,7 +173,12 @@ static bool resource_kind(const USILProgram *program, bool writable, bool struct
     for (unsigned lane = 1; lane < 4; ++lane)
         if (formats[lane] != format) return false;
     if (structured && !format) *kind = COMPUTE_SOURCE_STRUCTURED_UINT4_BITS;
-    else if (!structured && format == 4u) *kind = COMPUTE_SOURCE_TEXTURE2D_UINT4;
+    else if (!structured && format == 4u) {
+        const bool scalar_atomic = writable && program->instruction_count == 2 && program->instructions &&
+            program->instructions[0].opcode == USIL_OP_ATOMIC_IADD &&
+            program->instructions[1].opcode == USIL_OP_RET;
+        *kind = scalar_atomic ? COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC : COMPUTE_SOURCE_TEXTURE2D_UINT4;
+    }
     else if (!structured && format == 5u && writable && !program->texture_count)
         *kind = COMPUTE_SOURCE_TEXTURE2D_FLOAT4;
     else return false;
@@ -213,7 +218,10 @@ static ComputeSourceStatus resource_binding(const ComputeShaderObject *object,
                 (existing->witness_count && existing->variant_witnesses[existing->witness_count - 1] >= variant_row))
                 return COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE;
             existing->variant_witnesses[existing->witness_count++] = variant_row;
-            *binding = (HLSLComputeTypedResource){existing->name, existing->binding_register, existing->writable, structured, scalar};
+            *binding = (HLSLComputeTypedResource){.name = existing->name,
+                .binding_register = existing->binding_register, .writable = existing->writable,
+                .structured = structured, .scalar_type = scalar,
+                .scalar_atomic = kind == COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC};
             return COMPUTE_SOURCE_CANDIDATE_UNVERIFIED;
         }
     }
@@ -227,7 +235,10 @@ static ComputeSourceStatus resource_binding(const ComputeShaderObject *object,
     owned->variant_witnesses = calloc(candidate->variant_count, sizeof(*owned->variant_witnesses));
     if (!owned->variant_witnesses) return COMPUTE_SOURCE_ALLOCATION_FAILED;
     owned->variant_witnesses[owned->witness_count++] = variant_row;
-    *binding = (HLSLComputeTypedResource){owned->name, owned->binding_register, owned->writable, structured, scalar};
+    *binding = (HLSLComputeTypedResource){.name = owned->name,
+        .binding_register = owned->binding_register, .writable = owned->writable,
+        .structured = structured, .scalar_type = scalar,
+        .scalar_atomic = kind == COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC};
     return COMPUTE_SOURCE_CANDIDATE_UNVERIFIED;
 }
 
@@ -353,12 +364,13 @@ static ComputeSourceStatus emit_variant(const ComputeShaderObject *object,
             const USILInstruction *instruction = &program.instructions[index];
             if (instruction->opcode != USIL_OP_LD && instruction->opcode != USIL_OP_LD_UAV_TYPED &&
                 instruction->opcode != USIL_OP_STORE_UAV_TYPED &&
-                instruction->opcode != USIL_OP_LD_STRUCTURED && instruction->opcode != USIL_OP_STORE_STRUCTURED) continue;
+                instruction->opcode != USIL_OP_LD_STRUCTURED && instruction->opcode != USIL_OP_STORE_STRUCTURED &&
+                instruction->opcode != USIL_OP_ATOMIC_IADD) continue;
             USILEffectFlags effects;
             if (evidence->memory_effect_count >= 2u || !usil_instruction_effects(&program, instruction, &effects)) goto cleanup;
             int binding_operand = instruction->opcode == USIL_OP_LD ? 2 : 0;
             if (instruction->opcode == USIL_OP_LD_UAV_TYPED || instruction->opcode == USIL_OP_LD_STRUCTURED ||
-                instruction->opcode == USIL_OP_STORE_STRUCTURED) {
+                instruction->opcode == USIL_OP_STORE_STRUCTURED || instruction->opcode == USIL_OP_ATOMIC_IADD) {
                 USILMemoryAccess memory;
                 if (!usil_instruction_memory_access(&program, instruction, &memory)) goto cleanup;
                 binding_operand = memory.binding_operand;
@@ -616,8 +628,14 @@ ComputeSourceStatus compute_source_candidate_build(const ComputeShaderObject *ob
         const bool structured = declaration->kind == COMPUTE_SOURCE_STRUCTURED_UINT4_BITS;
         const char *type = structured ? (declaration->writable ? "RWStructuredBuffer" : "StructuredBuffer")
                                       : (declaration->writable ? "RWTexture2D" : "Texture2D");
-        const char *element = declaration->kind == COMPUTE_SOURCE_TEXTURE2D_FLOAT4 ? "float4" : "uint4";
-        sb_appendf(&candidate.source, "%s<%s> %s;\n", type, element, declaration->name);
+        const bool scalar_atomic = declaration->kind == COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC;
+        const char *element = scalar_atomic ? "uint" :
+            declaration->kind == COMPUTE_SOURCE_TEXTURE2D_FLOAT4 ? "float4" : "uint4";
+        if (scalar_atomic)
+            sb_appendf(&candidate.source, "%s<%s> %s : register(u%u);\n", type, element,
+                       declaration->name, declaration->binding_register);
+        else
+            sb_appendf(&candidate.source, "%s<%s> %s;\n", type, element, declaration->name);
         if (!declaration->witness_count) { status = COMPUTE_SOURCE_QUALITY_FAILED; goto cleanup; }
         for (size_t witness = 0; witness < declaration->witness_count; ++witness) {
             HLSLSourceQualityFacts fact;

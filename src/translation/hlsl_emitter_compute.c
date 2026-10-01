@@ -6,14 +6,16 @@
 #include "hlsl_compute_source_internal.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* A bounded source projection, not the Class72 declaration inverse. The
  * existing lossless decoder and USIL execution contract supply all metadata;
  * existing CFG/SSA supplies definition ownership. A private candidate route
  * admits one UINT4 texture or structured bits expression, or one FLOAT4 UAV
- * read/add/store with original metadata. Signed domains, other memory families
- * and control flow remain unavailable. */
+ * read/add/store with original metadata. A separate complete typed atomic use
+ * proves a scalar UINT UAV view. Signed data, other memory families and
+ * control flow remain unavailable. */
 /* This stage retains its own bound; generic V/F capacity grants no wider
  * compute admission or effect-planning authority. */
 enum { COMPUTE_SOURCE_INSTRUCTION_LIMIT = 64 };
@@ -100,10 +102,12 @@ static const char *barrier_intrinsic(uint8_t flags) {
 
 static bool typed_resources_valid(HLSLEmitterContext *ctx, const HLSLComputeTypedSource *typed) {
     const USILProgram *program = ctx->program;
+    const bool scalar_atomic = typed && typed->resource_count == 1u && typed->resources &&
+        typed->resources[0].scalar_atomic;
     if (!typed || typed->resource_count < 1 || typed->resource_count > 2 || !typed->resources ||
         program->shader_model_major != 5 || program->shader_model_minor != 0 ||
         program->compute.shared_memory_count || program->compute.barrier_count ||
-        program->compute.system_value_mask != USIL_COMPUTE_DISPATCH_THREAD_ID ||
+        program->compute.system_value_mask != (scalar_atomic ? 0u : USIL_COMPUTE_DISPATCH_THREAD_ID) ||
         program->texture_count < 0 || program->texture_count > 1 || program->uav_count != 1 ||
         program->texture_alloc < program->texture_count || program->uav_alloc < program->uav_count ||
         !program->uavs || (program->texture_count && !program->textures) ||
@@ -111,6 +115,9 @@ static bool typed_resources_valid(HLSLEmitterContext *ctx, const HLSLComputeType
         return reject_stage(ctx);
     for (size_t index = 0; index < typed->resource_count; ++index) {
         const HLSLComputeTypedResource *resource = &typed->resources[index];
+        if (resource->scalar_atomic != scalar_atomic ||
+            (scalar_atomic && (!resource->writable || resource->structured ||
+                resource->scalar_type != AST_SCALAR_UINT32))) return reject_stage(ctx);
         if (!hlsl_source_identifier_valid(resource->name) || !strcmp(resource->name, "dispatchThreadId")) return reject_stage(ctx);
         for (size_t previous = 0; previous < index; ++previous)
             if (strcmp(resource->name, typed->resources[previous].name) == 0 ||
@@ -442,7 +449,75 @@ static const HLSLComputeTypedResource *typed_binding(const HLSLComputeTypedSourc
     return NULL;
 }
 
+/* This complete SM5 use, rather than four repeated declaration formats,
+ * establishes the legal scalar R32_UINT view required by typed atomics. */
+static bool typed_atomic_instruction_valid(HLSLEmitterContext *ctx, int index) {
+    const USILProgram *program = ctx->program;
+    const USILInstruction *instruction = &program->instructions[index];
+    USILEffectFlags effects;
+    if (index == 1) {
+        if (instruction->opcode != USIL_OP_RET ||
+            !usil_instruction_effects(program, instruction, &effects) || effects != USIL_EFFECT_CONTROL)
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
+        return instruction_valid(ctx, index, true, false);
+    }
+    USILMemoryAccess memory;
+    if (index != 0 || instruction->opcode != USIL_OP_ATOMIC_IADD || instruction->operand_count != 3 ||
+        instruction->has_resource_dimension || instruction->has_resource_return_types ||
+        instruction->has_texel_offset || instruction->resource_stride ||
+        instruction->resource_info_return_type || instruction->sample_info_return_type ||
+        instruction->geometry_stream_id || instruction->geometry_stream_explicit ||
+        !usil_instruction_memory_access(program, instruction, &memory) ||
+        memory.kind != USIL_MEMORY_TYPED || memory.space != USIL_MEMORY_UNORDERED_ACCESS ||
+        strcmp(memory.dimension, "2d") || !memory.reads || !memory.writes || !memory.atomic ||
+        memory.globally_coherent || memory.rasterizer_ordered || memory.has_order_preserving_counter ||
+        memory.counter_mode != USIL_COUNTER_NONE || memory.byte_stride || memory.shared_memory_byte_count ||
+        memory.destination_operand != -1 || memory.binding_operand != 0 || memory.address_operand != 1 ||
+        memory.value_operand != 2 || memory.byte_offset_operand != -1 || memory.compare_operand != -1 ||
+        memory.destination_lanes || memory.address_lanes != 3u || memory.value_lanes != 1u ||
+        memory.memory_component_lanes != 1u ||
+        !usil_instruction_effects(program, instruction, &effects) ||
+        effects != (USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_EXTERNAL_WRITE | USIL_EFFECT_ATOMIC))
+        return reject_instruction(ctx, index, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+    for (unsigned component = 0; component < 4; ++component)
+        if (memory.return_types[component] != 4u || instruction->resource_return_types[component])
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
+    for (unsigned axis = 0; axis < 3; ++axis)
+        if (instruction->texel_offsets[axis])
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE);
+    for (int operand_index = 0; operand_index < 3; ++operand_index) {
+        const DXBCOperand *operand = &instruction->operands[operand_index];
+        USILOperandUseInfo use;
+        if (!operand_plain(operand) || operand->swizzle_mode ||
+            !usil_instruction_operand_use(program, instruction, operand_index, &use) ||
+            use.use != (operand_index ? USIL_OPERAND_USE_SOURCE : USIL_OPERAND_USE_RESOURCE_BINDING) ||
+            use.source_lane_mask != (operand_index == 1 ? 3u : operand_index == 2 ? 1u : 0u))
+            return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+        for (unsigned component = 0; component < 4; ++component)
+            if (operand->swizzle[component] != component)
+                return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+        if (!operand_index) {
+            if (operand->type != OPERAND_TYPE_UAV || !static_indices(operand, 1) ||
+                operand->raw_token != UINT32_C(0x0011e000) || operand->imm_value_count ||
+                operand->immediate_word_count)
+                return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+        } else {
+            const int width = operand_index == 1 ? 4 : 1;
+            if (operand->type != OPERAND_TYPE_IMMEDIATE32 || !static_indices(operand, 0) ||
+                operand->raw_token != (operand_index == 1 ? UINT32_C(0x4002) : UINT32_C(0x4001)) ||
+                operand->imm_value_count != width || operand->immediate_word_count != width)
+                return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+            for (int component = 0; component < width; ++component)
+                if (operand->imm_values[component] != operand->immediate_words[component] ||
+                    (operand_index == 1 && component >= 2 && operand->imm_values[component]))
+                    return reject_instruction(ctx, index, HLSL_EMIT_REASON_INVALID_OPERAND);
+        }
+    }
+    return true;
+}
+
 static bool typed_instruction_valid(HLSLEmitterContext *ctx, const HLSLComputeTypedSource *typed, int index) {
+    if (typed->resources[0].scalar_atomic) return typed_atomic_instruction_valid(ctx, index);
     const USILInstruction *instruction = &ctx->program->instructions[index];
     const bool float_data = typed->resources[0].scalar_type == AST_SCALAR_FLOAT32;
     if (instruction->opcode == USIL_OP_LD_STRUCTURED || instruction->opcode == USIL_OP_STORE_STRUCTURED) {
@@ -837,8 +912,13 @@ static void emit_typed_declarations(HLSLEmitterContext *ctx, const HLSLComputeTy
         const HLSLComputeTypedResource *resource = &typed->resources[index];
         const char *type = resource->structured ? (resource->writable ? "RWStructuredBuffer" : "StructuredBuffer")
                                                 : (resource->writable ? "RWTexture2D" : "Texture2D");
-        const char *element = resource->scalar_type == AST_SCALAR_FLOAT32 ? "float4" : "uint4";
-        sb_appendf(ctx->sb, "%s<%s> %s;\n", type, element, resource->name);
+        const char *element = resource->scalar_atomic ? "uint" :
+            resource->scalar_type == AST_SCALAR_FLOAT32 ? "float4" : "uint4";
+        if (resource->scalar_atomic)
+            sb_appendf(ctx->sb, "%s<%s> %s : register(u%u);\n", type, element,
+                       resource->name, resource->binding_register);
+        else
+            sb_appendf(ctx->sb, "%s<%s> %s;\n", type, element, resource->name);
         HLSLSourceQualityFacts fact;
         hlsl_source_quality_facts_init(&fact);
         fact.known = true;
@@ -1024,6 +1104,41 @@ static bool emit_typed_memory_body(HLSLEmitterContext *ctx, const HLSLComputeTyp
     return sb_ok(ctx->sb);
 }
 
+static bool emit_typed_atomic_body(HLSLEmitterContext *ctx, const HLSLComputeTypedSource *typed) {
+    ComputeMemoryPlan plan = {.ctx = ctx, .typed = typed, .store = 0, .load = -1};
+    const USILInstruction *instruction = &ctx->program->instructions[0];
+    ASTOperandProvenance origin;
+    ast_operand_provenance_init(&origin);
+    origin.complete = true;
+    origin.value_role = AST_OPERAND_VALUE_LOGICAL;
+    origin.logical_value_id = UINT64_C(0x200000000) | typed->resources[0].binding_register;
+    origin.instruction_index = 0;
+    origin.source_instruction_index = instruction->source_instruction_index;
+    origin.operand_index = 0;
+    ASTExpr *resource = ast_create_emitter_operand_with_provenance(typed->resources[0].name, &origin);
+    ASTExpr *coordinates = memory_operand(&plan, 0, 1, 3u, AST_SCALAR_SINT32, 0);
+    ASTExpr *value = memory_operand(&plan, 0, 2, 1u, AST_SCALAR_UINT32, 0);
+    if (!resource || !coordinates || !value) {
+        ast_free_expr(resource); ast_free_expr(coordinates); ast_free_expr(value);
+        return reject_instruction(ctx, 0, HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+    }
+    /* A void atomic effect owns three actual operand roots. It is never a
+     * numeric-result call masquerading as a destination definition. */
+    sb_append(ctx->sb, "    InterlockedAdd(");
+    if (!observe_memory_expression(&plan, resource, 0)) {
+        ast_free_expr(coordinates); ast_free_expr(value); return false;
+    }
+    sb_append(ctx->sb, "[");
+    if (!observe_memory_expression(&plan, coordinates, 0)) { ast_free_expr(value); return false; }
+    sb_append(ctx->sb, "], ");
+    if (!observe_memory_expression(&plan, value, 0)) return false;
+    sb_append(ctx->sb, ");\n");
+    hlsl_source_quality_emission(ctx, 0, true, 0);
+    sb_append(ctx->sb, "    return;\n");
+    hlsl_source_quality_emission(ctx, 0, true, 1);
+    return sb_ok(ctx->sb);
+}
+
 static void emit_shared_memory(HLSLEmitterContext *ctx) {
     for (size_t index = 0; index < ctx->program->compute.shared_memory_count; ++index) {
         const DXBCThreadGroupSharedMemoryContract *memory = &ctx->program->compute.shared_memory[index];
@@ -1062,7 +1177,8 @@ static bool emit_source(HLSLEmitterContext *ctx, const char *entry_point,
     sb_append(ctx->sb, ")\n{\n");
     hlsl_source_quality_emission(ctx, 0, false, -1);
     if (typed) {
-        if (!emit_typed_memory_body(ctx, typed)) return false;
+        if (!(typed->resources[0].scalar_atomic ? emit_typed_atomic_body(ctx, typed)
+                                               : emit_typed_memory_body(ctx, typed))) return false;
         sb_append(ctx->sb, "}\n");
         hlsl_source_quality_emission(ctx, 0, false, -1);
         return sb_ok(ctx->sb);
@@ -1122,6 +1238,293 @@ static bool emit_source(HLSLEmitterContext *ctx, const char *entry_point,
     sb_append(ctx->sb, "}\n");
     hlsl_source_quality_emission(ctx, 0, false, -1);
     return sb_ok(ctx->sb);
+}
+
+enum { COMPUTE_ATOMIC_NAME_LIMIT = 255, COMPUTE_ATOMIC_KEYWORD_LIMIT = 8,
+       COMPUTE_ATOMIC_SOURCE_LIMIT = 4096 };
+
+typedef struct {
+    const USILProgram *program;
+    USILProgram program_owner, owned_program;
+    USILInstruction instructions[2];
+    USILUav uav;
+    const HLSLComputeTypedSource *typed;
+    HLSLComputeTypedSource typed_owner, owned_typed;
+    HLSLComputeTypedResource resource_owner, owned_resource;
+    const HLSLEmitOptions *options;
+    HLSLEmitOptions options_owner, owned_options;
+    const HLSLEmitNames *names;
+    HLSLEmitNames names_owner;
+    const char *entry_owner;
+    size_t entry_owner_length, resource_length;
+    char entry[COMPUTE_ATOMIC_NAME_LIMIT + 1], resource[COMPUTE_ATOMIC_NAME_LIMIT + 1];
+    const char *keyword_owners[COMPUTE_ATOMIC_KEYWORD_LIMIT];
+    const char *owned_keywords[COMPUTE_ATOMIC_KEYWORD_LIMIT];
+    char keywords[COMPUTE_ATOMIC_KEYWORD_LIMIT][COMPUTE_ATOMIC_NAME_LIMIT + 1];
+    size_t keyword_lengths[COMPUTE_ATOMIC_KEYWORD_LIMIT];
+    StringBuilder expected, prefix;
+    StringBuilder *output;
+    StringBuilder output_owner;
+    HLSLEmitterContext *ctx;
+    bool published, ready, rejected;
+} ComputeAtomicGuard;
+
+static bool atomic_copy_identifier(char destination[COMPUTE_ATOMIC_NAME_LIMIT + 1],
+                                    const char *source, size_t *length) {
+    if (!hlsl_source_identifier_valid(source)) return false;
+    *length = strlen(source);
+    memcpy(destination, source, *length + 1u);
+    return true;
+}
+
+static bool atomic_program_top_supported(const USILProgram *program) {
+    return program->has_stage_contract && program->has_parsed_signature_authority &&
+        program->program_type == DXBC_PROGRAM_TYPE_COMPUTE && program->shader_model_major == 5u &&
+        program->shader_model_minor == 0u && program->compute.valid &&
+        program->instruction_count == 2 && program->instruction_alloc >= 2 && program->instructions &&
+        program->uav_count == 1 && program->uav_alloc >= 1 && program->uavs &&
+        !program->temp_count && !program->input_count && !program->output_count &&
+        !program->patch_constant_count && !program->signature_declaration_count &&
+        !program->cbuffer_count && !program->texture_count && !program->sampler_count &&
+        !program->indexable_temp_count && !program->index_range_count && !program->icb_value_count &&
+        !program->has_icb_declaration && !program->icb_declaration_owner &&
+        !program->geometry.valid && !program->tessellation.valid &&
+        !program->compute.system_value_mask && !program->compute.shared_memory_count &&
+        !program->compute.shared_memory_capacity && !program->compute.shared_memory &&
+        !program->compute.shared_memory_bytes && !program->compute.barrier_count;
+}
+
+static bool atomic_guard_model_matches(const ComputeAtomicGuard *guard) {
+    /* Top objects retain the original pointer/count lease. Compare them first,
+     * before any borrowed array or name can be followed after a callback. */
+    if (memcmp(guard->program, &guard->program_owner, sizeof(guard->program_owner)) ||
+        memcmp(guard->typed, &guard->typed_owner, sizeof(guard->typed_owner)) ||
+        memcmp(guard->options, &guard->options_owner, sizeof(guard->options_owner)) ||
+        (guard->names && memcmp(guard->names, &guard->names_owner, sizeof(guard->names_owner)))) return false;
+    if (memcmp(guard->program_owner.instructions, guard->instructions, sizeof(guard->instructions)) ||
+        memcmp(guard->program_owner.uavs, &guard->uav, sizeof(guard->uav)) ||
+        memcmp(guard->typed_owner.resources, &guard->resource_owner, sizeof(guard->resource_owner)) ||
+        memcmp(guard->resource_owner.name, guard->resource, guard->resource_length + 1u) ||
+        (guard->entry_owner && memcmp(guard->entry_owner,
+            guard->entry_owner_length ? guard->entry : "", guard->entry_owner_length + 1u))) return false;
+    const size_t count = guard->options_owner.reserved_preprocessor_identifier_count;
+    if (count && memcmp(guard->options_owner.reserved_preprocessor_identifiers,
+            guard->keyword_owners, count * sizeof(*guard->keyword_owners))) return false;
+    for (size_t index = 0; index < count; ++index)
+        if (memcmp(guard->keyword_owners[index], guard->keywords[index], guard->keyword_lengths[index] + 1u))
+            return false;
+    return true;
+}
+
+static bool atomic_builder_valid(const StringBuilder *builder) {
+    return sb_ok(builder) && (builder->buf
+        ? builder->len < builder->capacity && builder->buf[builder->len] == '\0'
+        : !builder->len && !builder->capacity);
+}
+
+static bool atomic_guard_source_matches(const ComputeAtomicGuard *guard, bool complete) {
+    const StringBuilder *source = guard->ctx->sb;
+    if (!guard->ready || !atomic_builder_valid(source) || source->len > guard->expected.len ||
+        (complete && source->len != guard->expected.len) ||
+        (source->len && memcmp(source->buf, guard->expected.buf, source->len)) ||
+        memcmp(guard->output, &guard->output_owner, sizeof(guard->output_owner))) return false;
+    const StringBuilder *output = guard->output;
+    const size_t prefix_length = guard->prefix.len;
+    const size_t suffix_length = guard->published ? guard->expected.len : 0u;
+    return atomic_builder_valid(output) && output->len >= prefix_length &&
+        output->len - prefix_length == suffix_length &&
+        (!prefix_length || memcmp(output->buf, guard->prefix.buf, prefix_length) == 0) &&
+        (!suffix_length || memcmp(output->buf + prefix_length, guard->expected.buf, suffix_length) == 0);
+}
+
+static bool atomic_guard_matches(const ComputeAtomicGuard *guard, bool complete) {
+    return atomic_guard_model_matches(guard) && atomic_guard_source_matches(guard, complete);
+}
+
+static void atomic_guard_fail(ComputeAtomicGuard *guard) {
+    guard->rejected = true;
+    hlsl_emit_fail(guard->ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED, HLSL_EMIT_PHASE_OUTPUT,
+                   HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+}
+
+static bool atomic_guard_observer(void *context, const HLSLSourceQualityObservation *observation) {
+    ComputeAtomicGuard *guard = context;
+    if (!atomic_guard_matches(guard, false)) { atomic_guard_fail(guard); return false; }
+    const StringBuilder staged = *guard->ctx->sb;
+    const bool accepted = !guard->options_owner.source_quality_observer ||
+        guard->options_owner.source_quality_observer(
+            guard->options_owner.source_quality_observer_context, observation);
+    if (!accepted || memcmp(guard->ctx->sb, &staged, sizeof(staged)) ||
+        !atomic_guard_matches(guard, false)) { atomic_guard_fail(guard); return false; }
+    return true;
+}
+
+static bool atomic_guard_retain(void *context, ASTExpr *expression) {
+    ComputeAtomicGuard *guard = context;
+    if (!atomic_guard_matches(guard, false)) { atomic_guard_fail(guard); return false; }
+    const StringBuilder staged = *guard->ctx->sb;
+    const bool accepted = guard->typed_owner.retain_expression(guard->typed_owner.expression_context, expression);
+    if (memcmp(guard->ctx->sb, &staged, sizeof(staged)) || !atomic_guard_matches(guard, false))
+        atomic_guard_fail(guard);
+    /* A successful callback owns the root even when it broke another lease.
+     * Let the failed builder reject publication without freeing it twice. */
+    return accepted;
+}
+
+static bool atomic_guard_prepare(ComputeAtomicGuard *guard, const USILProgram *program,
+    StringBuilder *output, const HLSLEmitNames *names, const HLSLEmitOptions *options,
+    const HLSLComputeTypedSource *typed, HLSLEmitterContext *ctx) {
+    guard->program = program; guard->program_owner = *program;
+    guard->typed = typed; guard->typed_owner = *typed;
+    guard->options = options; guard->options_owner = *options;
+    guard->names = names;
+    if (names) guard->names_owner = *names;
+    guard->output = output; guard->output_owner = *output;
+    guard->ctx = ctx;
+    if (!atomic_program_top_supported(&guard->program_owner) || typed->resource_count != 1u || !typed->resources ||
+        !typed->resources[0].scalar_atomic || output->len > COMPUTE_ATOMIC_SOURCE_LIMIT ||
+        !atomic_builder_valid(output) ||
+        options->reserved_preprocessor_identifier_count > COMPUTE_ATOMIC_KEYWORD_LIMIT ||
+        ((options->reserved_preprocessor_identifier_count != 0u) != (options->reserved_preprocessor_identifiers != NULL)) ||
+        (options->source_quality_observer && !options->source_quality) ||
+        options->expression_source_map || options->unity_uv_helper) return false;
+    memcpy(guard->instructions, program->instructions, sizeof(guard->instructions));
+    guard->uav = program->uavs[0];
+    guard->resource_owner = typed->resources[0];
+    if (!atomic_copy_identifier(guard->resource, guard->resource_owner.name, &guard->resource_length)) return false;
+    guard->entry_owner = names ? names->entry_point : NULL;
+    const char *entry = guard->entry_owner && guard->entry_owner[0] ? guard->entry_owner : "main";
+    size_t entry_length;
+    if (!atomic_copy_identifier(guard->entry, entry, &entry_length) ||
+        !strcmp(guard->entry, guard->resource) || !strcmp(guard->entry, "InterlockedAdd") ||
+        !strcmp(guard->resource, "InterlockedAdd")) return false;
+    guard->entry_owner_length = guard->entry_owner && guard->entry_owner[0] ? entry_length : 0u;
+    for (size_t index = 0; index < options->reserved_preprocessor_identifier_count; ++index) {
+        guard->keyword_owners[index] = options->reserved_preprocessor_identifiers[index];
+        if (!atomic_copy_identifier(guard->keywords[index], guard->keyword_owners[index], &guard->keyword_lengths[index]))
+            return false;
+        guard->owned_keywords[index] = guard->keywords[index];
+    }
+    guard->owned_program = guard->program_owner;
+    guard->owned_program.instructions = guard->instructions;
+    guard->owned_program.instruction_alloc = 2;
+    guard->owned_program.uavs = &guard->uav;
+    guard->owned_program.uav_alloc = 1;
+    guard->owned_resource = guard->resource_owner;
+    guard->owned_resource.name = guard->resource;
+    guard->owned_typed = guard->typed_owner;
+    guard->owned_typed.resources = &guard->owned_resource;
+    if (typed->retain_expression) {
+        guard->owned_typed.retain_expression = atomic_guard_retain;
+        guard->owned_typed.expression_context = guard;
+    }
+    guard->owned_options = guard->options_owner;
+    guard->owned_options.source_quality_observer = atomic_guard_observer;
+    guard->owned_options.source_quality_observer_context = guard;
+    guard->owned_options.reserved_preprocessor_identifiers =
+        options->reserved_preprocessor_identifier_count ? guard->owned_keywords : NULL;
+    ctx->program = &guard->owned_program;
+    ctx->reserved_preprocessor_identifiers = guard->owned_options.reserved_preprocessor_identifiers;
+    ctx->reserved_preprocessor_identifier_count = guard->owned_options.reserved_preprocessor_identifier_count;
+    if (!source_program_valid(ctx, &guard->owned_typed) ||
+        guard->instructions[0].source_instruction_index == UINT32_MAX ||
+        guard->instructions[0].source_instruction_index <= program->compute.declaration_source_instruction_index ||
+        guard->instructions[1].source_instruction_index == UINT32_MAX ||
+        guard->instructions[1].source_instruction_index != guard->instructions[0].source_instruction_index + 1u ||
+        !typed_atomic_instruction_valid(ctx, 0) || !typed_atomic_instruction_valid(ctx, 1)) return false;
+    sb_append_len(&guard->prefix, output->buf, output->len);
+    if (!sb_ok(&guard->prefix)) {
+        hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ALLOCATION_FAILED, HLSL_EMIT_PHASE_CONTEXT_ALLOCATION,
+                       HLSL_EMIT_REASON_ALLOCATION_FAILED);
+        return false;
+    }
+    HLSLEmitterContext *scratch = calloc(1u, sizeof(*scratch));
+    if (!scratch) {
+        hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ALLOCATION_FAILED, HLSL_EMIT_PHASE_CONTEXT_ALLOCATION,
+                       HLSL_EMIT_REASON_ALLOCATION_FAILED);
+        return false;
+    }
+    HLSLEmitDiagnostic scratch_diagnostic;
+    hlsl_emit_diagnostic_init(&scratch_diagnostic);
+    scratch->program = &guard->owned_program;
+    scratch->sb = &guard->expected;
+    scratch->diagnostic = &scratch_diagnostic;
+    scratch->emit_mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+    scratch->reserved_preprocessor_identifiers = ctx->reserved_preprocessor_identifiers;
+    scratch->reserved_preprocessor_identifier_count = ctx->reserved_preprocessor_identifier_count;
+    HLSLComputeTypedSource expected_typed = guard->owned_typed;
+    expected_typed.retain_expression = NULL;
+    expected_typed.expression_context = NULL;
+    const bool expected = sb_ok(&guard->prefix) && emit_source(scratch, guard->entry, &expected_typed) &&
+        hlsl_expression_identifiers_available(scratch, 0u) && guard->expected.len <= COMPUTE_ATOMIC_SOURCE_LIMIT &&
+        scratch_diagnostic.status == HLSL_EMIT_STATUS_OK;
+    free(scratch);
+    if (!expected && scratch_diagnostic.status != HLSL_EMIT_STATUS_OK && ctx->diagnostic)
+        *ctx->diagnostic = scratch_diagnostic;
+    if (!sb_ok(&guard->expected))
+        hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_OUTPUT_FAILED, HLSL_EMIT_PHASE_OUTPUT,
+                       HLSL_EMIT_REASON_OUTPUT_BUILDER_FAILED);
+    guard->ready = expected;
+    return expected;
+}
+
+static bool emit_atomic_compute_stage(const USILProgram *program, StringBuilder *output,
+    const HLSLEmitNames *names, const HLSLEmitOptions *options,
+    const HLSLComputeTypedSource *typed, HLSLEmitDiagnostic *diagnostic) {
+    StringBuilder staged;
+    sb_init(&staged);
+    HLSLEmitterContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.program = program; ctx.sb = &staged; ctx.diagnostic = diagnostic;
+    ctx.emit_mode = HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE;
+    ComputeAtomicGuard guard = {0};
+    sb_init(&guard.expected); sb_init(&guard.prefix);
+    bool emitted = false;
+    if (!atomic_guard_prepare(&guard, program, output, names, options, typed, &ctx)) {
+        if (!diagnostic || diagnostic->status == HLSL_EMIT_STATUS_OK) reject_stage(&ctx);
+        HLSLEmitOptions failed_options = *options;
+        failed_options.source_quality_observer = NULL;
+        failed_options.source_quality_observer_context = NULL;
+        hlsl_source_quality_initialize(&ctx, &failed_options);
+        goto cleanup;
+    }
+    if (!hlsl_source_quality_initialize(&ctx, &guard.owned_options) ||
+        !hlsl_source_quality_begin_entry(&ctx, true)) goto cleanup;
+    emitted = emit_source(&ctx, guard.entry, &guard.owned_typed) &&
+        hlsl_expression_identifiers_available(&ctx, 0u);
+    if (emitted && !atomic_guard_matches(&guard, true)) { atomic_guard_fail(&guard); emitted = false; }
+    if (emitted) {
+        sb_append_len(output, staged.buf, staged.len);
+        emitted = sb_ok(output);
+        if (emitted) {
+            guard.output_owner = *output;
+            guard.published = true;
+        } else {
+            hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_OUTPUT_FAILED, HLSL_EMIT_PHASE_OUTPUT,
+                           HLSL_EMIT_REASON_OUTPUT_BUILDER_FAILED);
+        }
+    }
+cleanup:
+    hlsl_source_quality_finish_emission(&ctx);
+    if (emitted && !atomic_guard_matches(&guard, true)) { atomic_guard_fail(&guard); emitted = false; }
+    emitted = emitted && sb_ok(&staged) && (!diagnostic || diagnostic->status == HLSL_EMIT_STATUS_OK);
+    if (!emitted) {
+        if (guard.ready) {
+            output->len = 0u;
+            output->failed = false;
+            if (output->buf) output->buf[0] = '\0';
+            sb_append_len(output, guard.prefix.buf, guard.prefix.len);
+        }
+        output->failed = true;
+        if (guard.rejected && guard.options_owner.source_quality) {
+            HLSLSourceQualityResult *quality = guard.options_owner.source_quality;
+            quality->emission_status = diagnostic ? diagnostic->status : HLSL_EMIT_STATUS_ANALYSIS_FAILED;
+            quality->classification = HLSL_SOURCE_QUALITY_FAILED;
+            quality->reasons |= HLSL_SOURCE_QUALITY_REASON_EMISSION_FAILED;
+        }
+    }
+    sb_free(&guard.expected); sb_free(&guard.prefix); sb_free(&staged);
+    return emitted;
 }
 
 static bool emit_compute_stage(const USILProgram *program, StringBuilder *output,
@@ -1230,5 +1633,7 @@ bool hlsl_emit_compute_typed_stage(const USILProgram *program, StringBuilder *ou
                        HLSL_EMIT_PHASE_ARGUMENT_VALIDATION, HLSL_EMIT_REASON_INVALID_ARGUMENT);
         return false;
     }
+    if (typed->resource_count == 1u && typed->resources && typed->resources[0].scalar_atomic)
+        return emit_atomic_compute_stage(program, output, names, options, typed, diagnostic);
     return emit_compute_stage(program, output, names, options, typed, diagnostic);
 }

@@ -765,6 +765,9 @@ static bool append_compute_candidate_evidence(
             case COMPUTE_SOURCE_TEXTURE2D_FLOAT4:
                 representation = "texture2d-float4";
                 break;
+            case COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC:
+                representation = "texture2d-uint-scalar-atomic";
+                break;
             default:
                 return false;
         }

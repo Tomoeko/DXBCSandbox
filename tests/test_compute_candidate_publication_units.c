@@ -5,6 +5,8 @@
 #include "app/shader_batch.h"
 #include "common/file_io.h"
 #include "dxbc/dxbc_hash.h"
+#include "dxbc/dxbc_compare.h"
+#include "translation/usil_validation.h"
 #include "test_support/file_mutation.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,19 +49,42 @@ static void big_endian(Bytes *b, size_t offset, uint64_t value, unsigned size) {
     for (unsigned index = 0; index < size; ++index) b->bytes[offset + index] = (uint8_t)(value >> (8u * (size - index - 1u)));
 }
 
-/* Authored, bounded v22/Class72 fixture with one controlled cs5 RET program.
- * This serializes fixture fields; every production decode/publication check
- * remains in the library. It carries no compiler-exact claim. */
-static bool released_compute(Bytes *file, uint64_t requirements) {
+/* Both token programs are authored here, not captured native containers.
+ * The scalar atomic follows the observed raw173 no-result grammar. The normal
+ * production parser supplies all Class72, stage, candidate and publication
+ * checks; this fixture carries no compiler-exact or runtime claim. */
+static bool fixture_code(Bytes *code, bool atomic) {
+    static const uint8_t zero[16] = {0};
+    static const uint32_t return_words[] = {
+        155u | 4u << 24u, 8u, 4u, 1u, 62u | 1u << 24u
+    };
+    static const uint32_t atomic_words[] = {
+        106u | 1u << 24u | 1u << 11u,
+        156u | 4u << 24u | 3u << 11u, 0x0011e000u, 0u, 0x4444u,
+        155u | 4u << 24u, 8u, 4u, 1u,
+        173u | 10u << 24u, 0x0011e000u, 0u,
+        0x4002u, 0u, 0u, 0u, 0u, 0x4001u, 1u,
+        62u | 1u << 24u
+    };
+    const uint32_t *words = atomic ? atomic_words : return_words;
+    const size_t count = atomic ? sizeof(atomic_words) / sizeof(atomic_words[0])
+                               : sizeof(return_words) / sizeof(return_words[0]);
+    const uint32_t payload_size = ((uint32_t)count + 2u) * 4u;
+    const uint32_t total_size = 44u + payload_size;
+    memset(code, 0, sizeof(*code));
+    if (!append(code, "DXBC", 4) || !append(code, zero, 16) || !u32(code, 1) || !u32(code, total_size) ||
+        !u32(code, 1) || !u32(code, 36) || !append(code, "SHEX", 4) || !u32(code, payload_size) ||
+        !u32(code, 0x50050) || !u32(code, (uint32_t)count + 2u)) return false;
+    for (size_t index = 0; index < count; ++index) if (!u32(code, words[index])) return false;
+    return code->size == total_size && dxbc_compute_hash(code->bytes, code->size, code->bytes + 4);
+}
+
+static bool released_compute_program(Bytes *file, uint64_t requirements, bool atomic) {
     static const uint8_t zero[16] = {0};
     static const uint8_t type_hash[16] = {0xab,0xd9,0x13,0x5b,0x8c,0xe8,0x3d,0x04,
         0x3f,0xef,0x4e,0x9e,0xc7,0xf5,0x33,0x66};
-    Bytes code = {0};
-    if (!append(&code, "DXBC", 4) || !append(&code, zero, 16) || !u32(&code, 1) || !u32(&code, 72) ||
-        !u32(&code, 1) || !u32(&code, 36) || !append(&code, "SHEX", 4) || !u32(&code, 28) ||
-        !u32(&code, 0x50050) || !u32(&code, 7) || !u32(&code, 155u | 4u << 24u) ||
-        !u32(&code, 8) || !u32(&code, 4) || !u32(&code, 1) || !u32(&code, 62u | 1u << 24u) ||
-        code.size != 72 || !dxbc_compute_hash(code.bytes, code.size, code.bytes + 4)) return false;
+    Bytes code;
+    if (!fixture_code(&code, atomic)) return false;
     memset(file, 0, sizeof(*file));
     if (!append(file, zero, 16) || !append(file, zero, 16) || !append(file, zero, 16)) return false;
     file->bytes[11] = 22;
@@ -76,8 +101,11 @@ static bool released_compute(Bytes *file, uint64_t requirements) {
     if (!align(file, 16)) return false;
     const size_t object_start = file->size;
     if (!string(file, "ComputeFixture") || !u32(file, 1) || !u32(file, 2) || !u32(file, 0) ||
-        !u32(file, 1) || !string(file, "ReturnOnly") || !u32(file, 1) || !string(file, "")) return false;
-    for (unsigned index = 0; index < 6; ++index) if (!u32(file, 0)) return false;
+        !u32(file, 1) || !string(file, atomic ? "AtomicKernel" : "ReturnOnly") || !u32(file, 1) || !string(file, "")) return false;
+    for (unsigned index = 0; index < 5; ++index) if (!u32(file, 0)) return false;
+    if (!u32(file, atomic ? 1u : 0u)) return false;
+    if (atomic && (!string(file, "AtomicCounts") || !string(file, "") ||
+        !u32(file, 0u) || !u32(file, UINT32_MAX) || !u32(file, 2u))) return false;
     if (!u32(file, (uint32_t)code.size) || !append(file, code.bytes, code.size) || !align(file, 4) ||
         !u32(file, 3) || !u32(file, 8) || !u32(file, 4) || !u32(file, 1) || !u64(file, requirements) ||
         !u32(file, 0) || !u32(file, 0) || !u32(file, 0) || !append(file, "\1", 1) || !align(file, 4)) return false;
@@ -87,6 +115,10 @@ static bool released_compute(Bytes *file, uint64_t requirements) {
     big_endian(file, 24, file->size, 8);
     big_endian(file, 32, object_start, 8);
     return true;
+}
+
+static bool released_compute(Bytes *file, uint64_t requirements) {
+    return released_compute_program(file, requirements, false);
 }
 
 static bool contains(const CommonFileBytes *bytes, const char *text) {
@@ -218,6 +250,114 @@ cleanup:
     return passed;
 }
 
+/* Exercise the actual released-input catalog/batch path, including its
+ * original binary inventory and the public candidate evidence switch. This
+ * authored Class72 fixture is never described as an observed native payload. */
+static bool check_atomic_publication(const char *input, const char *root) {
+    bool passed = false, selected = true;
+    Bytes fixture, original_code;
+    ShaderCatalog catalog;
+    ShaderBatchResult batch;
+    ShaderBatchOptions options;
+    shader_catalog_init(&catalog);
+    shader_batch_result_init(&batch);
+    shader_batch_options_default(&options);
+    CommonFileBytes manifest = {0}, source = {0}, evidence = {0}, actual = {0};
+    char *directory = NULL, *binary_path = NULL;
+    CHECK(released_compute_program(&fixture, 0x4001, true) && fixture_code(&original_code, true));
+    CHECK(remove(input) == 0);
+    CHECK(common_file_write_new_atomic(input, fixture.bytes, fixture.size) == COMMON_FILE_OK);
+    CHECK(catalog_input(input, &catalog, true));
+    CHECK(catalog.retained_source_snapshot_count == 1u && catalog.retained_source_snapshots);
+    const ComputeShaderObjectSummary original_summary = catalog.records[0].compute_summary;
+    CHECK(original_summary.platform_count == 1u && original_summary.kernel_parent_count == 1u &&
+        original_summary.kernel_variant_count == 1u && original_summary.code_blob_count == 1u &&
+        original_summary.dxbc_code_blob_count == 1u && original_summary.exact_thread_group_count == 1u &&
+        original_summary.resource_count == 1u && !original_summary.constant_buffer_count);
+    CHECK(shader_batch_extract_ex(&catalog, &selected, NULL, root, &options, &batch) == SHADER_BATCH_OK);
+    CHECK(shader_batch_is_complete(&batch) && batch.records[0].compute_artifact_publication_count == 3u &&
+        !batch.records[0].compute_source_candidate_attempted);
+    CHECK(common_file_read_regular(batch.records[0].output_path, 65536, &manifest) == COMMON_FILE_OK);
+    CHECK(contains(&manifest, "\"kernel_variants\":1,\"code_blobs\":1,\"dxbc_code_blobs\":1"));
+    directory = common_output_join_path(root, catalog.records[0].serialized_digest_hex);
+    CHECK(directory);
+    binary_path = common_output_join_path(directory, "compute_ComputeFixture__101.p0.k0.v0.dxbc");
+    CHECK(binary_path);
+    CHECK(common_file_read_regular(binary_path, 65536, &actual) == COMMON_FILE_OK);
+    DXBCCompareResult comparison;
+    CHECK(dxbc_compare_exact(original_code.bytes, original_code.size, actual.data, actual.size, &comparison) ==
+        DXBC_COMPARE_EQUAL);
+    common_file_bytes_dispose(&actual);
+    options.emit_compute_source_candidate = true;
+    shader_batch_result_dispose(&batch);
+    CHECK(shader_batch_extract_ex(&catalog, &selected, NULL, root, &options, &batch) == SHADER_BATCH_OK);
+    CHECK(shader_batch_is_complete(&batch) && batch.records[0].status == SHADER_BATCH_EMITTED);
+    const ShaderBatchRecordResult *record = &batch.records[0];
+    CHECK(record->compute_source_candidate_attempted && record->compute_source_candidate_generated &&
+        record->compute_source_candidate_status == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED &&
+        record->publication_authorized && !record->source_identity_close_deferred &&
+        !record->compute_publication_residue && record->compute_artifact_publication_count == 5u);
+    CHECK(record->compute_source_authority_status == COMPUTE_SHADER_SOURCE_AUTHORITY_DECLARATION_INVERSE_UNAVAILABLE);
+    CHECK(record->compute_source_candidate_diagnostic.requested_counts_known &&
+        record->compute_source_candidate_diagnostic.requested_kernels == 1u &&
+        record->compute_source_candidate_diagnostic.requested_variants == 1u &&
+        record->compute_source_candidate_diagnostic.examined_variants == 1u &&
+        record->compute_source_candidate_diagnostic.represented_variants == 1u);
+    CHECK(record->compute_source_candidate_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        !record->compute_source_candidate_quality.reasons &&
+        !record->compute_source_candidate_quality.counts.incomplete_units &&
+        !record->compute_source_candidate_quality.counts.unknown_provenance &&
+        !record->compute_source_candidate_quality.counts.residual_total);
+    CHECK(common_file_read_regular(record->compute_source_candidate_path, 65536, &source) == COMMON_FILE_OK);
+    CHECK(contains(&source, "RWTexture2D<uint> AtomicCounts : register(u0);"));
+    /* The owned binding expression retains the formatter's parentheses. */
+    CHECK(contains(&source, "InterlockedAdd((AtomicCounts)[int2(0, 0)], 1u);"));
+    CHECK(contains(&source, "[numthreads(8, 4, 1)]") && !contains(&source, "uint4") && !contains(&source, "].x"));
+    uint8_t source_digest[COMMON_SHA256_DIGEST_SIZE];
+    common_sha256(source.data, source.size, source_digest);
+    CHECK(!memcmp(source_digest, record->compute_source_candidate_source_sha256, sizeof(source_digest)));
+    CHECK(common_file_read_regular(record->compute_source_candidate_evidence_path, 65536, &evidence) == COMMON_FILE_OK);
+    CHECK(contains(&evidence, "\"status\":\"candidate-unverified\"") &&
+        contains(&evidence, "\"compiler\":\"not-run\"") && contains(&evidence, "\"import\":\"not-run\"") &&
+        contains(&evidence, "\"native\":\"not-run\"") && contains(&evidence, "\"semantic\":\"not-run\"") &&
+        contains(&evidence, "\"domain_complete\":true") && contains(&evidence, "\"kernels\":1,\"variants\":1"));
+    CHECK(contains(&evidence, "\"representation\":\"texture2d-uint-scalar-atomic\"") &&
+        contains(&evidence, "\"binding_register\":0,\"writable\":true") &&
+        contains(&evidence, "\"original_element_type_known\":true,\"variant_witnesses\":[0]") &&
+        contains(&evidence, "\"classification\":\"clean\"") && !contains(&evidence, "\"classification\":\"mixed\""));
+    char effect[256];
+    const uint32_t effects = (uint32_t)(USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_EXTERNAL_WRITE | USIL_EFFECT_ATOMIC);
+    const int effect_size = snprintf(effect, sizeof(effect),
+        "\"memory_effects\":[{\"opcode\":%u,\"effect_flags\":%u,\"instruction_index\":0,"
+        "\"source_instruction_index\":3,\"binding_register\":0}]", (unsigned)USIL_OP_ATOMIC_IADD, effects);
+    CHECK(effect_size > 0 && (size_t)effect_size < sizeof(effect) && contains(&evidence, effect));
+    size_t source_members = 0u, evidence_members = 0u;
+    for (size_t index = 0; index < record->compute_artifact_publication_count; ++index) {
+        const ShaderBatchComputeArtifactPublication *member = &record->compute_artifact_publications[index];
+        CHECK(member->preflight_attempted && member->publish_attempted && !member->publication_residue);
+        source_members += member->is_compute_source_candidate;
+        evidence_members += member->is_compute_source_candidate_evidence;
+    }
+    CHECK(source_members == 1u && evidence_members == 1u);
+    CHECK(common_file_read_regular(record->output_path, 65536, &actual) == COMMON_FILE_OK);
+    CHECK(actual.size == manifest.size && !memcmp(actual.data, manifest.data, actual.size));
+    common_file_bytes_dispose(&actual);
+    CHECK(common_file_read_regular(binary_path, 65536, &actual) == COMMON_FILE_OK);
+    CHECK(dxbc_compare_exact(original_code.bytes, original_code.size, actual.data, actual.size, &comparison) ==
+        DXBC_COMPARE_EQUAL);
+    CHECK(catalog.record_count == 1u && catalog.records[0].compute_summary.kernel_variant_count ==
+        original_summary.kernel_variant_count && catalog.records[0].compute_summary.resource_count == original_summary.resource_count);
+    passed = true;
+cleanup:
+    common_file_bytes_dispose(&manifest); common_file_bytes_dispose(&source);
+    common_file_bytes_dispose(&evidence); common_file_bytes_dispose(&actual);
+    free(directory); free(binary_path);
+    cleanup_outputs(root, &catalog);
+    shader_batch_result_dispose(&batch);
+    shader_catalog_dispose(&catalog);
+    return passed;
+}
+
 static bool check_unavailable_and_identity(const char *input, const char *root) {
     bool passed = false, selected = true;
     Bytes fixture;
@@ -267,7 +407,8 @@ int main(void) {
     (void)remove(input);
     if (!released_compute(&fixture, 0x4001) ||
         common_file_write_new_atomic(input, fixture.bytes, fixture.size) != COMMON_FILE_OK) return 1;
-    const bool passed = check_publication(input, root) && check_unavailable_and_identity(input, root);
+    const bool passed = check_publication(input, root) && check_unavailable_and_identity(input, root) &&
+        check_atomic_publication(input, root);
     (void)remove(input);
     (void)REMOVE_DIRECTORY(root);
     return passed ? 0 : 1;

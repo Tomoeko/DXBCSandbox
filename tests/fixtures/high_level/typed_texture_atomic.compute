@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-only
+#pragma kernel Main
+#pragma only_renderers d3d11
+
+RWTexture2D<uint> _Counts : register(u0);
+
+[numthreads(1, 1, 1)]
+void Main()
+{
+    InterlockedAdd(_Counts[int2(0, 0)], 1u);
+}

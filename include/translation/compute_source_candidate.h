@@ -96,7 +96,10 @@ typedef struct {
 typedef enum {
     COMPUTE_SOURCE_TEXTURE2D_UINT4 = 0,
     COMPUTE_SOURCE_STRUCTURED_UINT4_BITS,
-    COMPUTE_SOURCE_TEXTURE2D_FLOAT4
+    COMPUTE_SOURCE_TEXTURE2D_FLOAT4,
+    /* Exact unsigned SM5 typed atomic use requires an R32_UINT scalar view.
+     * This records the semantic view, never the original HLSL spelling. */
+    COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC
 } ComputeSourceResourceKind;
 
 typedef struct {
@@ -105,6 +108,7 @@ typedef struct {
     bool writable;
     ComputeSourceResourceKind kind;
     uint32_t byte_stride;
+    /* Known semantic scalar type/width; never an original source spelling. */
     bool original_element_type_known;
     /* Owned original candidate-row IDs containing this exact declaration. */
     uint32_t *variant_witnesses;
@@ -120,8 +124,9 @@ typedef struct {
     size_t local_keyword_count;
     size_t kernel_count;
     /* Strong declaration union: names, type and binding agree in every entry.
-     * UINT4/FLOAT4 textures and explicit UINT4-bit structured representations remain
-     * distinct. Unknown original structured types keep whole source MIXED. */
+     * UINT4/FLOAT4 textures, proved scalar UINT atomic views and explicit
+     * UINT4-bit structured representations remain distinct. Unknown original
+     * structured types keep whole source MIXED. */
     ComputeSourceTypedResource resources[COMPUTE_SOURCE_MAX_TYPED_RESOURCES];
     size_t resource_count;
     uint8_t serialized_object_sha256[COMMON_SHA256_DIGEST_SIZE];

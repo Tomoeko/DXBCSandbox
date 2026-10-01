@@ -3,6 +3,9 @@
 #include "translation/compute_source_candidate.h"
 #include "translation/hlsl_source_identifier.h"
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/hlsl_compute_source_internal.h"
+#include "translation/hlsl_source_quality_internal.h"
+#include "translation/usil_validation.h"
 #include "dxbc/dxbc_hash.h"
 
 #include <stdio.h>
@@ -1474,8 +1477,237 @@ static bool check_float_uav_candidate(void) {
     return true;
 }
 
+/* Literal-only scalar atomic grammar, authored through the same complete
+ * token/container path as the existing typed memory fixtures. */
+static const uint32_t atomic_candidate_words[] = {
+    INSTRUCTION(106, 1) | (1u << 11u),
+    INSTRUCTION(156, 4) | (3u << 11u), UINT32_C(0x0011e000), 0u, UINT32_C(0x4444),
+    INSTRUCTION(155, 4), 1u, 1u, 1u,
+    INSTRUCTION(173, 10), UINT32_C(0x0011e000), 0u,
+    UINT32_C(0x00004002), 0u, 0u, 0u, 0u,
+    UINT32_C(0x00004001), 1u,
+    INSTRUCTION(62, 1)
+};
+
+static bool atomic_candidate_fixture(Fixture *fixture, const uint32_t *words, size_t count) {
+    CHECK(fixture_init(fixture, NULL, 0));
+    CHECK(typed_code(fixture, words, count));
+    const ComputeShaderStringView name = text(fixture, "AtomicCounts");
+    for (size_t kernel = 0; kernel < 2; ++kernel) for (size_t variant = 0; variant < 4; ++variant) {
+        for (size_t axis = 0; axis < 3; ++axis) fixture->groups[kernel][variant][axis] = words[6u + axis];
+        fixture->outputs[kernel][variant] = (ComputeShaderResource){.name = name,
+            .bind_point = (int)words[3], .sampler_bind_point = -1, .texture_dimension = 2};
+        fixture->variants[kernel][variant].output_buffers = &fixture->outputs[kernel][variant];
+        fixture->variants[kernel][variant].output_buffer_count = 1;
+    }
+    return true;
+}
+
+static bool check_atomic_candidate_evidence(const ComputeSourceCandidate *candidate,
+                                           uint32_t binding, uint32_t increment, uint32_t x, uint32_t y) {
+    CHECK(candidate->status == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED && candidate->domain_complete &&
+        candidate->kernel_count == 2u && candidate->variant_count == 8u && candidate->resource_count == 1u);
+    CHECK(candidate->source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        !candidate->source_quality.reasons && !candidate->source_quality.counts.incomplete_units &&
+        !candidate->source_quality.counts.unknown_provenance && !candidate->source_quality.counts.residual_total);
+    const ComputeSourceTypedResource *resource = &candidate->resources[0];
+    CHECK(resource->kind == COMPUTE_SOURCE_TEXTURE2D_UINT_SCALAR_ATOMIC &&
+        resource->writable && resource->binding_register == binding &&
+        resource->original_element_type_known && resource->witness_count == 8u);
+    char declaration[96];
+    const int declaration_size = snprintf(declaration, sizeof(declaration),
+        "RWTexture2D<uint> AtomicCounts : register(u%u);\n", binding);
+    CHECK(declaration_size > 0 && (size_t)declaration_size < sizeof(declaration));
+    CHECK(strstr(candidate->source.buf, declaration) &&
+        strstr(candidate->source.buf, "InterlockedAdd(") && !strstr(candidate->source.buf, "].x") &&
+        !strstr(candidate->source.buf, "dispatchThreadId") && !strstr(candidate->source.buf, "uint4"));
+    for (size_t row = 0; row < candidate->variant_count; ++row) {
+        const ComputeSourceVariant *entry = &candidate->variants[row];
+        CHECK(resource->variant_witnesses[row] == (uint32_t)row && entry->source_unit_id == (uint32_t)row + 1u &&
+            entry->kernel_index == row / 4u && entry->variant_index == row % 4u);
+        CHECK(entry->entry_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+            !entry->entry_quality.reasons && !entry->entry_quality.counts.incomplete_units &&
+            !entry->entry_quality.counts.unknown_provenance && !entry->entry_quality.counts.residual_total);
+        CHECK(entry->expression_count == 3u && entry->memory_effect_count == 1u);
+        const ComputeSourceMemoryEffect *effect = &entry->memory_effects[0];
+        CHECK(effect->opcode == USIL_OP_ATOMIC_IADD && effect->instruction_index == 0 &&
+            effect->source_instruction_index == 3u && effect->binding_register == binding &&
+            effect->effect_flags == (uint32_t)(USIL_EFFECT_ATOMIC | USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_EXTERNAL_WRITE));
+        CHECK(entry->expressions[0]->kind == AST_EXPR_EMITTER_OPERAND &&
+            entry->expressions[0]->operand_provenance.complete &&
+            entry->expressions[0]->operand_provenance.instruction_index == 0 &&
+            entry->expressions[0]->operand_provenance.source_instruction_index == 3u &&
+            entry->expressions[0]->operand_provenance.operand_index == 0);
+        for (size_t root = 1; root < 3; ++root) CHECK(entry->expressions[root]->logical_origin.complete &&
+            entry->expressions[root]->logical_origin.scalar_type == (root == 1u ? AST_SCALAR_SINT32 : AST_SCALAR_UINT32) &&
+            entry->expressions[root]->logical_origin.components == (root == 1u ? 2u : 1u) &&
+            entry->expressions[root]->logical_origin.destination_lanes == (root == 1u ? 3u : 1u) &&
+            entry->expressions[root]->logical_origin.instruction_index == 0 &&
+            entry->expressions[root]->logical_origin.source_instruction_index == 3u);
+        const ASTExpr *coordinates = entry->expressions[1];
+        CHECK(coordinates->kind == AST_EXPR_LITERAL && coordinates->u.literal.scalar_type == AST_SCALAR_SINT32 &&
+            coordinates->u.literal.components == 2 && coordinates->u.literal.val[0] == x && coordinates->u.literal.val[1] == y);
+        const ASTExpr *value = entry->expressions[2];
+        CHECK(value->kind == AST_EXPR_LITERAL && value->u.literal.scalar_type == AST_SCALAR_UINT32 &&
+            value->u.literal.components == 1 && value->u.literal.val[0] == increment);
+        size_t effect_events = 0;
+        for (size_t event = 0; event < entry->emission_fact_count; ++event) {
+            const HLSLSourceQualityFacts *fact = &entry->emission_facts[event];
+            if (fact->instruction_index < 0) continue;
+            CHECK(effect_events < 2u && fact->known && fact->logical_operation && !fact->artifacts &&
+                fact->instruction_index == (int)effect_events && fact->source_instruction_index == (uint32_t)effect_events + 3u);
+            ++effect_events;
+        }
+        CHECK(effect_events == 2u);
+    }
+    uint8_t digest[COMMON_SHA256_DIGEST_SIZE];
+    common_sha256(candidate->source.buf, candidate->source.len, digest);
+    CHECK(!memcmp(digest, candidate->source_sha256, sizeof(digest)));
+    return true;
+}
+
+static bool check_literal_atomic_candidate(void) {
+    const uint32_t configurations[][7] = {
+        /* x,y,value,groupX,groupY,groupZ,binding */
+        {0u, 0u, 1u, 1u, 1u, 1u, 0u},
+        {3u, 5u, UINT32_MAX, 4u, 2u, 1u, 0u},
+        {2u, 7u, 0u, 8u, 4u, 1u, 3u}
+    };
+    for (size_t configuration = 0; configuration < COUNT(configurations); ++configuration) {
+        uint32_t words[COUNT(atomic_candidate_words)]; memcpy(words, atomic_candidate_words, sizeof(words));
+        const uint32_t *values = configurations[configuration];
+        words[13] = values[0]; words[14] = values[1]; words[18] = values[2];
+        words[6] = values[3]; words[7] = values[4]; words[8] = values[5]; words[3] = words[11] = values[6];
+        Fixture fixture; CHECK(atomic_candidate_fixture(&fixture, words, COUNT(words)));
+        ComputeSourceCandidate first, second;
+        ComputeSourceDiagnostic diagnostic;
+        compute_source_candidate_init(&first); compute_source_candidate_init(&second);
+        CHECK(compute_source_candidate_build(&fixture.object, &first, &diagnostic) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        CHECK(diagnostic.requested_counts_known && diagnostic.requested_kernels == 2u &&
+            diagnostic.requested_variants == 8u && diagnostic.examined_variants == 8u && diagnostic.represented_variants == 8u);
+        CHECK(check_atomic_candidate_evidence(&first, values[6], values[2], values[0], values[1]));
+        CHECK(compute_source_candidate_build(&fixture.object, &second, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+        CHECK(first.source.len == second.source.len && !memcmp(first.source.buf, second.source.buf, first.source.len) &&
+            hlsl_source_quality_results_equal(&first.source_quality, &second.source_quality));
+        CHECK(!memcmp(first.modeled_input_sha256, second.modeled_input_sha256, COMMON_SHA256_DIGEST_SIZE));
+        for (size_t row = 0; row < first.variant_count; ++row) CHECK(
+            first.variants[row].expressions != second.variants[row].expressions &&
+            first.variants[row].expressions[0] != second.variants[row].expressions[0] &&
+            hlsl_source_quality_results_equal(&first.variants[row].entry_quality, &second.variants[row].entry_quality));
+        memset(fixture.bytes, 0, sizeof(fixture.bytes));
+        CHECK(check_atomic_candidate_evidence(&first, values[6], values[2], values[0], values[1]));
+        StringBuilder held; sb_init(&held); ast_format_expr(first.variants[7].expressions[0], &held);
+        CHECK(sb_ok(&held) && strstr(held.buf, "AtomicCounts")); sb_free(&held);
+        compute_source_candidate_dispose(&first); compute_source_candidate_dispose(&second);
+    }
+    Fixture fixture; CHECK(atomic_candidate_fixture(&fixture, atomic_candidate_words, COUNT(atomic_candidate_words)));
+    ComputeSourceCandidate baseline, renamed; compute_source_candidate_init(&baseline); compute_source_candidate_init(&renamed);
+    /* Both candidate names belong to the same held serialized span before
+     * hashing it; only the modeled selection changes between these builds. */
+    const ComputeShaderStringView changed_name = text(&fixture, "RenamedCounts");
+    CHECK(compute_source_candidate_build(&fixture.object, &baseline, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    for (size_t kernel = 0; kernel < 2; ++kernel) for (size_t variant = 0; variant < 4; ++variant)
+        fixture.outputs[kernel][variant].name = changed_name;
+    CHECK(compute_source_candidate_build(&fixture.object, &renamed, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(memcmp(baseline.modeled_input_sha256, renamed.modeled_input_sha256, COMMON_SHA256_DIGEST_SIZE) &&
+        !memcmp(baseline.serialized_object_sha256, renamed.serialized_object_sha256, COMMON_SHA256_DIGEST_SIZE) &&
+        strstr(baseline.source.buf, "AtomicCounts") && strstr(renamed.source.buf, "RenamedCounts"));
+    compute_source_candidate_dispose(&renamed);
+    const ComputeShaderResource original = fixture.outputs[0][0];
+    fixture.outputs[0][0].texture_dimension = -1;
+    CHECK(expect_failure(&fixture, &baseline, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][0] = original;
+    fixture.outputs[0][0].bind_point = 1;
+    CHECK(expect_failure(&fixture, &baseline, COMPUTE_SOURCE_EMISSION_FAILED)); fixture.outputs[0][0] = original;
+    fixture.outputs[0][0].sampler_bind_point = 0;
+    CHECK(expect_failure(&fixture, &baseline, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][0] = original;
+    fixture.outputs[0][0].generated_name = changed_name;
+    CHECK(expect_failure(&fixture, &baseline, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][0] = original;
+    fixture.outputs[0][0].name = fixture.global[0][0];
+    CHECK(expect_failure(&fixture, &baseline, COMPUTE_SOURCE_NAME_UNREPRESENTABLE)); fixture.outputs[0][0] = original;
+    fixture.outputs[0][1].name = text(&fixture, "SiblingConflict");
+    CHECK(expect_failure(&fixture, &baseline, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE)); fixture.outputs[0][1] = original;
+    /* Genuine token mutations stay in the complete requested row domain;
+     * a rejected body cannot become an absent successful variant. */
+    for (unsigned mutation = 0; mutation < 7; ++mutation) {
+        uint32_t words[COUNT(atomic_candidate_words) + 1u]; memcpy(words, atomic_candidate_words, sizeof(atomic_candidate_words));
+        size_t count = COUNT(atomic_candidate_words);
+        switch (mutation) {
+            case 0: words[4] = UINT32_C(0x3333); break; /* Signed resource. */
+            case 1: words[1] = INSTRUCTION(156, 4) | (5u << 11u); break; /* 3D. */
+            case 2: words[1] |= 1u << 16u; break; /* Globally coherent. */
+            case 3: words[15] = 1u; break; /* Unused address word cannot disappear. */
+            case 4: words[6] = 0u; break; /* Invalid execution contract. */
+            case 5: words[9] = INSTRUCTION(171, 10); break; /* Another actual atomic opcode. */
+            case 6:
+                words[count] = words[count - 1u]; words[count - 1u] = INSTRUCTION(190, 1) | (8u << 11u);
+                ++count; break;
+        }
+        CHECK(atomic_candidate_fixture(&fixture, words, count));
+        CHECK(expect_failure(&fixture, &baseline,
+            mutation == 4u ? COMPUTE_SOURCE_STAGE_CONTRACT_FAILED : COMPUTE_SOURCE_EMISSION_FAILED));
+    }
+    compute_source_candidate_dispose(&baseline);
+    return true;
+}
+
+static bool check_atomic_descriptor_boundary(void) {
+    Fixture fixture; CHECK(uav_read_fixture(&fixture));
+    DXBCDocument document; dxbc_document_init(&document);
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract; dxbc_stage_contract_init(&contract);
+    USILProgram program = {0};
+    CHECK(dxbc_document_parse(&document, fixture.variants[0][0].code, fixture.variants[0][0].code_size, NULL));
+    CHECK(dxbc_document_decode_semantic(&document, &semantic));
+    CHECK(dxbc_stage_contract_decode(&document, &semantic, &contract, NULL));
+    CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
+    HLSLComputeTypedResource resource = {.name = "OutputTexels", .binding_register = 0,
+        .writable = true, .scalar_type = AST_SCALAR_UINT32};
+    HLSLComputeTypedSource typed = {.resources = &resource, .resource_count = 1u, .emit_declarations = true};
+    HLSLSourceQualityResult quality;
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT; options.source_quality = &quality;
+    HLSLEmitDiagnostic diagnostic;
+    StringBuilder source; sb_init(&source);
+    CHECK(hlsl_emit_compute_typed_stage(&program, &source, NULL, &options, &typed, &diagnostic));
+    CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && strstr(source.buf, "RWTexture2D<uint4>"));
+    sb_free(&source);
+    /* Identical 4444 return formats do not authorize a scalar view of an
+     * ordinary load/store program. The whole atomic-use proof is required. */
+    resource.scalar_atomic = true;
+    sb_init(&source); sb_append(&source, "prefix");
+    CHECK(!hlsl_emit_compute_typed_stage(&program, &source, NULL, &options, &typed, &diagnostic));
+    CHECK(source.failed && source.len == 6u && !strcmp(source.buf, "prefix") &&
+        diagnostic.status != HLSL_EMIT_STATUS_OK && quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+    sb_free(&source);
+    usil_free(&program); dxbc_stage_contract_free(&contract); dxbc_free(&semantic); dxbc_document_free(&document);
+    /* Each row must authorize the same declaration. The same UINT return
+     * formats, name and binding cannot merge a scalar atomic resource view
+     * with a genuinely decoded four-component load/store sibling. */
+    CHECK(atomic_candidate_fixture(&fixture, atomic_candidate_words, COUNT(atomic_candidate_words)));
+    ComputeSourceCandidate held, restored; compute_source_candidate_init(&held); compute_source_candidate_init(&restored);
+    CHECK(compute_source_candidate_build(&fixture.object, &held, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    const uint8_t *atomic_code = fixture.variants[0][0].code;
+    const size_t atomic_size = fixture.variants[0][0].code_size;
+    CHECK(typed_code(&fixture, uav_read_words, COUNT(uav_read_words)));
+    const uint8_t *legacy_code = fixture.variants[0][0].code;
+    const size_t legacy_size = fixture.variants[0][0].code_size;
+    for (size_t kernel = 0; kernel < 2; ++kernel) for (size_t variant = 0; variant < 4; ++variant) {
+        fixture.variants[kernel][variant].code = atomic_code;
+        fixture.variants[kernel][variant].code_size = atomic_size;
+    }
+    fixture.variants[0][3].code = legacy_code; fixture.variants[0][3].code_size = legacy_size;
+    fixture.groups[0][3][0] = fixture.groups[0][3][1] = 4u;
+    CHECK(expect_failure(&fixture, &held, COMPUTE_SOURCE_RESOURCE_INVERSE_UNAVAILABLE));
+    fixture.variants[0][3].code = atomic_code; fixture.variants[0][3].code_size = atomic_size;
+    fixture.groups[0][3][0] = fixture.groups[0][3][1] = 1u;
+    CHECK(compute_source_candidate_build(&fixture.object, &restored, NULL) == COMPUTE_SOURCE_CANDIDATE_UNVERIFIED);
+    CHECK(held.source.len == restored.source.len && !memcmp(held.source.buf, restored.source.buf, held.source.len) &&
+        hlsl_source_quality_results_equal(&held.source_quality, &restored.source_quality));
+    compute_source_candidate_dispose(&held); compute_source_candidate_dispose(&restored);
+    return true;
+}
+
 int main(void) {
-    return check_float_uav_candidate() && check_partial_uav_candidate() && check_replicated_uav_address_lanes() && check_same_uav_address_ownership() && check_uav_read_candidate() && check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
+    return check_literal_atomic_candidate() && check_atomic_descriptor_boundary() && check_float_uav_candidate() && check_partial_uav_candidate() && check_replicated_uav_address_lanes() && check_same_uav_address_ownership() && check_uav_read_candidate() && check_partial_structured_candidate() && check_typed_uint_operations() && check_structured_candidate() && check_owned_quality_resolver() && check_typed_candidate() && check_typed_effect_rejections() && check_identifier_names() && check_complete_candidate() && check_transactional_failures() &&
         check_modeled_input_binding() && check_empty_keyword_domain_and_limits() &&
         check_modeled_program_binding() && check_barrier_candidates() ? 0 : 1;
 }
