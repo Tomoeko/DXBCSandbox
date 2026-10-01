@@ -596,6 +596,7 @@ bool hlsl_source_quality_cbuffer_inventory_supported(const HLSLEmitterContext *c
 bool hlsl_source_quality_cbuffer_inventory_complete(const HLSLEmitterContext *ctx);
 bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
     int layout_index, uint8_t *shell_authority);
+bool hlsl_source_quality_packed_output_guard_active(const HLSLEmitterContext *ctx);
 bool hlsl_source_quality_cbuffer_syntax(HLSLEmitterContext *ctx, int layout_index,
     HLSLSourceQualityCBufferDeclarationKind kind, int field_index, uint8_t authority);
 void emit_cbuffer_helpers(HLSLEmitterContext* ctx);

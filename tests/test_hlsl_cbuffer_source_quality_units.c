@@ -117,6 +117,8 @@ typedef struct {
 static bool observe_cbuffer(void *context, const HLSLSourceQualityObservation *value) {
     Ledger *ledger = context;
     const HLSLSourceQualityFacts *facts = &value->facts;
+    if (facts->cbuffer_field_rows || facts->cbuffer_field_columns || facts->cbuffer_field_is_matrix)
+        return false; /* Existing scalar/vector receipts retain zero shape. */
     if (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_NONE)
         return true;
     const unsigned sequence = ledger->sequence++;
@@ -439,6 +441,27 @@ static bool check_invalid_observer_facts(void) {
     return true;
 }
 
+static bool check_matrix_receipt_requires_guard(void) {
+    Fixture f; fixture_init(&f);
+    f.cbuffer.size = 4;
+    f.fields[0] = (SerializedVariable){"ObjectTransform", {0, 0, 0, 4, 1, 0}};
+    f.buffers[0].size = 64; f.buffers[0].var_count = 1;
+    /* This test owns only the local layout predicate. Its hand-authored
+     * program does not acquire parsed authority or a ready whole-source guard. */
+    StringBuilder source; HLSLEmitterContext *ctx = layout_context(&f, &source);
+    CHECK(ctx && ctx->cbuffer_layouts[0].variable_count == 1 &&
+        ctx->cbuffer_layouts[0].variables[0].is_matrix &&
+        ctx->cbuffer_layouts[0].variables[0].byte_size == 64 &&
+        !hlsl_source_quality_packed_output_guard_active(ctx) &&
+        !hlsl_source_quality_named_cbuffer_supported(ctx, 0, NULL) &&
+        !hlsl_source_quality_cbuffer_inventory_supported(ctx));
+    ctx->high_level_packed_outputs = true; /* A nominal flag cannot supply the private lease. */
+    CHECK(!hlsl_source_quality_packed_output_guard_active(ctx) &&
+        !hlsl_source_quality_named_cbuffer_supported(ctx, 0, NULL));
+    layout_context_free(ctx, &source);
+    return true;
+}
+
 static bool check_raw_mode_remains_incomplete(void) {
     Fixture f;
     fixture_init(&f);
@@ -464,6 +487,7 @@ int main(void) {
         !check_other_stage_scalar_layouts() || !check_invalid_natural_marker() ||
         !check_actual_syntax_coverage() || !check_metadata_gaps() ||
         !check_resource_namespace_and_invalid_syntax() || !check_invalid_observer_facts() ||
+        !check_matrix_receipt_requires_guard() ||
         !check_raw_mode_remains_incomplete())
         return 1;
     if (g_allocations_count != allocations || g_allocated_bytes != bytes) {

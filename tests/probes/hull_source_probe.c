@@ -334,8 +334,8 @@ static bool scalar_fixture_reflection(const UnityCompilerBinaryResponse *respons
 }
 
 /* A controlled native callback projection, not a player-blob capture or an
- * authored property/default-value lookup. The text-layout model is only the
- * existing emitter's named parameter input, and owns all copied strings. */
+ * authored property/default-value lookup. Complete FLOAT4 and FLOAT4x4 tuples
+ * use the existing text-layout input, which owns all copied strings. */
 static bool native_parameter_string_bounded(const char *text, size_t limit) {
     if (!text) return false;
     size_t size = 0;
@@ -343,7 +343,54 @@ static bool native_parameter_string_bounded(const char *text, size_t limit) {
     return size > 0 && size < limit;
 }
 
-static bool native_float4_parameters(const UnityCompilerBinaryResponse *response,
+static bool native_reflection_record_canonical(const UnityCompilerReflectionRecord *record) {
+    if (!record ||
+        !native_parameter_string_bounded(record->record, (size_t)PROBE_NATIVE_CB_RECORD_BYTES) ||
+        (record->name && !native_parameter_string_bounded(record->name,
+            (size_t)PROBE_NATIVE_CB_NAME_LIMIT))) return false;
+    UnityCompilerReflectionRecord canonical = {0};
+    const bool equal = unity_compiler_reflection_record_parse(record->record, &canonical) &&
+        record->kind == canonical.kind && record->value_count == canonical.value_count &&
+        !memcmp(record->values, canonical.values, sizeof(record->values)) &&
+        ((record->name && canonical.name && !strcmp(record->name, canonical.name)) ||
+         (!record->name && !canonical.name));
+    unity_compiler_reflection_record_free(&canonical);
+    return equal;
+}
+
+/* Observe every canonical native tuple before bounded projection rejects an
+ * unsupported shape. This grants no parameter authority. */
+static bool inspect_native_cb_records(const UnityCompilerBinaryResponse *response,
+    const char *role) {
+    if (!response || !role ||
+        response->reflection_record_count > (size_t)PROBE_NATIVE_CB_RECORD_LIMIT ||
+        (response->reflection_record_count && !response->reflection_records)) return false;
+    bool has_parameters = false;
+    for (size_t index = 0; index < response->reflection_record_count; ++index) {
+        const UnityCompilerReflectionKind kind = response->reflection_records[index].kind;
+        has_parameters |= kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER ||
+            kind == UNITY_COMPILER_REFLECTION_CONSTANT ||
+            kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING;
+    }
+    if (!has_parameters) return true; /* No-CB output remains unchanged. */
+    for (size_t index = 0; index < response->reflection_record_count; ++index) {
+        const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
+        if (!native_reflection_record_canonical(record)) return false;
+        if (record->kind != UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER &&
+            record->kind != UNITY_COMPILER_REFLECTION_CONSTANT &&
+            record->kind != UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) continue;
+        printf("native_cb_inspection_record role=%s index=%zu kind=%u name=%s count=%zu", role,
+            index, (unsigned)record->kind, record->name, record->value_count);
+        for (size_t value = 0; value < record->value_count; ++value)
+            printf(" value%zu=%" PRId32, value, record->values[value]);
+        putchar('\n');
+    }
+    printf("native_cb_inspection role=%s canonical_records=%zu "
+           "parameter_projection=not-granted\n", role, response->reflection_record_count);
+    return true;
+}
+
+static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
     SerializedProgramParameters *parameters, const char *role) {
     if (!response || !parameters || parameters->cb_count || parameters->res_count ||
         parameters->constant_buffers || parameters->resources ||
@@ -364,21 +411,11 @@ static bool native_float4_parameters(const UnityCompilerBinaryResponse *response
     SerializedResourceParam binding = {.bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER,
         .array_size = 1};
     bool have_buffer = false, have_binding = false, constant_scope = false;
+    uint32_t next_offset = 0;
     int32_t variable_count = -1;
     for (size_t index = 0; index < response->reflection_record_count; ++index) {
         const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
-        if (!native_parameter_string_bounded(record->record, (size_t)PROBE_NATIVE_CB_RECORD_BYTES) ||
-            (record->name && !native_parameter_string_bounded(record->name,
-                (size_t)PROBE_NATIVE_CB_NAME_LIMIT)))
-            return false;
-        UnityCompilerReflectionRecord canonical = {0};
-        const bool canonical_record = unity_compiler_reflection_record_parse(record->record, &canonical) &&
-            record->kind == canonical.kind && record->value_count == canonical.value_count &&
-            !memcmp(record->values, canonical.values, sizeof(record->values)) &&
-            ((record->name && canonical.name && !strcmp(record->name, canonical.name)) ||
-             (!record->name && !canonical.name));
-        unity_compiler_reflection_record_free(&canonical);
-        if (!canonical_record) return false;
+        if (!native_reflection_record_canonical(record)) return false;
         if (record->kind == UNITY_COMPILER_REFLECTION_STATS) continue;
         if (record->kind == UNITY_COMPILER_REFLECTION_INPUT) {
             constant_scope = false;
@@ -396,10 +433,11 @@ static bool native_float4_parameters(const UnityCompilerBinaryResponse *response
         }
         if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER) {
             if (have_buffer || have_binding || record->value_count != 2u ||
-                record->values[0] < 16 || record->values[0] > PROBE_NATIVE_CB_FIELD_LIMIT * 16 ||
+                record->values[0] < 16 || record->values[0] > PROBE_NATIVE_CB_FIELD_LIMIT * 64 ||
                 (record->values[0] & 15) || record->values[1] < 1 ||
                 record->values[1] > PROBE_NATIVE_CB_FIELD_LIMIT ||
-                record->values[0] != record->values[1] * 16 ||
+                record->values[0] < record->values[1] * 16 ||
+                record->values[0] > record->values[1] * 64 ||
                 (!hlsl_source_identifier_valid(record->name) && strcmp(record->name, "$Globals")))
                 return false;
             buffer.name = record->name;
@@ -408,20 +446,23 @@ static bool native_float4_parameters(const UnityCompilerBinaryResponse *response
             have_buffer = true;
             constant_scope = true;
         } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT) {
+            const bool matrix = record->values[2] == 1 && record->values[3] == 4;
             if (!have_buffer || !constant_scope || have_binding || record->value_count != 6u ||
                 buffer.var_count >= variable_count ||
-                record->values[0] != buffer.var_count * 16 ||
-                record->values[1] || record->values[2] || record->values[3] != 1 ||
+                record->values[0] < 0 || (uint32_t)record->values[0] != next_offset ||
+                record->values[1] || (!matrix && (record->values[2] || record->values[3] != 1)) ||
                 record->values[4] != 4 || record->values[5] ||
+                next_offset > buffer.size || (matrix ? 64u : 16u) > buffer.size - next_offset ||
                 !hlsl_source_identifier_valid(record->name) || !strcmp(record->name, buffer.name))
                 return false;
             for (int field = 0; field < buffer.var_count; ++field)
                 if (!strcmp(fields[field].name, record->name)) return false;
             fields[buffer.var_count] = (SerializedVariable){.name = record->name,
-                .layout = {(uint32_t)record->values[0], 0, 0, 4, 0, 0}};
+                .layout = {(uint32_t)record->values[0], 0, 0, 4, matrix ? 1u : 0u, 0}};
+            next_offset += matrix ? 64u : 16u;
             ++buffer.var_count;
         } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) {
-            if (!have_buffer || have_binding || buffer.var_count != variable_count ||
+            if (!have_buffer || have_binding || buffer.var_count != variable_count || next_offset != buffer.size ||
                 record->value_count != 1u || record->values[0] < 0 ||
                 record->values[0] >= HLSL_SM5_CBUFFER_REGISTER_COUNT ||
                 strcmp(record->name, buffer.name)) return false;
@@ -431,9 +472,17 @@ static bool native_float4_parameters(const UnityCompilerBinaryResponse *response
             constant_scope = false;
         } else return false;
     }
-    if (!have_buffer || !have_binding || buffer.var_count != variable_count) return false;
+    if (!have_buffer || !have_binding || buffer.var_count != variable_count || next_offset != buffer.size) return false;
     const SerializedProgramParameters projected = {.constant_buffers = &buffer,
         .cb_count = 1, .resources = &binding, .res_count = 1};
+    for (int field = 0; field < buffer.var_count; ++field) {
+        const bool matrix = fields[field].layout[4] != 0;
+        DecodedVariableLayout layout;
+        if (!parameter_layout_decode(&projected, &fields[field], &layout) ||
+            layout.byte_offset != fields[field].layout[0] || layout.scalar_type || layout.array_size ||
+            layout.is_matrix != matrix || layout.rows != (matrix ? 4u : 1u) || layout.columns != 4u ||
+            parameter_layout_byte_size(&layout) != (matrix ? 64u : 16u)) return false;
+    }
     if (!serialized_program_parameters_copy(parameters, &projected)) return false;
     if (role) {
         printf("native_cb_projection role=%s records=%zu fields=%d "
@@ -443,18 +492,18 @@ static bool native_float4_parameters(const UnityCompilerBinaryResponse *response
     return true;
 }
 
-static bool native_float4_parameters_equal(const UnityCompilerBinaryResponse *response,
+static bool native_named_parameters_equal(const UnityCompilerBinaryResponse *response,
     const SerializedProgramParameters *original, const char *role) {
     SerializedProgramParameters current;
     serialized_program_parameters_init(&current);
-    const bool equal = native_float4_parameters(response, &current, role) &&
+    const bool equal = native_named_parameters(response, &current, role) &&
         serialized_program_parameters_equal(original, &current);
     serialized_program_parameters_free(&current);
     printf("native_cb_projection_equal role=%s original_tuples_equal=%d\n", role, equal);
     return equal;
 }
 
-static bool native_float4_program_matches(const USILProgram *program,
+static bool native_named_program_matches(const USILProgram *program,
     const SerializedProgramParameters *parameters) {
     if (!parameters) return true;
     return program && parameters->cb_count == 1 && parameters->constant_buffers &&
@@ -831,7 +880,7 @@ static bool packed_output_mul_literal(const USILProgram *program,
 static bool reconstruct_structured(const DXBCContainerView *target,
     StringBuilder *source, ProbeDecodedLiteral *literal_owner, bool change_literal,
     bool vertex_fixture, bool packed_output_fixture,
-    const SerializedProgramParameters *parameters) {
+    const SerializedProgramParameters *parameters, bool inspect_only) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -850,7 +899,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         program.program_type != (vertex_fixture ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL) ||
         program.instruction_count > PROBE_DOMAIN_INSTRUCTION_LIMIT ||
         program.input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
-        !native_float4_program_matches(&program, parameters) ||
+        !native_named_program_matches(&program, parameters) ||
         (packed_output_fixture
             ? program.output_count < 1 || program.output_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
               program.output_alloc < program.output_count
@@ -942,6 +991,13 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                "type=%u interpolation=%u\n", index, dxbc_signature_semantic_name(field),
                field->semantic_index, field->register_id, (unsigned)field->mask, (unsigned)field->rw_mask,
                field->component_type, (unsigned)field->interpolation_mode);
+    }
+    if (inspect_only) {
+        if (program.cbuffer_count < 0 || program.cbuffer_count > HLSL_SM5_CBUFFER_REGISTER_COUNT ||
+            program.cbuffer_alloc < program.cbuffer_count || (program.cbuffer_count && !program.cbuffers)) goto done;
+        for (int index = 0; index < program.cbuffer_count; ++index)
+            printf("structured_cbuffer index=%d register=%d rows=%d dynamic_indexed=%d\n", index,
+                program.cbuffers[index].reg_idx, program.cbuffers[index].size, program.cbuffers[index].dynamic_indexed);
     }
     ProbeDecodedLiteral captured = {0};
     unsigned packed_literal_count = 0;
@@ -1054,6 +1110,15 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         puts("structured_literal_owner=unavailable");
         goto done;
     }
+    if (inspect_only) {
+        printf("structured_literal_owner=decoded-target instruction=%d raw_instruction=%u "
+               "operand=%d component_mask=%u original_bits=0x%08" PRIx32 " changed=0\n",
+               captured.instruction, captured.raw_instruction, captured.operand,
+               (unsigned)captured.component_mask, captured.original_bits);
+        puts("structured_inspection=complete structured_source_result=not-attempted "
+             "reason=unavailable-projected-metadata source_construction=not-run");
+        goto done;
+    }
     if (change_literal) {
         if (!literal_owner->valid || captured.instruction != literal_owner->instruction ||
             captured.operand != literal_owner->operand || captured.component_mask != literal_owner->component_mask ||
@@ -1099,11 +1164,13 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                        : (change_literal ? "mutated_fragment_sha256" : "reconstructed_fragment_sha256"),
                    source->buf, source->len);
         printf("structured_quality=%s reasons=0x%x units=%zu incomplete=%zu residual=%zu "
-               "unknown_provenance=%zu map_complete=%d map_count=%zu map_valid=%d\n",
+               "unknown_provenance=%zu map_complete=%d map_count=%zu map_valid=%d "
+               "cbuffer_declarations=%zu cbuffer_fields=%zu\n",
                hlsl_source_quality_class_name(quality.classification), quality.reasons,
                quality.counts.inspected_units, quality.counts.incomplete_units,
                quality.counts.residual_total, quality.counts.unknown_provenance,
-               map.complete, map.count, map_valid);
+               map.complete, map.count, map_valid,
+               quality.counts.cbuffer_declarations, quality.counts.cbuffer_fields);
         accepted = map_valid && map.complete &&
             quality.classification != HLSL_SOURCE_QUALITY_FAILED;
         if (packed_output_fixture) {
@@ -2297,16 +2364,25 @@ int main(int argc, char **argv) {
     if (structured_fixture) {
         if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target)) goto done;
         print_hash("target_complete_dxbc_sha256", target.data, target.size);
+        if (packed_output_vertex_fixture && !inspect_native_cb_records(&compiled[0], "original")) {
+            puts("native_cb_inspection=incomplete actual_metadata_not_substituted=1");
+            goto done;
+        }
         if (packed_output_vertex_fixture &&
-            !native_float4_parameters(&compiled[0], &native_parameters, "original")) {
+            !native_named_parameters(&compiled[0], &native_parameters, "original")) {
             puts("native_cb_projection=unavailable actual_metadata_not_substituted=1");
+            (void)reconstruct_structured(&target, &hull, &structured_literal, false,
+                structured_vertex_fixture, packed_output_vertex_fixture, NULL, true);
+            puts("packed_output_source=not-attempted reason=unavailable-projected-metadata "
+                 "packed_output_candidate=not-run packed_output_warm_mutation=not-run "
+                 "packed_output_warm_restore=not-run");
             goto done;
         }
         if (native_parameters.cb_count)
             puts("metadata_authority=actual-native-callback-projection player_metadata=not-supplied");
         if (!reconstruct_structured(&target, &hull, &structured_literal, false,
                 structured_vertex_fixture, packed_output_vertex_fixture,
-                native_parameters.cb_count ? &native_parameters : NULL) ||
+                native_parameters.cb_count ? &native_parameters : NULL, false) ||
             !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture)) {
             if (packed_output_vertex_fixture)
                 puts("packed_output_candidate=not-run packed_output_warm_mutation=not-run "
@@ -2369,7 +2445,7 @@ int main(int argc, char **argv) {
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
     if (native_parameters.cb_count &&
-        !native_float4_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
+        !native_named_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
     const bool controls_equal =
         selected_controls_equal(&requests[0], &requests[1]);
     const bool toolchain_equal =
@@ -2421,7 +2497,7 @@ int main(int argc, char **argv) {
         sb_init(&mutated_fragment);
         mutation_built = reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
                 structured_vertex_fixture, packed_output_vertex_fixture,
-                native_parameters.cb_count ? &native_parameters : NULL) &&
+                native_parameters.cb_count ? &native_parameters : NULL, false) &&
             structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture);
         sb_free(&mutated_fragment);
     } else {
@@ -2439,7 +2515,7 @@ int main(int argc, char **argv) {
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
     if (native_parameters.cb_count &&
-        !native_float4_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
+        !native_named_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
     const DXBCCompareStatus mutation_status = dxbc_compare_exact(
         candidate.data, candidate.size, changed.data, changed.size, &comparison);
     const bool mutation_diff =
@@ -2471,7 +2547,7 @@ int main(int argc, char **argv) {
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
     if (native_parameters.cb_count &&
-        !native_float4_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;
+        !native_named_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;
     const DXBCCompareStatus repeated_status = dxbc_compare_exact(
         summary_only ? target.data : candidate.data,
         summary_only ? target.size : candidate.size,

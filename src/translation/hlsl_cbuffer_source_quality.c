@@ -50,12 +50,23 @@ static bool field_matches(const TempVariable *field, const SerializedVariable *v
         parameter_layout_byte_size(decoded) == field->byte_size;
 }
 
+static bool layout_has_matrix_field(const HLSLCBufferLayout *layout) {
+    if (!layout || layout->variable_count < 0 ||
+        layout->variable_count > CBUFFER_INVENTORY_ROW_LIMIT ||
+        (layout->variable_count && !layout->variables)) return false;
+    for (int field = 0; field < layout->variable_count; ++field)
+        if (layout->variables[field].is_matrix) return true;
+    return false;
+}
+
 /* Require every serialized field to survive in the actual emitted inventory,
  * including unused fields. A filtered field or anonymous tail remains a gap.
  * Scalar/vector row alignment is supplied by actual packoffset qualifiers,
  * except the separately proved HULL b0 scalar at offset zero, whose one
  * 16-byte row uses implicit cbuffer rounding. Generated dummy variables do
- * not supply coverage. Sibling declaration authority is excluded. */
+ * not supply coverage. A complete FLOAT4x4 occupies four rows but one actual
+ * declaration, only within the independently replayed packed-output unit.
+ * Sibling declaration authority is excluded. */
 bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
     int index, uint8_t *shell_authority) {
     if (!ctx || !ctx->program || !ctx->program->cbuffers || index < 0 ||
@@ -73,18 +84,26 @@ bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
         layout->row_count > CBUFFER_INVENTORY_ROW_LIMIT ||
         ctx->program->cbuffers[index].dynamic_indexed ||
         layout->reflection_size_bytes != (uint32_t)layout->row_count * 16u ||
-        layout->variable_count != layout->row_count || !layout->variables ||
+        layout->variable_count <= 0 || layout->variable_count > layout->row_count || !layout->variables ||
         layout->projection_status != DXBC_CBUFFER_PROJECTION_EXACT ||
         layout->projection.saw_dynamic_access || layout->projection.saw_padding_access) return false;
+    const bool matrix_inventory = layout_has_matrix_field(layout);
+    if (matrix_inventory ? !hlsl_source_quality_packed_output_guard_active(ctx)
+                         : layout->variable_count != layout->row_count) return false;
     uint32_t cursor = 0;
     for (int variable = 0; variable < layout->variable_count; ++variable) {
         const TempVariable *field = &layout->variables[variable];
         if ((field->authority != 1 && field->authority != 2) ||
             !name_available(ctx, layout, field, field->name) || field->type ||
-            field->is_matrix || field->matrix_array_size || field->row_major || field->rows != 1 ||
-            !field->dim || field->dim > 4 || field->byte_offset != cursor ||
-            field->reg_offset != cursor / 16u || field->byte_size != field->dim * 4u) return false;
-        cursor += 16u;
+            field->matrix_array_size || field->row_major || field->byte_offset != cursor ||
+            field->reg_offset != cursor / 16u) return false;
+        const uint32_t extent = field->is_matrix ? 64u : 16u;
+        if (field->is_matrix ? field->rows != 4 || field->dim != 4 || field->byte_size != 64
+                             : field->rows != 1 || !field->dim || field->dim > 4 ||
+                                   field->byte_size != field->dim * 4u) return false;
+        if (cursor > layout->reflection_size_bytes ||
+            extent > layout->reflection_size_bytes - cursor) return false;
+        cursor += extent;
     }
     if (cursor != layout->reflection_size_bytes) return false;
     uint8_t authority = 0;
@@ -110,7 +129,15 @@ bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
                 const SerializedVariable *variable = &metadata->variables[member];
                 if (!parameter_layout_decode(parameters, variable, &decoded) ||
                     (decoded.byte_offset & 15u)) return false;
-                const uint32_t field = decoded.byte_offset / 16u;
+                uint32_t field = decoded.byte_offset / 16u;
+                if (matrix_inventory) {
+                    field = UINT32_MAX;
+                    for (int candidate = 0; candidate < layout->variable_count; ++candidate) {
+                        if (!field_matches(&layout->variables[candidate], variable, &decoded)) continue;
+                        if (field != UINT32_MAX) return false;
+                        field = (uint32_t)candidate;
+                    }
+                }
                 if (field >= (uint32_t)layout->variable_count ||
                     !field_matches(&layout->variables[field], variable, &decoded)) return false;
                 if (field_authorities[field] & (1u << source)) return false;
@@ -187,6 +214,16 @@ bool hlsl_source_quality_cbuffer_syntax(HLSLEmitterContext *ctx, int index,
         facts.cbuffer_field_index = (uint32_t)field_index;
         facts.cbuffer_byte_offset = field->byte_offset;
         facts.cbuffer_byte_size = field->byte_size;
+        if (layout_has_matrix_field(layout)) {
+            if (!hlsl_source_quality_named_cbuffer_supported(ctx, index, NULL)) {
+                hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED, HLSL_EMIT_PHASE_CBUFFER_EMISSION,
+                               HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+                return false;
+            }
+            facts.cbuffer_field_rows = (uint8_t)field->rows;
+            facts.cbuffer_field_columns = (uint8_t)field->dim;
+            facts.cbuffer_field_is_matrix = field->is_matrix != 0;
+        }
     }
     if (hlsl_source_quality_analysis_emission(ctx->source_quality_analysis, &facts)) return true;
     hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED, HLSL_EMIT_PHASE_CBUFFER_EMISSION,

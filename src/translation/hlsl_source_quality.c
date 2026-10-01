@@ -99,6 +99,10 @@ static bool facts_valid(const HLSLSourceQualityFacts *facts) {
     if (facts->cbuffer_declaration_kind < HLSL_SOURCE_CBUFFER_NONE ||
         facts->cbuffer_declaration_kind > HLSL_SOURCE_CBUFFER_END)
         return false;
+    const bool explicit_cbuffer_shape = facts->cbuffer_field_rows ||
+        facts->cbuffer_field_columns || facts->cbuffer_field_is_matrix;
+    if (explicit_cbuffer_shape && facts->cbuffer_declaration_kind != HLSL_SOURCE_CBUFFER_FIELD)
+        return false;
     if (facts->cbuffer_declaration_kind != HLSL_SOURCE_CBUFFER_NONE) {
         if (!facts->known || facts->instruction_index != -1 || facts->logical_operation ||
             facts->artifacts || facts->resource_declaration_kind != HLSL_SOURCE_RESOURCE_NONE ||
@@ -110,10 +114,21 @@ static bool facts_valid(const HLSLSourceQualityFacts *facts) {
              facts->cbuffer_declaration_authority != 2))
             return false;
         if (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD) {
-            if (facts->cbuffer_field_index != facts->cbuffer_byte_offset / 16u ||
-                facts->cbuffer_byte_size > 16 ||
-                (facts->cbuffer_byte_size & 3u) || (facts->cbuffer_byte_offset & 15u))
+            if (explicit_cbuffer_shape) {
+                if ((facts->cbuffer_byte_offset & 15u) ||
+                    facts->cbuffer_field_index > facts->cbuffer_byte_offset / 16u ||
+                    (facts->cbuffer_field_is_matrix
+                         ? facts->cbuffer_field_rows != 4 || facts->cbuffer_field_columns != 4 ||
+                               facts->cbuffer_byte_size != 64
+                         : facts->cbuffer_field_rows != 1 || !facts->cbuffer_field_columns ||
+                               facts->cbuffer_field_columns > 4 ||
+                               facts->cbuffer_byte_size != (uint32_t)facts->cbuffer_field_columns * 4u))
+                    return false;
+            } else if (facts->cbuffer_field_index != facts->cbuffer_byte_offset / 16u ||
+                       facts->cbuffer_byte_size > 16 ||
+                       (facts->cbuffer_byte_size & 3u) || (facts->cbuffer_byte_offset & 15u)) {
                 return false;
+            }
         } else if (facts->cbuffer_field_index != UINT32_MAX || facts->cbuffer_byte_offset ||
                    (facts->cbuffer_byte_size & 15u))
             return false;
@@ -818,7 +833,10 @@ bool hlsl_source_quality_facts_equal(const HLSLSourceQualityFacts *a, const HLSL
         a->cbuffer_field_index == b->cbuffer_field_index &&
         a->cbuffer_byte_offset == b->cbuffer_byte_offset &&
         a->cbuffer_byte_size == b->cbuffer_byte_size &&
-        a->cbuffer_declaration_authority == b->cbuffer_declaration_authority;
+        a->cbuffer_declaration_authority == b->cbuffer_declaration_authority &&
+        a->cbuffer_field_rows == b->cbuffer_field_rows &&
+        a->cbuffer_field_columns == b->cbuffer_field_columns &&
+        a->cbuffer_field_is_matrix == b->cbuffer_field_is_matrix;
 }
 
 static bool quality_observations_equal(const HLSLSourceQualityObservation *a, const HLSLSourceQualityObservation *b) {

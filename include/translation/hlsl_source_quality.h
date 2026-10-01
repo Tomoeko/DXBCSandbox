@@ -123,6 +123,11 @@ typedef struct {
     uint32_t cbuffer_byte_offset;
     uint32_t cbuffer_byte_size;
     uint8_t cbuffer_declaration_authority;
+    /* Matrix-containing named inventories retain actual declaration ordinals
+     * and explicit field shapes. Legacy vector-only facts leave these zero. */
+    uint8_t cbuffer_field_rows;
+    uint8_t cbuffer_field_columns;
+    bool cbuffer_field_is_matrix;
 } HLSLSourceQualityFacts;
 
 void hlsl_source_quality_facts_init(HLSLSourceQualityFacts *facts);

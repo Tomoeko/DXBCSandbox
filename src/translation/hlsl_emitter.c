@@ -1662,6 +1662,11 @@ typedef struct HLSLPackedOutputGuard {
   bool ready;
 } HLSLPackedOutputGuard;
 
+bool hlsl_source_quality_packed_output_guard_active(const HLSLEmitterContext *ctx) {
+  return ctx && ctx->high_level_packed_outputs && ctx->packed_output_guard &&
+      ctx->packed_output_guard->ready;
+}
+
 static bool packed_output_lease(HLSLPackedOutputGuard *guard, const void *source, size_t size) {
   if (!size) return true;
   if (!source || guard->lease_count == (size_t)PACKED_OUTPUT_LEASE_LIMIT ||

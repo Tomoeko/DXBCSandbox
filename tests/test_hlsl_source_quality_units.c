@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_source_quality.h"
+#include "translation/hlsl_source_quality_internal.h"
 #include "translation/usil.h"
 
 #include <stdio.h>
@@ -821,6 +822,78 @@ static bool check_natural_interfaces_and_residual_projections(void) {
     return true;
 }
 
+static bool check_cbuffer_shape_facts(void) {
+    HLSLSourceQualityFacts base;
+    memset(&base, 0xff, sizeof(base)); hlsl_source_quality_facts_init(&base);
+    CHECK(!base.cbuffer_field_rows && !base.cbuffer_field_columns && !base.cbuffer_field_is_matrix);
+    base.known = true; base.cbuffer_declaration_kind = HLSL_SOURCE_CBUFFER_FIELD;
+    base.cbuffer_binding_register = 0; base.cbuffer_declaration_authority = 1;
+    base.cbuffer_field_index = 0; base.cbuffer_byte_size = 64;
+    base.cbuffer_field_rows = 4; base.cbuffer_field_columns = 4; base.cbuffer_field_is_matrix = true;
+    for (unsigned variant = 0; variant < 5; ++variant) {
+        HLSLSourceQualityFacts fact = base;
+        if (variant == 1) { fact.cbuffer_field_index = 1; fact.cbuffer_byte_offset = 16; }
+        if (variant >= 2) {
+            fact.cbuffer_field_index = 1; fact.cbuffer_byte_offset = 64; fact.cbuffer_byte_size = 16;
+            fact.cbuffer_field_rows = 1; fact.cbuffer_field_is_matrix = false;
+        }
+        if (variant == 3) { fact.cbuffer_field_rows = fact.cbuffer_field_columns = 0; fact.cbuffer_field_index = 4; }
+        if (variant == 4) {
+            fact.cbuffer_declaration_kind = HLSL_SOURCE_CBUFFER_END; fact.cbuffer_field_index = UINT32_MAX;
+            fact.cbuffer_byte_offset = 0; fact.cbuffer_byte_size = 80;
+            fact.cbuffer_field_rows = fact.cbuffer_field_columns = 0;
+        }
+        HLSLSourceQualityUnit unit = {.kind = HLSL_SOURCE_UNIT_ENTRY_POINT, .coverage_complete = true,
+            .emission_facts = &fact, .emission_fact_count = 1};
+        HLSLSourceQualityRequest request = {.stage = DXBC_PROGRAM_TYPE_VERTEX, .emission_status = HLSL_EMIT_STATUS_OK,
+            .units = &unit, .unit_count = 1, .expected_unit_count = 1};
+        HLSLSourceQualityResult result;
+        /* This checks the analyzer's fact grammar, not a producer receipt or
+         * proof that a standalone declaration covers an actual program. */
+        CHECK(hlsl_source_quality_analyze(&request, &result) && result.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+            result.counts.cbuffer_fields == (variant == 4 ? 0u : 1u));
+    }
+    for (unsigned mutation = 0; mutation < 14; ++mutation) {
+        HLSLSourceQualityFacts fact = base;
+        if (mutation == 0) {
+            fact.cbuffer_field_rows = fact.cbuffer_field_columns = 0; fact.cbuffer_field_is_matrix = false;
+        }
+        if (mutation == 1) fact.cbuffer_field_index = 1; /* Ordinal one cannot start at byte zero. */
+        if (mutation == 2) fact.cbuffer_field_rows = 3;
+        if (mutation == 3) fact.cbuffer_field_columns = 3;
+        if (mutation == 4) fact.cbuffer_byte_size = 16;
+        if (mutation == 5) fact.cbuffer_field_is_matrix = false;
+        if (mutation == 6) { fact.cbuffer_field_rows = 1; fact.cbuffer_field_is_matrix = false; }
+        if (mutation == 7) fact.cbuffer_byte_size = 128; /* Array extents have no shape authority here. */
+        if (mutation == 8) fact.cbuffer_byte_offset = 4;
+        if (mutation == 9) fact.cbuffer_byte_offset = 65520;
+        if (mutation >= 10) {
+            fact.cbuffer_declaration_kind = mutation == 10 ? HLSL_SOURCE_CBUFFER_NONE :
+                mutation == 11 ? HLSL_SOURCE_CBUFFER_BEGIN : HLSL_SOURCE_CBUFFER_END;
+            fact.cbuffer_field_index = UINT32_MAX;
+            if (mutation == 13) { fact.cbuffer_field_rows = fact.cbuffer_field_columns = 0; }
+        }
+        HLSLSourceQualityUnit unit = {.kind = HLSL_SOURCE_UNIT_ENTRY_POINT, .coverage_complete = true,
+            .emission_facts = &fact, .emission_fact_count = 1};
+        HLSLSourceQualityRequest request = {.stage = DXBC_PROGRAM_TYPE_VERTEX, .emission_status = HLSL_EMIT_STATUS_OK,
+            .units = &unit, .unit_count = 1, .expected_unit_count = 1};
+        HLSLSourceQualityResult result;
+        CHECK(!hlsl_source_quality_analyze(&request, &result) && result.classification == HLSL_SOURCE_QUALITY_FAILED);
+    }
+    CHECK(hlsl_source_quality_facts_equal(&base, &base));
+    for (unsigned member = 0; member < 3; ++member) {
+        HLSLSourceQualityFacts other = base;
+        if (!member) --other.cbuffer_field_rows;
+        if (member == 1) --other.cbuffer_field_columns;
+        if (member == 2) other.cbuffer_field_is_matrix = false;
+        CHECK(!hlsl_source_quality_facts_equal(&base, &other));
+        HLSLSourceQualityResult a = {.has_first_issue = true}, b = a;
+        a.first_issue.facts = base; b.first_issue.facts = other;
+        CHECK(!hlsl_source_quality_results_equal(&a, &b));
+    }
+    return true;
+}
+
 static bool check_multiple_entry_inventory(void) {
     HLSLSourceQualityFacts fact;
     hlsl_source_quality_facts_init(&fact);
@@ -873,7 +946,8 @@ int main(void) {
         !check_hidden_helpers_and_categories() || !check_statements_and_emission_outcomes() ||
         !check_invalid_and_bounded_analysis() || !check_streaming_matches_batch() ||
         !check_real_emitter_quality_is_independent() || !check_owned_ast_logical_origins() ||
-        !check_natural_interfaces_and_residual_projections() || !check_multiple_entry_inventory())
+        !check_natural_interfaces_and_residual_projections() || !check_multiple_entry_inventory() ||
+        !check_cbuffer_shape_facts())
         return 1;
     puts("HLSL semantic source-quality classifications passed");
     return 0;
