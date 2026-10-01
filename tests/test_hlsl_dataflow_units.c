@@ -2244,6 +2244,11 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
             source->extended_tokens[0] = UINT32_C(1) | (source->has_neg ? UINT32_C(0xc0) : UINT32_C(0x80));
             break;
         }
+        case 32: {
+            DXBCOperand *threshold = &program->instructions[ledger->arithmetic_instruction].operands[2];
+            threshold->imm_values[0] = threshold->immediate_words[0] = UINT32_C(0x3f400000);
+            break;
+        }
         }
         ledger->mutated = true;
     }
@@ -2507,23 +2512,17 @@ static bool check_natural_if_rejections(void) {
     memcpy(program->instructions, saved, sizeof(saved));
     program->inputs[0] = saved_input;
     program->outputs[0] = saved_output;
-    /* Well-formed nested IF has an explicit ELSE at both levels; its rejection
-     * tests the bounded scope rather than an unbalanced control-flow stream. */
-    USILInstruction nested[16] = {0};
-    nested[0] = saved[0];
-    nested[1] = saved[0];
-    nested[2] = saved[1]; nested[3] = saved[2];
-    nested[4] = saved[3]; nested[5] = saved[4]; nested[6] = saved[5];
-    nested[7] = saved[6];
-    nested[8] = saved[3]; nested[9] = saved[4]; nested[10] = saved[5];
-    nested[11] = saved[6]; nested[12] = saved[7];
-    nested[13] = saved[8]; nested[14] = saved[9];
-    for (int index = 0; index < 15; ++index)
+    /* Two balanced sequential diamonds remain outside the contained-region
+     * route. Neither diamond writes an output conditionally. */
+    USILInstruction nested[24] = {0};
+    memcpy(nested, saved, 7u * sizeof(*saved));
+    memcpy(nested + 7, saved, sizeof(saved));
+    for (int index = 0; index < 17; ++index)
         nested[index].source_instruction_index = (uint32_t)index + 5u;
     USILProgram extended = *program;
     extended.instructions = nested;
-    extended.instruction_count = 15;
-    extended.instruction_alloc = 16;
+    extended.instruction_count = 17;
+    extended.instruction_alloc = 24;
     CHECK(natural_if_rejected(&extended, NULL));
     /* A balanced loop containing the complete IF is also outside the route. */
     nested[0] = (USILInstruction){.opcode = USIL_OP_LOOP};
@@ -4289,6 +4288,7 @@ typedef struct {
     NaturalIfObservations common;
     uint8_t result_mask, packed_fields;
     uint64_t dot_calls;
+    uint64_t scalar_phi_ids;
     size_t scalar_phi_events;
 } NaturalDotObservations;
 
@@ -4306,6 +4306,9 @@ static bool observe_natural_dot(void *context, const HLSLSourceQualityObservatio
             (facts->logical_value_id >> 16u) == (UINT64_C(0x8000000000060000) >> 16u)) {
             ++ledger->scalar_phi_events;
             if (facts->components != 1) ledger->common.wrong_owner = true;
+            const uint64_t ordinal = facts->logical_value_id & UINT64_C(0xffff);
+            if (ordinal < 64) ledger->scalar_phi_ids |= UINT64_C(1) << (unsigned)ordinal;
+            else ledger->common.wrong_owner = true;
         }
         if (observation->ast_kind == AST_EXPR_CALL && facts->instruction_index >= 0 &&
             facts->instruction_index < ledger->common.program->instruction_count) {
@@ -4948,6 +4951,566 @@ static bool check_natural_source_modifiers(void) {
     return true;
 }
 
+typedef struct {
+    NaturalIfFixture decoded;
+    int outer_if, inner_if, outer_comparison, inner_comparison;
+    int inner_then, inner_else, other_writer, inner_end, outer_end;
+    uint8_t writer_mask;
+    bool dot, inner_in_else, compared;
+    unsigned width;
+} NaturalNestedFixture;
+
+typedef struct {
+    uint32_t words[128];
+    size_t count;
+    int operations;
+} NaturalNestedWords;
+
+/* Assemble only complete instruction slices from the existing authored
+ * documents. The official token reader and a new ordinary decode retain
+ * declaration, raw-instruction, signature, CFG and SSA authority. */
+static bool natural_nested_copy_instruction(NaturalNestedWords *words,
+    const NaturalIfFixture *base, int instruction, bool prefix, bool inner,
+    uint8_t writer_mask) {
+    const uint32_t raw = base->program.instructions[instruction].source_instruction_index;
+    const DXBCDocumentInstruction *record = NULL;
+    for (size_t index = 0; index < base->document.instruction_count; ++index)
+        if (base->document.instructions[index].instruction_index == raw)
+            record = &base->document.instructions[index];
+    CHECK(record && words->count + record->token_count <= sizeof(words->words) / sizeof(*words->words));
+    const size_t begin = words->count;
+    for (uint32_t index = 0; index < record->token_count; ++index)
+        CHECK(dxbc_document_instruction_token(record, index, &words->words[words->count++]));
+    unsigned lane = 0;
+    while (!(writer_mask & (1u << lane))) ++lane;
+    if (prefix) {
+        CHECK(base->program.instructions[instruction].opcode == USIL_OP_LT && record->token_count == 7);
+        words->words[begin + 1] = (words->words[begin + 1] & ~UINT32_C(0xf0)) | (UINT32_C(1) << (lane + 4u));
+        words->words[begin + 2] = 0;
+        if (inner) words->words[begin + 6] = UINT32_C(0x3f000000);
+    } else if (base->program.instructions[instruction].opcode == USIL_OP_IF) {
+        CHECK(record->token_count == 3);
+        if (base->condition) {
+            words->words[begin + 1] = UINT32_C(0x0010000a) | (uint32_t)lane << 4u;
+            words->words[begin + 2] = 0;
+        }
+        if (inner) words->words[begin] ^= UINT32_C(0x40000);
+    }
+    ++words->operations;
+    return true;
+}
+
+static bool natural_nested_copy_range(NaturalNestedWords *words,
+    const NaturalIfFixture *base, int first, int end, bool prefix, bool inner,
+    uint8_t writer_mask) {
+    for (int index = first; index < end; ++index)
+        CHECK(natural_nested_copy_instruction(words, base, index, prefix, inner, writer_mask));
+    return true;
+}
+
+static bool natural_nested_inner(NaturalNestedWords *words, const NaturalIfFixture *base,
+    int otherwise, int end, NaturalNestedFixture *nested) {
+    nested->inner_comparison = base->condition ? words->operations : -1;
+    CHECK(natural_nested_copy_range(words, base, 0, base->condition, true, true, nested->writer_mask));
+    nested->inner_if = words->operations;
+    CHECK(natural_nested_copy_instruction(words, base, base->condition, false, true, nested->writer_mask));
+    nested->inner_then = words->operations + base->then_value - base->condition - 1;
+    CHECK(natural_nested_copy_range(words, base, base->condition + 1, otherwise, false, false, nested->writer_mask));
+    CHECK(natural_nested_copy_instruction(words, base, otherwise, false, false, nested->writer_mask));
+    nested->inner_else = words->operations + base->else_value - otherwise - 1;
+    CHECK(natural_nested_copy_range(words, base, otherwise + 1, end, false, false, nested->writer_mask));
+    nested->inner_end = words->operations;
+    CHECK(natural_nested_copy_instruction(words, base, end, false, false, nested->writer_mask));
+    return true;
+}
+
+static bool natural_nested_fixture(NaturalNestedFixture *nested, unsigned width,
+    uint8_t mask, bool dot, bool inner_in_else, bool compared, bool vertex, bool dead_read) {
+    memset(nested, 0, sizeof(*nested));
+    nested->dot = dot; nested->width = width; nested->writer_mask = mask;
+    nested->inner_in_else = inner_in_else; nested->compared = compared;
+    NaturalIfFixture base;
+    if (dot) {
+        const NaturalDotShape shape = {.width = width, .layout = width == 2 ?
+            NATURAL_IF_INPUTS_PACKED_SPLIT : NATURAL_IF_INPUTS_SEPARATE,
+            .compared = compared, .nonzero = true};
+        CHECK(!vertex && mask == 1 && natural_dot_fixture(&base, shape));
+    } else if (vertex) {
+        CHECK(width == 3 && mask == 7 && natural_if_multiple_outputs_fixture_mode(&base,
+            true, compared ? USIL_OP_LT : USIL_OP_NOP, 1, true));
+    } else {
+        CHECK(natural_if_fixture_init_mode(&base, width, mask, true, false, false, false,
+            compared ? USIL_OP_LT : USIL_OP_NOP, 1, UINT32_C(0x3ec00000)));
+    }
+    NaturalNestedWords words = {0};
+    const uint32_t first_raw = base.program.instructions[0].source_instruction_index;
+    for (size_t index = 0; index < base.document.instruction_count; ++index) {
+        const DXBCDocumentInstruction *record = &base.document.instructions[index];
+        if (record->instruction_index >= first_raw) continue;
+        CHECK(words.count + record->token_count <= sizeof(words.words) / sizeof(*words.words));
+        for (uint32_t token = 0; token < record->token_count; ++token)
+            CHECK(dxbc_document_instruction_token(record, token, &words.words[words.count++]));
+    }
+    int otherwise = -1, end = -1;
+    for (int index = 0; index < base.program.instruction_count; ++index) {
+        if (base.program.instructions[index].opcode == USIL_OP_ELSE) otherwise = index;
+        if (base.program.instructions[index].opcode == USIL_OP_ENDIF) end = index;
+    }
+    CHECK(otherwise > base.condition && end > otherwise);
+    nested->outer_comparison = compared ? words.operations : -1;
+    CHECK(natural_nested_copy_range(&words, &base, 0, base.condition, true, false, mask));
+    nested->outer_if = words.operations;
+    CHECK(natural_nested_copy_instruction(&words, &base, base.condition, false, false, mask));
+    if (!inner_in_else) CHECK(natural_nested_inner(&words, &base, otherwise, end, nested));
+    else {
+        nested->other_writer = words.operations + base.then_value - base.condition - 1;
+        CHECK(natural_nested_copy_range(&words, &base, base.condition + 1, otherwise, false, false, mask));
+    }
+    CHECK(natural_nested_copy_instruction(&words, &base, otherwise, false, false, mask));
+    if (inner_in_else) CHECK(natural_nested_inner(&words, &base, otherwise, end, nested));
+    else {
+        nested->other_writer = words.operations + base.else_value - otherwise - 1;
+        CHECK(natural_nested_copy_range(&words, &base, otherwise + 1, end, false, false, mask));
+    }
+    nested->outer_end = words.operations;
+    CHECK(natural_nested_copy_instruction(&words, &base, end, false, false, mask));
+    if (dead_read) {
+        /* The result W is unused, but this real ADD still reads outer Y. Its
+         * incoming inner-Y phi has an undefined true edge in the DP3 grammar. */
+        CHECK(dot && width == 3 && words.count + 7u <= sizeof(words.words) / sizeof(*words.words));
+        const uint8_t y[] = {1, 1, 1, 1};
+        const uint32_t read[] = {UINT32_C(0x07000000), UINT32_C(0x00100082), 0,
+            natural_if_source_token(OPERAND_TYPE_TEMP, y), 0, UINT32_C(0x4001), UINT32_C(0x3e800000)};
+        memcpy(words.words + words.count, read, sizeof(read)); words.count += 7; ++words.operations;
+    }
+    const int suffix = words.operations;
+    CHECK(natural_nested_copy_range(&words, &base, end + 1, base.program.instruction_count, false, false, mask));
+    NaturalIfFixture *decoded = &nested->decoded;
+    dxbc_document_init(&decoded->document); dxbc_stage_contract_init(&decoded->contract);
+    CHECK(natural_if_fixture_decode_words(decoded, vertex ? UINT32_C(0x00010050) : UINT32_C(0x00000050),
+        words.words, words.count, base.program.inputs, (unsigned)base.program.input_count,
+        base.program.outputs, (unsigned)base.program.output_count));
+    decoded->condition = nested->outer_if; decoded->then_value = nested->inner_then;
+    decoded->else_value = nested->inner_else;
+    decoded->join_value = suffix + base.join_value - end - 1;
+    decoded->output = suffix + base.output - end - 1;
+    CHECK(decoded->program.instruction_count == words.operations);
+    natural_if_fixture_dispose(&base);
+    return true;
+}
+
+static const HLSLPhiNode *natural_nested_phi(const HLSLEmitterContext *ctx, int block, int value) {
+    const HLSLBlockPhis *phis = &ctx->ssa.block_phis[block];
+    for (int index = 0; index < phis->phi_count; ++index)
+        if (phis->phis[index].ssa_var == value) return &phis->phis[index];
+    return NULL;
+}
+
+static bool check_natural_nested_owners(NaturalNestedFixture *fixture) {
+    USILProgram *program = &fixture->decoded.program;
+    HLSLEmitterContext ctx; CHECK(analyze(&ctx, program));
+    HLSLIfRegion outer, inner;
+    CHECK(hlsl_cfg_if_region(&ctx, fixture->outer_if, &outer) &&
+        hlsl_cfg_if_region(&ctx, fixture->inner_if, &inner) && outer.end_instruction == fixture->outer_end &&
+        inner.end_instruction == fixture->inner_end && inner.end_instruction < outer.end_instruction &&
+        hlsl_cfg_dominates(&ctx.cfg, outer.header_block, inner.header_block));
+    CHECK(fixture->inner_in_else ? fixture->inner_if > outer.else_instruction : fixture->inner_end < outer.else_instruction);
+    const HLSLBlockPhis *inner_phis = &ctx.ssa.block_phis[inner.join_block];
+    const HLSLBlockPhis *outer_phis = &ctx.ssa.block_phis[outer.join_block];
+    CHECK(ctx.cfg.blocks[inner.join_block].predecessor_count == 2 && ctx.cfg.blocks[outer.join_block].predecessor_count == 2);
+    unsigned actual_lanes = 0, dead_chain = 0, undefined_inner = 0;
+    for (int index = 0; index < inner_phis->phi_count; ++index) {
+        const HLSLPhiNode *phi = &inner_phis->phis[index];
+        if (phi->register_index != 0) continue;
+        CHECK(phi->component >= 0 && phi->component < 4 && phi->incoming_vars && phi->incoming_blocks);
+        const HLSLPhiNode *following = NULL;
+        for (int item = 0; item < outer_phis->phi_count; ++item) {
+            const HLSLPhiNode *candidate = &outer_phis->phis[item];
+            if (candidate->register_index == 0 && candidate->component == phi->component &&
+                (candidate->incoming_vars[0] == phi->ssa_var || candidate->incoming_vars[1] == phi->ssa_var)) following = candidate;
+        }
+        CHECK(following);
+        if (fixture->writer_mask & (1u << (unsigned)phi->component)) {
+            ++actual_lanes;
+            const int left = phi->incoming_vars[0], right = phi->incoming_vars[1];
+            CHECK(left >= 0 && right >= 0 && left < ctx.ssa.ssa_var_count && right < ctx.ssa.ssa_var_count);
+            const int a = ctx.ssa.ssa_var_defs[left], b = ctx.ssa.ssa_var_defs[right];
+            CHECK((a == fixture->inner_then && b == fixture->inner_else) ||
+                (a == fixture->inner_else && b == fixture->inner_then));
+            const int other = following->incoming_vars[following->incoming_vars[0] == phi->ssa_var ? 1 : 0];
+            CHECK(other >= 0 && other < ctx.ssa.ssa_var_count && ctx.ssa.ssa_var_defs[other] == fixture->other_writer &&
+                ctx.ssa.ssa_var_defs[following->ssa_var] == HLSL_DEFINITION_AMBIGUOUS);
+            const int output_lane = fixture->dot ? 0 : (int)actual_lanes - 1;
+            CHECK(variable(&ctx, fixture->decoded.join_value, 1, output_lane) == following->ssa_var);
+        } else {
+            ++dead_chain;
+            for (int edge = 0; edge < 2; ++edge)
+                if (phi->incoming_vars[edge] < 0 || ctx.ssa.ssa_var_defs[phi->incoming_vars[edge]] == HLSL_DEFINITION_UNKNOWN)
+                    ++undefined_inner;
+        }
+    }
+    CHECK(actual_lanes == (fixture->dot ? 1u : fixture->width));
+    if (fixture->dot && fixture->width < 4) CHECK(dead_chain && undefined_inner);
+    if (fixture->dot) {
+        const int writers[] = {fixture->inner_then, fixture->inner_else, fixture->other_writer};
+        const uint8_t demand = (uint8_t)((1u << fixture->width) - 1u);
+        for (unsigned item = 0; item < 3; ++item) {
+            const USILInstruction *writer = &program->instructions[writers[item]];
+            CHECK(writer->operand_count == 3 && usil_operand_destination_lane_mask(&writer->operands[0]) == 1);
+            for (int operand = 1; operand < 3; ++operand) {
+                USILOperandUseInfo use;
+                CHECK(usil_instruction_operand_use(program, writer, operand, &use) &&
+                    use.use == USIL_OPERAND_USE_SOURCE && use.source_lane_mask == demand);
+            }
+        }
+    }
+    if (fixture->compared) {
+        const int comparisons[] = {fixture->outer_comparison, fixture->inner_comparison};
+        const int conditions[] = {fixture->outer_if, fixture->inner_if};
+        unsigned lane = 0; while (!(fixture->writer_mask & (1u << lane))) ++lane;
+        int first_ssa = -1;
+        for (unsigned index = 0; index < 2; ++index) {
+            int consumer = -1;
+            const int value = variable(&ctx, comparisons[index], 0, (int)lane);
+            CHECK(hlsl_scalar_comparison_predicate_supported(&ctx, comparisons[index], &consumer) && consumer == conditions[index] &&
+                value >= 0 && value < ctx.ssa.ssa_var_count && ctx.ssa.ssa_var_defs[value] == comparisons[index] &&
+                variable(&ctx, conditions[index], 0, 0) == value && (index == 0 || value != first_ssa));
+            first_ssa = value;
+        }
+        CHECK(program->instructions[comparisons[0]].operands[0].register_index ==
+            program->instructions[comparisons[1]].operands[0].register_index);
+    }
+    dispose(&ctx); return true;
+}
+
+static bool check_natural_nested_positive(unsigned width, uint8_t mask, bool dot,
+    bool inner_in_else, bool compared, bool vertex) {
+    NaturalNestedFixture fixture;
+    CHECK(natural_nested_fixture(&fixture, width, mask, dot, inner_in_else, compared, vertex, false) &&
+        check_natural_nested_owners(&fixture));
+    USILProgram *program = &fixture.decoded.program;
+    ASTExpr *owned = NULL;
+    if (dot) {
+        const NaturalDotShape shape = {.width = width, .layout = width == 2 ?
+            NATURAL_IF_INPUTS_PACKED_SPLIT : NATURAL_IF_INPUTS_SEPARATE,
+            .compared = compared, .nonzero = true};
+        CHECK(natural_dot_owned_tree(&fixture.decoded, shape, &owned));
+    }
+    StringBuilder original, selected; sb_init(&original); sb_init(&selected);
+    HLSLExpressionSourceMap original_map, selected_map;
+    HLSLSourceQualityResult original_quality, selected_quality; HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations baseline = {.program = program, .mutable_source = &original};
+    const bool emitted = natural_if_emit(program, &original, &original_map, &original_quality, &baseline, &diagnostic);
+    if (!emitted) fprintf(stderr, "Nested natural width=%u mask=%u dot=%d inner_else=%d compared=%d vertex=%d: %s/%s at %d\n",
+        width, mask, dot, inner_in_else, compared, vertex, hlsl_emit_status_name(diagnostic.status),
+        hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index);
+    CHECK(emitted && original_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !original_quality.reasons &&
+        original_quality.counts.inspected_units == 1 && !original_quality.counts.incomplete_units &&
+        !original_quality.counts.residual_total && !original_quality.counts.unknown_provenance &&
+        original_map.complete && original_map.count == (size_t)program->instruction_count &&
+        hlsl_expression_source_map_matches(&original_map, program, original.buf) && !baseline.wrong_owner &&
+        baseline.observations > 2 && baseline.comparison_events == (compared ? 2u : 0u));
+    CHECK(!strstr(original.buf, "u_xlat") && !strstr(original.buf, "float4 r0"));
+    const int controls[] = {fixture.outer_if, fixture.inner_if};
+    for (unsigned item = 0; item < 2; ++item) {
+        const int index = controls[item]; const HLSLExpressionOrigin *origin = &original_map.origins[index];
+        CHECK(origin->kind == HLSL_EXPRESSION_ORIGIN_CONTROL && !origin->destination_lanes &&
+            origin->instruction_index == index && origin->source_instruction_index == program->instructions[index].source_instruction_index &&
+            origin->source_begin < origin->source_end &&
+            (memchr(original.buf + origin->source_begin, '!', origin->source_end - origin->source_begin) != NULL) == (item != 0));
+    }
+    const int writers[] = {fixture.inner_then, fixture.inner_else, fixture.other_writer};
+    for (unsigned item = 0; item < 3; ++item) {
+        const int index = writers[item]; const HLSLExpressionOrigin *origin = &original_map.origins[index];
+        CHECK(origin->instruction_index == index && origin->source_instruction_index == program->instructions[index].source_instruction_index &&
+            origin->destination_lanes == mask && origin->source_begin < origin->source_end);
+        if (dot) {
+            CHECK(program->instructions[index].opcode == (width == 2 ? USIL_OP_DP2 : width == 3 ? USIL_OP_DP3 : USIL_OP_DP4));
+            const char *call = strstr(original.buf + origin->source_begin, "dot(");
+            CHECK(call && call < original.buf + origin->source_end);
+        }
+    }
+    /* The outer assignment remains owned by its real MOV/MUL/ADD mask; the
+     * nested scalar dot phis do not counterfeit a vector result owner. */
+    const HLSLExpressionOrigin *output = &original_map.origins[fixture.decoded.output];
+    CHECK(output->destination_lanes == (dot || vertex ? 7u : (1u << width) - 1u));
+    if (dot) CHECK(!strstr(original.buf, "float2 dxbc_merge_") && !strstr(original.buf, "float3 dxbc_merge_") &&
+        !strstr(original.buf, "float4 dxbc_merge_") && !memchr(original.buf + output->source_begin, '.', output->source_end - output->source_begin));
+    if (dot) {
+        NaturalDotObservations typed = {.common = {.program = program}, .result_mask = 1};
+        CHECK(natural_dot_emit(program, &selected, &selected_map, &selected_quality, &typed, &diagnostic) &&
+            selected.len == original.len && !memcmp(selected.buf, original.buf, original.len) &&
+            natural_if_maps_equal(&original_map, &selected_map) && hlsl_source_quality_results_equal(&original_quality, &selected_quality) &&
+            !typed.common.wrong_owner && typed.dot_calls == ((UINT64_C(1) << (unsigned)fixture.inner_then) |
+                (UINT64_C(1) << (unsigned)fixture.inner_else) | (UINT64_C(1) << (unsigned)fixture.other_writer)) &&
+            typed.scalar_phi_ids && (typed.scalar_phi_ids & (typed.scalar_phi_ids - 1u)));
+        if (width == 2) CHECK(typed.packed_fields == 3);
+    }
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        options.expression_source_map = outputs & 1u ? &selected_map : NULL;
+        options.source_quality = outputs & 2u ? &selected_quality : NULL;
+        options.source_quality_pass_index = 3; options.source_quality_entry_point_index = 4;
+        sb_free(&selected); sb_init(&selected);
+        CHECK(hlsl_emit_with_options_diagnostic(program, &selected, NULL, NULL, NULL, &options, &diagnostic) &&
+            selected.len == original.len && !memcmp(selected.buf, original.buf, original.len));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&original_map, &selected_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&original_quality, &selected_quality));
+    }
+    const size_t points[] = {1, baseline.observations / 2u, baseline.observations};
+    for (unsigned point = 0; point < sizeof(points) / sizeof(*points); ++point) {
+        NaturalIfObservations veto = {.program = program, .reject_at = points[point]};
+        sb_free(&selected); sb_init(&selected);
+        CHECK(!natural_if_emit(program, &selected, &selected_map, &selected_quality, &veto, &diagnostic) &&
+            veto.observations == points[point] && !selected_map.complete && !selected_map.count &&
+            selected_quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+    }
+    NaturalIfObservations fresh = {.program = program};
+    sb_free(&selected); sb_init(&selected);
+    CHECK(natural_if_emit(program, &selected, &selected_map, &selected_quality, &fresh, &diagnostic) &&
+        selected.len == original.len && !memcmp(selected.buf, original.buf, original.len) &&
+        natural_if_maps_equal(&original_map, &selected_map) && hlsl_source_quality_results_equal(&original_quality, &selected_quality));
+    sb_free(&selected); sb_free(&original); natural_if_fixture_dispose(&fixture.decoded);
+    if (owned) {
+        CHECK(owned->kind == AST_EXPR_CALL && owned->logical_origin.components == 1 &&
+            owned->u.call.arg_count == 2 && owned->u.call.args[0] != owned->u.call.args[1] &&
+            owned->u.call.args[0]->operand_provenance.complete && owned->u.call.args[1]->operand_provenance.complete &&
+            owned->u.call.args[0]->operand_provenance.operand_index == 1 &&
+            owned->u.call.args[1]->operand_provenance.operand_index == 2 &&
+            owned->u.call.args[0]->u.emitter_operand[0] && owned->u.call.args[1]->u.emitter_operand[0]);
+        ast_free_expr(owned);
+    }
+    return true;
+}
+
+static bool check_natural_nested_callbacks(void) {
+    NaturalNestedFixture fixture;
+    CHECK(natural_nested_fixture(&fixture, 3, 1, true, true, true, false, false));
+    USILProgram *program = &fixture.decoded.program;
+    CHECK(program->instruction_count <= 24 && program->input_count == 3);
+    USILInstruction instructions[24]; DXBCSignatureElement inputs[3];
+    const size_t instruction_bytes = (size_t)program->instruction_count * sizeof(*instructions);
+    memcpy(instructions, program->instructions, instruction_bytes); memcpy(inputs, program->inputs, sizeof(inputs));
+    const char *prefix = "// retained nested caller prefix\n";
+    StringBuilder original, changed; sb_init(&original); sb_init(&changed); sb_append(&original, prefix);
+    HLSLExpressionSourceMap original_map, changed_map; HLSLSourceQualityResult original_quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations baseline = {.program = program, .mutable_source = &original};
+    CHECK(natural_if_emit(program, &original, &original_map, &original_quality, &baseline, &diagnostic) &&
+        original_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && baseline.first_header_observation && baseline.signature_observation);
+    const size_t points[] = {1, baseline.observations / 2u, baseline.observations};
+    const struct {unsigned mutation; int instruction;} changes[] = {
+        {29, fixture.outer_if}, {29, fixture.inner_if}, {32, fixture.inner_comparison},
+        {26, fixture.inner_then}, {28, fixture.inner_else - 1}, {27, fixture.inner_then}};
+    for (unsigned action = 0; action < sizeof(changes) / sizeof(*changes); ++action) {
+        for (unsigned point = 0; point < sizeof(points) / sizeof(*points); ++point) {
+            NaturalIfObservations drift = {.program = program, .mutable_program = program,
+                .mutation = changes[action].mutation, .mutate_at = points[point],
+                .condition_instruction = changes[action].instruction, .arithmetic_instruction = changes[action].instruction};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(!natural_if_emit(program, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+                drift.mutated && !changed_map.complete && !changed_map.count && changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+            NaturalIfObservations fresh = {.program = program};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            const bool regenerated = natural_if_emit(program, &changed, &changed_map, &changed_quality, &fresh, &diagnostic);
+            if (!regenerated) fprintf(stderr, "Nested changed model mutation=%u: %s/%s at %d\n", changes[action].mutation,
+                hlsl_emit_status_name(diagnostic.status), hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index);
+            CHECK(regenerated && changed_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && changed_map.complete &&
+                hlsl_expression_source_map_matches(&changed_map, program, changed.buf) && strcmp(original.buf, changed.buf));
+            memcpy(program->instructions, instructions, instruction_bytes); memcpy(program->inputs, inputs, sizeof(inputs));
+            fresh = (NaturalIfObservations){.program = program};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                changed.len == original.len && !memcmp(changed.buf, original.buf, original.len) &&
+                natural_if_maps_equal(&original_map, &changed_map) && hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+        }
+    }
+    const struct {unsigned mutation; size_t point, offset;} attacks[] = {
+        {19, baseline.first_header_observation, 0}, {20, baseline.signature_observation, 0},
+        {4, baseline.observations, original_map.origins[fixture.inner_then].source_begin},
+        {15, baseline.observations, 0}, {4, baseline.first_preheader_observation, 0}};
+    CHECK(baseline.first_preheader_observation);
+    for (unsigned attack = 0; attack < sizeof(attacks) / sizeof(*attacks); ++attack) {
+        NaturalIfObservations drift = {.program = program, .mutable_program = program, .mutable_source = &changed,
+            .mutable_map = &changed_map, .mutation = attacks[attack].mutation, .mutate_at = attacks[attack].point,
+            .source_offset = attacks[attack].offset, .arithmetic_instruction = fixture.inner_then};
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(!natural_if_emit(program, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+            drift.mutated && !changed_map.complete && !changed_map.count && changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED &&
+            !memcmp(program->instructions, instructions, instruction_bytes) && !memcmp(program->inputs, inputs, sizeof(inputs)));
+        NaturalIfObservations fresh = {.program = program};
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+            changed.len == original.len && !memcmp(changed.buf, original.buf, original.len) &&
+            natural_if_maps_equal(&original_map, &changed_map) && hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+    }
+    sb_free(&changed); sb_free(&original); natural_if_fixture_dispose(&fixture.decoded); return true;
+}
+
+static bool natural_nested_control_negative(NaturalNestedFixture *source, unsigned edit) {
+    const NaturalIfFixture *base = &source->decoded;
+    CHECK(!source->compared && edit < 2);
+    NaturalNestedWords words = {0};
+    const uint32_t first_raw = base->program.instructions[0].source_instruction_index;
+    for (size_t index = 0; index < base->document.instruction_count; ++index) {
+        const DXBCDocumentInstruction *record = &base->document.instructions[index];
+        if (record->instruction_index >= first_raw) continue;
+        CHECK(words.count + record->token_count <= sizeof(words.words) / sizeof(*words.words));
+        for (uint32_t token = 0; token < record->token_count; ++token)
+            CHECK(dxbc_document_instruction_token(record, token, &words.words[words.count++]));
+    }
+    int inner_else = -1;
+    for (int index = source->inner_if + 1; index < source->inner_end; ++index)
+        if (base->program.instructions[index].opcode == USIL_OP_ELSE) inner_else = index;
+    CHECK(inner_else >= 0);
+    for (int index = 0; index < base->program.instruction_count; ++index) {
+        if (edit == 0 && index == inner_else) continue; /* Balanced, genuinely decoded IF without ELSE. */
+        if (edit == 1 && index == source->inner_then) {
+            /* A third contained diamond has a complete scalar write on both
+             * edges. Its exclusion does not rely on an undefined output. */
+            CHECK(natural_nested_copy_instruction(&words, base, source->inner_if, false, false, 1) &&
+                natural_nested_copy_instruction(&words, base, index, false, false, 1) &&
+                natural_nested_copy_instruction(&words, base, inner_else, false, false, 1));
+        }
+        CHECK(natural_nested_copy_instruction(&words, base, index, false, false, 1));
+        if (edit == 1 && index == source->inner_then)
+            CHECK(natural_nested_copy_instruction(&words, base, source->inner_end, false, false, 1));
+    }
+    NaturalIfFixture changed = {0};
+    dxbc_document_init(&changed.document); dxbc_stage_contract_init(&changed.contract);
+    CHECK(natural_if_fixture_decode_words(&changed, UINT32_C(0x00000050), words.words, words.count,
+        base->program.inputs, (unsigned)base->program.input_count, base->program.outputs, (unsigned)base->program.output_count));
+    const bool rejected = natural_if_rejected(&changed.program, NULL);
+    natural_if_fixture_dispose(&changed);
+    CHECK(rejected); return true;
+}
+
+static bool check_natural_nested_rejections(void) {
+    NaturalNestedFixture fixture;
+    CHECK(natural_nested_fixture(&fixture, 3, 1, true, false, false, false, false) && check_natural_nested_owners(&fixture));
+    CHECK(natural_nested_control_negative(&fixture, 0) && natural_nested_control_negative(&fixture, 1));
+    USILProgram *program = &fixture.decoded.program;
+    CHECK(program->instruction_count <= 24);
+    const size_t instruction_bytes = (size_t)program->instruction_count * sizeof(USILInstruction);
+    USILInstruction instructions[24]; memcpy(instructions, program->instructions, instruction_bytes);
+    const DXBCSignatureElement input = program->inputs[0];
+    StringBuilder original, restored_source; sb_init(&original); sb_init(&restored_source);
+    HLSLExpressionSourceMap original_map, restored_map; HLSLSourceQualityResult original_quality, restored_quality;
+    HLSLEmitDiagnostic diagnostic; NaturalIfObservations baseline = {.program = program};
+    CHECK(natural_if_emit(program, &original, &original_map, &original_quality, &baseline, &diagnostic));
+    DXBCOperand relative = program->instructions[fixture.decoded.output].operands[1];
+    relative.swizzle_mode = 2;
+    memset(relative.swizzle, 1, sizeof(relative.swizzle));
+    relative.raw_token = UINT32_C(0x0010001a);
+    for (unsigned mutation = 0; mutation < 11; ++mutation) {
+        bool relative_proved = true;
+        USILInstruction *dot = &program->instructions[fixture.inner_then];
+        DXBCOperand *output_source = &program->instructions[fixture.decoded.output].operands[1];
+        switch (mutation) {
+        case 0: /* Inner false edge no longer defines the demanded scalar X. */
+            program->instructions[fixture.inner_else].operands[0].destination_mask = 0x80;
+            program->instructions[fixture.inner_else].operands[0].raw_token = UINT32_C(0x00100082); break;
+        case 1: /* Actual output Y demand propagates outer->inner phi liveness. */
+            memset(output_source->swizzle, 1, sizeof(output_source->swizzle));
+            output_source->raw_token = natural_if_source_token(OPERAND_TYPE_TEMP, output_source->swizzle); break;
+        case 2: /* A vector TEMP is not a scalar reduction writer. */
+            dot->operands[0].destination_mask = 0x30; dot->operands[0].raw_token = UINT32_C(0x00100032); break;
+        case 3: /* The inner ELSE dot needs all three physical ADD YZW lanes. */
+            program->instructions[fixture.inner_else - 1].operands[0].destination_mask = 0x60;
+            program->instructions[fixture.inner_else - 1].operands[0].raw_token = UINT32_C(0x00100062); break;
+        case 4: /* Output is written only within the inner true arm. */
+            dot->operands[0].type = OPERAND_TYPE_OUTPUT; dot->operands[0].destination_mask = 0x70;
+            dot->operands[0].raw_token = UINT32_C(0x00102072); break;
+        case 5: program->instructions[fixture.decoded.output].operands[0].destination_mask = 0x30;
+            program->instructions[fixture.decoded.output].operands[0].raw_token = UINT32_C(0x00102032); break;
+        case 6: dot->operands[1].min_precision = 1; break;
+        case 7: program->inputs[0].component_type = 2; break;
+        case 8: dot->operands[1].type = OPERAND_TYPE_RESOURCE; break;
+        case 9: /* A real relative slot reads the unresolved outer Y phi. */
+            output_source->index_has_immediate[0] = false; output_source->index_representations[0] = 2;
+            output_source->raw_token = (output_source->raw_token & ~UINT32_C(0x01c00000)) | UINT32_C(0x00800000);
+            output_source->rel_op0 = &relative;
+            {
+                HLSLEmitterContext ctx;
+                relative_proved = analyze(&ctx, program);
+                if (relative_proved) {
+                    const int value = ctx.ssa.relative_operand_ssa_vars[(size_t)fixture.decoded.output * DXBC_MAX_OPERANDS * 4u + 4u];
+                    relative_proved = value >= 0 && value < ctx.ssa.ssa_var_count &&
+                        ctx.ssa.ssa_var_defs[value] == HLSL_DEFINITION_AMBIGUOUS &&
+                        hlsl_relative_operand_definition(&ctx, fixture.decoded.output, 1, 0) == HLSL_DEFINITION_AMBIGUOUS;
+                }
+                dispose(&ctx);
+            }
+            break;
+        case 10: program->instructions[fixture.inner_if].operands[0].has_abs = true; break;
+        }
+        const bool rejected = natural_if_rejected(program, NULL);
+        if (!rejected) fprintf(stderr, "Nested natural rejection mutation=%u admitted\n", mutation);
+        memcpy(program->instructions, instructions, instruction_bytes); program->inputs[0] = input;
+        CHECK(rejected && relative_proved); /* Borrowed selector is detached before assertions or cleanup. */
+        NaturalIfObservations fresh = {.program = program};
+        sb_free(&restored_source); sb_init(&restored_source);
+        CHECK(natural_if_emit(program, &restored_source, &restored_map, &restored_quality, &fresh, &diagnostic) &&
+            restored_source.len == original.len && !memcmp(restored_source.buf, original.buf, original.len) &&
+            natural_if_maps_equal(&original_map, &restored_map) && hlsl_source_quality_results_equal(&original_quality, &restored_quality));
+    }
+    sb_free(&restored_source); sb_free(&original); natural_if_fixture_dispose(&fixture.decoded);
+
+    /* No demand is clipped merely because the resulting W arithmetic is dead.
+     * Its Y input must traverse both retained phi edges to a defined writer. */
+    CHECK(natural_nested_fixture(&fixture, 3, 1, true, false, false, false, true));
+    program = &fixture.decoded.program;
+    const int read = fixture.outer_end + 1;
+    HLSLEmitterContext ctx; CHECK(analyze(&ctx, program));
+    HLSLIfRegion outer, inner;
+    CHECK(hlsl_cfg_if_region(&ctx, fixture.outer_if, &outer) && hlsl_cfg_if_region(&ctx, fixture.inner_if, &inner) &&
+        program->instructions[read].opcode == USIL_OP_ADD &&
+        usil_operand_destination_lane_mask(&program->instructions[read].operands[0]) == 8 &&
+        hlsl_definition_use_count(&ctx, read, 3) == 0);
+    const int y = variable(&ctx, read, 1, 3);
+    const HLSLPhiNode *outer_y = natural_nested_phi(&ctx, outer.join_block, y);
+    CHECK(outer_y && outer_y->register_index == 0 && outer_y->component == 1);
+    const HLSLPhiNode *inner_y = NULL;
+    for (int edge = 0; edge < 2; ++edge)
+        if (outer_y->incoming_vars[edge] >= 0)
+            inner_y = inner_y ? inner_y : natural_nested_phi(&ctx, inner.join_block, outer_y->incoming_vars[edge]);
+    CHECK(inner_y && inner_y->component == 1 &&
+        (inner_y->incoming_vars[0] < 0 || inner_y->incoming_vars[1] < 0));
+    dispose(&ctx);
+    CHECK(natural_if_rejected(program, NULL)); natural_if_fixture_dispose(&fixture.decoded);
+
+    /* A complete scalar/FLOAT2/FLOAT3 group cannot merge differently sized
+     * generations, even though both regions and all outputs remain present. */
+    CHECK(natural_nested_fixture(&fixture, 2, 12, false, true, true, false, false));
+    program = &fixture.decoded.program;
+    const USILInstruction final_else = program->instructions[fixture.inner_else];
+    program->instructions[fixture.inner_else].operands[0].destination_mask = 0x40;
+    program->instructions[fixture.inner_else].operands[0].raw_token = UINT32_C(0x00100042);
+    const bool mismatched = natural_if_rejected(program, NULL);
+    program->instructions[fixture.inner_else] = final_else;
+    CHECK(mismatched);
+    /* Numeric consumption of the actual inner BOOL is separately excluded. */
+    const USILInstruction first = program->instructions[fixture.inner_then - 1];
+    DXBCOperand *numeric = &program->instructions[fixture.inner_then - 1].operands[1];
+    numeric->type = OPERAND_TYPE_TEMP; numeric->register_index = 0; numeric->index_values[0] = 0;
+    memset(numeric->swizzle, 2, sizeof(numeric->swizzle));
+    numeric->raw_token = natural_if_source_token(OPERAND_TYPE_TEMP, numeric->swizzle);
+    const bool bool_numeric = natural_if_rejected(program, NULL);
+    program->instructions[fixture.inner_then - 1] = first;
+    CHECK(bool_numeric); natural_if_fixture_dispose(&fixture.decoded); return true;
+}
+
+static bool check_natural_nested_emission(void) {
+    const struct {unsigned width; uint8_t mask; bool dot, inner_else, compared, vertex;} cases[] = {
+        {1, 2, false, false, false, false}, {2, 12, false, true, true, false}, {3, 7, false, false, true, false},
+        {2, 1, true, false, false, false}, {2, 1, true, true, true, false},
+        {3, 1, true, true, true, false}, {4, 1, true, false, true, false}, {3, 7, false, true, true, true}};
+    for (unsigned index = 0; index < sizeof(cases) / sizeof(*cases); ++index)
+        CHECK(check_natural_nested_positive(cases[index].width, cases[index].mask, cases[index].dot,
+            cases[index].inner_else, cases[index].compared, cases[index].vertex));
+    CHECK(check_natural_nested_rejections() && check_natural_nested_callbacks()); return true;
+}
+
 static bool check_natural_conditional_emission(void) {
     const struct {unsigned width; uint8_t mask;} shapes[] = {
         {1, 1}, {2, 3}, {3, 7}, {1, 2}, {2, 12}};
@@ -4973,6 +5536,7 @@ static bool check_natural_conditional_emission(void) {
     CHECK(check_natural_unique_header_callbacks());
     CHECK(check_natural_dot_emission());
     CHECK(check_natural_source_modifiers());
+    CHECK(check_natural_nested_emission());
     /* DXBC IF_Z/NZ compares the raw DWORD, including the float sign bit. A
      * numeric float comparison would take the opposite branch for -0. */
     const struct {uint32_t bits; bool nonzero;} conditions[] = {

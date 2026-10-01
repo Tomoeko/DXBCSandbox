@@ -11,8 +11,8 @@
 
 /* Reuse the expression contracts, CFG and lane SSA. The established full
  * vector route retains its spelling and loop boundary. A separate bounded
- * natural-width mode proves one complete two-arm join and the physical lanes
- * belonging to each scalar/vector value before assigning it a source type. */
+ * natural-width mode proves complete bounded two-arm joins and the physical
+ * lanes belonging to each scalar/vector value before assigning a source type. */
 enum { STRUCTURED_VALUE_LIMIT = HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT * 2 };
 #define STRUCTURED_PHI_LOGICAL_ID_BASE UINT64_C(0x8000000000060000)
 
@@ -45,6 +45,7 @@ typedef struct {
     HLSLIfRegion regions[HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT];
     int *ssa_value;
     int *ssa_lane;
+    bool *ssa_live; /* Only the two contained natural IF regions need this proof. */
     CountedLoop loop;
     bool natural_width;
 } StructuredPlan;
@@ -207,7 +208,8 @@ bool hlsl_natural_structured_candidate(const USILProgram *program) {
         else if (opcode == USIL_OP_ELSE) ++alternatives;
         else if (opcode == USIL_OP_ENDIF) ++joins;
     }
-    return conditions == 1u && alternatives == 1u && joins == 1u;
+    return (conditions == 1u || conditions == 2u) &&
+        alternatives == conditions && joins == conditions;
 }
 
 static uint8_t demanded_lanes(const HLSLEmitterContext *ctx, int instruction, int operand) {
@@ -231,10 +233,9 @@ static bool map_variable(const HLSLEmitterContext *ctx, StructuredPlan *plan, in
     return true;
 }
 
-/* Unpruned lane SSA can add undefined sibling phis beside a scalar dot
- * result. Isolate that result only when no actual source, relative index or
- * phi edge consumes any sibling. The ordinary whole-value closure remains
- * responsible for every live merge. */
+/* Preserve the established single-join rule: unpruned lane SSA can add
+ * undefined siblings beside a scalar dot result, which may be isolated only
+ * when no actual source, relative index or phi edge consumes any sibling. */
 static bool ssa_variable_unused(const HLSLEmitterContext *ctx, int variable) {
     if (variable < 0 || variable >= ctx->ssa.ssa_var_count ||
         ctx->ssa.instruction_count != ctx->program->instruction_count ||
@@ -271,6 +272,87 @@ static bool ssa_variable_unused(const HLSLEmitterContext *ctx, int variable) {
     return true;
 }
 
+/* A dead inner sibling may feed another dead outer phi. Seed every actual
+ * read, including a read in an otherwise unused instruction, before following
+ * only the incoming edges of live phi results. The existing plan maps every
+ * scalar SSA definition into at most four lanes of one bounded value. */
+static bool prepare_nested_phi_liveness(const HLSLEmitterContext *ctx, StructuredPlan *plan) {
+    const int variables = ctx->ssa.ssa_var_count;
+    if (variables < 0 || variables > STRUCTURED_VALUE_LIMIT * 4 || plan->ssa_live ||
+        ctx->ssa.instruction_count != ctx->program->instruction_count ||
+        !ctx->ssa.operand_ssa_vars || !ctx->ssa.relative_operand_ssa_vars ||
+        !ctx->ssa.block_phis || !ctx->cfg.blocks || ctx->cfg.block_count < 1 ||
+        ctx->cfg.block_count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT)
+        return false;
+    plan->ssa_live = calloc(variables ? (size_t)variables : 1u, sizeof(*plan->ssa_live));
+    if (!plan->ssa_live) return false;
+    for (int index = 0; index < ctx->program->instruction_count; ++index) {
+        const USILInstruction *instruction = &ctx->program->instructions[index];
+        for (int operand = 0; operand < instruction->operand_count; ++operand) {
+            USILOperandUseInfo use;
+            if (!usil_instruction_operand_use(ctx->program, instruction, operand, &use)) return false;
+            if (use.use == USIL_OPERAND_USE_SOURCE &&
+                instruction->operands[operand].type == OPERAND_TYPE_TEMP) {
+                for (int lane = 0; lane < 4; ++lane) if (use.source_lane_mask & (1u << lane)) {
+                    const int variable = operand_variable(ctx, index, operand, lane);
+                    if (variable < 0 || variable >= variables) return false;
+                    plan->ssa_live[variable] = true;
+                }
+            }
+            const size_t offset = ((size_t)index * DXBC_MAX_OPERANDS + (size_t)operand) * 4u;
+            for (int dimension = 0; dimension < 3; ++dimension) {
+                const int variable = ctx->ssa.relative_operand_ssa_vars[offset + (size_t)dimension];
+                if (variable < 0) continue;
+                if (variable >= variables) return false;
+                plan->ssa_live[variable] = true;
+            }
+        }
+    }
+    /* The selected loop-free CFG has only forward predecessors. Validate the
+     * retained edge coordinates even for dead phis, without demanding a value
+     * for an undefined edge that has no actual use. */
+    for (int block = 0; block < ctx->cfg.block_count; ++block) {
+        const HLSLBasicBlock *owner = &ctx->cfg.blocks[block];
+        const HLSLBlockPhis *phis = &ctx->ssa.block_phis[block];
+        if (owner->predecessor_count < 0 || owner->predecessor_count > ctx->cfg.block_count ||
+            (owner->predecessor_count && !owner->predecessors) ||
+            phis->phi_count < 0 || phis->phi_count > variables ||
+            (phis->phi_count && !phis->phis)) return false;
+        for (int item = 0; item < phis->phi_count; ++item) {
+            const HLSLPhiNode *phi = &phis->phis[item];
+            if (phi->ssa_var < 0 || phi->ssa_var >= variables ||
+                phi->register_index < 0 || phi->register_index >= ctx->program->temp_count ||
+                phi->component < 0 || phi->component >= 4 ||
+                (owner->predecessor_count && (!phi->incoming_vars || !phi->incoming_blocks)))
+                return false;
+            for (int edge = 0; edge < owner->predecessor_count; ++edge)
+                if (owner->predecessors[edge] < 0 || owner->predecessors[edge] >= block ||
+                    phi->incoming_blocks[edge] != owner->predecessors[edge] ||
+                    phi->incoming_vars[edge] < -1 || phi->incoming_vars[edge] >= variables) return false;
+        }
+    }
+    for (int pass = 0; pass <= variables; ++pass) {
+        bool changed = false;
+        for (int block = 0; block < ctx->cfg.block_count; ++block) {
+            const HLSLBlockPhis *phis = &ctx->ssa.block_phis[block];
+            for (int item = 0; item < phis->phi_count; ++item) {
+                const HLSLPhiNode *phi = &phis->phis[item];
+                if (!plan->ssa_live[phi->ssa_var]) continue;
+                for (int edge = 0; edge < ctx->cfg.blocks[block].predecessor_count; ++edge) {
+                    const int variable = phi->incoming_vars[edge];
+                    if (variable < 0 || variable >= variables) return false;
+                    if (!plan->ssa_live[variable]) {
+                        plan->ssa_live[variable] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (!changed) return true;
+    }
+    return false;
+}
+
 static bool scalar_dot_phi_supported(const HLSLEmitterContext *ctx, const StructuredPlan *plan,
     int block, const HLSLPhiNode *phi) {
     const HLSLBasicBlock *owner = &ctx->cfg.blocks[block];
@@ -288,11 +370,22 @@ static bool scalar_dot_phi_supported(const HLSLEmitterContext *ctx, const Struct
         const int source = plan->ssa_value[variable];
         if (source < 0 || source >= plan->value_count) return false;
         const StructuredValue *value = &plan->values[source];
-        if (value->instruction < 0 || value->instruction >= ctx->program->instruction_count ||
-            !scalar_dot_opcode(ctx->program->instructions[value->instruction].opcode) ||
-            value->register_index != phi->register_index || value->mask != mask ||
+        if (value->register_index != phi->register_index || value->mask != mask ||
             value->width != 1 || value->predicate ||
             !hlsl_cfg_dominates(&ctx->cfg, value->block, owner->predecessors[edge])) return false;
+        if (value->instruction >= 0) {
+            if (value->instruction >= ctx->program->instruction_count ||
+                !scalar_dot_opcode(ctx->program->instructions[value->instruction].opcode)) return false;
+        } else {
+            /* Earlier grouping already proved this scalar's complete DOT
+             * leaf closure. Its incoming[] is not populated until resolution;
+             * bind the retained SSA lane instead of reading that empty state. */
+            const HLSLPhiNode *retained = value->lanes[phi->component];
+            if (!plan->ssa_live || !value->dot_scalar_phi || value->block < 0 ||
+                value->block >= block || !retained || retained->ssa_var != variable ||
+                retained->register_index != phi->register_index || retained->component != phi->component)
+                return false;
+        }
     }
     const HLSLBlockPhis *siblings = &ctx->ssa.block_phis[block];
     if (siblings->phi_count < 0 || siblings->phi_count > ctx->ssa.ssa_var_count ||
@@ -300,7 +393,9 @@ static bool scalar_dot_phi_supported(const HLSLEmitterContext *ctx, const Struct
     for (int item = 0; item < siblings->phi_count; ++item) {
         const HLSLPhiNode *sibling = &siblings->phis[item];
         if (sibling != phi && sibling->register_index == phi->register_index &&
-            !ssa_variable_unused(ctx, sibling->ssa_var)) return false;
+            (plan->ssa_live ? (sibling->ssa_var < 0 || sibling->ssa_var >= ctx->ssa.ssa_var_count ||
+                              plan->ssa_live[sibling->ssa_var])
+                            : !ssa_variable_unused(ctx, sibling->ssa_var))) return false;
     }
     return true;
 }
@@ -585,6 +680,7 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
     const int return_block = ctx->cfg.instruction_block[program->instruction_count - 1];
     bool outputs[HLSL_SM5_IO_REGISTER_COUNT] = {0};
     unsigned natural_if_count = 0, natural_else_count = 0, natural_end_count = 0;
+    int natural_ifs[2] = {-1, -1};
     for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *inst = &program->instructions[index];
         if (inst->precise_mask || inst->saturate)
@@ -609,11 +705,14 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
                 return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
             if (!hlsl_cfg_if_region(ctx, index, &plan->regions[index]))
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
-            if (plan->natural_width && (++natural_if_count != 1 ||
-                plan->regions[index].else_instruction < 0 || inst->operand_count != 1 ||
-                (inst->condition_test != DXBC_INSTRUCTION_TEST_ZERO &&
-                 inst->condition_test != DXBC_INSTRUCTION_TEST_NONZERO)))
-                return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+            if (plan->natural_width) {
+                if (natural_if_count == 2u || plan->regions[index].else_instruction < 0 ||
+                    inst->operand_count != 1 ||
+                    (inst->condition_test != DXBC_INSTRUCTION_TEST_ZERO &&
+                     inst->condition_test != DXBC_INSTRUCTION_TEST_NONZERO))
+                    return reject(ctx, index, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+                natural_ifs[natural_if_count++] = index;
+            }
             int join = plan->regions[index].join_block;
             if (plan->join_if[join] >= 0)
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
@@ -692,8 +791,25 @@ static bool build_plan(HLSLEmitterContext *ctx, StructuredPlan *plan) {
                 return reject(ctx, index, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
         }
     }
-    if (plan->natural_width && (natural_if_count != 1 || natural_else_count != 1 || natural_end_count != 1))
-        return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+    if (plan->natural_width) {
+        if ((natural_if_count != 1u && natural_if_count != 2u) ||
+            natural_else_count != natural_if_count || natural_end_count != natural_if_count)
+            return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
+        if (natural_if_count == 2u) {
+            const int outer_index = natural_ifs[0], inner_index = natural_ifs[1];
+            const HLSLIfRegion *outer = &plan->regions[outer_index];
+            const HLSLIfRegion *inner = &plan->regions[inner_index];
+            const bool inner_then = inner_index < outer->else_instruction &&
+                inner->end_instruction < outer->else_instruction;
+            const bool inner_else = inner_index > outer->else_instruction &&
+                inner->end_instruction < outer->end_instruction;
+            if (inner_index <= outer_index || (!inner_then && !inner_else) ||
+                outer->header_block >= inner->header_block || inner->join_block >= outer->join_block ||
+                !hlsl_cfg_dominates(&ctx->cfg, outer->header_block, inner->header_block) ||
+                !prepare_nested_phi_liveness(ctx, plan))
+                return reject(ctx, -1, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+        }
+    }
     for (int index = 0; index < program->output_count; ++index)
         if (program->outputs[index].register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
             !outputs[program->outputs[index].register_id])
@@ -780,6 +896,7 @@ bool hlsl_natural_structured_preflight(HLSLEmitterContext *ctx) {
     const bool supported = build_plan(scratch, &plan) && plan.natural_width;
     free(plan.ssa_value);
     free(plan.ssa_lane);
+    free(plan.ssa_live);
     sb_free(&output);
     free(scratch);
     return supported;
@@ -1356,6 +1473,7 @@ bool emit_high_level_structured(HLSLEmitterContext *ctx) {
 cleanup:
     free(plan.ssa_value);
     free(plan.ssa_lane);
+    free(plan.ssa_live);
     if (!success && ctx->natural_structured_owners_guarded) {
         /* The new route must never return a partly owned body. Model drift is
          * detected before borrowing analysis or reading the next instruction. */
@@ -1451,6 +1569,7 @@ static bool body_replay(HLSLEmitterContext *ctx,
     }
     free(plan.ssa_value);
     free(plan.ssa_lane);
+    free(plan.ssa_live);
     sb_free(&output);
     free(replay);
     free(scratch);
