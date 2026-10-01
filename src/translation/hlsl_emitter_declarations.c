@@ -1614,12 +1614,19 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
   for (int i = 0; i < program->cbuffer_count; i++) {
     HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[i];
     int reg = layout->reg;
-    if (layout->omit_declaration) continue;
     uint8_t shell_authority = 0;
     const bool named_inventory =
         hlsl_source_quality_named_cbuffer_supported(ctx, i, &shell_authority);
+    const bool natural_hull_scalar = layout->natural_hull_scalar_packing;
+    if (natural_hull_scalar && !named_inventory) {
+      fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
+                            HLSL_EMIT_PHASE_CBUFFER_EMISSION,
+                            HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT, i, -1);
+      return;
+    }
+    if (layout->omit_declaration) continue;
 
-    bool use_packoffset = !layout->is_unity_builtin &&
+    bool use_packoffset = !natural_hull_scalar && !layout->is_unity_builtin &&
                           layout->variable_count > 0 &&
                           !layout->is_globals;
     if (!layout->is_globals) {
@@ -1860,7 +1867,8 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
        * continues to use row_count from stripped DXBC. D3DCompiler retains
        * this unused tail in reflection while trimming it from dcl_constantbuffer. */
       uint32_t total_size_bytes = layout->reflection_size_bytes;
-      if (current_byte_offset < total_size_bytes && !layout->compact_global_layout) {
+      if (current_byte_offset < total_size_bytes && !layout->compact_global_layout &&
+          !natural_hull_scalar) {
         if (use_packoffset) {
           uint32_t last_reg = (total_size_bytes / 16) - 1;
           if (current_byte_offset <= last_reg * 16) {

@@ -5,6 +5,8 @@
 #include "test_tessellation_fixture.h"
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/hlsl_global_declarations.h"
+#include "translation/hlsl_source_quality_internal.h"
+#include "translation/hlsl_stage_coverage_internal.h"
 #include "translation/usil_validation.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -442,6 +444,21 @@ static void fixture_free(Fixture *f) {
     dxbc_document_free(&f->document);
 }
 
+static bool scalar_declaration_matches(const Fixture *f, const char *source) {
+    char expected[256];
+    const bool named = strcmp(f->buffer.name, "$Globals") != 0;
+    const int length = named
+        ? snprintf(expected, sizeof(expected),
+                   "cbuffer %s : register(b0) {\n    float %s;\n};\n",
+                   f->buffer.name, f->field.name)
+        : snprintf(expected, sizeof(expected), "float %s : register(c0);",
+                   f->field.name);
+    CHECK(length > 0 && (size_t)length < sizeof(expected));
+    CHECK(strstr(source, expected) && !strstr(source, "packoffset(") &&
+          !strstr(source, "_pad") && !strstr(source, "cb0_"));
+    return true;
+}
+
 static bool emit_with_union(Fixture *f, bool expected,
                             const SerializedProgramParameters *current,
                             const SerializedProgramParameters *common,
@@ -469,7 +486,9 @@ static bool emit_with_union(Fixture *f, bool expected,
     if (expected) {
         CHECK(quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
         CHECK(quality.counts.incomplete_units == 0 &&
-              quality.counts.unknown_provenance == 0);
+              quality.counts.unknown_provenance == 0 &&
+              quality.counts.residual_total == 0);
+        CHECK(scalar_declaration_matches(f, source.buf));
         CHECK(
             hlsl_expression_source_map_matches(&map, &f->program, source.buf));
         char outer[256], inner[256];
@@ -1268,10 +1287,10 @@ static bool float3_scalar_name_collisions(void) {
                           cases[index].buffer);
         CHECK(length > 0 && (size_t)length < sizeof(expected) &&
               strstr(source.buf, expected));
-        /* Named buffer fields retain their actual byte-zero location through
-         * the shared declarator, rather than an unqualified global form. */
+        /* The sole byte-zero scalar retains its named b0 shell. The 16-byte
+         * cbuffer rounding needs no qualifier or anonymous tail. */
         length = snprintf(expected, sizeof(expected),
-                          "    float %s : packoffset(c0);\n",
+                          "    float %s;\n",
                           cases[index].field);
         CHECK(length > 0 && (size_t)length < sizeof(expected) &&
               strstr(source.buf, expected));
@@ -1288,6 +1307,88 @@ static bool float3_scalar_name_collisions(void) {
     }
     return true;
 }
+static bool scalar_packing_capture_parity(void) {
+    /* Current-only, common-only and split shell/partial-field authority all
+     * traverse the normal producer before the independent owned captures. */
+    for (unsigned float3 = 0; float3 < 2; ++float3) {
+        for (unsigned authority = 0; authority < 3; ++authority) {
+            for (unsigned renamed = 0; renamed < 2; ++renamed) {
+                Fixture f;
+                CHECK(fixture_init_shape(&f, authority % 2 != 0, true, false,
+                                         float3 != 0));
+                if (renamed) {
+                    f.field.name = "PatchScale";
+                    f.buffer.name = f.binding.name = "PatchInputs";
+                }
+                SerializedConstantBuffer shells[2] = {
+                    {.name = "$Globals", .role = SERIALIZED_CBUFFER_LOOSE_PARAMETERS},
+                    {.name = f.buffer.name, .role = SERIALIZED_CBUFFER_NAMED, .size = 16}};
+                SerializedProgramParameters current_shell = {
+                    .constant_buffers = shells, .cb_count = 2};
+                const SerializedProgramParameters *current = authority == 1 ? NULL : &f.parameters;
+                const SerializedProgramParameters *common = authority == 0 ? NULL : &f.parameters;
+                if (authority == 2) {
+                    f.buffer.has_is_partial = f.buffer.is_partial = true;
+                    current = &current_shell;
+                }
+                HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+                HLSLSourceQualityResult normal_quality, captured_quality, independent_quality;
+                HLSLExpressionSourceMap normal_map = {0}, captured_map = {0};
+                HLSLEmitDiagnostic diagnostic;
+                StringBuilder normal, captured, independent;
+                sb_init(&normal); sb_init(&captured); sb_init(&independent);
+                options.source_quality = &normal_quality;
+                options.expression_source_map = &normal_map;
+                CHECK(hlsl_emit_with_options_diagnostic(&f.program, &normal, current,
+                    common, NULL, &options, &diagnostic));
+                CHECK(scalar_declaration_matches(&f, normal.buf));
+                CHECK(normal_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                      !normal_quality.counts.residual_total && !normal_quality.counts.unknown_provenance &&
+                      !normal_quality.counts.incomplete_units && normal_quality.counts.inspected_units == 3 &&
+                      normal_quality.counts.cbuffer_declarations == 1 && normal_quality.counts.cbuffer_fields == 1);
+                HLSLStageCoverage coverage = {0}, other = {0};
+                options.source_quality = &captured_quality;
+                options.expression_source_map = &captured_map;
+                CHECK(hlsl_emit_with_stage_coverage(&f.program, &captured, current,
+                    common, NULL, &options, &coverage, &diagnostic));
+                CHECK(normal.len == captured.len && !memcmp(normal.buf, captured.buf, normal.len + 1));
+                CHECK(hlsl_source_quality_results_equal(&normal_quality, &captured_quality));
+                CHECK(normal_map.complete && captured_map.complete && normal_map.count == captured_map.count);
+                for (size_t origin = 0; origin < normal_map.count; ++origin)
+                    CHECK(hlsl_expression_origins_equal(&normal_map.origins[origin], &captured_map.origins[origin]));
+                unsigned declarations = 0;
+                for (size_t event = 0; event < coverage.syntax_count; ++event) {
+                    const HLSLSourceQualityFacts *facts = &coverage.syntax[event].facts;
+                    if (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_NONE) continue;
+                    CHECK(facts->known && !facts->artifacts && !facts->cbuffer_binding_register &&
+                          !facts->cbuffer_byte_offset && facts->cbuffer_declaration_authority ==
+                              (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD ?
+                               (authority == 0 ? 1 : 2) : (authority == 1 ? 2 : 1)));
+                    CHECK(facts->cbuffer_byte_size ==
+                        (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD ? 4u : 16u));
+                    ++declarations;
+                }
+                CHECK(declarations == 3 && coverage.unit_count == 3 &&
+                      (coverage.obligations & HLSL_STAGE_COVERAGE_BODY) &&
+                      (coverage.obligations & HLSL_STAGE_COVERAGE_LOCAL_DECLARATION));
+                options.source_quality = &independent_quality;
+                options.expression_source_map = NULL;
+                CHECK(hlsl_emit_with_stage_coverage(&f.program, &independent, current,
+                    common, NULL, &options, &other, &diagnostic));
+                CHECK(independent.len == normal.len && !memcmp(independent.buf, normal.buf, normal.len + 1) &&
+                      hlsl_source_quality_results_equal(&captured_quality, &independent_quality) &&
+                      hlsl_stage_coverage_equal(&coverage, &other));
+                fixture_free(&f);
+                CHECK(hlsl_stage_coverage_validate(&coverage, &captured) &&
+                      hlsl_stage_coverage_validate(&other, &independent));
+                hlsl_stage_coverage_dispose(&other); hlsl_stage_coverage_dispose(&coverage);
+                sb_free(&independent); sb_free(&captured); sb_free(&normal);
+            }
+        }
+    }
+    return true;
+}
+
 static bool negatives(void) {
     for (unsigned scenario = 0; scenario < 33; ++scenario) {
         Fixture f;
@@ -1582,7 +1683,7 @@ static bool control_point_reads_reject(void) {
 
 int main(void) {
     if (!positive() || !float3_scalar_authority() ||
-        !float3_scalar_name_collisions() || !negatives() ||
+        !float3_scalar_name_collisions() || !scalar_packing_capture_parity() || !negatives() ||
         !factor_minmax_and_lane_matrix() || !factor_index_rejections() ||
         !final_clamp_parsed_matrix() || !final_clamp_parsed_rejections() ||
         !invalid_clamp_maximum_declarations() ||

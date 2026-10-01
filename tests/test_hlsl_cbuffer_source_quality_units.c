@@ -207,6 +207,43 @@ static bool check_observer_rejection(void) {
     return true;
 }
 
+static bool check_other_stage_scalar_layouts(void) {
+    /* The identical byte-zero scalar/16-byte shell in ordinary pixel and
+     * vertex emission keeps the existing explicit layout in both modes. */
+    for (unsigned vertex = 0; vertex < 2; ++vertex) {
+        for (unsigned raw = 0; raw < 2; ++raw) {
+            Fixture f;
+            fixture_init(&f);
+            f.cbuffer.size = 1;
+            f.instructions[0].opcode = USIL_OP_MOV;
+            f.instructions[0].operand_count = 2;
+            for (unsigned authority = 0; authority < 2; ++authority) {
+                f.buffers[authority].size = 16;
+                f.buffers[authority].var_count = 1;
+            }
+            if (vertex) {
+                f.program.program_type = DXBC_PROGRAM_TYPE_VERTEX;
+                memcpy(f.program.shader_type_model, "vs_5_0", sizeof("vs_5_0"));
+                memcpy(f.output.semantic_name, "SV_Position", sizeof("SV_Position"));
+                f.output.system_value = 1;
+            }
+            if (raw) {
+                f.options.mode = HLSL_EMIT_MODE_RECOMPILE;
+                f.options.expression_source_map = NULL;
+            }
+            StringBuilder source;
+            CHECK(emit(&f, &source, &f.parameters[0], NULL));
+            CHECK(strstr(source.buf, "cbuffer MaterialInputs : register(b0)") &&
+                  strstr(source.buf, "float _Amount : packoffset(c0);") &&
+                  !strstr(source.buf, "float _Amount;"));
+            if (raw) CHECK(f.quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+            else CHECK(hlsl_expression_source_map_matches(&f.map, &f.program, source.buf));
+            sb_free(&source);
+        }
+    }
+    return true;
+}
+
 static HLSLEmitterContext *layout_context(Fixture *f, StringBuilder *source) {
     HLSLEmitterContext *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
@@ -231,6 +268,28 @@ static void layout_context_free(HLSLEmitterContext *ctx, StringBuilder *source) 
     free(ctx->cb_reg_map);
     free(ctx);
     sb_free(source);
+}
+
+static bool check_invalid_natural_marker(void) {
+    Fixture f;
+    fixture_init(&f);
+    StringBuilder source;
+    HLSLEmitterContext *ctx = layout_context(&f, &source);
+    CHECK(ctx && !ctx->cbuffer_layouts[0].natural_hull_scalar_packing);
+    /* The normal omitted-declaration route is still a no-op. A malformed
+     * natural-layout marker must fail before that skip can hide it. */
+    ctx->cbuffer_layouts[0].omit_declaration = true;
+    HLSLEmitDiagnostic diagnostic = {0};
+    ctx->diagnostic = &diagnostic;
+    emit_cbuffers(ctx);
+    CHECK(!source.len && diagnostic.status == HLSL_EMIT_STATUS_OK);
+    ctx->cbuffer_layouts[0].natural_hull_scalar_packing = true;
+    emit_cbuffers(ctx);
+    CHECK(!source.len && diagnostic.status == HLSL_EMIT_STATUS_INVALID_METADATA &&
+          diagnostic.phase == HLSL_EMIT_PHASE_CBUFFER_EMISSION &&
+          diagnostic.reason == HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT);
+    layout_context_free(ctx, &source);
+    return true;
 }
 
 static bool check_actual_syntax_coverage(void) {
@@ -402,6 +461,7 @@ int main(void) {
     const size_t allocations = g_allocations_count;
     const size_t bytes = g_allocated_bytes;
     if (!check_stage_and_common_authority() || !check_observer_rejection() ||
+        !check_other_stage_scalar_layouts() || !check_invalid_natural_marker() ||
         !check_actual_syntax_coverage() || !check_metadata_gaps() ||
         !check_resource_namespace_and_invalid_syntax() || !check_invalid_observer_facts() ||
         !check_raw_mode_remains_incomplete())

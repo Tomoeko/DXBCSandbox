@@ -73,6 +73,12 @@ typedef struct {
     /* Named, row-aligned fields cover the captured implicit-global shell.
      * Explicit constant bindings avoid anonymous padding declarations. */
     bool compact_global_layout;
+    /* Derived only after the strict high-level HULL scalar preparation and
+     * named declaration authority both pass: b0 has one 4-byte float at
+     * offset zero in one 16-byte row. Implicit cbuffer rounding preserves
+     * that layout without a packoffset qualifier or an anonymous tail.
+     * Ordinary and freshly built layouts leave this flag false. */
+    bool natural_hull_scalar_packing;
     bool is_unity_builtin;
     bool omit_declaration;
     bool raw_storage;
@@ -490,7 +496,7 @@ static inline HLSLRegisterPermutation* hlsl_register_permutation_at(
 static inline const HLSLRegisterPermutation*
 hlsl_register_permutation_at_const(const HLSLEmitterContext* ctx,
                                    int instruction, int reg) {
-    return &ctx->inst_reg_permutation[
+    return (const HLSLRegisterPermutation*)&ctx->inst_reg_permutation[
         (size_t)instruction * (size_t)ctx->temp_state_count + (size_t)reg];
 }
 

@@ -141,6 +141,26 @@ static void fixture_dispose(Fixture *fixture) {
     memset(fixture, 0, sizeof(*fixture));
 }
 
+static bool fixture_scalar_names(Fixture *fixture, bool renamed) {
+    if (!renamed) return true;
+    SerializedProgramParameters *parameters = &fixture->pass.common_parameters[HULL_STAGE];
+    CHECK(parameters->cb_count == 1 && parameters->res_count == 1 &&
+          parameters->constant_buffers[0].var_count == 1);
+    SerializedVariable field = parameters->constant_buffers[0].variables[0];
+    SerializedConstantBuffer buffer = parameters->constant_buffers[0];
+    SerializedResourceParam binding = parameters->resources[0];
+    field.name = "PatchScale";
+    buffer.name = binding.name = "PatchInputs";
+    buffer.variables = &field;
+    SerializedProgramParameters source = *parameters, replacement = {0};
+    source.constant_buffers = &buffer;
+    source.resources = &binding;
+    CHECK(serialized_program_parameters_copy(&replacement, &source));
+    serialized_program_parameters_free(parameters);
+    *parameters = replacement;
+    return true;
+}
+
 static bool fixture_init_icb(Fixture *fixture, bool scalar) {
     CHECK(fixture_init(fixture, false, scalar));
     const uint32_t values[] = {UINT32_C(0x3fa00000), UINT32_C(0x40200000), UINT32_C(0x40700000)};
@@ -471,9 +491,12 @@ static bool check_selected_stage(const Fixture *fixture, const ShaderLabEmittedH
     return true;
 }
 
-static bool positive_capture(bool control_point, bool scalar, bool two_states, bool icb, EmptyRoute route) {
+static bool positive_capture_names(bool control_point, bool scalar, bool two_states, bool icb,
+                                   EmptyRoute route, bool renamed) {
     Fixture fixture, replacement;
     CHECK(icb ? fixture_init_icb(&fixture, scalar) : fixture_init(&fixture, control_point, scalar));
+    CHECK(!renamed || scalar);
+    CHECK(fixture_scalar_names(&fixture, renamed));
     if (two_states) CHECK(fixture_second_state(&fixture, false));
     CHECK(route == EMPTY_ROUTE_ABSENT || (!scalar && two_states));
     CHECK(fixture_empty_route(&fixture, route));
@@ -507,7 +530,7 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
           normal_result.classification == owned_result.classification &&
           normal_result.observed_stage_incomplete_units == owned_result.observed_stage_incomplete_units);
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &independent) == SHADERLAB_HULL_COVERAGE_OK);
-    if (route != EMPTY_ROUTE_ABSENT) CHECK(check_selected_stage(&fixture, owned));
+    if (scalar || route != EMPTY_ROUTE_ABSENT) CHECK(check_selected_stage(&fixture, owned));
     for (size_t index = 0; index < owned->entry_count; ++index) {
         HLSLHullCoverageCapture *entry = &owned->entries[index];
         ShaderLabEmittedHullEntry observation;
@@ -529,6 +552,34 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
               entry->inputs.common.cb_count == ((scalar || route != EMPTY_ROUTE_ABSENT) ? 1 : 0));
         if (entry->inputs.current.cb_count)
             CHECK(entry->inputs.current.constant_buffers != entry->inputs.common.constant_buffers);
+        if (scalar) {
+            const SerializedConstantBuffer *current = entry->inputs.current.constant_buffers;
+            const SerializedConstantBuffer *common = entry->inputs.common.constant_buffers;
+            CHECK(current->name != common->name && current->variables != common->variables &&
+                  current->variables[0].name != common->variables[0].name &&
+                  common != fixture.pass.common_parameters[HULL_STAGE].constant_buffers &&
+                  common->name != fixture.pass.common_parameters[HULL_STAGE].constant_buffers[0].name);
+            CHECK(!strcmp(current->name, renamed ? "PatchInputs" : "FactorInputs") &&
+                  !strcmp(current->variables[0].name, renamed ? "PatchScale" : "_Factor") &&
+                  !strcmp(current->name, common->name) &&
+                  !strcmp(current->variables[0].name, common->variables[0].name) &&
+                  current->size == 16 && common->size == 16 &&
+                  current->variables[0].layout[0] == 0 && common->variables[0].layout[0] == 0);
+            char declaration[256];
+            const int length = snprintf(declaration, sizeof(declaration),
+                "cbuffer %s : register(b0) {\n    float %s;\n};\n", current->name, current->variables[0].name);
+            CHECK(length > 0 && (size_t)length < sizeof(declaration) &&
+                  strstr(entry->coverage.source, declaration) &&
+                  !strstr(entry->coverage.source, "packoffset(") &&
+                  !strstr(entry->coverage.source, "_pad") && !strstr(entry->coverage.source, "cb0_"));
+            CHECK(observation.base_quality.counts.cbuffer_declarations == 1 &&
+                  observation.base_quality.counts.cbuffer_fields == 1 &&
+                  !observation.base_quality.counts.unknown_provenance);
+            if (!icb) CHECK(observation.base_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                            !observation.base_quality.counts.residual_total &&
+                            !observation.base_quality.counts.incomplete_units &&
+                            observation.base_quality.counts.inspected_units == 3);
+        }
         if (route != EMPTY_ROUTE_ABSENT) {
             CHECK(entry->inputs.current.is_binary == parsed && !entry->inputs.common.is_binary &&
                   entry->inputs.current.version == (parsed ? UNITY_2021_3_PLAYER_BLOB_VERSION : 0) &&
@@ -567,6 +618,7 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
     CHECK(!shaderlab_emitted_hull_coverage_entry(owned, owned->entry_count, &(ShaderLabEmittedHullEntry){0}));
 
     CHECK(icb ? fixture_init_icb(&replacement, scalar) : fixture_init(&replacement, control_point, scalar));
+    CHECK(fixture_scalar_names(&replacement, renamed));
     if (two_states) CHECK(fixture_second_state(&replacement, false));
     CHECK(fixture_empty_route(&replacement, route));
     fixture_dispose(&fixture);
@@ -587,6 +639,10 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states, b
     shaderlab_emitted_hull_coverage_free(owned);
     fixture_dispose(&replacement);
     return true;
+}
+
+static bool positive_capture(bool control_point, bool scalar, bool two_states, bool icb, EmptyRoute route) {
+    return positive_capture_names(control_point, scalar, two_states, icb, route, false);
 }
 
 typedef struct {
@@ -752,6 +808,8 @@ int main(void) {
         !positive_capture(false, false, true, true, EMPTY_ROUTE_ABSENT) ||
         !rejection_and_restore(false) || !rejection_and_restore(true)) return 1;
     for (unsigned icb = 0; icb < 2; ++icb) {
+        if (!positive_capture(false, true, true, icb, EMPTY_ROUTE_ABSENT) ||
+            !positive_capture_names(false, true, true, icb, EMPTY_ROUTE_ABSENT, true)) return 1;
         for (EmptyRoute route = EMPTY_ROUTE_COMMON; route <= EMPTY_ROUTE_MIXED_PARSED; ++route)
             if (!positive_capture(false, false, true, icb, route)) return 1;
         if (!empty_route_rejections(icb)) return 1;

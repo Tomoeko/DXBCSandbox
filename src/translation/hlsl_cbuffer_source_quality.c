@@ -53,7 +53,9 @@ static bool field_matches(const TempVariable *field, const SerializedVariable *v
 /* Require every serialized field to survive in the actual emitted inventory,
  * including unused fields. A filtered field or anonymous tail remains a gap.
  * Scalar/vector row alignment is supplied by actual packoffset qualifiers,
- * never generated dummy variables. Sibling declaration authority is excluded. */
+ * except the separately proved HULL b0 scalar at offset zero, whose one
+ * 16-byte row uses implicit cbuffer rounding. Generated dummy variables do
+ * not supply coverage. Sibling declaration authority is excluded. */
 bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
     int index, uint8_t *shell_authority) {
     if (!ctx || !ctx->program || !ctx->program->cbuffers || index < 0 ||

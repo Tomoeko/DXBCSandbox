@@ -883,7 +883,7 @@ static bool prepare_scalar_cbuffer(HLSLEmitterContext *ctx) {
     if (!scalar_cbuffer_shape(ctx->program) || !build_cbuffer_register_map(ctx) ||
         !build_cbuffer_emission_layouts(ctx) || ctx->cbuffer_layout_count != 1 ||
         !hlsl_source_quality_cbuffer_inventory_supported(ctx)) return false;
-    const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[0];
+    HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[0];
     if (layout->reg || layout->row_count != 1 || layout->reflection_size_bytes != 16 ||
         !layout->has_serialized_authority || !layout->has_reflection_size_authority ||
         layout->variable_count != 1 || !layout->variables || layout->raw_storage ||
@@ -892,12 +892,18 @@ static bool prepare_scalar_cbuffer(HLSLEmitterContext *ctx) {
         layout->projection_status != DXBC_CBUFFER_PROJECTION_EXACT ||
         layout->projection.saw_dynamic_access || layout->projection.saw_padding_access) return false;
     const TempVariable *field = &layout->variables[0];
-    return field->name && hlsl_source_identifier_valid(field->name) &&
+    const bool prepared = field->name && hlsl_source_identifier_valid(field->name) &&
         (!ctx->entry_point_name || (strcmp(field->name, ctx->entry_point_name) &&
             (!layout->declaration_name || strcmp(layout->declaration_name, ctx->entry_point_name)))) &&
         (field->authority == 1 || field->authority == 2) && !field->type &&
         !field->is_matrix && !field->matrix_array_size && !field->row_major && field->rows == 1 &&
         field->dim == 1 && !field->byte_offset && !field->reg_offset && field->byte_size == 4;
+    if (!prepared) return false;
+    /* Only the complete named scalar layout acquires this source policy.
+     * Compact Globals declarations retain their existing explicit binding. */
+    layout->natural_hull_scalar_packing =
+        hlsl_source_quality_named_cbuffer_supported(ctx, 0, NULL);
+    return true;
 }
 
 static ASTExpr *control_point_source_expression(HLSLEmitterContext *ctx, int index, int operand,
