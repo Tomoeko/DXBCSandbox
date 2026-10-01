@@ -173,6 +173,67 @@ bool hlsl_high_level_output_projection(const USILProgram *program,
   return true;
 }
 
+bool hlsl_position_output_plan_prepare(const USILProgram *program, HLSLPositionOutputPlan *plan) {
+  if (!plan) return false;
+  memset(plan, 0, sizeof(*plan));
+  if (!packed_output_layout_supported(program) || !program->instructions ||
+      program->instruction_count < 3 || program->instruction_count > 64 ||
+      program->instruction_alloc < program->instruction_count) return false;
+  int field = -1;
+  for (int output = 0; output < program->output_count; ++output)
+    if (program->outputs[output].system_value == 1u) field = output;
+  if (field < 0 || program->outputs[field].semantic_name_extended) return false;
+  HLSLPositionOutputPlan candidate = {0};
+  candidate.assembly.present = true;
+  candidate.assembly.output_signature_index = (uint32_t)field;
+  candidate.assembly.output = program->outputs[field];
+  const int returned = program->instruction_count - 1;
+  if (program->instructions[returned].opcode != USIL_OP_RET ||
+      program->instructions[returned].operand_count) return false;
+  candidate.assembly.return_instruction_index = returned;
+  candidate.assembly.return_source_instruction_index = program->instructions[returned].source_instruction_index;
+  for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
+    const USILInstruction *owner = &program->instructions[piece];
+    const DXBCOperand *destination = &owner->operands[0];
+    const uint8_t mask = piece ? 12 : 3;
+    if (owner->opcode != USIL_OP_MOV || owner->operand_count != 2 || owner->saturate ||
+        owner->precise_mask || owner->condition_test ||
+        !usil_instruction_shape_valid(program, owner) ||
+        destination->type != OPERAND_TYPE_OUTPUT || !hlsl_lift_operand_is_plain(destination) ||
+        destination->register_index != (int)candidate.assembly.output.register_id ||
+        destination->register_index_dim != 1 || !destination->index_has_immediate[0] ||
+        destination->index_representations[0] || destination->index_value_exceeds_int[0] ||
+        destination->index_values[0] != candidate.assembly.output.register_id ||
+        usil_operand_destination_lane_mask(destination) != mask) return false;
+    candidate.assembly.pieces[piece] = (HLSLDomainOutputPiece){
+        .instruction_index = (int)piece, .source_instruction_index = owner->source_instruction_index,
+        .opcode = owner->opcode, .destination_register = candidate.assembly.output.register_id,
+        .destination_raw_token = destination->raw_token, .mask = mask, .width = 2};
+  }
+  const DXBCOperand *input = &program->instructions[0].operands[1];
+  HLSLNaturalInputProjection projection;
+  if (input->type != OPERAND_TYPE_INPUT || !hlsl_natural_input_projection(program, input, 3, &projection) ||
+      usil_operand_source_component(input, 0) != 0 || usil_operand_source_component(input, 1) != 1) return false;
+  const DXBCOperand *literal = &program->instructions[1].operands[1];
+  static const uint32_t bits[4] = {0, 0, 0, UINT32_C(0x3f800000)};
+  if (literal->type != OPERAND_TYPE_IMMEDIATE32 || !hlsl_lift_operand_is_plain(literal) ||
+      literal->raw_token != UINT32_C(0x00004002) || literal->imm_value_count != 4 ||
+      usil_operand_source_component(literal, 2) != 2 || usil_operand_source_component(literal, 3) != 3 ||
+      literal->immediate_word_count != 4 || memcmp(literal->imm_values, bits, sizeof(bits)) ||
+      memcmp(literal->immediate_words, bits, sizeof(bits))) return false;
+  candidate.immediate_raw_token = literal->raw_token;
+  memcpy(candidate.immediate_words, bits, sizeof(bits));
+  *plan = candidate;
+  return true;
+}
+
+bool hlsl_position_output_plans_equal(const HLSLPositionOutputPlan *left,
+    const HLSLPositionOutputPlan *right) {
+  return left && right && hlsl_domain_output_plans_equal(&left->assembly, &right->assembly) &&
+      left->immediate_raw_token == right->immediate_raw_token &&
+      !memcmp(left->immediate_words, right->immediate_words, sizeof(left->immediate_words));
+}
+
 bool hlsl_packed_output_candidate(const USILProgram *program) {
   if (!packed_output_layout_supported(program) ||
       (program->shader_model_major != 4 && program->shader_model_major != 5) ||
@@ -185,6 +246,8 @@ bool hlsl_packed_output_candidate(const USILProgram *program) {
       program->icb_value_count || program->has_icb_declaration || program->geometry.valid ||
       program->tessellation.valid || program->compute.valid ||
       (program->has_global_flags && program->global_flags != 1u)) return false;
+  HLSLPositionOutputPlan position;
+  const bool split_position = hlsl_position_output_plan_prepare(program, &position);
   bool written[HLSL_SM5_IO_REGISTER_COUNT] = {false};
   for (int index = 0; index < program->instruction_count; ++index) {
     const USILInstruction *instruction = &program->instructions[index];
@@ -201,6 +264,10 @@ bool hlsl_packed_output_candidate(const USILProgram *program) {
           (value->raw_token & UINT32_C(0x80000000))) return false;
       if (!operand) {
         if (value->type == OPERAND_TYPE_OUTPUT) {
+          if (split_position && index < HLSL_DOMAIN_OUTPUT_PIECE_COUNT) {
+            if (index == 1) written[position.assembly.output_signature_index] = true;
+            continue;
+          }
           HLSLNaturalOutputProjection projection;
           if (!hlsl_high_level_output_projection(program, value, &projection) ||
               written[projection.field_index]) return false;
@@ -906,6 +973,17 @@ void hlsl_source_quality_interface_statement_emitted(HLSLEmitterContext *ctx, in
   if (!owner->operand_count || owner->operands[0].type != OPERAND_TYPE_OUTPUT ||
       !hlsl_lift_operand_is_plain(&owner->operands[0])) return;
   if (ctx->high_level_packed_outputs) {
+    if (ctx->position_output_plan.assembly.present &&
+        instruction == ctx->position_output_plan.assembly.pieces[1].instruction_index) {
+      HLSLPositionOutputPlan current;
+      if (!hlsl_position_output_plan_prepare(ctx->program, &current) ||
+          !hlsl_position_output_plans_equal(&current, &ctx->position_output_plan)) return;
+      /* The two actual child writes now own one complete field statement. */
+      ctx->high_level_output_statements_emitted |= UINT32_C(1) << current.assembly.output.register_id;
+      ctx->high_level_output_field_statements |= UINT32_C(1) << current.assembly.output_signature_index;
+      ctx->high_level_statement_instruction = -1;
+      return;
+    }
     HLSLNaturalOutputProjection projection;
     if (!hlsl_high_level_output_projection(ctx->program, &owner->operands[0], &projection)) return;
     ctx->high_level_output_statements_emitted |= UINT32_C(1) << projection.register_index;
@@ -959,6 +1037,17 @@ const char *hlsl_high_level_output_field_name(const HLSLEmitterContext *ctx, int
   if (!ctx->high_level_packed_outputs)
     return hlsl_high_level_output_name(ctx, (int)ctx->program->outputs[field].register_id);
   return ctx->high_level_output_names[field][0] ? ctx->high_level_output_names[field] : NULL;
+}
+
+bool hlsl_append_position_output(HLSLEmitterContext *ctx) {
+  HLSLPositionOutputPlan current;
+  if (!ctx || !ctx->high_level_packed_outputs || !ctx->position_output_plan.assembly.present ||
+      !hlsl_position_output_plan_prepare(ctx->program, &current) ||
+      !hlsl_position_output_plans_equal(&current, &ctx->position_output_plan)) return false;
+  const char *name = hlsl_high_level_output_field_name(ctx, (int)current.assembly.output_signature_index);
+  if (!name) return false;
+  sb_appendf(ctx->sb, "%s.%s", ctx->high_level_output_variable, name);
+  return sb_ok(ctx->sb);
 }
 
 bool hlsl_append_high_level_output(HLSLEmitterContext *ctx, const DXBCOperand *destination) {

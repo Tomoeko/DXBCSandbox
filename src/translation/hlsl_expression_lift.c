@@ -145,6 +145,70 @@ static ASTExpr *logical_expression(HLSLEmitterContext *ctx, ASTExpr *expression,
     return expression;
 }
 
+static bool output_piece_expression_owned(const HLSLDomainOutputPiece *piece, const ASTExpr *expression) {
+    if (!expression || expression_width(expression) != piece->width) return false;
+    if (expression->kind == AST_EXPR_EMITTER_OPERAND) {
+        const ASTOperandProvenance *origin = &expression->operand_provenance;
+        return origin->complete && origin->value_role == AST_OPERAND_VALUE_LOGICAL &&
+            origin->instruction_index == piece->instruction_index &&
+            origin->source_instruction_index == piece->source_instruction_index &&
+            origin->destination_lanes == piece->mask && origin->result_components == piece->width &&
+            origin->bitcast_role == AST_OPERAND_BITCAST_NONE && !origin->raw_buffer_reconstruction &&
+            !origin->synthetic_interface;
+    }
+    const ASTLogicalValueOrigin *origin = &expression->logical_origin;
+    return origin->complete && origin->scalar_type == AST_SCALAR_FLOAT32 &&
+        origin->instruction_index == piece->instruction_index &&
+        origin->source_instruction_index == piece->source_instruction_index &&
+        origin->destination_lanes == piece->mask && origin->components == piece->width;
+}
+
+ASTExpr *hlsl_output_assembly_expression(const HLSLDomainOutputPlan *plan,
+    uint64_t logical_id, ASTExpr *first, ASTExpr *second) {
+    if (!plan || !plan->present ||
+        (logical_id != HLSL_DOMAIN_OUTPUT_LOGICAL_ID && logical_id != HLSL_POSITION_OUTPUT_LOGICAL_ID) ||
+        !first || !second || first == second ||
+        !plan->pieces[0].width || plan->pieces[0].width > 3 ||
+        !plan->pieces[1].width || plan->pieces[1].width > 3 ||
+        plan->output.mask != 15 || plan->pieces[0].width + plan->pieces[1].width != 4 ||
+        plan->output.component_type != 3 || plan->output.system_value != 1 || plan->output.rw_mask ||
+        plan->pieces[0].instruction_index < 0 ||
+        plan->pieces[1].instruction_index != plan->pieces[0].instruction_index + 1 ||
+        plan->pieces[0].destination_register != plan->output.register_id ||
+        plan->pieces[1].destination_register != plan->output.register_id ||
+        plan->pieces[0].mask != (uint8_t)((1u << plan->pieces[0].width) - 1u) ||
+        (plan->pieces[0].mask & plan->pieces[1].mask) ||
+        (plan->pieces[0].mask | plan->pieces[1].mask) != 15 ||
+        lane_count(plan->pieces[0].mask) != plan->pieces[0].width ||
+        lane_count(plan->pieces[1].mask) != plan->pieces[1].width ||
+        !output_piece_expression_owned(&plan->pieces[0], first) ||
+        !output_piece_expression_owned(&plan->pieces[1], second)) {
+        if (first != second) ast_free_expr(second);
+        ast_free_expr(first);
+        return NULL;
+    }
+    ASTExpr *arguments[HLSL_DOMAIN_OUTPUT_PIECE_COUNT] = {first, second};
+    ASTExpr *construction = ast_create_call("float4", arguments, HLSL_DOMAIN_OUTPUT_PIECE_COUNT);
+    if (!construction) {
+        ast_free_expr(first);
+        ast_free_expr(second);
+        return NULL;
+    }
+    ASTLogicalValueOrigin assembly;
+    ast_logical_value_origin_init(&assembly);
+    assembly.complete = true;
+    assembly.scalar_type = AST_SCALAR_FLOAT32;
+    assembly.components = 4;
+    assembly.logical_value_id = logical_id;
+    /* The children own every actual write; constructing the complete interface
+     * value has no opcode, raw instruction or fabricated destination lanes. */
+    if (!ast_set_logical_value_origin(construction, &assembly)) {
+        ast_free_expr(construction);
+        return NULL;
+    }
+    return construction;
+}
+
 ASTExpr *hlsl_instruction_logical_expression(HLSLEmitterContext *ctx,
     ASTExpr *expression, int instruction, uint8_t lanes, unsigned width) {
     if (!ctx || !ctx->program || !ctx->program->instructions || instruction < 0 ||
@@ -1557,6 +1621,8 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
     ASTExpr *roots[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     uint8_t logical_widths[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     HLSLInstructionOwners pending_owners[EXPRESSION_INSTRUCTION_LIMIT] = {0};
+    /* Both stage-specific plans use this owned first-piece slot. Their
+     * acquisition and observation receipts remain separate. */
     ASTExpr *domain_vector = NULL;
     HLSLInstructionOwners domain_vector_owners = {0};
     HLSLMatrixLiftPlan matrix_plans[EXPRESSION_INSTRUCTION_LIMIT] = {0};
@@ -1705,28 +1771,51 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
                 ast_free_expr(scalar);
                 goto cleanup;
             }
-            ASTExpr *arguments[] = {domain_vector, scalar};
-            ASTExpr *construction = ast_create_call("float4", arguments, HLSL_DOMAIN_OUTPUT_PIECE_COUNT);
-            if (!construction) {
-                ast_free_expr(scalar);
-                goto cleanup;
-            }
-            domain_vector = NULL; /* The constructor now owns both actual pieces. */
-            ASTLogicalValueOrigin assembly;
-            ast_logical_value_origin_init(&assembly);
-            assembly.complete = true;
-            assembly.scalar_type = AST_SCALAR_FLOAT32;
-            assembly.components = 4;
-            assembly.logical_value_id = HLSL_DOMAIN_OUTPUT_LOGICAL_ID;
-            /* Canonical interface assembly has no fabricated opcode owner.
-             * The private receipt retains the two real XYZ/W write owners. */
-            if (!ast_set_logical_value_origin(construction, &assembly)) {
-                ast_free_expr(construction);
-                goto cleanup;
-            }
+            ASTExpr *first_piece = domain_vector;
+            domain_vector = NULL; /* The shared worker consumes both pieces. */
+            ASTExpr *construction = hlsl_output_assembly_expression(
+                plan, HLSL_DOMAIN_OUTPUT_LOGICAL_ID, first_piece, scalar);
+            if (!construction) goto cleanup;
             expression = construction;
             hlsl_instruction_owners_union(&owners, &domain_vector_owners);
             domain_construction = true;
+        }
+        bool position_construction = false;
+        if (!scope && ctx->position_output_plan.assembly.present &&
+            inst->operands[0].type == OPERAND_TYPE_OUTPUT &&
+            inst->operands[0].register_index == (int)ctx->position_output_plan.assembly.output.register_id) {
+            const HLSLDomainOutputPlan *plan = &ctx->position_output_plan.assembly;
+            HLSLPositionOutputPlan current;
+            if (!hlsl_position_output_plan_prepare(ctx->program, &current) ||
+                !hlsl_position_output_plans_equal(&current, &ctx->position_output_plan)) {
+                ast_free_expr(expression);
+                goto cleanup;
+            }
+            if (index == plan->pieces[0].instruction_index) {
+                if (domain_vector || expression_width(expression) != 2) {
+                    ast_free_expr(expression);
+                    goto cleanup;
+                }
+                domain_vector = expression;
+                domain_vector_owners = owners;
+                continue;
+            }
+            if (index != plan->pieces[1].instruction_index || !domain_vector ||
+                expression->kind != AST_EXPR_LITERAL || expression_width(expression) != 2 ||
+                expression->u.literal.components != 2 || expression->u.literal.scalar_type != AST_SCALAR_FLOAT32 ||
+                expression->u.literal.val[0] != 0 || expression->u.literal.val[1] != UINT32_C(0x3f800000)) {
+                ast_free_expr(expression);
+                goto cleanup;
+            }
+            ASTExpr *second = logical_expression(ctx, expression, index, 12, 2);
+            if (!second) goto cleanup;
+            roots[index] = second;
+            ASTExpr *first_piece = domain_vector;
+            domain_vector = NULL;
+            expression = hlsl_output_assembly_expression(plan, HLSL_POSITION_OUTPUT_LOGICAL_ID, first_piece, second);
+            if (!expression) goto cleanup;
+            hlsl_instruction_owners_union(&owners, &domain_vector_owners);
+            position_construction = true;
         }
         ExpressionSpanContext trace = {
             .map = map, .roots = roots, .owners = owners, .function = group >= 0,
@@ -1765,7 +1854,8 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
         } else {
             if (!(scope ? scope->append_destination(ctx, index, scope->context)
                     : ctx->high_level_interface
-                        ? hlsl_append_high_level_output(ctx, destination)
+                        ? position_construction ? hlsl_append_position_output(ctx)
+                            : hlsl_append_high_level_output(ctx, destination)
                         : hlsl_float4_append_output(ctx, destination))) {
                 ast_free_expr(expression);
                 goto cleanup;

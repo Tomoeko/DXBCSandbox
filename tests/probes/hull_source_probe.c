@@ -39,6 +39,64 @@ typedef struct {
     bool valid;
 } ProbeDecodedLiteral;
 
+typedef struct {
+    HLSLPositionOutputPlan plan;
+    unsigned observations, assembly_observations;
+    bool child_observed[HLSL_DOMAIN_OUTPUT_PIECE_COUNT];
+} ProbePositionOutput;
+
+/* The plan comes from the actual decoded target. This observer records only
+ * typed source facts; it neither recognizes printed field names nor supplies
+ * replacement source or instruction owners. */
+static bool position_output_observer(void *context,
+                                    const HLSLSourceQualityObservation *observation) {
+    ProbePositionOutput *position = context;
+    if (!position || !observation ||
+        position->observations >= (unsigned)PROBE_DOMAIN_OPERAND_LIMIT) return false;
+    ++position->observations;
+    if (observation->kind != HLSL_SOURCE_OBSERVATION_EXPRESSION) return true;
+    const HLSLSourceQualityFacts *facts = &observation->facts;
+    if (facts->logical_value_id == HLSL_POSITION_OUTPUT_LOGICAL_ID) {
+        if (observation->ast_kind != AST_EXPR_CALL || !facts->known ||
+            facts->value_kind != HLSL_SOURCE_VALUE_LOGICAL || facts->components != 4u ||
+            facts->instruction_index != -1 || facts->source_instruction_index != UINT32_MAX ||
+            facts->lanes || facts->artifacts) return false;
+        ++position->assembly_observations;
+    }
+    for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
+        const HLSLDomainOutputPiece *owner = &position->plan.assembly.pieces[piece];
+        if (facts->instruction_index == owner->instruction_index &&
+            facts->source_instruction_index == owner->source_instruction_index &&
+            facts->lanes == owner->mask && facts->known &&
+            facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL && facts->components == 2u &&
+            !facts->artifacts) position->child_observed[piece] = true;
+    }
+    return true;
+}
+
+static bool position_output_map_owned(const ProbePositionOutput *position,
+    const HLSLExpressionSourceMap *map, size_t source_length) {
+    if (!position || !position->plan.assembly.present || !map || !map->complete ||
+        position->assembly_observations != 1u || !position->child_observed[0] ||
+        !position->child_observed[1]) return false;
+    const HLSLExpressionOrigin *children[HLSL_DOMAIN_OUTPUT_PIECE_COUNT] = {0};
+    for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
+        const HLSLDomainOutputPiece *owner = &position->plan.assembly.pieces[piece];
+        if (owner->instruction_index < 0 || (size_t)owner->instruction_index >= map->count)
+            return false;
+        const HLSLExpressionOrigin *origin = &map->origins[owner->instruction_index];
+        if (origin->kind != HLSL_EXPRESSION_ORIGIN_EXPRESSION ||
+            origin->instruction_index != owner->instruction_index ||
+            origin->source_instruction_index != owner->source_instruction_index ||
+            origin->destination_lanes != owner->mask ||
+            origin->source_begin >= origin->source_end || origin->source_end > source_length ||
+            !hlsl_expression_origin_ranges_valid(origin, source_length)) return false;
+        children[piece] = origin;
+    }
+    return children[0]->source_end <= children[1]->source_begin ||
+        children[1]->source_end <= children[0]->source_begin;
+}
+
 /* A small by-value link summary of actual admitted targets. No source spelling
  * or compiler reflection is used to manufacture an interface. This fixture
  * route requires inline names and retains role-specific RW masks. */
@@ -463,8 +521,8 @@ static bool print_domain_operand(const DXBCOperand *operand, int instruction,
  * masks encode never-written components, unlike input RW masks. No shader text
  * or source-field spelling is used to infer a packed lane owner. */
 static bool packed_output_vertex_shape(const USILProgram *program,
-                                       int *packed_register) {
-    if (!program || !packed_register ||
+                                       int *packed_register, int *position_field) {
+    if (!program || !packed_register || !position_field ||
         program->program_type != DXBC_PROGRAM_TYPE_VERTEX ||
         !program->has_stage_contract || !program->has_parsed_signature_authority ||
         program->input_count < 0 || program->input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
@@ -479,22 +537,28 @@ static bool packed_output_vertex_shape(const USILProgram *program,
             (program->signature_declarations != NULL) ||
         !usil_signature_authority_is_valid(program)) return false;
     const DXBCSignatureElement *position = NULL, *xy = NULL, *zw = NULL;
+    int position_index = -1;
     for (int index = 0; index < program->output_count; ++index) {
         const DXBCSignatureElement *field = &program->outputs[index];
         if (!linked_inline_signature(field) || field->component_type != 3 ||
             field->stream_index || field->min_precision ||
+            field->register_id >= (unsigned)HLSL_SM5_IO_REGISTER_COUNT ||
             field->rw_mask != (uint8_t)(15u & ~(unsigned)field->mask)) return false;
         if (field->system_value == 1 && field->semantic_index == 0 &&
-            field->mask == 15 && !position) position = field;
+            field->mask == 15 && !position) {
+            position = field;
+            position_index = index;
+        }
         else if (!field->system_value && !strcmp(field->semantic_name, "TEXCOORD") &&
                  field->semantic_index == 0 && field->mask == 3 && !xy) xy = field;
         else if (!field->system_value && !strcmp(field->semantic_name, "TEXCOORD") &&
                  field->semantic_index == 1 && field->mask == 12 && !zw) zw = field;
         else return false;
     }
-    if (!position || !xy || !zw || position->register_id != 0 ||
-        xy->register_id != 1 || zw->register_id != xy->register_id) return false;
+    if (!position || !xy || !zw || position->register_id == xy->register_id ||
+        zw->register_id != xy->register_id) return false;
     *packed_register = (int)xy->register_id;
+    *position_field = position_index;
     return true;
 }
 
@@ -574,10 +638,10 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         puts("structured_decode=failed structured_source_result=not-attempted");
         goto done;
     }
-    int packed_register = -1;
+    int packed_register = -1, position_field = -1;
     const bool packed_shape = !packed_output_fixture ||
         (print_domain_signature("packed-vertex-output", program.outputs, program.output_count) &&
-         packed_output_vertex_shape(&program, &packed_register));
+         packed_output_vertex_shape(&program, &packed_register, &position_field));
     bool output_shape = packed_output_fixture || (!vertex_fixture && program.outputs[0].mask == 7 &&
         program.outputs[0].component_type == 3);
     if (vertex_fixture && !packed_output_fixture) {
@@ -591,6 +655,56 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         output_shape = position == 1 && value == 1;
     }
     if (!output_shape) goto done;
+    ProbePositionOutput position_output = {0};
+    bool position_split = false, position_prepared = false;
+    if (packed_output_fixture && packed_shape) {
+        unsigned writes = 0;
+        uint8_t written_mask = 0;
+        const DXBCSignatureElement *position = &program.outputs[position_field];
+        for (int index = 0; index < program.instruction_count; ++index) {
+            const USILInstruction *instruction = &program.instructions[index];
+            if (!instruction->operand_count) continue;
+            const DXBCOperand *destination = &instruction->operands[0];
+            USILOperandUseInfo use = {0};
+            if (destination->type != OPERAND_TYPE_OUTPUT || destination->register_index < 0 ||
+                (uint32_t)destination->register_index != position->register_id ||
+                !usil_instruction_operand_use(&program, instruction, 0, &use) ||
+                use.use != USIL_OPERAND_USE_DESTINATION) continue;
+            ++writes;
+            written_mask |= usil_operand_destination_lane_mask(destination);
+        }
+        position_split = writes != 1u || written_mask != 15;
+        position_prepared = hlsl_position_output_plan_prepare(&program, &position_output.plan) &&
+            position_output.plan.assembly.present &&
+            position_output.plan.assembly.output_signature_index == (uint32_t)position_field &&
+            position_output.plan.assembly.output.register_id == position->register_id &&
+            position_output.plan.assembly.output.system_value == 1u &&
+            position_output.plan.assembly.output.mask == 15 &&
+            !position_output.plan.assembly.output.rw_mask &&
+            position_output.plan.assembly.pieces[0].opcode == USIL_OP_MOV &&
+            position_output.plan.assembly.pieces[1].opcode == USIL_OP_MOV &&
+            position_output.plan.assembly.pieces[0].mask == 3 &&
+            position_output.plan.assembly.pieces[1].mask == 12 &&
+            position_output.plan.assembly.pieces[0].width == 2 &&
+            position_output.plan.assembly.pieces[1].width == 2 &&
+            position_output.plan.assembly.pieces[0].instruction_index !=
+                position_output.plan.assembly.pieces[1].instruction_index;
+        printf("packed_output_position field=%d register=%u writes=%u union_lanes=%u "
+               "scope=%s actual_mov_plan=%d\n", position_field, position->register_id,
+               writes, (unsigned)written_mask, position_split
+                   ? position_prepared ? "two-mov-pieces" : "outside-bounded-mov" : "full-field",
+               position_prepared);
+        if (position_prepared) {
+            for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
+                const HLSLDomainOutputPiece *owner = &position_output.plan.assembly.pieces[piece];
+                printf("packed_output_position_piece index=%u instruction=%d raw_instruction=%u "
+                       "opcode=%u destination_register=%u destination_lanes=%u width=%u\n",
+                       piece, owner->instruction_index, owner->source_instruction_index,
+                       (unsigned)owner->opcode, owner->destination_register,
+                       (unsigned)owner->mask, (unsigned)owner->width);
+            }
+        }
+    }
     printf("structured_decode=complete stage=%u signature_authority=%d stage_contract=%d "
            "inputs=%d outputs=%d instructions=%d temps=%d\n",
            (unsigned)program.program_type, program.has_parsed_signature_authority, program.has_stage_contract,
@@ -737,6 +851,10 @@ static bool reconstruct_structured(const DXBCContainerView *target,
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
     options.expression_source_map = &map;
     options.source_quality = &quality;
+    if (position_prepared) {
+        options.source_quality_observer = position_output_observer;
+        options.source_quality_observer_context = &position_output;
+    }
     const HLSLEmitNames names = {.entry_point = vertex_fixture ? "vert" : "frag",
         .input_struct = vertex_fixture ? "VertexInput" : "FragmentInput",
         .output_struct = vertex_fixture ? "VertexOutput" : "FragmentOutput"};
@@ -770,6 +888,25 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                 origin->destination_lanes == captured.destination_lanes;
             printf("packed_output_decoded_literal_map_owned=%d\n", owner_printed);
             accepted = accepted && owner_printed;
+            if (position_split) {
+                const bool position_owned = position_prepared &&
+                    position_output_map_owned(&position_output, &map, source->len);
+                printf("packed_output_position_piece_map_owned=%d assembly_observations=%u "
+                       "xy_child_observed=%d zw_child_observed=%d\n", position_owned,
+                       position_output.assembly_observations, position_output.child_observed[0],
+                       position_output.child_observed[1]);
+                if (position_owned) {
+                    for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
+                        const HLSLDomainOutputPiece *owner = &position_output.plan.assembly.pieces[piece];
+                        const HLSLExpressionOrigin *origin = &map.origins[owner->instruction_index];
+                        printf("packed_output_position_child_span index=%u instruction=%d "
+                               "raw_instruction=%u destination_lanes=%u begin=%zu end=%zu\n",
+                               piece, origin->instruction_index, origin->source_instruction_index,
+                               (unsigned)origin->destination_lanes, origin->source_begin, origin->source_end);
+                    }
+                }
+                accepted = accepted && position_owned;
+            }
         }
     }
 done:

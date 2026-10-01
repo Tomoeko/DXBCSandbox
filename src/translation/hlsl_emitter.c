@@ -2449,6 +2449,7 @@ static bool hlsl_emit_with_options_impl(
     free(ctx_ptr);
     return false;
   }
+  if (packed_output) (void)hlsl_position_output_plan_prepare(program, &ctx.position_output_plan);
   if (emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
       !ctx.high_level_interface && !ctx.unity_uv_helper && program->output_count >= 1 &&
       program->output_count <= HLSL_SM5_IO_REGISTER_COUNT &&

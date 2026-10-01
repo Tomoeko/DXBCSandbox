@@ -282,6 +282,7 @@ typedef struct HLSLEmitterContext {
     bool high_level_geometry;
     bool high_level_domain;
     HLSLDomainOutputPlan domain_output_plan;
+    HLSLPositionOutputPlan position_output_plan;
     size_t domain_output_return_begin;
     uint8_t domain_owner_digest[32];
     bool natural_structured_owners_guarded;
@@ -496,6 +497,11 @@ bool hlsl_high_level_output_projection(const USILProgram *program,
     const DXBCOperand *destination, HLSLNaturalOutputProjection *projection);
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);
+/* Consumes both actual owned pieces on success and failure. Interface assembly
+ * has a canonical synthetic origin; neither decoded writer is widened. */
+ASTExpr *hlsl_output_assembly_expression(const HLSLDomainOutputPlan *plan,
+    uint64_t logical_id, ASTExpr *first, ASTExpr *second);
+bool hlsl_append_position_output(HLSLEmitterContext *ctx);
 /* Scratch naming only, after program/input-demand proof; never grants live
  * interface or quality authority. Ordinary preparation repeats preflight. */
 bool hlsl_prepare_packed_output_preflight_names(HLSLEmitterContext *ctx);
