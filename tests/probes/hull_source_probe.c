@@ -10,6 +10,7 @@
 #include "translation/hlsl_source_quality.h"
 #include "translation/hlsl_source_quality_internal.h"
 #include "translation/hlsl_stage_coverage_internal.h"
+#include "translation/hlsl_source_identifier.h"
 #include "translation/usil_validation.h"
 
 #include <inttypes.h>
@@ -22,7 +23,9 @@ enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096,
        PROBE_DOMAIN_DECLARATION_LIMIT = 32, PROBE_DOMAIN_SIGNATURE_LIMIT = 16,
        PROBE_DOMAIN_OPERAND_LIMIT = 128, PROBE_DOMAIN_OPERAND_DEPTH_LIMIT = 4,
        PROBE_LINKED_STAGE_COUNT = 2, PROBE_LINKED_COMPILE_SLOTS = 12,
-       PROBE_LINKED_FACTOR_LIMIT = 6, PROBE_LINKED_CONTROL_POINT_LIMIT = 32 };
+       PROBE_LINKED_FACTOR_LIMIT = 6, PROBE_LINKED_CONTROL_POINT_LIMIT = 32,
+       PROBE_NATIVE_CB_RECORD_LIMIT = 32, PROBE_NATIVE_CB_FIELD_LIMIT = 4,
+       PROBE_NATIVE_CB_NAME_LIMIT = 96, PROBE_NATIVE_CB_RECORD_BYTES = 512 };
 
 typedef struct {
     size_t begin, end;
@@ -43,7 +46,67 @@ typedef struct {
     HLSLPositionOutputPlan plan;
     unsigned observations, assembly_observations;
     bool child_observed[HLSL_DOMAIN_OUTPUT_PIECE_COUNT];
+    bool mad;
+    unsigned mad_binary_observations, mad_operand_observations;
+    uint64_t mad_leaf_ids[3];
+    bool mad_leaf_projection[3], mad_leaf_observed[3];
 } ProbePositionOutput;
+
+/* Observation IDs are projected from current decoded input membership and
+ * actual native field offsets. Operand selectors remain decoded/plan facts;
+ * the public callback does not expose their indices or child pointers. */
+static bool position_mad_leaf_facts(const USILProgram *program,
+    const SerializedProgramParameters *parameters, ProbePositionOutput *position) {
+    if (!position || !position->plan.assembly.present) return false;
+    const HLSLDomainOutputPiece *piece = &position->plan.assembly.pieces[0];
+    if (piece->opcode != USIL_OP_MAD) return piece->opcode == USIL_OP_MOV;
+    if (!program || !program->instructions || piece->instruction_index < 0 ||
+        piece->instruction_index >= program->instruction_count ||
+        !parameters || parameters->is_binary || parameters->cb_count != 1 ||
+        !parameters->constant_buffers || parameters->res_count != 1 || !parameters->resources)
+        return false;
+    const USILInstruction *instruction = &program->instructions[piece->instruction_index];
+    if (instruction->opcode != USIL_OP_MAD || instruction->operand_count != 4 ||
+        instruction->source_instruction_index != piece->source_instruction_index || piece->mask != 3)
+        return false;
+    HLSLNaturalInputProjection input;
+    if (!hlsl_natural_input_projection(program, &instruction->operands[1], piece->mask, &input) ||
+        input.result_components != 2 || input.selected_components[0] || input.selected_components[1] != 1)
+        return false;
+    const SerializedConstantBuffer *buffer = &parameters->constant_buffers[0];
+    const SerializedResourceParam *binding = &parameters->resources[0];
+    if (binding->bind_type != SERIALIZED_RESOURCE_CONSTANT_BUFFER || !buffer->variables ||
+        buffer->var_count < 1 || buffer->var_count > PROBE_NATIVE_CB_FIELD_LIMIT) return false;
+    position->mad_leaf_ids[0] = input.logical_value_id;
+    position->mad_leaf_projection[0] = input.natural_components != 2;
+    for (int operand = 2; operand < 4; ++operand) {
+        const DXBCOperand *source = &instruction->operands[operand];
+        USILOperandUseInfo use;
+        if (source->type != OPERAND_TYPE_CONSTANT_BUFFER || source->register_index < 0 ||
+            (uint32_t)source->register_index != binding->bind_index || source->rel_offset0 < 0 ||
+            source->rel_offset0 >= PROBE_NATIVE_CB_FIELD_LIMIT ||
+            !usil_instruction_operand_use(program, instruction, operand, &use) ||
+            use.use != USIL_OPERAND_USE_SOURCE || use.source_lane_mask != piece->mask) return false;
+        const uint32_t offset = (uint32_t)source->rel_offset0 * 16u;
+        const SerializedVariable *field = NULL;
+        for (int index = 0; index < buffer->var_count; ++index) {
+            const SerializedVariable *candidate = &buffer->variables[index];
+            if (candidate->layout[0] != offset) continue;
+            if (field) return false;
+            field = candidate;
+        }
+        if (!field || field->layout[1] || field->layout[2] || field->layout[3] != 4 ||
+            field->layout[4] || field->layout[5] || offset + 16u > buffer->size) return false;
+        /* This is the established material-operand logical identity: binding
+         * plus exact byte offset, independent of the copied field spelling. */
+        position->mad_leaf_ids[operand - 1] = ((uint64_t)(binding->bind_index + 1u) << 32) | offset;
+        position->mad_leaf_projection[operand - 1] = true;
+    }
+    if (position->mad_leaf_ids[1] != position->mad_leaf_ids[2] ||
+        position->mad_leaf_ids[0] == position->mad_leaf_ids[1]) return false;
+    position->mad = true;
+    return true;
+}
 
 /* The plan comes from the actual decoded target. This observer records only
  * typed source facts; it neither recognizes printed field names nor supplies
@@ -63,6 +126,24 @@ static bool position_output_observer(void *context,
             facts->lanes || facts->artifacts) return false;
         ++position->assembly_observations;
     }
+    const HLSLDomainOutputPiece *mad = &position->plan.assembly.pieces[0];
+    if (position->mad && facts->instruction_index == mad->instruction_index &&
+        facts->source_instruction_index == mad->source_instruction_index && facts->lanes == mad->mask) {
+        if (!facts->known || facts->value_kind != HLSL_SOURCE_VALUE_LOGICAL ||
+            facts->components != 2 || facts->artifacts || facts->real_bitcast) return false;
+        if (observation->ast_kind == AST_EXPR_BINARY) {
+            if (!facts->logical_operation || facts->logical_value_id != (uint64_t)mad->instruction_index ||
+                ++position->mad_binary_observations > 2u) return false;
+        } else if (observation->ast_kind == AST_EXPR_EMITTER_OPERAND) {
+            unsigned leaf = 0;
+            while (leaf < 3u && (position->mad_leaf_observed[leaf] ||
+                facts->logical_value_id != position->mad_leaf_ids[leaf] ||
+                facts->semantic_projection != position->mad_leaf_projection[leaf])) ++leaf;
+            if (leaf == 3u || facts->logical_operation || ++position->mad_operand_observations > 3u)
+                return false;
+            position->mad_leaf_observed[leaf] = true;
+        } else return false;
+    }
     for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
         const HLSLDomainOutputPiece *owner = &position->plan.assembly.pieces[piece];
         if (facts->instruction_index == owner->instruction_index &&
@@ -79,6 +160,9 @@ static bool position_output_map_owned(const ProbePositionOutput *position,
     if (!position || !position->plan.assembly.present || !map || !map->complete ||
         position->assembly_observations != 1u || !position->child_observed[0] ||
         !position->child_observed[1]) return false;
+    if (position->mad && (position->mad_binary_observations != 2u ||
+        position->mad_operand_observations != 3u || !position->mad_leaf_observed[0] ||
+        !position->mad_leaf_observed[1] || !position->mad_leaf_observed[2])) return false;
     const HLSLExpressionOrigin *children[HLSL_DOMAIN_OUTPUT_PIECE_COUNT] = {0};
     for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
         const HLSLDomainOutputPiece *owner = &position->plan.assembly.pieces[piece];
@@ -247,6 +331,140 @@ static bool scalar_fixture_reflection(const UnityCompilerBinaryResponse *respons
         seen |= 1u << expected;
     }
     return seen == 7;
+}
+
+/* A controlled native callback projection, not a player-blob capture or an
+ * authored property/default-value lookup. The text-layout model is only the
+ * existing emitter's named parameter input, and owns all copied strings. */
+static bool native_parameter_string_bounded(const char *text, size_t limit) {
+    if (!text) return false;
+    size_t size = 0;
+    while (size < limit && text[size]) ++size;
+    return size > 0 && size < limit;
+}
+
+static bool native_float4_parameters(const UnityCompilerBinaryResponse *response,
+    SerializedProgramParameters *parameters, const char *role) {
+    if (!response || !parameters || parameters->cb_count || parameters->res_count ||
+        parameters->constant_buffers || parameters->resources ||
+        parameters->owned_strings.count || parameters->owned_strings.strings ||
+        response->reflection_record_count > (size_t)PROBE_NATIVE_CB_RECORD_LIMIT ||
+        (response->reflection_record_count && !response->reflection_records)) return false;
+    bool has_parameters = false;
+    for (size_t index = 0; index < response->reflection_record_count; ++index) {
+        const UnityCompilerReflectionKind kind = response->reflection_records[index].kind;
+        has_parameters |= kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER ||
+            kind == UNITY_COMPILER_REFLECTION_CONSTANT ||
+            kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING;
+    }
+    if (!has_parameters) return true; /* Existing no-CB routes retain NULL. */
+    SerializedVariable fields[PROBE_NATIVE_CB_FIELD_LIMIT] = {0};
+    SerializedConstantBuffer buffer = {.role = SERIALIZED_CBUFFER_NAMED,
+        .variables = fields};
+    SerializedResourceParam binding = {.bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER,
+        .array_size = 1};
+    bool have_buffer = false, have_binding = false, constant_scope = false;
+    int32_t variable_count = -1;
+    for (size_t index = 0; index < response->reflection_record_count; ++index) {
+        const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
+        if (!native_parameter_string_bounded(record->record, (size_t)PROBE_NATIVE_CB_RECORD_BYTES) ||
+            (record->name && !native_parameter_string_bounded(record->name,
+                (size_t)PROBE_NATIVE_CB_NAME_LIMIT)))
+            return false;
+        UnityCompilerReflectionRecord canonical = {0};
+        const bool canonical_record = unity_compiler_reflection_record_parse(record->record, &canonical) &&
+            record->kind == canonical.kind && record->value_count == canonical.value_count &&
+            !memcmp(record->values, canonical.values, sizeof(record->values)) &&
+            ((record->name && canonical.name && !strcmp(record->name, canonical.name)) ||
+             (!record->name && !canonical.name));
+        unity_compiler_reflection_record_free(&canonical);
+        if (!canonical_record) return false;
+        if (record->kind == UNITY_COMPILER_REFLECTION_STATS) continue;
+        if (record->kind == UNITY_COMPILER_REFLECTION_INPUT) {
+            constant_scope = false;
+            continue;
+        }
+        if (!record->name) return false;
+        if (role && (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER ||
+            record->kind == UNITY_COMPILER_REFLECTION_CONSTANT ||
+            record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING)) {
+            printf("native_cb_record role=%s index=%zu kind=%u name=%s count=%zu", role,
+                   index, (unsigned)record->kind, record->name, record->value_count);
+            for (size_t value = 0; value < record->value_count; ++value)
+                printf(" value%zu=%" PRId32, value, record->values[value]);
+            putchar('\n');
+        }
+        if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER) {
+            if (have_buffer || have_binding || record->value_count != 2u ||
+                record->values[0] < 16 || record->values[0] > PROBE_NATIVE_CB_FIELD_LIMIT * 16 ||
+                (record->values[0] & 15) || record->values[1] < 1 ||
+                record->values[1] > PROBE_NATIVE_CB_FIELD_LIMIT ||
+                record->values[0] != record->values[1] * 16 ||
+                (!hlsl_source_identifier_valid(record->name) && strcmp(record->name, "$Globals")))
+                return false;
+            buffer.name = record->name;
+            buffer.size = (uint32_t)record->values[0];
+            variable_count = record->values[1];
+            have_buffer = true;
+            constant_scope = true;
+        } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT) {
+            if (!have_buffer || !constant_scope || have_binding || record->value_count != 6u ||
+                buffer.var_count >= variable_count ||
+                record->values[0] != buffer.var_count * 16 ||
+                record->values[1] || record->values[2] || record->values[3] != 1 ||
+                record->values[4] != 4 || record->values[5] ||
+                !hlsl_source_identifier_valid(record->name) || !strcmp(record->name, buffer.name))
+                return false;
+            for (int field = 0; field < buffer.var_count; ++field)
+                if (!strcmp(fields[field].name, record->name)) return false;
+            fields[buffer.var_count] = (SerializedVariable){.name = record->name,
+                .layout = {(uint32_t)record->values[0], 0, 0, 4, 0, 0}};
+            ++buffer.var_count;
+        } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) {
+            if (!have_buffer || have_binding || buffer.var_count != variable_count ||
+                record->value_count != 1u || record->values[0] < 0 ||
+                record->values[0] >= HLSL_SM5_CBUFFER_REGISTER_COUNT ||
+                strcmp(record->name, buffer.name)) return false;
+            binding.name = record->name;
+            binding.bind_index = (uint32_t)record->values[0];
+            have_binding = true;
+            constant_scope = false;
+        } else return false;
+    }
+    if (!have_buffer || !have_binding || buffer.var_count != variable_count) return false;
+    const SerializedProgramParameters projected = {.constant_buffers = &buffer,
+        .cb_count = 1, .resources = &binding, .res_count = 1};
+    if (!serialized_program_parameters_copy(parameters, &projected)) return false;
+    if (role) {
+        printf("native_cb_projection role=%s records=%zu fields=%d "
+               "authority=actual-native-callbacks player_metadata=not-supplied "
+               "authored_defaults=not-used\n", role, response->reflection_record_count, buffer.var_count);
+    }
+    return true;
+}
+
+static bool native_float4_parameters_equal(const UnityCompilerBinaryResponse *response,
+    const SerializedProgramParameters *original, const char *role) {
+    SerializedProgramParameters current;
+    serialized_program_parameters_init(&current);
+    const bool equal = native_float4_parameters(response, &current, role) &&
+        serialized_program_parameters_equal(original, &current);
+    serialized_program_parameters_free(&current);
+    printf("native_cb_projection_equal role=%s original_tuples_equal=%d\n", role, equal);
+    return equal;
+}
+
+static bool native_float4_program_matches(const USILProgram *program,
+    const SerializedProgramParameters *parameters) {
+    if (!parameters) return true;
+    return program && parameters->cb_count == 1 && parameters->constant_buffers &&
+        parameters->res_count == 1 && parameters->resources &&
+        program->cbuffer_count == 1 && program->cbuffer_alloc >= 1 && program->cbuffers &&
+        !program->cbuffers[0].dynamic_indexed && program->cbuffers[0].reg_idx >= 0 &&
+        (uint32_t)program->cbuffers[0].reg_idx == parameters->resources[0].bind_index &&
+        program->cbuffers[0].size > 0 &&
+        (uint32_t)program->cbuffers[0].size == parameters->constant_buffers[0].size / 16u &&
+        !program->texture_count && !program->sampler_count && !program->uav_count;
 }
 
 static void print_digest(const char *role, const uint8_t digest[32]) {
@@ -612,7 +830,8 @@ static bool packed_output_mul_literal(const USILProgram *program,
  * literal span or supplies authored fragment text to reconstruction. */
 static bool reconstruct_structured(const DXBCContainerView *target,
     StringBuilder *source, ProbeDecodedLiteral *literal_owner, bool change_literal,
-    bool vertex_fixture, bool packed_output_fixture) {
+    bool vertex_fixture, bool packed_output_fixture,
+    const SerializedProgramParameters *parameters) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -631,6 +850,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         program.program_type != (vertex_fixture ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL) ||
         program.instruction_count > PROBE_DOMAIN_INSTRUCTION_LIMIT ||
         program.input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
+        !native_float4_program_matches(&program, parameters) ||
         (packed_output_fixture
             ? program.output_count < 1 || program.output_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
               program.output_alloc < program.output_count
@@ -681,19 +901,26 @@ static bool reconstruct_structured(const DXBCContainerView *target,
             position_output.plan.assembly.output.system_value == 1u &&
             position_output.plan.assembly.output.mask == 15 &&
             !position_output.plan.assembly.output.rw_mask &&
-            position_output.plan.assembly.pieces[0].opcode == USIL_OP_MOV &&
+            (position_output.plan.assembly.pieces[0].opcode == USIL_OP_MOV ||
+             position_output.plan.assembly.pieces[0].opcode == USIL_OP_MAD) &&
             position_output.plan.assembly.pieces[1].opcode == USIL_OP_MOV &&
             position_output.plan.assembly.pieces[0].mask == 3 &&
             position_output.plan.assembly.pieces[1].mask == 12 &&
             position_output.plan.assembly.pieces[0].width == 2 &&
             position_output.plan.assembly.pieces[1].width == 2 &&
             position_output.plan.assembly.pieces[0].instruction_index !=
-                position_output.plan.assembly.pieces[1].instruction_index;
+                position_output.plan.assembly.pieces[1].instruction_index &&
+            position_mad_leaf_facts(&program, parameters, &position_output);
+        const bool actual_mad = program.instruction_count && program.instructions[0].opcode == USIL_OP_MAD;
         printf("packed_output_position field=%d register=%u writes=%u union_lanes=%u "
                "scope=%s actual_mov_plan=%d\n", position_field, position->register_id,
                writes, (unsigned)written_mask, position_split
-                   ? position_prepared ? "two-mov-pieces" : "outside-bounded-mov" : "full-field",
-               position_prepared);
+                   ? position_prepared ? actual_mad ? "mad-xy-and-mov-zw" : "two-mov-pieces"
+                       : actual_mad ? "outside-bounded-mad" : "outside-bounded-mov" : "full-field",
+               position_prepared && !actual_mad);
+        if (actual_mad)
+            printf("packed_output_position_actual_mad_plan=%d input_and_same_field_cb_facts=%d "
+                   "callback_operand_indices=not-exposed\n", position_prepared, position_output.mad);
         if (position_prepared) {
             for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
                 const HLSLDomainOutputPiece *owner = &position_output.plan.assembly.pieces[piece];
@@ -859,7 +1086,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         .input_struct = vertex_fixture ? "VertexInput" : "FragmentInput",
         .output_struct = vertex_fixture ? "VertexOutput" : "FragmentOutput"};
     const bool emitted = hlsl_emit_with_options_diagnostic(&program, source,
-        NULL, NULL, &names, &options, &diagnostic);
+        parameters, NULL, &names, &options, &diagnostic);
     printf("structured_source_result=%s status=%s phase=%s reason=%s instruction=%d "
            "raw_instruction=%u bytes=%zu\n", emitted ? "generated" : "unavailable",
            hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase),
@@ -895,6 +1122,16 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                        "xy_child_observed=%d zw_child_observed=%d\n", position_owned,
                        position_output.assembly_observations, position_output.child_observed[0],
                        position_output.child_observed[1]);
+                if (position_output.mad)
+                    printf("packed_output_position_mad_owned=%d actual_mad_instruction=%d "
+                           "raw_instruction=%u binary_observations=%u operand_observations=%u "
+                           "input_leaf_observed=%d scale_leaf_observed=%d offset_leaf_observed=%d "
+                           "callback_binary_operators=not-exposed callback_operand_indices=not-exposed\n",
+                           position_owned, position_output.plan.assembly.pieces[0].instruction_index,
+                           position_output.plan.assembly.pieces[0].source_instruction_index,
+                           position_output.mad_binary_observations, position_output.mad_operand_observations,
+                           position_output.mad_leaf_observed[0], position_output.mad_leaf_observed[1],
+                           position_output.mad_leaf_observed[2]);
                 if (position_owned) {
                     for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
                         const HLSLDomainOutputPiece *owner = &position_output.plan.assembly.pieces[piece];
@@ -2004,6 +2241,8 @@ int main(int argc, char **argv) {
         .cb_count = 1, .resources = &binding, .res_count = 1};
     if (linked_fixture)
         return run_linked_fixture(argv, shader_name, scalar_fixture, icb_fixture, &parameters);
+    SerializedProgramParameters native_parameters;
+    serialized_program_parameters_init(&native_parameters);
     UnityCompilerChannel channel = {.socket_fd = -1};
     UnityCompilerPreprocessResponse preprocessing[PROBE_COMPILE_SLOTS];
     UnityCompilerBinaryResponse compiled[PROBE_COMPILE_SLOTS];
@@ -2058,8 +2297,16 @@ int main(int argc, char **argv) {
     if (structured_fixture) {
         if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target)) goto done;
         print_hash("target_complete_dxbc_sha256", target.data, target.size);
+        if (packed_output_vertex_fixture &&
+            !native_float4_parameters(&compiled[0], &native_parameters, "original")) {
+            puts("native_cb_projection=unavailable actual_metadata_not_substituted=1");
+            goto done;
+        }
+        if (native_parameters.cb_count)
+            puts("metadata_authority=actual-native-callback-projection player_metadata=not-supplied");
         if (!reconstruct_structured(&target, &hull, &structured_literal, false,
-                structured_vertex_fixture, packed_output_vertex_fixture) ||
+                structured_vertex_fixture, packed_output_vertex_fixture,
+                native_parameters.cb_count ? &native_parameters : NULL) ||
             !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture)) {
             if (packed_output_vertex_fixture)
                 puts("packed_output_candidate=not-run packed_output_warm_mutation=not-run "
@@ -2121,6 +2368,8 @@ int main(int argc, char **argv) {
                                    &candidate))
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
+    if (native_parameters.cb_count &&
+        !native_float4_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
     const bool controls_equal =
         selected_controls_equal(&requests[0], &requests[1]);
     const bool toolchain_equal =
@@ -2171,7 +2420,8 @@ int main(int argc, char **argv) {
         StringBuilder mutated_fragment;
         sb_init(&mutated_fragment);
         mutation_built = reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
-                structured_vertex_fixture, packed_output_vertex_fixture) &&
+                structured_vertex_fixture, packed_output_vertex_fixture,
+                native_parameters.cb_count ? &native_parameters : NULL) &&
             structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture);
         sb_free(&mutated_fragment);
     } else {
@@ -2188,6 +2438,8 @@ int main(int argc, char **argv) {
                                    &changed))
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
+    if (native_parameters.cb_count &&
+        !native_float4_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
     const DXBCCompareStatus mutation_status = dxbc_compare_exact(
         candidate.data, candidate.size, changed.data, changed.size, &comparison);
     const bool mutation_diff =
@@ -2218,6 +2470,8 @@ int main(int argc, char **argv) {
                                    &repeated))
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
+    if (native_parameters.cb_count &&
+        !native_float4_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;
     const DXBCCompareStatus repeated_status = dxbc_compare_exact(
         summary_only ? target.data : candidate.data,
         summary_only ? target.size : candidate.size,
@@ -2394,6 +2648,7 @@ int main(int argc, char **argv) {
         }
     }
 done:
+    serialized_program_parameters_free(&native_parameters);
     for (unsigned index = 0; index < PROBE_COMPILE_SLOTS; ++index) {
         unity_compiler_binary_response_free(&compiled[index]);
         unity_compiler_preprocess_response_free(&preprocessing[index]);

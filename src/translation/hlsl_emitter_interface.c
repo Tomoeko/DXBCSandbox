@@ -196,7 +196,8 @@ bool hlsl_position_output_plan_prepare(const USILProgram *program, HLSLPositionO
     const USILInstruction *owner = &program->instructions[piece];
     const DXBCOperand *destination = &owner->operands[0];
     const uint8_t mask = piece ? 12 : 3;
-    if (owner->opcode != USIL_OP_MOV || owner->operand_count != 2 || owner->saturate ||
+    const bool mad = !piece && owner->opcode == USIL_OP_MAD;
+    if ((!mad && owner->opcode != USIL_OP_MOV) || owner->operand_count != (mad ? 4 : 2) || owner->saturate ||
         owner->precise_mask || owner->condition_test ||
         !usil_instruction_shape_valid(program, owner) ||
         destination->type != OPERAND_TYPE_OUTPUT || !hlsl_lift_operand_is_plain(destination) ||
@@ -214,6 +215,41 @@ bool hlsl_position_output_plan_prepare(const USILProgram *program, HLSLPositionO
   HLSLNaturalInputProjection projection;
   if (input->type != OPERAND_TYPE_INPUT || !hlsl_natural_input_projection(program, input, 3, &projection) ||
       usil_operand_source_component(input, 0) != 0 || usil_operand_source_component(input, 1) != 1) return false;
+  if (candidate.assembly.pieces[0].opcode == USIL_OP_MAD) {
+    const USILInstruction *owner = &program->instructions[0];
+    const DXBCOperand *scale = &owner->operands[2], *offset = &owner->operands[3];
+    if (program->cbuffer_count < 1 || program->cbuffer_count > 8 ||
+        program->cbuffer_alloc < program->cbuffer_count || !program->cbuffers ||
+        scale->register_index != offset->register_index || scale->rel_offset0 != offset->rel_offset0)
+      return false;
+    for (int operand = 2; operand < 4; ++operand) {
+      const DXBCOperand *source = &owner->operands[operand];
+      USILOperandUseInfo use;
+      const int first = operand == 2 ? 0 : 2;
+      if (source->type != OPERAND_TYPE_CONSTANT_BUFFER || !hlsl_lift_operand_is_plain(source) ||
+          source->extended_tokens || (source->raw_token & UINT32_C(0x80000000)) ||
+          source->register_index < 0 || source->register_index >= HLSL_SM5_CBUFFER_REGISTER_COUNT ||
+          source->rel_offset0 < 0 || source->register_index_dim != 2 ||
+          !source->index_has_immediate[0] || !source->index_has_immediate[1] ||
+          source->index_representations[0] || source->index_representations[1] ||
+          source->index_value_exceeds_int[0] || source->index_value_exceeds_int[1] ||
+          source->index_values[0] != (uint32_t)source->register_index ||
+          source->index_values[1] != (uint32_t)source->rel_offset0 ||
+          !usil_instruction_operand_use(program, owner, operand, &use) ||
+          use.use != USIL_OPERAND_USE_SOURCE || use.source_lane_mask != 3 ||
+          usil_operand_source_component(source, 0) != first ||
+          usil_operand_source_component(source, 1) != first + 1) return false;
+    }
+    bool declared = false;
+    for (int buffer = 0; buffer < program->cbuffer_count; ++buffer) {
+      const USILConstantBuffer *declaration = &program->cbuffers[buffer];
+      if (declaration->reg_idx != scale->register_index) continue;
+      if (declared || declaration->dynamic_indexed || declaration->size <= scale->rel_offset0)
+        return false;
+      declared = true;
+    }
+    if (!declared) return false;
+  }
   const DXBCOperand *literal = &program->instructions[1].operands[1];
   static const uint32_t bits[4] = {0, 0, 0, UINT32_C(0x3f800000)};
   if (literal->type != OPERAND_TYPE_IMMEDIATE32 || !hlsl_lift_operand_is_plain(literal) ||

@@ -6001,13 +6001,17 @@ typedef struct {
 /* The independent output rows share a register, but their RW masks describe
  * the complementary unwritten lanes. All authority comes from the normal
  * document/signature/declaration/USIL decoder chain above. */
-static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, unsigned arithmetic,
-    bool reversed, bool union_declaration, unsigned boundary, unsigned cbuffer, unsigned position_width) {
+typedef struct { unsigned row; bool different_rows, second_buffer; } PackedPositionMADConfig;
+
+static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fixture, unsigned arithmetic,
+    bool reversed, bool union_declaration, unsigned boundary, unsigned cbuffer, unsigned position_width,
+    const PackedPositionMADConfig *mad) {
     memset(fixture, 0, sizeof(*fixture));
     dxbc_document_init(&fixture->decoded.document);
     dxbc_stage_contract_init(&fixture->decoded.contract);
     CHECK(arithmetic < 4 && boundary < 3 && cbuffer < 3 && (!boundary || cbuffer != 2));
     CHECK(!position_width || (position_width >= 2 && position_width <= 4 && !boundary && !cbuffer));
+    CHECK(!mad || (position_width && mad->row < 2 && arithmetic == 1 && !reversed));
     uint32_t words[96]; size_t count = 0;
 #define PACKED_WORD(value) do { CHECK(count < sizeof(words) / sizeof(words[0])); words[count++] = (value); } while (0)
 #define PACKED_INST(opcode, length) ((uint32_t)(opcode) | (uint32_t)(length) << 24u)
@@ -6023,8 +6027,12 @@ static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, 
         PACKED_WORD(PACKED_INST(101, 3));
         PACKED_WORD(UINT32_C(0x00102002) | (uint32_t)mask << 4u); PACKED_WORD(1);
     }
-    if (cbuffer) {
-        PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(0); PACKED_WORD(cbuffer == 2 ? 4 : 1);
+    if (cbuffer || mad) {
+        PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(0);
+        PACKED_WORD(mad ? mad->different_rows ? 2u : mad->row + 1u : cbuffer == 2 ? 4u : 1u);
+    }
+    if (mad && mad->second_buffer) {
+        PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(1); PACKED_WORD(1);
     }
     if (cbuffer == 2) {
         PACKED_WORD(PACKED_INST(104, 2)); PACKED_WORD(1);
@@ -6042,6 +6050,15 @@ static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, 
                 PACKED_WORD(UINT32_C(0x00208e46)); PACKED_WORD(0); PACKED_WORD(components[row]);
             }
         }
+    } else if (mad) {
+        const uint8_t xy_selection[4] = {0, 1, 0, 0}, zw_selection[4] = {2, 3, 2, 2};
+        PACKED_WORD(PACKED_INST(50, 11)); PACKED_WORD(UINT32_C(0x00102032)); PACKED_WORD(0);
+        PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, xy_selection)); PACKED_WORD(0);
+        PACKED_WORD((natural_if_source_token(OPERAND_TYPE_CONSTANT_BUFFER, xy_selection) & ~(UINT32_C(3) << 20u)) |
+            UINT32_C(2) << 20u);
+        PACKED_WORD(0); PACKED_WORD(mad->row);
+        PACKED_WORD((natural_if_source_token(OPERAND_TYPE_CONSTANT_BUFFER, mad->different_rows ? xy_selection : zw_selection) &
+            ~(UINT32_C(3) << 20u)) | UINT32_C(2) << 20u); PACKED_WORD(0); PACKED_WORD(mad->different_rows ? 1u : mad->row);
     } else {
         PACKED_WORD(PACKED_INST(54, 5)); PACKED_WORD(position_width ? UINT32_C(0x00102032) :
             boundary == 1 ? UINT32_C(0x00102072) : UINT32_C(0x001020f2)); PACKED_WORD(0);
@@ -6070,7 +6087,9 @@ static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, 
         const USILOpcode opcode = is_xy ? xy[arithmetic] : zw[arithmetic];
         const uint32_t raw_opcode = opcode == USIL_OP_MOV ? 54 : natural_arithmetic_raw_opcode(opcode);
         const bool cbuffer_source = cbuffer == 1 && is_xy;
-        const unsigned length = (opcode == USIL_OP_MOV ? 5u : opcode == USIL_OP_MAD ? 9u : 7u) + (cbuffer_source ? 1u : 0u);
+        const bool uv_cbuffer = mad && (mad->row || mad->second_buffer) && is_xy;
+        const unsigned length = mad ? uv_cbuffer ? 8u : 10u :
+            (opcode == USIL_OP_MOV ? 5u : opcode == USIL_OP_MAD ? 9u : 7u) + (cbuffer_source ? 1u : 0u);
         PACKED_WORD(PACKED_INST(raw_opcode, length));
         PACKED_WORD(UINT32_C(0x00102002) | (uint32_t)mask << 4u); PACKED_WORD(1);
         if (cbuffer_source) {
@@ -6078,7 +6097,14 @@ static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, 
         } else {
             PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, selection)); PACKED_WORD(is_xy ? 1 : 2);
         }
-        if (opcode != USIL_OP_MOV) {
+        if (uv_cbuffer) {
+            PACKED_WORD(UINT32_C(0x00208046)); PACKED_WORD(mad->second_buffer ? 1u : 0u); PACKED_WORD(0);
+        } else if (mad) {
+            PACKED_WORD(UINT32_C(0x00004002));
+            for (unsigned component = 0; component < 4; ++component)
+                PACKED_WORD((mask & (1u << component)) ?
+                    is_xy ? UINT32_C(0x3e000000) : UINT32_C(0x3ec00000) : 0u);
+        } else if (opcode != USIL_OP_MOV) {
             PACKED_WORD(UINT32_C(0x00004001));
             PACKED_WORD(opcode == USIL_OP_MUL ? UINT32_C(0x3ec00000) : UINT32_C(0x3e800000));
         }
@@ -6110,11 +6136,21 @@ static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, 
     CHECK(program->program_type == DXBC_PROGRAM_TYPE_VERTEX && program->instruction_count ==
         (cbuffer == 2 ? 7 : boundary == 1 || position_width ? 5 : boundary == 2 ? 3 : 4) &&
         program->temp_count == (cbuffer == 2 ? 1 : 0) && program->signature_declaration_count == (union_declaration ? 5 : 6) &&
-        program->instructions[0].source_instruction_index == (uint32_t)(program->signature_declaration_count + (cbuffer == 2 ? 3 : cbuffer ? 2 : 1)) &&
+        program->instructions[0].source_instruction_index == (uint32_t)(program->signature_declaration_count +
+            (cbuffer == 2 ? 3 : cbuffer || mad ? 2 : 1) + (mad && mad->second_buffer ? 1 : 0)) &&
         usil_signature_authority_is_valid(program));
-    CHECK(program->cbuffer_count == (cbuffer ? 1 : 0));
-    if (cbuffer) CHECK(program->cbuffers[0].reg_idx == 0 && program->cbuffers[0].size == (cbuffer == 2 ? 4 : 1) && !program->cbuffers[0].dynamic_indexed);
+    CHECK(program->cbuffer_count == (mad && mad->second_buffer ? 2 : cbuffer || mad ? 1 : 0));
+    if (cbuffer || mad) CHECK(program->cbuffers[0].reg_idx == 0 && program->cbuffers[0].size ==
+        (mad ? (int)(mad->different_rows ? 2u : mad->row + 1u) : cbuffer == 2 ? 4 : 1) && !program->cbuffers[0].dynamic_indexed);
+    if (mad && mad->second_buffer) CHECK(program->cbuffers[1].reg_idx == 1 && program->cbuffers[1].size == 1 &&
+        !program->cbuffers[1].dynamic_indexed);
     return true;
+}
+
+static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, unsigned arithmetic,
+    bool reversed, bool union_declaration, unsigned boundary, unsigned cbuffer, unsigned position_width) {
+    return packed_output_fixture_layout_position_config(fixture, arithmetic, reversed, union_declaration,
+        boundary, cbuffer, position_width, NULL);
 }
 
 static bool packed_output_fixture_layout(PackedOutputFixture *fixture, unsigned arithmetic,
@@ -6138,13 +6174,17 @@ typedef struct {
     char *mutable_entry_name;
     SerializedProgramParameters *mutable_parameters;
     char *mutable_field_name;
+    SerializedVariable *replacement_fields;
     uint8_t writers_seen;
     size_t cbuffer_events;
     uint8_t cbuffer_authority;
     uint32_t cbuffer_field_bytes;
+    uint8_t cbuffer_fields_seen;
+    unsigned expected_cbuffer_fields;
     size_t position_assemblies;
     uint8_t position_children;
     bool inspect_position;
+    bool inspect_position_mad, mixed_cbuffer_authority;
     bool wrong_owner, mutated;
 } PackedOutputObservations;
 
@@ -6159,11 +6199,16 @@ static bool observe_packed_output(void *context, const HLSLSourceQualityObservat
         ++ledger->cbuffer_events;
         if (observation->kind != HLSL_SOURCE_OBSERVATION_EMISSION || !facts->known || facts->instruction_index != -1 ||
             facts->source_instruction_index != UINT32_MAX || facts->cbuffer_binding_register != 0 ||
-            (ledger->cbuffer_authority && ledger->cbuffer_authority != facts->cbuffer_declaration_authority))
+            (ledger->cbuffer_authority && ledger->cbuffer_authority != facts->cbuffer_declaration_authority &&
+                !(ledger->mixed_cbuffer_authority && facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD)))
             ledger->wrong_owner = true;
-        ledger->cbuffer_authority = facts->cbuffer_declaration_authority;
+        if (facts->cbuffer_declaration_kind != HLSL_SOURCE_CBUFFER_FIELD || !ledger->mixed_cbuffer_authority)
+            ledger->cbuffer_authority = facts->cbuffer_declaration_authority;
         if (facts->cbuffer_declaration_kind == HLSL_SOURCE_CBUFFER_FIELD) {
-            if (facts->cbuffer_field_index || facts->cbuffer_byte_offset) ledger->wrong_owner = true;
+            const unsigned fields = ledger->expected_cbuffer_fields ? ledger->expected_cbuffer_fields : 1u;
+            if (facts->cbuffer_field_index >= fields || facts->cbuffer_byte_offset != facts->cbuffer_field_index * 16u ||
+                (ledger->cbuffer_fields_seen & (1u << facts->cbuffer_field_index))) ledger->wrong_owner = true;
+            else ledger->cbuffer_fields_seen |= (uint8_t)(1u << facts->cbuffer_field_index);
             ledger->cbuffer_field_bytes = facts->cbuffer_byte_size;
         }
     }
@@ -6198,7 +6243,10 @@ static bool observe_packed_output(void *context, const HLSLSourceQualityObservat
         }
         if (facts->known && facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL && facts->instruction_index >= 0 &&
             facts->instruction_index < 2 && facts->components == 2 && facts->lanes == (facts->instruction_index ? 12 : 3)) {
-            if (facts->artifacts || observation->ast_kind != (facts->instruction_index ? AST_EXPR_LITERAL : AST_EXPR_EMITTER_OPERAND))
+            const bool first_kind = ledger->inspect_position_mad
+                ? observation->ast_kind == AST_EXPR_BINARY || observation->ast_kind == AST_EXPR_EMITTER_OPERAND
+                : observation->ast_kind == AST_EXPR_EMITTER_OPERAND;
+            if (facts->artifacts || (facts->instruction_index ? observation->ast_kind != AST_EXPR_LITERAL : !first_kind))
                 ledger->wrong_owner = true;
             ledger->position_children |= (uint8_t)(1u << (unsigned)facts->instruction_index);
         }
@@ -6273,6 +6321,26 @@ static bool observe_packed_output(void *context, const HLSLSourceQualityObservat
     case 14:
         program->instructions[0].operands[1].register_index = 1;
         program->instructions[0].operands[1].index_values[0] = 1;
+        break;
+    case 15:
+        if (!ledger->mutable_parameters || ledger->mutable_parameters->cb_count != 1 ||
+            !ledger->mutable_parameters->constant_buffers[0].var_count) return false;
+        ++ledger->mutable_parameters->constant_buffers[0].variables[0].layout[ledger->mutable_parameters->is_binary ? 1 : 5];
+        break; /* Semantically dormant vector word still belongs to the lease. */
+    case 16:
+        if (!ledger->mutable_parameters || ledger->mutable_parameters->cb_count != 1 || !ledger->replacement_fields) return false;
+        ledger->mutable_parameters->constant_buffers[0].variables = ledger->replacement_fields;
+        break;
+    case 17: {
+        DXBCOperand *third = &program->instructions[0].operands[3];
+        third->rel_offset0 = 0; third->index_values[1] = 0;
+        break;
+    }
+    case 18:
+        program->instructions[ledger->writer].operands[2].imm_values[2] = UINT32_C(0x3f400000);
+        program->instructions[ledger->writer].operands[2].immediate_words[2] = UINT32_C(0x3f400000);
+        program->instructions[ledger->writer].operands[2].imm_values[3] = UINT32_C(0x3f400000);
+        program->instructions[ledger->writer].operands[2].immediate_words[3] = UINT32_C(0x3f400000);
         break;
     }
     ledger->mutated = true;
@@ -7108,6 +7176,424 @@ static bool check_packed_position_callbacks(void) {
     sb_free(&baseline); sb_free(&changed); natural_if_fixture_dispose(&fixture.decoded); return true;
 }
 
+typedef struct {
+    char buffer_names[2][32], field_names[2][2][32];
+    SerializedVariable fields[2][2];
+    SerializedConstantBuffer buffers[2];
+    SerializedResourceParam bindings[2];
+    SerializedProgramParameters parameters[2];
+} PackedPositionMADMetadata;
+
+static bool packed_position_mad_metadata(PackedPositionMADMetadata *metadata, unsigned rows) {
+    CHECK(rows == 1 || rows == 2);
+    memset(metadata, 0, sizeof(*metadata));
+    for (unsigned source = 0; source < 2; ++source) {
+        const char *buffer_name = rows == 2 ? "OffsetPositionInputs" : "PositionInputs";
+        memcpy(metadata->buffer_names[source], buffer_name, strlen(buffer_name) + 1u);
+        for (unsigned row = 0; row < rows; ++row) {
+            const char *field_name = rows == 2 && !row ? "_UvOffset" : "_PositionScaleOffset";
+            memcpy(metadata->field_names[source][row], field_name, strlen(field_name) + 1u);
+            metadata->fields[source][row].name = metadata->field_names[source][row];
+            const uint32_t binary[6] = {0, 1, 4, 0, 0, row * 16u};
+            const uint32_t text[6] = {row * 16u, 0, 0, 4, 0, 0};
+            memcpy(metadata->fields[source][row].layout, source ? text : binary, sizeof(binary));
+        }
+        metadata->buffers[source] = (SerializedConstantBuffer){.name = metadata->buffer_names[source],
+            .role = SERIALIZED_CBUFFER_NAMED, .size = rows * 16u, .variables = metadata->fields[source], .var_count = (int)rows};
+        metadata->bindings[source] = (SerializedResourceParam){.name = metadata->buffer_names[source],
+            .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER, .array_size = 1};
+        metadata->parameters[source] = (SerializedProgramParameters){.is_binary = !source,
+            .constant_buffers = &metadata->buffers[source], .cb_count = 1, .resources = &metadata->bindings[source], .res_count = 1};
+        for (unsigned row = 0; row < rows; ++row) {
+            DecodedVariableLayout layout;
+            CHECK(parameter_layout_decode(&metadata->parameters[source], &metadata->fields[source][row], &layout) &&
+                layout.byte_offset == row * 16u && !layout.scalar_type && !layout.is_matrix && !layout.array_size &&
+                layout.rows == 1 && layout.columns == 4 && parameter_layout_byte_size(&layout) == 16);
+        }
+    }
+    return true;
+}
+
+static bool packed_position_mad_fixture(PackedOutputFixture *fixture, unsigned row, bool different_rows) {
+    const PackedPositionMADConfig config = {.row = row, .different_rows = different_rows};
+    return packed_output_fixture_layout_position_config(fixture, 1, false, false, 0, 0, 3, &config);
+}
+
+static bool packed_position_material_leaf(const ASTExpr *leaf, const USILProgram *program, int operand,
+    unsigned row, unsigned first) {
+    CHECK(leaf && leaf->kind == AST_EXPR_EMITTER_OPERAND && !leaf->logical_origin.complete &&
+        leaf->operand_provenance.complete && leaf->operand_provenance.value_role == AST_OPERAND_VALUE_LOGICAL &&
+        leaf->operand_provenance.logical_value_id == ((UINT64_C(1) << 32) | (uint64_t)(row * 16u)) &&
+        leaf->operand_provenance.natural_components == 4 && leaf->operand_provenance.result_components == 2 &&
+        leaf->operand_provenance.instruction_index == 0 && leaf->operand_provenance.operand_index == operand &&
+        leaf->operand_provenance.source_instruction_index == program->instructions[0].source_instruction_index &&
+        leaf->operand_provenance.destination_lanes == 3 &&
+        leaf->operand_provenance.selection_role == AST_COMPONENT_SELECTION_SEMANTIC &&
+        leaf->operand_provenance.selected_components[0] == first &&
+        leaf->operand_provenance.selected_components[1] == first + 1u &&
+        !leaf->operand_provenance.synthetic_interface && !leaf->operand_provenance.raw_buffer_reconstruction);
+    return true;
+}
+
+static bool packed_position_mad_owned_root(PackedOutputFixture *fixture, unsigned row, ASTExpr **owned, char name[96]) {
+    HLSLEmitterContext ctx; StringBuilder scratch; HLSLEmitDiagnostic diagnostic;
+    CHECK(packed_output_prepare_context(fixture, &ctx, &scratch, &diagnostic));
+    HLSLPositionOutputPlan plan, independent;
+    CHECK(hlsl_position_output_plan_prepare(ctx.program, &plan) && plan.assembly.present &&
+        hlsl_position_output_plan_prepare(ctx.program, &independent) && hlsl_position_output_plans_equal(&plan, &independent) &&
+        plan.assembly.pieces[0].opcode == USIL_OP_MAD && plan.assembly.pieces[1].opcode == USIL_OP_MOV &&
+        plan.assembly.output_signature_index == 0 && plan.assembly.output.system_value == 1 && plan.assembly.output.mask == 15 &&
+        !plan.assembly.output.rw_mask && plan.assembly.return_instruction_index == 4 &&
+        plan.immediate_raw_token == UINT32_C(0x4002) && !plan.immediate_words[0] && !plan.immediate_words[1] &&
+        !plan.immediate_words[2] && plan.immediate_words[3] == UINT32_C(0x3f800000));
+    ctx.position_output_plan = plan;
+    for (unsigned piece = 0; piece < 2; ++piece) {
+        const USILInstruction *instruction = &ctx.program->instructions[piece];
+        const HLSLDomainOutputPiece *receipt = &plan.assembly.pieces[piece];
+        const DXBCInstruction *raw = NULL;
+        for (int token = 0; token < fixture->decoded.semantic.instruction_count; ++token) {
+            const DXBCInstruction *candidate = &fixture->decoded.semantic.instructions[token];
+            if (candidate->has_raw_instruction_index && candidate->raw_instruction_index == instruction->source_instruction_index) {
+                CHECK(!raw); raw = candidate;
+            }
+        }
+        CHECK(raw && raw->opcode == (piece ? 54u : 50u) && raw->operand_count == (piece ? 2 : 4) &&
+            receipt->instruction_index == (int)piece && receipt->source_instruction_index == instruction->source_instruction_index &&
+            receipt->destination_raw_token == instruction->operands[0].raw_token && receipt->destination_register == 0 &&
+            receipt->mask == (piece ? 12 : 3) && receipt->width == 2 &&
+            usil_operand_destination_lane_mask(&instruction->operands[0]) == receipt->mask);
+        for (int operand = 1; operand < instruction->operand_count; ++operand) {
+            USILOperandUseInfo use;
+            CHECK(usil_instruction_operand_use(ctx.program, instruction, operand, &use) &&
+                use.use == USIL_OPERAND_USE_SOURCE && use.source_lane_mask == receipt->mask);
+        }
+    }
+    for (int operand = 2; operand < 4; ++operand) {
+        const DXBCOperand *source = &ctx.program->instructions[0].operands[operand];
+        CHECK(source->type == OPERAND_TYPE_CONSTANT_BUFFER && source->register_index == 0 && source->register_index_dim == 2 &&
+            source->rel_offset0 == (int)row && source->index_values[0] == 0 && source->index_values[1] == row &&
+            !source->index_representations[0] && !source->index_representations[1] &&
+            hlsl_material_source_supported(&ctx, source, 3));
+    }
+    const char *field = hlsl_high_level_output_field_name(&ctx, 0);
+    CHECK(field && strlen(field) < 96); strcpy(name, field);
+    ASTExpr *input = hlsl_natural_source_atom(&ctx, 0, 1, 3);
+    ASTExpr *scale = hlsl_material_source_expression(&ctx, 0, 2, 3);
+    ASTExpr *offset = hlsl_material_source_expression(&ctx, 0, 3, 3);
+    CHECK(input && input->kind == AST_EXPR_EMITTER_OPERAND && !input->logical_origin.complete &&
+        input->operand_provenance.complete && input->operand_provenance.instruction_index == 0 &&
+        input->operand_provenance.operand_index == 1 && input->operand_provenance.source_instruction_index ==
+        ctx.program->instructions[0].source_instruction_index && input->operand_provenance.natural_components == 3 &&
+        input->operand_provenance.result_components == 2 && input->operand_provenance.destination_lanes == 3 &&
+        input->operand_provenance.selected_components[0] == 0 && input->operand_provenance.selected_components[1] == 1 &&
+        packed_position_material_leaf(scale, ctx.program, 2, row, 0) && packed_position_material_leaf(offset, ctx.program, 3, row, 2));
+    ASTExpr *first = hlsl_natural_float_operation(&ctx, 0, input, scale, offset);
+    CHECK(first && first->kind == AST_EXPR_BINARY && first->u.binary.op == USIL_OP_ADD &&
+        first->u.binary.right == offset && first->u.binary.left->kind == AST_EXPR_BINARY &&
+        first->u.binary.left->u.binary.op == USIL_OP_MUL && first->u.binary.left->u.binary.left == input &&
+        first->u.binary.left->u.binary.right == scale && first->logical_origin.complete &&
+        first->logical_origin.scalar_type == AST_SCALAR_FLOAT32 && first->logical_origin.components == 2 &&
+        first->logical_origin.logical_value_id == 0 && first->logical_origin.instruction_index == 0 &&
+        first->logical_origin.source_instruction_index == ctx.program->instructions[0].source_instruction_index &&
+        first->logical_origin.destination_lanes == 3);
+    ASTExpr *second = hlsl_natural_source_atom(&ctx, 1, 1, 12);
+    CHECK(second && second->kind == AST_EXPR_LITERAL && second->u.literal.scalar_type == AST_SCALAR_FLOAT32 &&
+        second->u.literal.components == 2 && !second->u.literal.val[0] && second->u.literal.val[1] == UINT32_C(0x3f800000));
+    second = hlsl_instruction_logical_expression(&ctx, second, 1, 12, 2);
+    CHECK(second && second->logical_origin.complete && second->logical_origin.instruction_index == 1 &&
+        second->logical_origin.source_instruction_index == ctx.program->instructions[1].source_instruction_index &&
+        second->logical_origin.destination_lanes == 12 && second->logical_origin.components == 2);
+    ASTExpr *root = hlsl_output_assembly_expression(&plan.assembly, HLSL_POSITION_OUTPUT_LOGICAL_ID, first, second);
+    CHECK(root && root->kind == AST_EXPR_CALL && !strcmp(root->u.call.name, "float4") && root->u.call.arg_count == 2 &&
+        root->u.call.args[0] == first && root->u.call.args[1] == second && root->logical_origin.complete &&
+        root->logical_origin.scalar_type == AST_SCALAR_FLOAT32 && root->logical_origin.components == 4 &&
+        root->logical_origin.logical_value_id == HLSL_POSITION_OUTPUT_LOGICAL_ID &&
+        root->logical_origin.instruction_index == -1 && root->logical_origin.source_instruction_index == UINT32_MAX &&
+        !root->logical_origin.destination_lanes && !root->logical_origin.program_bitcast);
+    *owned = root; dispose(&ctx); sb_free(&scratch); return true;
+}
+
+static bool check_packed_position_mad_positive(unsigned row, unsigned authority) {
+    CHECK(row < 2 && authority < 4);
+    PackedOutputFixture fixture; CHECK(packed_position_mad_fixture(&fixture, row, false));
+    PackedPositionMADMetadata metadata; CHECK(packed_position_mad_metadata(&metadata, row + 1u));
+    fixture.parameters = authority == 1 ? NULL : &metadata.parameters[0];
+    fixture.common_parameters = authority == 0 ? NULL : &metadata.parameters[1];
+    if (authority == 3) { metadata.parameters[0].cb_count = 0; metadata.parameters[1].res_count = 0; }
+    ASTExpr *root = NULL; char name[96]; CHECK(packed_position_mad_owned_root(&fixture, row, &root, name));
+    StringBuilder held, retained, baseline, repeated; sb_init(&held); sb_init(&retained); sb_init(&baseline); sb_init(&repeated);
+    ast_format_expr(root, &held); CHECK(sb_ok(&held) && held.len && strstr(held.buf, "_PositionScaleOffset"));
+    const char prefix[] = "// caller prefix\n"; sb_append(&baseline, prefix);
+    HLSLExpressionSourceMap map, repeated_map; HLSLSourceQualityResult quality, repeated_quality; HLSLEmitDiagnostic diagnostic;
+    PackedOutputObservations observer = {.inspect_position = true, .inspect_position_mad = true, .expected_cbuffer_fields = row + 1u};
+    const bool emitted = packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic);
+    if (!emitted) fprintf(stderr, "Packed POSITION MAD row=%u authority=%u status=%s phase=%s reason=%s instruction=%d\n",
+        row, authority, hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase),
+        hlsl_emit_reason_name(diagnostic.reason), diagnostic.instruction_index);
+    CHECK(emitted && packed_output_clean(&quality) && !observer.wrong_owner && observer.position_assemblies == 1 &&
+        observer.position_children == 3 && observer.cbuffer_events == row + 3u && observer.cbuffer_field_bytes == 16 &&
+        observer.cbuffer_fields_seen == (uint8_t)((1u << (row + 1u)) - 1u) &&
+        observer.cbuffer_authority == (authority == 1 || authority == 3 ? 2 : 1) &&
+        quality.counts.cbuffer_declarations == 1 && quality.counts.cbuffer_fields == row + 1u &&
+        map.complete && map.count == 5 && hlsl_expression_source_map_matches(&map, &fixture.decoded.program, baseline.buf));
+    char declaration[128];
+    snprintf(declaration, sizeof(declaration), "cbuffer %.31s : register(b0)", metadata.buffer_names[0]);
+    CHECK(strstr(baseline.buf, declaration));
+    for (unsigned field = 0; field <= row; ++field) {
+        snprintf(declaration, sizeof(declaration), "float4 %.31s : packoffset(c%u)", metadata.field_names[0][field], field);
+        CHECK(strstr(baseline.buf, declaration));
+    }
+    char assignment[128]; snprintf(assignment, sizeof(assignment), "output.%.95s = ", name);
+    const char *statement = strstr(baseline.buf, assignment); CHECK(statement);
+    const size_t begin = (size_t)(statement + strlen(assignment) - baseline.buf);
+    CHECK(begin < baseline.len && held.len < baseline.len - begin && !memcmp(baseline.buf + begin, held.buf, held.len) &&
+        baseline.buf[begin + held.len] == ';' && !strstr(statement + strlen(assignment), assignment));
+    for (unsigned piece = 0; piece < 2; ++piece) {
+        StringBuilder child; sb_init(&child); ast_format_expr(root->u.call.args[piece], &child);
+        const HLSLExpressionOrigin *origin = &map.origins[piece];
+        CHECK(sb_ok(&child) && child.len && origin->kind == HLSL_EXPRESSION_ORIGIN_EXPRESSION &&
+            origin->instruction_index == (int)piece && origin->source_instruction_index ==
+            fixture.decoded.program.instructions[piece].source_instruction_index && origin->destination_lanes == (piece ? 12 : 3) &&
+            origin->source_begin >= begin && origin->source_end <= begin + held.len &&
+            origin->source_end - origin->source_begin == child.len && !memcmp(baseline.buf + origin->source_begin, child.buf, child.len));
+        sb_free(&child);
+    }
+    CHECK(map.origins[0].source_end < map.origins[1].source_begin);
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        sb_free(&repeated); sb_init(&repeated); sb_append(&repeated, prefix);
+        CHECK(packed_output_emit(&fixture, &repeated, outputs & 1u ? &repeated_map : NULL,
+            outputs & 2u ? &repeated_quality : NULL, NULL, &diagnostic) && repeated.len == baseline.len &&
+            !memcmp(repeated.buf, baseline.buf, baseline.len));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &repeated_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &repeated_quality));
+    }
+    const size_t points[] = {1, observer.observations / 2u, observer.observations};
+    for (unsigned point = 0; point < sizeof(points) / sizeof(*points); ++point) {
+        PackedOutputObservations veto = {.reject_at = points[point]}; sb_free(&repeated); sb_init(&repeated);
+        CHECK(!packed_output_emit(&fixture, &repeated, &repeated_map, &repeated_quality, &veto, &diagnostic) &&
+            veto.observations == points[point] && !repeated_map.complete && !repeated_map.count &&
+            repeated_quality.classification == HLSL_SOURCE_QUALITY_FAILED && !repeated.len &&
+            (!repeated.buf || !repeated.buf[0]));
+    }
+    natural_if_fixture_dispose(&fixture.decoded); memset(&metadata, 0, sizeof(metadata)); ast_format_expr(root, &retained);
+    CHECK(sb_ok(&retained) && retained.len == held.len && !memcmp(retained.buf, held.buf, held.len));
+    ast_free_expr(root); sb_free(&held); sb_free(&retained); sb_free(&baseline); sb_free(&repeated); return true;
+}
+
+static bool check_packed_position_mad_rejections(void) {
+    PackedOutputFixture fixture; CHECK(packed_position_mad_fixture(&fixture, 1, false));
+    PackedPositionMADMetadata metadata; CHECK(packed_position_mad_metadata(&metadata, 2));
+    fixture.parameters = &metadata.parameters[0];
+    USILProgram *program = &fixture.decoded.program;
+    StringBuilder baseline, rejected; sb_init(&baseline); sb_init(&rejected);
+    HLSLExpressionSourceMap map, rejected_map; HLSLSourceQualityResult quality, rejected_quality; HLSLEmitDiagnostic diagnostic;
+    CHECK(packed_output_emit(&fixture, &baseline, &map, &quality, NULL, &diagnostic) && packed_output_clean(&quality));
+    USILInstruction instructions[5]; DXBCSignatureElement outputs[3]; USILConstantBuffer buffer = program->cbuffers[0];
+    memcpy(instructions, program->instructions, sizeof(instructions)); memcpy(outputs, program->outputs, sizeof(outputs));
+    const PackedPositionMADMetadata saved = metadata;
+    for (unsigned mutation = 0; mutation < 26; ++mutation) {
+        DXBCOperand relative = {0}; uint32_t extension = UINT32_C(0x41);
+        DXBCOperand *scale = &program->instructions[0].operands[2], *offset = &program->instructions[0].operands[3];
+        switch (mutation) {
+        case 0: fixture.parameters = NULL; break;
+        case 1: metadata.parameters[0].res_count = 0; break;
+        case 2: metadata.parameters[0].cb_count = 0; break;
+        case 3: metadata.fields[0][1].layout[2] = 2; break;
+        case 4: metadata.fields[0][1].layout[3] = 1; break;
+        case 5: metadata.fields[0][1].layout[4] = 1; break;
+        case 6: metadata.fields[0][1].layout[0] = 1; break;
+        case 7: metadata.fields[0][1].layout[5] += 4; break;
+        case 8: offset->rel_offset0 = 0; offset->index_values[1] = 0; break;
+        case 9: offset->register_index = 1; offset->index_values[0] = 1; break;
+        case 10: { const DXBCOperand old = *scale; *scale = *offset; *offset = old; break; }
+        case 11: program->instructions[0].operand_count = 3; break;
+        case 12: scale->has_neg = true; scale->raw_token |= UINT32_C(0x80000000);
+            scale->extended_tokens = &extension; scale->extended_token_count = 1; break;
+        case 13: scale->min_precision = 1; break;
+        case 14:
+            relative = instructions[0].operands[1]; relative.swizzle_mode = 2;
+            memset(relative.swizzle, 0, sizeof(relative.swizzle)); relative.raw_token = UINT32_C(0x0010100a);
+            scale->index_representations[1] = 2; scale->index_has_immediate[1] = false; scale->rel_op1 = &relative;
+            scale->raw_token = (scale->raw_token & ~(UINT32_C(7) << 25u)) | UINT32_C(2) << 25u; break;
+        case 15: program->cbuffers[0].size = 1; break;
+        case 16: program->cbuffers[0].dynamic_indexed = true; break;
+        case 17: program->instructions[1].operands[1].imm_values[3] = UINT32_C(0x40000000);
+            program->instructions[1].operands[1].immediate_words[3] = UINT32_C(0x40000000); break;
+        case 18: program->instructions[1].opcode = USIL_OP_NOP; program->instructions[1].operand_count = 0; break;
+        case 19: program->instructions[0].opcode = USIL_OP_ADD; program->instructions[0].operand_count = 3; break;
+        case 20: program->instructions[0].saturate = true; break;
+        case 21: program->outputs[0].system_value = 0; break;
+        case 22: metadata.fields[0][0].layout[5] = 16; break;
+        case 23: fixture.common_parameters = &metadata.parameters[1]; metadata.buffers[1].size = 64; break;
+        case 24:
+            offset->swizzle[0] = 0; offset->swizzle[1] = 1;
+            offset->raw_token = (natural_if_source_token(OPERAND_TYPE_CONSTANT_BUFFER, offset->swizzle) &
+                ~(UINT32_C(3) << 20u)) | UINT32_C(2) << 20u; break;
+        case 25: program->instructions[0].precise_mask = 1; break;
+        }
+        HLSLPositionOutputPlan shape;
+        if (mutation < 8 || mutation == 22 || mutation == 23)
+            CHECK(hlsl_position_output_plan_prepare(program, &shape)); /* Shape is not typed metadata authority. */
+        sb_free(&rejected); sb_init(&rejected);
+        const bool failed = !packed_output_emit(&fixture, &rejected, &rejected_map, &rejected_quality, NULL, &diagnostic);
+        memcpy(program->instructions, instructions, sizeof(instructions)); memcpy(program->outputs, outputs, sizeof(outputs));
+        program->cbuffers[0] = buffer; metadata = saved;
+        fixture.parameters = &metadata.parameters[0]; fixture.common_parameters = NULL;
+        if (!failed) fprintf(stderr, "Packed POSITION MAD unexpectedly admitted mutation=%u\n", mutation);
+        CHECK(failed && diagnostic.status != HLSL_EMIT_STATUS_OK && !rejected_map.complete && !rejected_map.count &&
+            rejected_quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        sb_free(&rejected); sb_init(&rejected);
+        CHECK(packed_output_emit(&fixture, &rejected, &rejected_map, &rejected_quality, NULL, &diagnostic) &&
+            rejected.len == baseline.len && !memcmp(rejected.buf, baseline.buf, baseline.len) &&
+            natural_if_maps_equal(&map, &rejected_map) && hlsl_source_quality_results_equal(&quality, &rejected_quality));
+    }
+    /* Two adjacent FLOAT2 fields cannot authorize one FLOAT4 MAD field. */
+    SerializedVariable halves[2] = {{"_PositionScale", {0, 1, 2, 0, 0, 16}},
+        {"_PositionOffset", {0, 1, 2, 0, 0, 24}}};
+    SerializedVariable split_fields[3] = {metadata.fields[0][0], halves[0], halves[1]};
+    metadata.buffers[0].variables = split_fields; metadata.buffers[0].var_count = 3;
+    sb_free(&rejected); sb_init(&rejected);
+    const bool split_rejected = !packed_output_emit(&fixture, &rejected, &rejected_map, &rejected_quality, NULL, &diagnostic);
+    metadata = saved;
+    CHECK(split_rejected && !rejected_map.complete && !rejected_map.count && rejected_quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+    sb_free(&baseline); sb_free(&rejected); natural_if_fixture_dispose(&fixture.decoded);
+    /* Genuine decoded different-row sources match the measured excluded target. */
+    CHECK(packed_position_mad_fixture(&fixture, 0, true) && packed_position_mad_metadata(&metadata, 2));
+    fixture.parameters = &metadata.parameters[0];
+    HLSLPositionOutputPlan excluded;
+    CHECK(!hlsl_position_output_plan_prepare(&fixture.decoded.program, &excluded) && !excluded.assembly.present);
+    sb_init(&rejected);
+    CHECK(!packed_output_emit(&fixture, &rejected, &rejected_map, &rejected_quality, NULL, &diagnostic) &&
+        !rejected_map.complete && !rejected_map.count && rejected_quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+    sb_free(&rejected); natural_if_fixture_dispose(&fixture.decoded); return true;
+}
+
+static bool check_packed_position_mad_duplicate_field(void) {
+    PackedOutputFixture fixture; const PackedPositionMADConfig config = {.second_buffer = true};
+    CHECK(packed_output_fixture_layout_position_config(&fixture, 1, false, false, 0, 0, 3, &config));
+    PackedPositionMADMetadata metadata; CHECK(packed_position_mad_metadata(&metadata, 1));
+    char other_name[32] = "_PositionScaleOffset";
+    SerializedVariable other = {.name = other_name, .layout = {0, 1, 4, 0, 0, 0}};
+    SerializedConstantBuffer buffers[2] = {metadata.buffers[0],
+        {.name = "DuplicatePositionInputs", .role = SERIALIZED_CBUFFER_NAMED, .size = 16, .variables = &other, .var_count = 1}};
+    SerializedResourceParam bindings[2] = {metadata.bindings[0],
+        {.name = "DuplicatePositionInputs", .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER, .bind_index = 1, .array_size = 1}};
+    SerializedProgramParameters parameters = {.is_binary = true, .constant_buffers = buffers, .cb_count = 2,
+        .resources = bindings, .res_count = 2};
+    fixture.parameters = &parameters;
+    CHECK(fixture.decoded.program.instructions[2].operands[2].type == OPERAND_TYPE_CONSTANT_BUFFER &&
+        fixture.decoded.program.instructions[2].operands[2].register_index == 1);
+    HLSLPositionOutputPlan plan;
+    CHECK(hlsl_position_output_plan_prepare(&fixture.decoded.program, &plan));
+    StringBuilder source; sb_init(&source); HLSLExpressionSourceMap map; HLSLSourceQualityResult quality; HLSLEmitDiagnostic diagnostic;
+    CHECK(!packed_output_emit(&fixture, &source, &map, &quality, NULL, &diagnostic) &&
+        !map.complete && !map.count && quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+    memcpy(other_name, "_DifferentUvOffset", sizeof("_DifferentUvOffset")); sb_free(&source); sb_init(&source);
+    CHECK(packed_output_emit(&fixture, &source, &map, &quality, NULL, &diagnostic) && packed_output_clean(&quality) &&
+        quality.counts.cbuffer_declarations == 2 && quality.counts.cbuffer_fields == 2 &&
+        strstr(source.buf, "_DifferentUvOffset") && hlsl_expression_source_map_matches(&map, &fixture.decoded.program, source.buf));
+    memcpy(other_name, "_PositionScaleOffset", sizeof("_PositionScaleOffset")); sb_free(&source); sb_init(&source);
+    CHECK(!packed_output_emit(&fixture, &source, &map, &quality, NULL, &diagnostic) && !map.complete && !map.count);
+    sb_free(&source); natural_if_fixture_dispose(&fixture.decoded); return true;
+}
+
+static bool check_packed_position_mad_callbacks(void) {
+    PackedOutputFixture fixture; CHECK(packed_position_mad_fixture(&fixture, 1, false));
+    PackedPositionMADMetadata metadata; CHECK(packed_position_mad_metadata(&metadata, 2));
+    USILProgram *program = &fixture.decoded.program;
+    const char prefix[] = "// caller prefix\n"; char entry_name[] = "entryName";
+    const HLSLEmitNames names = {.entry_point = entry_name};
+    StringBuilder baseline, changed; sb_init(&baseline); sb_init(&changed);
+    HLSLExpressionSourceMap map, changed_map; HLSLSourceQualityResult quality, changed_quality; HLSLEmitDiagnostic diagnostic;
+    USILInstruction instructions[5]; DXBCSignatureElement inputs[3], outputs[3];
+    memcpy(instructions, program->instructions, sizeof(instructions)); memcpy(inputs, program->inputs, sizeof(inputs));
+    memcpy(outputs, program->outputs, sizeof(outputs));
+    const PackedPositionMADMetadata saved = metadata;
+    for (unsigned authority = 0; authority < 2; ++authority) {
+        fixture.parameters = authority ? NULL : &metadata.parameters[0];
+        fixture.common_parameters = authority ? &metadata.parameters[1] : NULL;
+        sb_free(&baseline); sb_init(&baseline); sb_append(&baseline, prefix);
+        PackedOutputObservations observer = {.names = &names, .inspect_position = true, .inspect_position_mad = true,
+            .expected_cbuffer_fields = 2};
+        CHECK(packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic) && packed_output_clean(&quality) &&
+            !observer.wrong_owner && observer.position_assemblies == 1 && observer.position_children == 3);
+        const size_t points[] = {1, observer.observations};
+        for (unsigned point = 0; point < 2; ++point) {
+            PackedOutputObservations drift = {.names = &names, .mutation = 10, .mutate_at = points[point],
+                .mutable_field_name = metadata.field_names[authority][1]};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic) && drift.mutated &&
+                !changed_map.complete && !changed_map.count && changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED &&
+                changed.len == sizeof(prefix) - 1u && changed.buf && !strcmp(changed.buf, prefix));
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            PackedOutputObservations fresh = {.names = &names};
+            CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                packed_output_clean(&changed_quality) && hlsl_expression_source_map_matches(&changed_map, program, changed.buf) &&
+                (changed.len != baseline.len || memcmp(changed.buf, baseline.buf, baseline.len)));
+            metadata = saved; sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            PackedOutputObservations restored = {.names = &names};
+            CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &restored, &diagnostic) &&
+                changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) &&
+                natural_if_maps_equal(&map, &changed_map) && hlsl_source_quality_results_equal(&quality, &changed_quality));
+        }
+    }
+    fixture.parameters = &metadata.parameters[0]; fixture.common_parameters = &metadata.parameters[1];
+    sb_free(&baseline); sb_init(&baseline); sb_append(&baseline, prefix);
+    PackedOutputObservations observer = {.names = &names, .inspect_position = true, .inspect_position_mad = true,
+        .expected_cbuffer_fields = 2};
+    CHECK(packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic) && packed_output_clean(&quality) &&
+        !observer.wrong_owner && observer.first_config && observer.first_header > observer.first_config &&
+        observer.last_header > observer.first_header);
+    const struct {unsigned mutation; size_t point, offset; unsigned fresh; bool common;} attacks[] = {
+        {12, 1, 0, 1, false}, {18, observer.observations / 2u, 0, 1, false}, {1, observer.observations, 0, 1, false},
+        {9, observer.observations, 0, 1, false},
+        {15, 1, 0, 2, false}, {15, observer.observations, 0, 2, true},
+        {16, observer.observations, 0, 2, false},
+        {17, observer.observations / 2u, 0, 0, false}, {13, observer.observations, 0, 0, false},
+        {6, observer.first_header, 0, 0, false}, {5, observer.last_header, 0, 0, false},
+        {5, observer.first_config, 0, 0, false}, {4, observer.first_config, sizeof(prefix), 0, false},
+        {4, 1, 0, 0, false}, {4, observer.observations, map.origins[0].source_begin, 0, false},
+        {7, observer.observations, 0, 0, false}};
+    for (unsigned attack = 0; attack < sizeof(attacks) / sizeof(*attacks); ++attack) {
+        SerializedVariable replacement[2]; memcpy(replacement, metadata.fields[0], sizeof(replacement));
+        PackedOutputObservations drift = {.names = &names, .mutation = attacks[attack].mutation, .mutate_at = attacks[attack].point,
+            .source_offset = attacks[attack].offset, .field = fixture.zw_field, .writer = fixture.zw_writer,
+            .mutable_entry_name = entry_name, .mutable_parameters = &metadata.parameters[attacks[attack].common ? 1 : 0],
+            .replacement_fields = replacement};
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        const bool rejected = !packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic);
+        /* Retain replacement storage until emission completes, then detach it. */
+        if (drift.mutation == 16) metadata.buffers[0].variables = metadata.fields[0];
+        if (!rejected) fprintf(stderr, "Packed POSITION MAD callback falsely accepted attack=%u action=%u point=%zu\n",
+            attack, drift.mutation, drift.mutate_at);
+        CHECK(rejected && drift.mutated && !changed_map.complete && !changed_map.count &&
+            changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && changed.len == sizeof(prefix) - 1u &&
+            changed.buf && !strcmp(changed.buf, prefix));
+        if (attacks[attack].fresh) {
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            PackedOutputObservations fresh = {.names = &names};
+            CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                packed_output_clean(&changed_quality) && hlsl_expression_source_map_matches(&changed_map, program, changed.buf));
+            if (attacks[attack].fresh == 1) CHECK(changed.len != baseline.len || memcmp(changed.buf, baseline.buf, baseline.len));
+            else CHECK(changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) &&
+                natural_if_maps_equal(&map, &changed_map) && hlsl_source_quality_results_equal(&quality, &changed_quality));
+        }
+        memcpy(program->instructions, instructions, sizeof(instructions)); memcpy(program->inputs, inputs, sizeof(inputs));
+        memcpy(program->outputs, outputs, sizeof(outputs)); metadata = saved; memcpy(entry_name, "entryName", sizeof(entry_name));
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        PackedOutputObservations restored = {.names = &names};
+        const bool restored_emitted = packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &restored, &diagnostic);
+        const bool source_equal = restored_emitted && changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len);
+        const bool map_equal = restored_emitted && natural_if_maps_equal(&map, &changed_map);
+        const bool quality_equal = restored_emitted && hlsl_source_quality_results_equal(&quality, &changed_quality);
+        if (!source_equal || !map_equal || !quality_equal) fprintf(stderr,
+            "Packed POSITION MAD callback restore attack=%u action=%u emitted=%d status=%s source=%d map=%d quality=%d\n",
+            attack, drift.mutation, restored_emitted, hlsl_emit_status_name(diagnostic.status), source_equal, map_equal, quality_equal);
+        CHECK(source_equal && map_equal && quality_equal);
+    }
+    sb_free(&baseline); sb_free(&changed); natural_if_fixture_dispose(&fixture.decoded); return true;
+}
+
 static bool check_packed_output_emission(void) {
     for (unsigned arithmetic = 0; arithmetic < 4; ++arithmetic)
         CHECK(check_packed_output_positive(arithmetic, arithmetic == 1, false));
@@ -7116,6 +7602,10 @@ static bool check_packed_output_emission(void) {
         check_packed_output_matrix_cbuffer());
     CHECK(check_packed_position_positive(3, 0, false, false) && check_packed_position_positive(2, 1, true, true) &&
         check_packed_position_positive(4, 2, false, false) && check_packed_position_rejections() && check_packed_position_callbacks());
+    for (unsigned row = 0; row < 2; ++row) for (unsigned authority = 0; authority < 3; ++authority)
+        CHECK(check_packed_position_mad_positive(row, authority));
+    CHECK(check_packed_position_mad_positive(1, 3) && check_packed_position_mad_rejections() &&
+        check_packed_position_mad_duplicate_field() && check_packed_position_mad_callbacks());
     return true;
 }
 

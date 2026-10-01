@@ -827,6 +827,68 @@ bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
     return validate_float_expressions(ctx, uses, true, NULL, NULL);
 }
 
+/* The program-only position plan identifies the two physical slices. MAD
+ * additionally needs one serialized float4 field; two adjacent float2 fields
+ * cannot supply that source identity. Reuse the merged, scoped layout rather
+ * than treating a variable name or a DXBC row as declaration authority. */
+static bool position_output_material_supported(HLSLEmitterContext *ctx,
+    const HLSLPositionOutputPlan *plan) {
+    HLSLPositionOutputPlan current;
+    if (!ctx || !plan || !hlsl_position_output_plan_prepare(ctx->program, &current) ||
+        !hlsl_position_output_plans_equal(&current, plan)) return false;
+    if (plan->assembly.pieces[0].opcode == USIL_OP_MOV) return true;
+    if (plan->assembly.pieces[0].opcode != USIL_OP_MAD || !ctx->cbuffer_layouts_built ||
+        ctx->cbuffer_layout_count < 1 || ctx->cbuffer_layout_count > HLSL_MAX_CBUFFER_LAYOUTS)
+        return false;
+    const USILInstruction *owner = &ctx->program->instructions[plan->assembly.pieces[0].instruction_index];
+    const DXBCOperand *scale = &owner->operands[2], *offset = &owner->operands[3];
+    if (!hlsl_material_source_supported(ctx, scale, 3) ||
+        !hlsl_material_source_supported(ctx, offset, 3)) return false;
+    const HLSLCBufferLayout *buffer = get_cbuffer_emission_layout(ctx, scale->register_index);
+    const char *binding = get_cbuffer_name_from_map(ctx, scale->register_index);
+    if (!buffer || buffer->raw_storage || buffer->row_struct_storage ||
+        !buffer->has_serialized_authority || !buffer->serialized_name || !binding ||
+        strcmp(buffer->serialized_name, binding) || buffer->variable_count < 1 ||
+        buffer->variable_alloc < buffer->variable_count || !buffer->variables ||
+        scale->rel_offset0 >= buffer->row_count) return false;
+    const uint64_t byte_offset = (uint64_t)(uint32_t)scale->rel_offset0 * 16u;
+    if (byte_offset > UINT32_MAX) return false;
+    const TempVariable *field = NULL;
+    for (int variable = 0; variable < buffer->variable_count; ++variable) {
+        const TempVariable *candidate = &buffer->variables[variable];
+        if (candidate->byte_offset != (uint32_t)byte_offset) continue;
+        if (field) return false;
+        field = candidate;
+    }
+    if (!field || !field->name || field->type != 0 || field->rows != 1 || field->dim != 4 ||
+        field->is_matrix || field->matrix_array_size || field->byte_size != 16 ||
+        (field->authority != 1 && field->authority != 2)) return false;
+    /* The shared name-to-layout resolver is intentionally unscoped. A same
+     * spelling in another buffer cannot prove this field's source identity,
+     * even when both physical layouts happen to be identical. */
+    for (int buffer_index = 0; buffer_index < ctx->cbuffer_layout_count; ++buffer_index) {
+        const HLSLCBufferLayout *other = &ctx->cbuffer_layouts[buffer_index];
+        if (other->variable_count < 0 || other->variable_alloc < other->variable_count ||
+            (other->variable_count && !other->variables)) return false;
+        for (int variable = 0; variable < other->variable_count; ++variable) {
+            const TempVariable *candidate = &other->variables[variable];
+            if (!candidate->name || (candidate != field && !strcmp(candidate->name, field->name)))
+                return false;
+        }
+    }
+    for (int component = 0; component < 4; ++component) {
+        int field_offset = -1;
+        const char *name = resolve_cb_variable_ctx(ctx, scale->register_index,
+            scale->rel_offset0, component, &field_offset);
+        if (!name || strcmp(name, field->name) || field_offset != component * 4) return false;
+    }
+    DecodedVariableLayout layout;
+    return resolve_variable_layout_ctx(ctx, field->name, &layout) &&
+        layout.scalar_type == field->type && layout.rows == field->rows && layout.columns == field->dim &&
+        !layout.is_matrix && !layout.array_size && layout.byte_offset == field->byte_offset &&
+        parameter_layout_byte_size(&layout) == field->byte_size;
+}
+
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx) {
     if (!ctx || !hlsl_packed_output_candidate(ctx->program) ||
         !ctx->cfg.blocks || ctx->cfg.block_count != 2 ||
@@ -881,7 +943,10 @@ bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx) {
     scratch->high_level_packed_inputs = false;
     unsigned uses[EXPRESSION_INSTRUCTION_LIMIT] = {0};
     HLSLMatrixLiftPlan *matrices = calloc(EXPRESSION_INSTRUCTION_LIMIT, sizeof(*matrices));
+    HLSLPositionOutputPlan position;
+    const bool position_present = hlsl_position_output_plan_prepare(ctx->program, &position);
     const bool supported = matrices && hlsl_prepare_packed_output_preflight_names(scratch) &&
+        (!position_present || position_output_material_supported(scratch, &position)) &&
         validate_float_expressions(scratch, uses, false, matrices, NULL);
     if (matrices) {
         for (int index = 0; index < EXPRESSION_INSTRUCTION_LIMIT; ++index)
@@ -1787,7 +1852,8 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
             const HLSLDomainOutputPlan *plan = &ctx->position_output_plan.assembly;
             HLSLPositionOutputPlan current;
             if (!hlsl_position_output_plan_prepare(ctx->program, &current) ||
-                !hlsl_position_output_plans_equal(&current, &ctx->position_output_plan)) {
+                !hlsl_position_output_plans_equal(&current, &ctx->position_output_plan) ||
+                !position_output_material_supported(ctx, &current)) {
                 ast_free_expr(expression);
                 goto cleanup;
             }

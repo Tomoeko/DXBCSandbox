@@ -39,8 +39,9 @@ typedef struct {
 bool hlsl_domain_output_plan_prepare(const USILProgram *program, HLSLDomainOutputPlan *plan);
 bool hlsl_domain_output_plans_equal(const HLSLDomainOutputPlan *left, const HLSLDomainOutputPlan *right);
 
-/* The separate vertex boundary owns consecutive XY/ZW MOV pieces. Reuse the
- * same complete signature and actual writer tuple; the immediate source also
+/* The separate vertex boundary owns consecutive XY MOV or same-field MAD and
+ * ZW MOV pieces. MAD additionally needs the context's serialized float4 proof.
+ * Reuse the complete signature and actual writer tuple; the immediate source
  * retains all four raw payload words, including unselected components. */
 typedef struct {
     HLSLDomainOutputPlan assembly;
