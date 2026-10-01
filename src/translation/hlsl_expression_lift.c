@@ -1325,28 +1325,33 @@ static ASTExpr *vector_operation(HLSLEmitterContext *ctx, int index, ASTExpr *le
     return hlsl_float4_operation(ctx, index, left, right);
 }
 
-ASTExpr *hlsl_natural_float_binary_operation(HLSLEmitterContext *ctx,
-    int instruction, ASTExpr *left, ASTExpr *right) {
+ASTExpr *hlsl_natural_float_operation(HLSLEmitterContext *ctx,
+    int instruction, ASTExpr *left, ASTExpr *right, ASTExpr *third) {
     bool supported = ctx && ctx->program && ctx->program->instructions &&
         instruction >= 0 && instruction < ctx->program->instruction_count &&
         instruction < ctx->program->instruction_alloc &&
         ctx->program->instruction_count <= HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT &&
-        left && left != right;
+        left && left != right && (!third || (third != left && third != right));
     if (supported) {
         const USILInstruction *owner = &ctx->program->instructions[instruction];
         const bool moved = owner->opcode == USIL_OP_MOV;
-        supported = (moved || owner->opcode == USIL_OP_ADD || owner->opcode == USIL_OP_MUL ||
+        const bool multiply_add = owner->opcode == USIL_OP_MAD;
+        const int operand_count = moved ? 2 : multiply_add ? 4 : 3;
+        const bool children_match = moved ? !right && !third
+            : right && (multiply_add ? third != NULL : third == NULL);
+        supported = (moved || multiply_add || owner->opcode == USIL_OP_ADD || owner->opcode == USIL_OP_MUL ||
             owner->opcode == USIL_OP_MIN || owner->opcode == USIL_OP_MAX || owner->opcode == USIL_OP_DIV) &&
-            owner->operand_count == (moved ? 2 : 3) && (moved ? !right : right != NULL) &&
+            owner->operand_count == operand_count && children_match &&
             usil_instruction_shape_valid(ctx->program, owner) &&
             hlsl_natural_float_instruction_supported(ctx, instruction);
     }
     if (!supported) {
+        if (third != left && third != right) ast_free_expr(third);
         if (left != right) ast_free_expr(right);
         ast_free_expr(left);
         return NULL;
     }
-    return vector_operation(ctx, instruction, left, right, NULL, NULL);
+    return vector_operation(ctx, instruction, left, right, third, NULL);
 }
 
 bool hlsl_float4_append_output(HLSLEmitterContext *ctx, const DXBCOperand *destination) {

@@ -676,11 +676,13 @@ ASTExpr *hlsl_float4_operation(HLSLEmitterContext *ctx, int instruction, ASTExpr
 bool hlsl_natural_float_program_supported(HLSLEmitterContext *ctx);
 HLSLEmitReason hlsl_natural_float_program_contract(const USILProgram *program);
 bool hlsl_natural_float_instruction_supported(HLSLEmitterContext *ctx, int instruction);
-/* Consumes both children on every outcome. The structured planner proves the
+/* Consumes every supplied child on every outcome, freeing aliased roots once
+ * when rejecting them. MOV takes one child, binary operations two, and MAD
+ * three; every unused child must be NULL. The structured planner proves the
  * natural FLOAT32 sources and lane mappings; this bounded factory reuses the
  * ordinary vector operation without any stage-specific scope callbacks. */
-ASTExpr *hlsl_natural_float_binary_operation(HLSLEmitterContext *ctx,
-    int instruction, ASTExpr *owned_left, ASTExpr *owned_right);
+ASTExpr *hlsl_natural_float_operation(HLSLEmitterContext *ctx,
+    int instruction, ASTExpr *owned_left, ASTExpr *owned_right, ASTExpr *owned_third);
 ASTExpr *hlsl_natural_source_atom(HLSLEmitterContext *ctx, int instruction,
                                  int operand, uint8_t demanded_lanes);
 ASTExpr *hlsl_project_logical_temp(HLSLEmitterContext *ctx, ASTExpr *owned_expression,

@@ -1726,7 +1726,8 @@ typedef enum {
     NATURAL_IF_RIGHT_SCALAR_LITERAL,
     NATURAL_IF_RIGHT_VECTOR_LITERAL,
     NATURAL_IF_RIGHT_VECTOR_INPUT,
-    NATURAL_IF_RIGHT_SCALAR_INPUT
+    NATURAL_IF_RIGHT_SCALAR_INPUT,
+    NATURAL_IF_RIGHT_VECTOR_TEMP
 } NaturalIfRightOperand;
 
 typedef enum {
@@ -1740,6 +1741,10 @@ typedef struct {
     NaturalIfRightOperand arm_right, join_right;
     bool custom_literals;
     uint32_t then_bits, else_bits, join_bits;
+    /* Only MAD emits these fields, preserving every binary fixture's words. */
+    NaturalIfRightOperand arm_third, join_third;
+    bool custom_third_literals;
+    uint32_t then_third_bits, else_third_bits, join_third_bits;
 } NaturalIfArithmetic;
 
 static uint32_t natural_arithmetic_raw_opcode(USILOpcode opcode) {
@@ -1751,6 +1756,7 @@ static uint32_t natural_arithmetic_raw_opcode(USILOpcode opcode) {
     case USIL_OP_DIV: return 14;
     case USIL_OP_MIN: return 51;
     case USIL_OP_MAX: return 52;
+    case USIL_OP_MAD: return 50;
     default: return UINT32_MAX;
     }
 }
@@ -1769,7 +1775,8 @@ static bool natural_if_fixture_init_layout(NaturalIfFixture *fixture, unsigned w
     CHECK(!arithmetic || (natural_arithmetic_raw_opcode(arithmetic->then_opcode) != UINT32_MAX &&
         natural_arithmetic_raw_opcode(arithmetic->else_opcode) != UINT32_MAX &&
         natural_arithmetic_raw_opcode(arithmetic->join_opcode) != UINT32_MAX &&
-        arithmetic->arm_right <= NATURAL_IF_RIGHT_SCALAR_INPUT && arithmetic->join_right <= NATURAL_IF_RIGHT_SCALAR_INPUT));
+        arithmetic->arm_right <= NATURAL_IF_RIGHT_SCALAR_INPUT && arithmetic->join_right <= NATURAL_IF_RIGHT_SCALAR_INPUT &&
+        arithmetic->arm_third <= NATURAL_IF_RIGHT_VECTOR_TEMP && arithmetic->join_third <= NATURAL_IF_RIGHT_VECTOR_TEMP));
     const bool compared = comparison != USIL_OP_NOP;
     CHECK(!compared || (!temp_condition && !dead_phi && predicate_mask &&
         !(predicate_mask & (predicate_mask - 1u)) && predicate_mask <= 8 &&
@@ -1806,12 +1813,19 @@ static bool natural_if_fixture_init_layout(NaturalIfFixture *fixture, unsigned w
         NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, (components))); NATURAL_WORD(0); \
     } else if ((mode) == NATURAL_IF_RIGHT_SCALAR_INPUT) { \
         NATURAL_WORD(packed_inputs ? UINT32_C(0x0010103a) : UINT32_C(0x0010100a)); NATURAL_WORD(packed_inputs ? 0 : 1); \
+    } else if ((mode) == NATURAL_IF_RIGHT_VECTOR_TEMP) { \
+        NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, (components))); NATURAL_WORD(0); \
     } else { \
         NATURAL_WORD(UINT32_C(0x00004001)); NATURAL_WORD(bits); \
     } \
 } while (0)
     const NaturalIfRightOperand arm_right = arithmetic ? arithmetic->arm_right : NATURAL_IF_RIGHT_SCALAR_LITERAL;
     const NaturalIfRightOperand join_right = arithmetic ? arithmetic->join_right : NATURAL_IF_RIGHT_VECTOR_INPUT;
+    const bool then_mad = arithmetic && arithmetic->then_opcode == USIL_OP_MAD;
+    const bool else_mad = arithmetic && arithmetic->else_opcode == USIL_OP_MAD;
+    const bool join_mad = arithmetic && arithmetic->join_opcode == USIL_OP_MAD;
+    const unsigned arm_third_words = arithmetic && arithmetic->arm_third == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 5u : 2u;
+    const unsigned join_third_words = arithmetic && arithmetic->join_third == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 5u : 2u;
     NATURAL_WORD(NATURAL_INST(106, 1) | 1u << 11u);
     NATURAL_WORD(NATURAL_INST(98, 3) | 2u << 11u);
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_INPUT,
@@ -1858,25 +1872,34 @@ static bool natural_if_fixture_init_layout(NaturalIfFixture *fixture, unsigned w
         NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, input_for_temp)); NATURAL_WORD(0);
     }
     NATURAL_WORD(NATURAL_INST(arithmetic ? natural_arithmetic_raw_opcode(arithmetic->then_opcode) : 0,
-        arm_right == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 10 : 7));
+        (arm_right == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 10u : 7u) + (then_mad ? arm_third_words : 0u)));
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
     NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, identity)); NATURAL_WORD(0);
     NATURAL_RIGHT(arm_right, arithmetic && arithmetic->custom_literals ? arithmetic->then_bits : UINT32_C(0x3fa00000), input_for_temp);
+    if (then_mad) NATURAL_RIGHT(arithmetic->arm_third,
+        arithmetic->custom_third_literals ? arithmetic->then_third_bits : UINT32_C(0x3f800000),
+        arithmetic->arm_third == NATURAL_IF_RIGHT_VECTOR_TEMP ? identity : input_for_temp);
     NATURAL_WORD(NATURAL_INST(18, 1));
     NATURAL_WORD(NATURAL_INST(54, 5));
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
     NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, input_for_temp)); NATURAL_WORD(0);
     NATURAL_WORD(NATURAL_INST(arithmetic ? natural_arithmetic_raw_opcode(arithmetic->else_opcode) : 56,
-        arm_right == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 10 : 7));
+        (arm_right == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 10u : 7u) + (else_mad ? arm_third_words : 0u)));
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, temp_mask)); NATURAL_WORD(0);
     NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, identity)); NATURAL_WORD(0);
     NATURAL_RIGHT(arm_right, arithmetic && arithmetic->custom_literals ? arithmetic->else_bits : UINT32_C(0x40000000), input_for_temp);
+    if (else_mad) NATURAL_RIGHT(arithmetic->arm_third,
+        arithmetic->custom_third_literals ? arithmetic->else_third_bits : UINT32_C(0x40400000),
+        arithmetic->arm_third == NATURAL_IF_RIGHT_VECTOR_TEMP ? identity : input_for_temp);
     NATURAL_WORD(NATURAL_INST(21, 1));
     NATURAL_WORD(NATURAL_INST(arithmetic ? natural_arithmetic_raw_opcode(arithmetic->join_opcode) : 0,
-        join_right == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 10 : 7));
+        (join_right == NATURAL_IF_RIGHT_VECTOR_LITERAL ? 10u : 7u) + (join_mad ? join_third_words : 0u)));
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_TEMP, output_mask)); NATURAL_WORD(1);
     NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, temp_for_output)); NATURAL_WORD(0);
     NATURAL_RIGHT(join_right, arithmetic && arithmetic->custom_literals ? arithmetic->join_bits : UINT32_C(0x3f000000), identity);
+    if (join_mad) NATURAL_RIGHT(arithmetic->join_third,
+        arithmetic->custom_third_literals ? arithmetic->join_third_bits : UINT32_C(0x3e800000),
+        arithmetic->join_third == NATURAL_IF_RIGHT_VECTOR_TEMP ? temp_for_output : identity);
     NATURAL_WORD(NATURAL_INST(54, 5));
     NATURAL_WORD(NATURAL_DEST(OPERAND_TYPE_OUTPUT, output_mask)); NATURAL_WORD(0);
     NATURAL_WORD(natural_if_source_token(OPERAND_TYPE_TEMP, identity)); NATURAL_WORD(1);
@@ -1947,6 +1970,7 @@ typedef struct {
     size_t declaration_events, return_events;
     size_t comparison_events;
     uint64_t arithmetic_owners;
+    uint8_t mad_binary_events[64];
     size_t reject_at;
     USILProgram *mutable_program;
     StringBuilder *mutable_source;
@@ -2016,9 +2040,13 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
         facts->instruction_index < 64 && facts->known && facts->value_kind == HLSL_SOURCE_VALUE_LOGICAL &&
         (observation->ast_kind == AST_EXPR_CALL || observation->ast_kind == AST_EXPR_BINARY)) {
         const USILInstruction *owner = &ledger->program->instructions[facts->instruction_index];
-        if (owner->opcode == USIL_OP_MIN || owner->opcode == USIL_OP_MAX || owner->opcode == USIL_OP_DIV) {
+        if (owner->opcode == USIL_OP_MIN || owner->opcode == USIL_OP_MAX || owner->opcode == USIL_OP_DIV ||
+            owner->opcode == USIL_OP_MAD) {
             if (facts->lanes != usil_operand_destination_lane_mask(&owner->operands[0])) ledger->wrong_owner = true;
             else ledger->arithmetic_owners |= UINT64_C(1) << (unsigned)facts->instruction_index;
+            if (owner->opcode == USIL_OP_MAD && observation->ast_kind == AST_EXPR_BINARY &&
+                ledger->mad_binary_events[facts->instruction_index] < UINT8_MAX)
+                ++ledger->mad_binary_events[facts->instruction_index];
         }
     }
     const bool early_header = ledger->mutation == 19 && !ledger->mutated &&
@@ -2140,6 +2168,31 @@ static bool observe_natural_if(void *context, const HLSLSourceQualityObservation
             if (!ledger->mutable_source) return false;
             sb_append(ledger->mutable_source, "// injected header bytes\n");
             break;
+        case 21: {
+            DXBCOperand *third = &program->instructions[ledger->arithmetic_instruction].operands[3];
+            third->imm_values[0] = third->immediate_words[0] = UINT32_C(0x40200000);
+            break;
+        }
+        case 22: {
+            USILInstruction *owner = &program->instructions[ledger->arithmetic_instruction];
+            const DXBCOperand right = owner->operands[2];
+            owner->operands[2] = owner->operands[3]; owner->operands[3] = right;
+            break;
+        }
+        case 23: {
+            DXBCOperand *third = &program->instructions[ledger->arithmetic_instruction].operands[3];
+            memset(third->swizzle, 1, sizeof(third->swizzle));
+            third->raw_token &= ~UINT32_C(0x00000ff0);
+            for (unsigned lane = 0; lane < 4; ++lane)
+                third->raw_token |= (uint32_t)third->swizzle[lane] << (4u + lane * 2u);
+            break;
+        }
+        case 24: {
+            USILInstruction *owner = &program->instructions[ledger->arithmetic_instruction];
+            owner->opcode = USIL_OP_MUL; owner->operand_count = 3;
+            memset(&owner->operands[3], 0, sizeof(owner->operands[3]));
+            break;
+        }
         }
         ledger->mutated = true;
     }
@@ -3050,7 +3103,10 @@ static bool check_natural_arithmetic_fixture(NaturalIfFixture *fixture, unsigned
     HLSLExpressionSourceMap original_map, selected_map;
     HLSLSourceQualityResult original_quality, selected_quality;
     HLSLEmitDiagnostic diagnostic;
-    NaturalIfObservations observations = {.program = program};
+    bool packed_inputs = false;
+    CHECK(hlsl_natural_input_layout_supported(program, &packed_inputs));
+    NaturalIfObservations observations = {.program = program, .track_packed = packed_inputs,
+        .packed_xyz_field = 0, .packed_scalar_field = 1};
     const bool emitted = natural_if_emit(program, &original, &original_map, &original_quality, &observations, &diagnostic);
     if (!emitted) fprintf(stderr, "Natural arithmetic opcode=%d width=%u mask=%u compared=%d: status=%s reason=%s instruction=%d\n",
         (int)arithmetic->then_opcode, width, temp_mask, compared, hlsl_emit_status_name(diagnostic.status),
@@ -3062,6 +3118,7 @@ static bool check_natural_arithmetic_fixture(NaturalIfFixture *fixture, unsigned
         !original_quality.counts.residual_total && !original_quality.counts.unknown_provenance &&
         observations.observations && !observations.wrong_owner);
     CHECK((observations.comparison_events != 0) == compared);
+    if (packed_inputs) CHECK(observations.packed_fields_seen == 3);
     if (compared) CHECK(strstr(original.buf, "const bool dxbc_value_i0 = ") && !strstr(original.buf, "asuint("));
     else CHECK(strstr(original.buf, nonzero ? "[branch] if (asuint(" : "[branch] if (!asuint("));
     const HLSLExpressionOrigin *condition = &original_map.origins[fixture->condition];
@@ -3080,8 +3137,14 @@ static bool check_natural_arithmetic_fixture(NaturalIfFixture *fixture, unsigned
             origin->source_begin < origin->source_end && origin->source_end <= original.len &&
             (observations.arithmetic_owners & (UINT64_C(1) << (unsigned)index)));
         const char *operation = strstr(original.buf + origin->source_begin,
-            opcodes[owner] == USIL_OP_MIN ? "min(" : opcodes[owner] == USIL_OP_MAX ? "max(" : " / ");
+            opcodes[owner] == USIL_OP_MIN ? "min(" : opcodes[owner] == USIL_OP_MAX ? "max(" :
+            opcodes[owner] == USIL_OP_MAD ? " * " : " / ");
         CHECK(operation && operation < original.buf + origin->source_end);
+        if (opcodes[owner] == USIL_OP_MAD) {
+            const char *addition = strstr(operation + 3, " + ");
+            CHECK(addition && addition < original.buf + origin->source_end &&
+                observations.mad_binary_events[index] >= 2 && !strstr(original.buf, "mad("));
+        }
         if (width == 1) snprintf(declaration, sizeof(declaration), "const float dxbc_value_i%d = ", index);
         else snprintf(declaration, sizeof(declaration), "const float%u dxbc_value_i%d = ", width, index);
         CHECK(strstr(original.buf, declaration));
@@ -3559,6 +3622,226 @@ static bool check_natural_packed_inputs(void) {
     return true;
 }
 
+static bool check_natural_mad_owners(NaturalIfFixture *fixture) {
+    USILProgram *program = &fixture->program;
+    const int owners[] = {fixture->then_value, fixture->else_value, fixture->join_value};
+    HLSLEmitterContext ctx;
+    CHECK(analyze(&ctx, program));
+    for (unsigned owner = 0; owner < 3; ++owner) {
+        const int index = owners[owner];
+        const USILInstruction *instruction = &program->instructions[index];
+        const uint8_t mask = usil_operand_destination_lane_mask(&instruction->operands[0]);
+        CHECK(instruction->opcode == USIL_OP_MAD && instruction->operand_count == 4 &&
+            usil_instruction_shape_valid(program, instruction));
+        const DXBCInstruction *raw = NULL;
+        for (int token = 0; token < fixture->semantic.instruction_count; ++token) {
+            const DXBCInstruction *candidate = &fixture->semantic.instructions[token];
+            if (candidate->has_raw_instruction_index &&
+                candidate->raw_instruction_index == instruction->source_instruction_index) {
+                CHECK(!raw); raw = candidate;
+            }
+        }
+        CHECK(raw && raw->opcode == 50 && raw->operand_count == 4 && !strcmp(dxbc_opcode_name(raw->opcode), "MAD"));
+        for (int operand = 1; operand <= 3; ++operand) {
+            const DXBCOperand *source = &instruction->operands[operand];
+            USILOperandUseInfo use;
+            CHECK(usil_instruction_operand_use(program, instruction, operand, &use) &&
+                use.use == USIL_OPERAND_USE_SOURCE && use.source_lane_mask == mask);
+            if (source->type == OPERAND_TYPE_TEMP) {
+                for (int lane = 0; lane < 4; ++lane) {
+                    if (!(mask & (1u << lane))) continue;
+                    const int value = variable(&ctx, index, operand, lane);
+                    CHECK(value >= 0 && value < ctx.ssa.ssa_var_count &&
+                        value != variable(&ctx, index, 0, lane));
+                    if (owner < 2) CHECK(ctx.ssa.ssa_var_defs[value] == index - 1);
+                    else {
+                        CHECK(ctx.ssa.ssa_var_defs[value] == HLSL_DEFINITION_AMBIGUOUS);
+                        const int block_index = ctx.cfg.instruction_block[index];
+                        CHECK(ctx.cfg.blocks[block_index].predecessor_count == 2);
+                        const HLSLBlockPhis *block = &ctx.ssa.block_phis[block_index];
+                        const HLSLPhiNode *phi = NULL;
+                        for (int candidate = 0; candidate < block->phi_count; ++candidate)
+                            if (block->phis[candidate].ssa_var == value) phi = &block->phis[candidate];
+                        CHECK(phi && phi->register_index == 0 &&
+                            phi->component == usil_operand_source_component(source, lane));
+                        const int incoming0 = ctx.ssa.ssa_var_defs[phi->incoming_vars[0]];
+                        const int incoming1 = ctx.ssa.ssa_var_defs[phi->incoming_vars[1]];
+                        CHECK((incoming0 == fixture->then_value && incoming1 == fixture->else_value) ||
+                            (incoming1 == fixture->then_value && incoming0 == fixture->else_value));
+                    }
+                }
+            } else if (source->type == OPERAND_TYPE_INPUT) {
+                HLSLNaturalInputProjection projection;
+                CHECK(hlsl_natural_input_projection(program, source, use.source_lane_mask, &projection) &&
+                    projection.field_index >= 0 && projection.field_index < program->input_count &&
+                    projection.field_mask == program->inputs[projection.field_index].mask);
+                unsigned demanded_components = 0, register_fields = 0;
+                for (unsigned lane = 0; lane < 4; ++lane)
+                    if (use.source_lane_mask & (1u << lane)) ++demanded_components;
+                for (int field = 0; field < program->input_count; ++field)
+                    if (program->inputs[field].register_id == projection.register_index) ++register_fields;
+                CHECK(projection.result_components == demanded_components &&
+                    projection.packed == (register_fields == 2) &&
+                    projection.logical_value_id == (projection.packed ?
+                        HLSL_NATURAL_INPUT_FIELD_LOGICAL_ID_BASE | (uint64_t)(unsigned)projection.field_index :
+                        (UINT64_C(1) << 63) | projection.register_index));
+                /* The projection retains each demanded physical lane. The
+                 * typed source atom later collapses this repeated scalar. */
+                if (projection.field_mask == 8) {
+                    CHECK(projection.packed && projection.natural_components == 1);
+                    for (unsigned component = 0; component < projection.result_components; ++component)
+                        CHECK(!projection.selected_components[component]);
+                }
+            } else {
+                CHECK(source->type == OPERAND_TYPE_IMMEDIATE32 &&
+                    (source->immediate_word_count == 1 || source->immediate_word_count == 4) &&
+                    source->imm_value_count == source->immediate_word_count &&
+                    raw->operands[operand].immediate_word_count == source->immediate_word_count);
+                for (int word = 0; word < source->immediate_word_count; ++word)
+                    CHECK(source->imm_values[word] == source->immediate_words[word] &&
+                        raw->operands[operand].immediate_words[word] == source->immediate_words[word]);
+            }
+        }
+    }
+    dispose(&ctx);
+    return true;
+}
+
+static bool check_natural_mad_callback_drift(void) {
+    const NaturalIfArithmetic arithmetic = {.then_opcode = USIL_OP_MAD, .else_opcode = USIL_OP_MAD, .join_opcode = USIL_OP_MAD,
+        .arm_right = NATURAL_IF_RIGHT_SCALAR_LITERAL, .join_right = NATURAL_IF_RIGHT_VECTOR_INPUT,
+        .arm_third = NATURAL_IF_RIGHT_SCALAR_LITERAL, .join_third = NATURAL_IF_RIGHT_VECTOR_INPUT};
+    NaturalIfFixture fixture;
+    CHECK(natural_if_fixture_init_arithmetic(&fixture, 2, 12, true, false, false, false,
+        USIL_OP_LT, 2, UINT32_C(0x3ec00000), &arithmetic));
+    USILProgram *program = &fixture.program;
+    CHECK(program->instruction_count == 11);
+    USILInstruction saved[11]; memcpy(saved, program->instructions, sizeof(saved));
+    StringBuilder original, changed; sb_init(&original); sb_init(&changed);
+    HLSLExpressionSourceMap original_map, changed_map;
+    HLSLSourceQualityResult original_quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic;
+    NaturalIfObservations baseline = {.program = program};
+    CHECK(natural_if_emit(program, &original, &original_map, &original_quality, &baseline, &diagnostic) &&
+        original_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && baseline.observations > 2);
+    const size_t points[] = {1, baseline.observations / 2u, baseline.observations};
+    const unsigned mutations[] = {21, 22, 23, 24};
+    for (size_t action = 0; action < sizeof(mutations) / sizeof(*mutations); ++action) {
+        for (size_t point = 0; point < sizeof(points) / sizeof(*points); ++point) {
+            NaturalIfObservations drift = {.program = program, .mutable_program = program,
+                .mutation = mutations[action], .mutate_at = points[point],
+                .arithmetic_instruction = mutations[action] == 23 ? fixture.join_value : fixture.then_value};
+            sb_free(&changed); sb_init(&changed);
+            CHECK(!natural_if_emit(program, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+                drift.mutated && !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && diagnostic.status != HLSL_EMIT_STATUS_OK);
+            NaturalIfObservations fresh = {.program = program};
+            sb_free(&changed); sb_init(&changed);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_CLEAN && changed_map.complete &&
+                hlsl_expression_source_map_matches(&changed_map, program, changed.buf) && strcmp(original.buf, changed.buf));
+            memcpy(program->instructions, saved, sizeof(saved));
+            fresh = (NaturalIfObservations){.program = program};
+            sb_free(&changed); sb_init(&changed);
+            CHECK(natural_if_emit(program, &changed, &changed_map, &changed_quality, &fresh, &diagnostic) &&
+                !strcmp(original.buf, changed.buf) && natural_if_maps_equal(&original_map, &changed_map) &&
+                hlsl_source_quality_results_equal(&original_quality, &changed_quality));
+        }
+    }
+    sb_free(&changed); sb_free(&original); natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_mad_rejections(void) {
+    const NaturalIfArithmetic arithmetic = {.then_opcode = USIL_OP_MAD, .else_opcode = USIL_OP_MAD, .join_opcode = USIL_OP_MAD,
+        .arm_right = NATURAL_IF_RIGHT_SCALAR_LITERAL, .join_right = NATURAL_IF_RIGHT_VECTOR_INPUT,
+        .arm_third = NATURAL_IF_RIGHT_VECTOR_TEMP, .join_third = NATURAL_IF_RIGHT_VECTOR_TEMP};
+    NaturalIfFixture fixture;
+    CHECK(natural_if_fixture_init_arithmetic(&fixture, 2, 12, true, false, false, false,
+        USIL_OP_LT, 2, UINT32_C(0x3ec00000), &arithmetic));
+    USILProgram *program = &fixture.program;
+    CHECK(program->instruction_count == 11 && check_natural_mad_owners(&fixture));
+    USILInstruction saved[11]; memcpy(saved, program->instructions, sizeof(saved));
+    /* Borrow one actual decoded scalar TEMP selector only while checking the
+     * relative-index rejection; restoring saved[] detaches it before cleanup. */
+    DXBCOperand relative = program->instructions[fixture.condition].operands[0];
+    for (unsigned mutation = 0; mutation < 13; ++mutation) {
+        USILInstruction *owner = &program->instructions[fixture.then_value];
+        DXBCOperand *third = &owner->operands[3];
+        switch (mutation) {
+        case 0: owner->operand_count = 3; break;
+        case 1: third->register_index = 1; third->index_values[0] = 1; break; /* Defined only later. */
+        case 2: /* Demand the comparison's actually defined Y, isolating BOOL-to-float misuse. */
+            third->register_index = 2; third->index_values[0] = 2;
+            memset(third->swizzle, 1, sizeof(third->swizzle));
+            third->raw_token &= ~UINT32_C(0x00000ff0);
+            for (unsigned lane = 0; lane < 4; ++lane)
+                third->raw_token |= (uint32_t)third->swizzle[lane] << (4u + lane * 2u);
+            break;
+        case 3: third->has_neg = true; break;
+        case 4: third->has_abs = true; break;
+        case 5: third->min_precision = 1; break;
+        case 6: third->type = OPERAND_TYPE_RESOURCE; break;
+        case 7: third->type = OPERAND_TYPE_CONSTANT_BUFFER; break;
+        case 8: /* The physical TEMP X was never written by the ZW definition. */
+            third->swizzle[2] = 0;
+            third->raw_token &= ~UINT32_C(0x00000300);
+            break;
+        case 9: owner->precise_mask = 12; break;
+        case 10: owner->saturate = true; break;
+        case 11: program->instructions[fixture.else_value].operands[0].destination_mask = 0x40; break;
+        case 12:
+            third->index_representations[0] = 2; third->index_has_immediate[0] = false;
+            third->raw_token = (third->raw_token & ~UINT32_C(0x01c00000)) | UINT32_C(0x00800000);
+            third->rel_op0 = &relative;
+            break;
+        }
+        const bool rejected = natural_if_rejected(program, NULL);
+        if (!rejected) fprintf(stderr, "Natural MAD rejection mutation=%u owner=%d third_type=%d third_register=%d\n",
+            mutation, fixture.then_value, (int)third->type, third->register_index);
+        memcpy(program->instructions, saved, sizeof(saved));
+        CHECK(rejected);
+    }
+    CHECK(check_natural_arithmetic_fixture(&fixture, 2, 12, true, true, &arithmetic));
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_natural_mad_emission(void) {
+    CHECK(natural_arithmetic_raw_opcode(USIL_OP_MAD) == 50 && !strcmp(dxbc_opcode_name(50), "MAD"));
+    const struct {unsigned width; uint8_t mask; bool compared, nonzero;
+        NaturalIfRightOperand third; NaturalIfInputLayout layout;} shapes[] = {
+        {1, 2, false, true, NATURAL_IF_RIGHT_SCALAR_LITERAL, NATURAL_IF_INPUTS_SEPARATE},
+        {2, 12, true, false, NATURAL_IF_RIGHT_VECTOR_LITERAL, NATURAL_IF_INPUTS_SEPARATE},
+        {3, 7, false, false, NATURAL_IF_RIGHT_SCALAR_INPUT, NATURAL_IF_INPUTS_SEPARATE},
+        {2, 12, true, true, NATURAL_IF_RIGHT_VECTOR_TEMP, NATURAL_IF_INPUTS_SEPARATE},
+        {3, 7, true, false, NATURAL_IF_RIGHT_SCALAR_INPUT, NATURAL_IF_INPUTS_PACKED_SPLIT}};
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(*shapes); ++shape) {
+        NaturalIfArithmetic arithmetic = {.then_opcode = USIL_OP_MAD, .else_opcode = USIL_OP_MAD, .join_opcode = USIL_OP_MAD,
+            .arm_right = NATURAL_IF_RIGHT_SCALAR_LITERAL, .join_right = NATURAL_IF_RIGHT_VECTOR_INPUT,
+            .arm_third = shapes[shape].third, .join_third = shapes[shape].third};
+        if (shape == 0) {
+            arithmetic.custom_third_literals = true;
+            arithmetic.then_third_bits = UINT32_C(0x80000000);
+            arithmetic.else_third_bits = 1;
+            arithmetic.join_third_bits = UINT32_C(0x7fc12345);
+        }
+        if (shapes[shape].layout != NATURAL_IF_INPUTS_SEPARATE)
+            arithmetic.join_third = NATURAL_IF_RIGHT_VECTOR_INPUT;
+        NaturalIfFixture fixture;
+        CHECK(natural_if_fixture_init_layout(&fixture, shapes[shape].width, shapes[shape].mask, shapes[shape].nonzero,
+            false, false, false, shapes[shape].compared ? USIL_OP_LT : USIL_OP_NOP, shapes[shape].compared ? 8 : 0,
+            UINT32_C(0x3ec00000), &arithmetic, shapes[shape].layout) && check_natural_mad_owners(&fixture));
+        if (shapes[shape].layout != NATURAL_IF_INPUTS_SEPARATE) CHECK(check_natural_packed_projection(&fixture));
+        CHECK(check_natural_arithmetic_fixture(&fixture, shapes[shape].width, shapes[shape].mask,
+            shapes[shape].nonzero, shapes[shape].compared, &arithmetic));
+        natural_if_fixture_dispose(&fixture);
+    }
+    CHECK(check_natural_mad_rejections());
+    CHECK(check_natural_mad_callback_drift());
+    return true;
+}
+
 static bool check_natural_conditional_emission(void) {
     const struct {unsigned width; uint8_t mask;} shapes[] = {
         {1, 1}, {2, 3}, {3, 7}, {1, 2}, {2, 12}};
@@ -3580,6 +3863,7 @@ static bool check_natural_conditional_emission(void) {
     CHECK(check_natural_comparison_emission());
     CHECK(check_natural_arithmetic_emission());
     CHECK(check_natural_packed_inputs());
+    CHECK(check_natural_mad_emission());
     /* DXBC IF_Z/NZ compares the raw DWORD, including the float sign bit. A
      * numeric float comparison would take the opposite branch for -0. */
     const struct {uint32_t bits; bool nonzero;} conditions[] = {

@@ -119,7 +119,7 @@ static bool scalar_comparison_opcode(USILOpcode opcode) {
 
 static bool natural_arithmetic_opcode(USILOpcode opcode) {
     return opcode == USIL_OP_MOV || opcode == USIL_OP_ADD || opcode == USIL_OP_MUL ||
-        opcode == USIL_OP_MIN || opcode == USIL_OP_MAX || opcode == USIL_OP_DIV;
+        opcode == USIL_OP_MIN || opcode == USIL_OP_MAX || opcode == USIL_OP_DIV || opcode == USIL_OP_MAD;
 }
 
 /* A loop's scalar induction values belong to the old FLOAT4 route. Select
@@ -1145,10 +1145,12 @@ static bool emit_structured_plan(HLSLEmitterContext *ctx, StructuredPlan *plan,
             ASTExpr *left = source_expression(ctx, plan, index, 1, 4);
             ASTExpr *right =
                 inst->opcode == USIL_OP_MOV ? NULL : source_expression(ctx, plan, index, 2, 4);
+            ASTExpr *third = plan->natural_width && inst->opcode == USIL_OP_MAD
+                ? source_expression(ctx, plan, index, 3, 4) : NULL;
             const bool comparison = plan->natural_width && scalar_comparison_opcode(inst->opcode);
             ASTExpr *expression = comparison
                 ? hlsl_scalar_comparison_expression(ctx, index, left, right)
-                : plan->natural_width ? hlsl_natural_float_binary_operation(ctx, index, left, right)
+                : plan->natural_width ? hlsl_natural_float_operation(ctx, index, left, right, third)
                     : hlsl_float4_operation(ctx, index, left, right);
             if (!expression)
                 goto cleanup;
