@@ -1,17 +1,14 @@
-Special thanks to [@nesrak1](https://github.com/nesrak1) for the idea of [USCSandbox](https://github.com/nesrak1/USCSandbox) which was a great foundation to start off.
-
-DXBCSandbox is an experiment utilizing Codex, ChatGPT, and OpenAI heavily.
-
 # DXBCSandbox
 
-C11 tools for inspecting Unity shader assets, decoding DXBC, and checking
-recompiled output. Currently produces **low-level HLSL**, with ShaderLab
-structure reconstructed from supported serialized metadata. High-level Unity
-shader reconstruction is in progress.
+C11 tools for inspecting Unity shader assets, decoding DXBC, and reconstructing
+ShaderLab and HLSL. Targets supported Unity 2021.3 formats.
 
-## Build and test
+Default extraction emits low-level HLSL. High-level shader and compute
+reconstruction is experimental; unsupported forms are reported explicitly.
 
-Requires CMake 3.10+ and a C11 compiler. Initialize the UnityCommon submodule:
+## Build
+
+Requires CMake 3.10+ and a C11 compiler.
 
 ```sh
 git submodule update --init --recursive
@@ -20,260 +17,39 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The default build does not need Unity. Use `-DBUILD_TESTING=OFF` for tools only.
-With CMake older than 3.20, run `ctest` inside `build` instead of `--test-dir`.
-An existing checkout can be selected with
-`-DDXBCSANDBOX_UNITY_COMMON_DIR=/path/to/UnityCommon`.
+With CMake older than 3.20, run `ctest` from the build directory. Unity is optional.
 
 ## Usage
 
 ```sh
 build/dxbc-sandbox list /path/to/assets --format table
 build/dxbc-sandbox extract /path/to/assets --all --out recovered
-build/dxbc-sandbox extract /path/to/assets --name 'Unlit/Color' \
-  --materials --out recovered
-cmake --install build --prefix /path/to/install
+build/dxbc-sandbox extract /path/to/assets --name 'Unlit/Color' --out recovered
 ```
 
-Inputs may be UnityFS bundles, SerializedFiles, or player folders. Tree-free
-inputs can use `--schema-registry schemas/unity-2021.3-player-shader.registry`.
-Each command supports `--help`; reports distinguish unsupported data from
-successful extraction. Additional tools inspect schemas, compile profiles,
-player capabilities, OraclePacks, and release-shader certificates.
+Accepts UnityFS bundles, SerializedFiles, and player folders. For inputs without
+type trees, use `--schema-registry schemas/unity-2021.3-player-shader.registry`.
+Run each command with `--help` for options.
 
-## Optional Unity verification
+## Unity verification
 
-The compiler protocol backend currently supports macOS and Unity 2021.3.35f1.
-A private Editor build is supported; executable fingerprints identify the
-selected toolchain and cache entries, without comparison to a stock release.
+The optional compiler backend supports macOS and Unity 2021.3.35f1:
 
 ```sh
-cmake -S . -B build-unity -DCMAKE_BUILD_TYPE=Debug \
-  -DDXBCSANDBOX_BUILD_UNITY_COMPILER=ON \
-  -DDXBCSANDBOX_REGISTER_LIVE_UNITY_TESTS=ON
-cmake --build build-unity --parallel
-DXBC_UNITY_APP=/path/to/Unity.app \
-  ctest --test-dir build-unity --output-on-failure
-DXBC_UNITY_APP=/path/to/Unity.app build-unity/dxbc-compiler-session
-DXBC_UNITY_APP=/path/to/Unity.app build-unity/unity_golden_verifier
-build-unity/dxbc-sandbox extract /path/to/assets --kind graphics --all \
-  --high-level --compile-profile captured.profile --out recovered --format json
+cmake -S . -B build -DDXBCSANDBOX_BUILD_UNITY_COMPILER=ON
+cmake --build build --config Release --parallel
+DXBC_UNITY_APP=/path/to/Unity.app build/dxbc-compiler-session
 ```
 
-Select Unity with `DXBC_UNITY_CONTENTS_PATH`, `DXBC_UNITY_APP`, or
-`UNITY_EDITOR_PATH`. Additional package headers must be supplied through
-`--includes` or a local `shader_includes/` folder under the project root.
-Unity binaries and copied package headers are not included. Compiler verification
-captures bounded literal include dependencies, including inactive branches and
-external headers. Macro-expanded include names and implicit Surface Shader
-generation currently return `include-authority-unavailable`.
+High-level extraction requires a captured compile profile. Compiler checks compare
+complete DXBC containers; matching bytecode does not prove original source recovery
+or universal visual equivalence. See [VERIFICATION.md](VERIFICATION.md) for supported
+checks and their scope.
 
-`unity_golden_verifier --high-level --report results.jsonl` tests an opt-in
-float expression lift for bounded vertex/fragment programs. Straight-line
-expressions recover scalar and narrower vector values, partial writes, and
-static metadata-backed material fields. Supported graphs include dot products,
-floating-point intrinsics, pixel derivatives, source modifiers, metadata-backed
-matrix multiplication and Texture2D sampling with ordinary, explicit LOD, bias
-or gradient operations. Sampling and reordered argument computations retain
-their evaluation sites; missing bindings and unsupported effects reject the
-candidate. Structured conditionals, counted loops,
-and repeated pure multiplication helpers retain their separate float4 domain.
-Each accepted candidate must reproduce its entire target DXBC container;
-unsupported candidates retain verified low-level output. Extraction's
-`--high-level` checks every local D3D11 pass/state/tier under the supplied
-profile and records request hashes and instruction spans. If the raw emitter
-cannot represent a stage, a high-level candidate can establish its own complete
-generated-domain evidence. Other baseline failures stop candidate work; the
-failed baseline remains recorded and supplies no fallback.
-A bounded packed-UV helper can use the selected Unity include
-after checking its actual definitions and exact DXBC for every selected variant.
-These checks do not certify import, external dependencies,
-player/runtime selection, or visual equivalence.
+## License and credits
 
-The candidate emitter also reconstructs straight-line geometry with typed point,
-line, triangle and adjacency arrays, named output fields and ordered stream0
-`Append`/`RestartStrip` operations. A separate bounded geometry planner recovers
-one signed unit-step loop, proven emission limits, scalar control predicates,
-named values and stream0 operations from CFG/SSA ownership. Its source quality
-independently audits emitted interface/control syntax; anonymous packed constant-buffer
-padding still keeps those declarations incomplete. Dynamic input indexing, geometry
-instancing and multiple streams remain unsupported in these paths.
-A bounded domain path emits typed control-point patches, triangle barycentric
-or quad/isoline coordinates, tessellation-factor declarations in their retained
-interface order, and SSA expressions. It admits static point indices in patches
-of up to 32 points and retains a separate 64-instruction limit. Patch resources
-and wider phase forms remain open. A bounded hull path reconstructs
-independent scalar-factor fork phases, signature-backed implicit control-point
-passthrough and pure float4 control-point transforms using separate CFG/SSA scopes
-for triangle, quad and isoline domains. Temporary bounds and control-point indices
-retain their own phase authority. Explicit phases also admit output counts no
-larger than their input patches; implicit copies preserve the count. An implicit
-copy also admits one matching custom `float3` field, preserving its actual
-semantic as `pointValue` without inferring a coordinate space. Explicit FLOAT3
-control-point expressions remain unsupported. Complete
-linked vertex/hull/domain/fragment passes admit independently validated empty
-Globals metadata, preserving each stage's declaration and read scope. Tessellation
-factor phases also admit one metadata-backed float at byte zero of a static
-16-byte buffer at b0, including a complete current buffer paired with a common
-partial field. They retain natural `min`/`max` expressions and the actual
-singleton SSA lane of unmodified fork-ID copies. A final scalar `min` with the
-exact declared maximum and a sole factor-output consumer can use the compiler's
-`maxtessfactor` lowering. Its decoded instruction remains owned by both the
-assignment and attribute spans. Indexed ICB arrays, control-point
-buffer reads and broader buffer layouts remain unsupported. Custom
-scalar and scalar-array patch constants also admit bounded fork phases and a
-one-instance join phase that reads earlier fork-owned constants. Hull and domain
-stages share the retained patch layout. Disjoint signature-backed `float2` and
-`float3` patch fields use their original component and phase ownership. Precise
-patch arithmetic, vector arrays, join-to-join reads and patch-resource reads remain
-unsupported.
+[GPL-3.0-only](LICENSE). UnityCommon has its own license and third-party notices.
 
-Source quality is a separate semantic/provenance result. The optional
-`HLSLEmitOptions.source_quality` ledger records residual register machinery,
-semantic projections, missing coverage and emission failures. Complete audited
-entry points, helpers and includes with zero residuals are required for `clean`;
-compilation and exact bytecode alone do not satisfy that gate.
-The generic expression planner admits up to 256 instructions, retaining source
-ownership across the complete graph. Geometry and compute keep their narrower
-stage bounds. Larger or unsupported graphs report an explicit analysis limit.
-Extraction's JSON lift report carries independent quality counters and reasons
-for each emitted stage entry. The bounded `shaderlab_source_quality_emit` API records contiguous receipts for
-up to four subshaders and eight ordinary vertex/fragment passes total, with
-optional supported geometry or paired hull/domain stages. Every retained pass
-must participate in the selected D3D11 route. Whole-source limits remain 32 linked
-stage bodies, 256 receipts and 4 MiB. The inventory covers properties, render state
-and variant routing, retains each linked entry's independent quality and replays receipt
-authority against the current source/model. Whole ShaderLab remains `mixed` while
-external include or dependency coverage is incomplete; no stage aggregate grants
-whole-source cleanliness. The compiler-side `unity_hlsl_expansion_inspect_request`
-API observes the unchanged graphics invocation with canonical request and control
-identities. A bounded cbuffer inventory records expanded declarations, packing and
-extent. These receipts cover declarations only; callers still need actual target
-bindings, instruction reads and include semantics before granting source quality.
-The opaque `unity_hlsl_matrix_declaration_capture` API joins actual current/common
-column-major float4x4 reads with live expanded declarations, full-container equality
-and reflection. Replay checks owned models and the active compiler/include lease.
-Legacy half storage requires an explicit captured contract and a matching request
-profile. These observations grant no emitted AST or whole-source quality authority.
-The opaque `shaderlab_emitted_matrix_uses_capture` and
-`unity_emitted_matrix_attachment_capture` APIs retain actual formatted matrix ASTs
-and join their owned read inventory to the normal compiler request's declaration
-receipts. Their initial scope is one ordinary vertex/fragment pass. Replay checks
-source, typed models, ASTs, instruction owners and the active compiler lease;
-these observations preserve the existing source-quality gaps. Each request may
-also carry a separate `scoped_source_quality` result for its emitted entry and
-complete required external declaration fragments, using owned AST, formatter
-and decoded instruction facts. Include bodies, wrappers and asset/runtime
-dependencies remain outside that scope.
-Extraction reports historical bounded source inventories for ordinary high-level
-artifacts and binds the published view to the accepted file's size and hash.
-These snapshots preserve quality gaps and remain separate from compiler acceptance;
-retain the core inventory and original inputs when typed receipt replay is needed.
-
-Compute inspection retains group dimensions, shared-memory declarations, barrier
-flags and memory effects in the IR. A bounded HLSL entry-point projection supports
-unsigned straight-line values and typed thread/group arguments. Complete Unity
-`.compute` artifact reconstruction and compute certification remain in progress.
-A bounded `compute_source_candidate_build` API reconstructs complete kernel domains
-with their captured names, keywords and group dimensions. It supports resource-free
-RET/barrier bodies and a typed `Texture2D<uint4>` load / `RWTexture2D<uint4>` store
-path with dispatch coordinates, unsigned addition, bitwise operations and logical
-shifts. A single `RWTexture2D<uint4>` also admits one read and a complete final store
-with the same physical SSA address producer, including proven replicated lanes
-of its unsigned operation. Both access operands retain their original lane owners.
-Partial identity-selected UAV reads use meaningful scalar/vector projections of
-the declared UINT4 value. Every loaded component must be consumed once; distinct
-SSA producers compose the complete stored value in its original order.
-A single `RWTexture2D<float4>` admits a full read, one full floating-point
-addition and a full final store at the same unsigned SSA address. The decoded
-resource format governs the data type; integer address operations stay unsigned.
-The addition retains its original operand order and raw constant bits.
-Coherent UAVs and multiple retained reads remain unsupported.
-A 16-byte structured load/store path uses an explicit `uint4` bit
-representation, preserving the actual index, byte window and memory-effect order. Release metadata does not retain the original
-structured element type; that declaration gap keeps whole source quality `mixed`
-even when the unsigned entry bodies are `clean`. These memory paths require one
-complete final store and at most one retained read, preceding the store when
-present. Structured reads admit aligned, ascending
-word projections within the element and compose distinct SSA producers as natural
-scalar/vector constructor arguments. Typed texture declarations retain the
-decoded `uint4` or `float4` representation;
-the separate read-only `Texture2D` path still requires a complete read.
-Wider strides, other floating-point operations, partial floating-point accesses,
-other resources, control flow, shared memory and atomics remain unsupported.
-Use `dxbc-sandbox extract INPUT --kind compute --all --compute-source-candidate
---out recovered --format json` to export these candidates alongside the exact binary
-package. Each `_candidate.compute` has a separate evidence file. Unsupported
-reconstruction retains the binary package and reports a failed requested candidate.
-Candidates remain explicitly unverified; this workflow supplies no generic Class72
-certificate, compiler equality, import or native result. Version2 candidate evidence
-records resource representations, original-type availability, declaration witnesses
-and original ordered memory-effect owners alongside source-quality results.
-
-The optional macOS compiler backend also exposes explicit native compute
-preprocessing and kernel compilation requests. Preprocessing owns Unity's returned
-kernel macros, keyword-family lines, requirements, flags, include dependencies,
-source and API masks. Its wire protocol has no success flag; complete transport
-and retained diagnostics are separate observations. Kernel compilation retains
-its actual terminal status and complete native payload, decoded by
-`unity_compute_binary_decode`. That payload has a separate layout from player
-ClassID 72 and cannot supply its absent keyword keys, requirements or buffer
-variant indices.
-
-For a manual selected-kernel compiler check, build `compute_preprocess_probe` and
-run `compute_preprocess_probe SOURCE.compute PROJECT_ROOT INCLUDES_DIR KERNEL
-[--target DXBC_FILE] [USER_KEYWORD ...]`, using `-` for no extra include directory.
-The probe compiles Unity's actual returned source and controls, preserving the
-preprocessing mode. It fails on actionable diagnostics or an unequal requested
-complete DXBC target. Without a target it validates the returned container only.
-This is a selected-request observation, not exhaustive keyword coverage, import,
-ClassID 72 production, a logical compute certificate or physical execution.
-
-The portable `unity_compute_domain` helper lazily enumerates supported returned
-keyword families with explicit budgets, preserving global/local scope and kernel
-macros. Ambiguous families and unknown conditional context remain unavailable.
-`unity_compute_verify_kernel` independently decodes a raw native payload and
-compares complete DXBC, declared groups and ordered common resource records.
-Constant-buffer selection remains unsupported at this comparison boundary.
-The manual `compute_domain_probe RELEASED_INPUT COMPUTE_OBJECT_NAME PROJECT_ROOT
-BUILD_PLATFORM COMPILER_PLATFORM [INCLUDES_DIR]` reconstructs from released bytes
-and checks every supported returned state against its decoded target. It exports
-no source or binary files and grants no original-control, import, semantic or runtime certificate.
-
-The import, bundle, and finite-visual gate commands accept an explicit Editor
-path and use isolated projects. Their installed C# bridges live in
-`share/dxbc-sandbox/unity/Editor`. `quick_test.sh --help` describes bundle-wide
-verification with explicit compile-profile authority. Cached or captured
-OraclePack results are valid only for their recorded inputs and toolchain.
-
-With compiler and bundle support enabled, the `unity_shader_contract` C API
-coordinates accepted-source compilation, isolated import, release comparisons,
-and captured player metadata under one subject. It requests every D3D11 logical
-plane. Optional authenticated native capture enables a conservative closed
-selection-congruence check. A logical certificate applies only when all eleven
-planes pass under the [defined runtime conditions](VERIFICATION.md); missing
-native authority leaves selection unavailable.
-
-The `unity_native_runtime` API retrieves authenticated D3D11Validation
-observations through its headless SSH worker. It binds the released bundles and
-player package and compares complete bound stages and raw pixels for six paired
-fixtures. Those finite observations remain separate from runtime-selection proof.
-
-## Limits and layout
-
-- Parsing targets explicitly supported Unity 2021.3 schemas, not every version.
-- HLSL/ShaderLab emission is experimental. Unsupported variants fail closed;
-  wider hull phases and domain/geometry forms remain unavailable.
-- Readable output is a presentation mode. Recompilation checks require exact
-  mode and matching compiler, platform, keyword, and include authority.
-- Matching DXBC or a finite visual test does not prove universal visual equality
-  or recovery of original source. Regression fixtures are a finite sample.
-- `include/`, `src/`, `resources/`, `schemas/`, and `tests/` hold the public API,
-  implementation, Editor bridges, schemas, and fixtures. Build options and
-  target groups are in `cmake/`; live probes are in `tests/probes/`.
-  Version-specific ABI diagnostics in `tests/abi/` are disabled by default.
-
-## License
-
-GNU General Public License v3.0 only; see [LICENSE](LICENSE).
-UnityCommon carries its own license and third-party notices.
+Thanks to [nesrak1](https://github.com/nesrak1) for
+[USCSandbox](https://github.com/nesrak1/USCSandbox), the project's starting point.
+This experiment uses Codex, ChatGPT, and OpenAI.
