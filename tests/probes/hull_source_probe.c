@@ -19,13 +19,101 @@
 enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096,
        PROBE_COMPILE_SLOTS = 7, PROBE_DOMAIN_INSTRUCTION_LIMIT = 64,
        PROBE_DOMAIN_DECLARATION_LIMIT = 32, PROBE_DOMAIN_SIGNATURE_LIMIT = 16,
-       PROBE_DOMAIN_OPERAND_LIMIT = 128, PROBE_DOMAIN_OPERAND_DEPTH_LIMIT = 4 };
+       PROBE_DOMAIN_OPERAND_LIMIT = 128, PROBE_DOMAIN_OPERAND_DEPTH_LIMIT = 4,
+       PROBE_LINKED_STAGE_COUNT = 2, PROBE_LINKED_COMPILE_SLOTS = 12 };
 
 typedef struct {
     size_t begin, end;
     uint32_t original_bits;
     bool valid;
 } OwnedLiteralMutation;
+
+/* A small by-value link summary of actual admitted targets. No source spelling
+ * or compiler reflection is used to manufacture an interface. This fixture
+ * route requires inline names and retains role-specific RW masks. */
+typedef struct {
+    DXBCProgramType stage;
+    DXBCTessellatorDomain domain;
+    uint32_t input_control_points, output_control_points;
+    DXBCSignatureElement input, output, patch_constants[4];
+    bool valid;
+} ProbeLinkedInterface;
+
+static bool linked_inline_signature(const DXBCSignatureElement *signature) {
+    return signature && !signature->semantic_name_extended &&
+        memchr(signature->semantic_name, 0, sizeof(signature->semantic_name));
+}
+
+static bool linked_interface_freeze(const USILProgram *program,
+                                    ProbeLinkedInterface *interface) {
+    if (!program || !interface || interface->valid ||
+        (program->program_type != DXBC_PROGRAM_TYPE_HULL &&
+         program->program_type != DXBC_PROGRAM_TYPE_DOMAIN) ||
+        program->tessellation.domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE ||
+        program->tessellation.input_control_point_count != 3 ||
+        program->tessellation.output_control_point_count !=
+            (program->program_type == DXBC_PROGRAM_TYPE_HULL ? 3u : 0u) ||
+        program->input_count != 1 || program->output_count != 1 ||
+        program->patch_constant_count != 4 || !program->inputs ||
+        !program->outputs || !program->patch_constants ||
+        !linked_inline_signature(program->inputs) ||
+        !linked_inline_signature(program->outputs)) return false;
+    ProbeLinkedInterface captured = {
+        .stage = program->program_type, .domain = program->tessellation.domain,
+        .input_control_points = program->tessellation.input_control_point_count,
+        .output_control_points = program->tessellation.output_control_point_count,
+        .input = program->inputs[0], .output = program->outputs[0]};
+    unsigned seen = 0;
+    for (int index = 0; index < 4; ++index) {
+        const DXBCSignatureElement *signature = &program->patch_constants[index];
+        if (!linked_inline_signature(signature) || signature->register_id >= 4 ||
+            (seen & (1u << signature->register_id))) return false;
+        seen |= 1u << signature->register_id;
+        captured.patch_constants[signature->register_id] = *signature;
+    }
+    if (seen != 15) return false;
+    captured.valid = true;
+    *interface = captured;
+    return true;
+}
+
+static bool linked_signature_equal(const DXBCSignatureElement *left,
+                                   const DXBCSignatureElement *right,
+                                   uint8_t left_rw, uint8_t right_rw) {
+    return linked_inline_signature(left) && linked_inline_signature(right) &&
+        !strcmp(left->semantic_name, right->semantic_name) &&
+        left->semantic_index == right->semantic_index &&
+        left->system_value == right->system_value &&
+        left->component_type == right->component_type &&
+        left->register_id == right->register_id && left->mask == right->mask &&
+        left->rw_mask == left_rw && right->rw_mask == right_rw &&
+        left->stream_index == right->stream_index &&
+        left->min_precision == right->min_precision &&
+        left->interpolation_mode == right->interpolation_mode;
+}
+
+static bool linked_interfaces_match(const ProbeLinkedInterface *hull,
+                                    const ProbeLinkedInterface *domain) {
+    if (!hull || !domain || !hull->valid || !domain->valid ||
+        hull->stage != DXBC_PROGRAM_TYPE_HULL || domain->stage != DXBC_PROGRAM_TYPE_DOMAIN ||
+        hull->domain != DXBC_TESSELLATOR_DOMAIN_TRIANGLE || hull->domain != domain->domain ||
+        hull->input_control_points != 3 || hull->output_control_points != 3 ||
+        domain->input_control_points != hull->output_control_points || domain->output_control_points ||
+        hull->input.mask != 7 || hull->input.component_type != 3 || hull->input.system_value ||
+        hull->input.register_id || hull->input.semantic_index ||
+        strcmp(hull->input.semantic_name, "POINTVALUE") ||
+        !linked_signature_equal(&hull->input, &hull->output, 7, 8) ||
+        !linked_signature_equal(&hull->output, &domain->input, 8, 7) ||
+        domain->output.mask != 15 || domain->output.component_type != 3 ||
+        domain->output.system_value != 1 || domain->output.register_id ||
+        domain->output.semantic_index || domain->output.rw_mask) return false;
+    for (unsigned index = 0; index < 4; ++index) {
+        const DXBCSignatureElement *factor = &hull->patch_constants[index];
+        if (factor->component_type != 3 || factor->mask != 1 ||
+            !linked_signature_equal(factor, &domain->patch_constants[index], 14, 0)) return false;
+    }
+    return true;
+}
 
 /* Manual selected-native isolated HULL or DOMAIN comparison. Other stages are
  * authored compilation stubs. No Editor, import, linked or runtime certificate. */
@@ -307,7 +395,8 @@ static bool print_domain_operand(const DXBCOperand *operand, int instruction,
  * mode prints bounded facts only and supplies no substitute DOMAIN or metadata.
  */
 static bool inspect_domain(const DXBCContainerView *target, StringBuilder *source,
-                           OwnedLiteralMutation *mutation) {
+                           OwnedLiteralMutation *mutation,
+                           ProbeLinkedInterface *linked_interface) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -489,7 +578,10 @@ static bool inspect_domain(const DXBCContainerView *target, StringBuilder *sourc
                    root->begin, root->end, root->tree->u.literal.val[0]);
         }
         accepted = accepted && matches == 1;
-        printf("domain_isolated_wrapper_shape_and_mutation_owned=%d\n", accepted);
+        if (accepted && linked_interface)
+            accepted = linked_interface_freeze(&program, linked_interface);
+        printf("domain_%s_wrapper_shape_and_mutation_owned=%d\n",
+               linked_interface ? "paired" : "isolated", accepted);
     } else {
         puts("domain_quality=unavailable domain_map=unavailable");
     }
@@ -497,7 +589,8 @@ done:
     if (!accepted)
         puts("domain_candidate_comparison=not-run domain_warm_mutation=not-run "
              "domain_warm_restore=not-run");
-    puts("linked_hull_domain_reconstruction=not-run linked_stage_certificate=not-run");
+    if (!linked_interface)
+        puts("linked_hull_domain_reconstruction=not-run linked_stage_certificate=not-run");
     hlsl_stage_coverage_dispose(&coverage);
     sb_free(&owned_source);
     usil_free(&program);
@@ -514,7 +607,9 @@ done:
 static bool reconstruct_hull(const DXBCContainerView *target,
                              const SerializedProgramParameters *parameters,
                              StringBuilder *source, bool icb_fixture,
-                             OwnedLiteralMutation *icb_mutation) {
+                             OwnedLiteralMutation *icb_mutation,
+                             ProbeLinkedInterface *linked_interface,
+                             OwnedLiteralMutation *maximum_mutation) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -660,6 +755,34 @@ static bool reconstruct_hull(const DXBCContainerView *target,
             }
         }
     }
+    if (accepted && linked_interface) {
+        accepted = maximum_mutation && linked_interface_freeze(&program, linked_interface) &&
+            coverage.hull_contract.tessellation.has_max_tessellation_factor &&
+            coverage.hull_contract.tessellation.max_tessellation_factor_bits == UINT32_C(0x42000000);
+        size_t matches = 0;
+        for (size_t index = 0; accepted && index < coverage.root_count; ++index) {
+            const HLSLStageOwnedRoot *root = &coverage.roots[index];
+            if (root->owner.kind != HLSL_STAGE_ROOT_HULL_MAXIMUM) continue;
+            if (root->instruction != -1 || root->owner.phase_index != -1 ||
+                root->owner.source_instruction_index !=
+                    coverage.hull_contract.tessellation.max_tessellation_factor_source_instruction_index ||
+                root->owner.value_bits != UINT32_C(0x42000000) ||
+                !root->tree || root->tree->kind != AST_EXPR_LITERAL ||
+                root->tree->u.literal.scalar_type != AST_SCALAR_FLOAT32 ||
+                root->tree->u.literal.components != 1 ||
+                root->tree->u.literal.val[0] != root->owner.value_bits ||
+                root->source_unit_id != 2 || root->begin >= root->end || root->end > source->len) {
+                accepted = false;
+                break;
+            }
+            *maximum_mutation = (OwnedLiteralMutation){root->begin, root->end,
+                root->owner.value_bits, true};
+            ++matches;
+            printf("hull_maximum_mutation_owner raw_instruction=%u begin=%zu end=%zu bits=0x%08" PRIx32 "\n",
+                   root->owner.source_instruction_index, root->begin, root->end, root->owner.value_bits);
+        }
+        accepted = accepted && matches == 1;
+    }
     hlsl_stage_coverage_dispose(&coverage);
     sb_free(&owned_source);
 done:
@@ -672,18 +795,29 @@ done:
 
 static bool candidate_wrapper(const StringBuilder *stage,
                               StringBuilder *wrapper, const char *shader_name,
-                              bool domain_fixture) {
+                              bool domain_fixture, const StringBuilder *paired_domain) {
+    if (paired_domain && (domain_fixture || !sb_ok(stage) || !stage->buf ||
+        !sb_ok(paired_domain) || !paired_domain->buf ||
+        stage->len > PROBE_SOURCE_LIMIT || paired_domain->len > PROBE_SOURCE_LIMIT - stage->len))
+        return false;
     sb_appendf(
         wrapper,
         "// SPDX-License-Identifier: GPL-3.0-only\n"
-        "// Other stages are authored evaluation stubs.\nShader \"%s\"\n{\n"
+        "%sShader \"%s\"\n{\n"
         "    SubShader\n    {\n        Pass\n        {\n            "
         "HLSLPROGRAM\n"
         "#pragma target 5.0\n#pragma only_renderers d3d11\n#pragma vertex "
         "vert\n"
         "#pragma hull hull\n#pragma domain domain\n#pragma fragment frag\n%s\n",
+        paired_domain ? "// Vertex and fragment are authored evaluation stubs.\n"
+                      : "// Other stages are authored evaluation stubs.\n",
         shader_name, stage->buf);
-    if (domain_fixture) {
+    if (paired_domain) {
+        sb_append_len(wrapper, paired_domain->buf, paired_domain->len);
+        sb_append(wrapper,
+        "\nHullPoint vert(float4 input : POSITION) {\n"
+        "    HullPoint result = { input.xyz }; return result;\n}\n");
+    } else if (domain_fixture) {
         sb_append(wrapper,
         "DomainPoint vert(float4 input : POSITION) {\n"
         "    DomainPoint result = { input.xyz }; return result;\n}\n"
@@ -715,7 +849,7 @@ static bool candidate_wrapper(const StringBuilder *stage,
         "float4 frag() : SV_Target { return float4(0.25f, 0.5f, 0.75f, 1.0f); "
         "}\n"
         "ENDHLSL\n        }\n    }\n}\n");
-    return sb_ok(wrapper);
+    return sb_ok(wrapper) && (!paired_domain || wrapper->len <= PROBE_SOURCE_LIMIT);
 }
 
 static bool changed_factor_wrapper(const StringBuilder *hull,
@@ -745,7 +879,7 @@ static bool changed_factor_wrapper(const StringBuilder *hull,
         sb_append_len(&mutated, hull->buf + icb_mutation->end, hull->len - icb_mutation->end);
         ast_free_expr(literal);
         const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name,
-                                                                domain_fixture);
+                                                                domain_fixture, NULL);
         if (built) {
             puts(domain_fixture
                 ? "warm_mutation owned_domain_w_literal_span=1 classification=not-promoted"
@@ -775,7 +909,7 @@ static bool changed_factor_wrapper(const StringBuilder *hull,
     sb_append_len(&mutated, hull->buf, (size_t)(match - hull->buf));
     sb_append(&mutated, changed);
     sb_append(&mutated, match + original_length);
-    const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name, false);
+    const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name, false, NULL);
     if (built) {
         printf("warm_mutation matched_owned_inverse_occurrences=1 scalar_fixture=%d\n",
                scalar_fixture);
@@ -808,7 +942,7 @@ static bool static_factor_calibration(const StringBuilder *hull,
     sb_append(&calibration, assignments);
     sb_append(&calibration, match + strlen(loop));
     const bool built = sb_ok(&calibration) &&
-        candidate_wrapper(&calibration, wrapper, shader_name, false);
+        candidate_wrapper(&calibration, wrapper, shader_name, false, NULL);
     if (built) {
         puts("source_shape_calibration=three-authored-static-assignments "
              "inverse_source_map=not-retained quality=not-classified");
@@ -944,12 +1078,244 @@ compiler_environment_equal(const UnityCompilerToolchainProvenance *left,
                    right->environment_fingerprint, 32);
 }
 
+static bool mutate_owned_literal(const StringBuilder *source,
+                                 const OwnedLiteralMutation *mutation,
+                                 uint32_t changed_bits, StringBuilder *changed) {
+    if (!source || !sb_ok(source) || !source->buf || source->len > PROBE_SOURCE_LIMIT ||
+        !mutation || !mutation->valid || mutation->begin >= mutation->end ||
+        mutation->end > source->len || !changed || !sb_ok(changed) || changed->len ||
+        changed_bits == mutation->original_bits) return false;
+    ASTExpr *original = ast_create_literal_bits(&mutation->original_bits, 1, AST_SCALAR_FLOAT32);
+    ASTExpr *replacement = ast_create_literal_bits(&changed_bits, 1, AST_SCALAR_FLOAT32);
+    StringBuilder formatted;
+    sb_init(&formatted);
+    if (original) ast_format_expr(original, &formatted);
+    const bool bound = original && replacement && sb_ok(&formatted) &&
+        formatted.len == mutation->end - mutation->begin &&
+        !memcmp(formatted.buf, source->buf + mutation->begin, formatted.len);
+    if (bound) {
+        sb_append_len(changed, source->buf, mutation->begin);
+        ast_format_expr(replacement, changed);
+        sb_append_len(changed, source->buf + mutation->end, source->len - mutation->end);
+    }
+    ast_free_expr(original);
+    ast_free_expr(replacement);
+    sb_free(&formatted);
+    return bound && sb_ok(changed) && changed->len <= PROBE_SOURCE_LIMIT;
+}
+
+/* Each pair compiles exactly the same actual source for two selected stages.
+ * Responses own their contracts/containers until all comparisons finish. */
+static bool compile_linked_pair(UnityCompilerChannel *channel, const char *role,
+    const StringBuilder *source, const char *directory, const char *shader_name,
+    uint32_t valid_apis, bool scalar_fixture,
+    UnityCompilerPreprocessResponse preprocessing[PROBE_LINKED_STAGE_COUNT],
+    UnityCompilerSnippetCompileRequest requests[PROBE_LINKED_STAGE_COUNT],
+    UnityCompilerBinaryResponse compiled[PROBE_LINKED_STAGE_COUNT],
+    UnityCompilerToolchainProvenance provenance[PROBE_LINKED_STAGE_COUNT],
+    DXBCContainerView containers[PROBE_LINKED_STAGE_COUNT]) {
+    const UnityCompilerProgramStage stages[] = {
+        UNITY_COMPILER_PROGRAM_HULL, UNITY_COMPILER_PROGRAM_DOMAIN};
+    const char *const names[] = {"hull", "domain"};
+    if (!source || !sb_ok(source) || !source->buf || source->len > PROBE_SOURCE_LIMIT)
+        return false;
+    for (unsigned stage = 0; stage < (unsigned)PROBE_LINKED_STAGE_COUNT; ++stage) {
+        printf("paired_request phase=%s stage=%s\n", role, names[stage]);
+        if (!compile_selected(channel, role, source->buf, directory, shader_name,
+            valid_apis, stages[stage], true, &preprocessing[stage], &requests[stage],
+            &compiled[stage], &provenance[stage]) ||
+            !dxbc_container_view_first(compiled[stage].data, compiled[stage].size,
+                &containers[stage]) ||
+            (stage == 0 && scalar_fixture && !scalar_fixture_reflection(&compiled[stage])))
+            return false;
+        print_hash(stage ? "paired_domain_complete_dxbc_sha256"
+                         : "paired_hull_complete_dxbc_sha256",
+                   containers[stage].data, containers[stage].size);
+    }
+    return true;
+}
+
+static int run_linked_fixture(char *const argv[], const char *shader_name,
+    bool scalar_fixture, bool icb_fixture, const SerializedProgramParameters *parameters) {
+    CommonFileBytes authored = {0};
+    UnityCompilerChannel channel = {.socket_fd = -1};
+    UnityCompilerPreprocessResponse preprocessing[PROBE_LINKED_COMPILE_SLOTS];
+    UnityCompilerSnippetCompileRequest requests[PROBE_LINKED_COMPILE_SLOTS] = {0};
+    UnityCompilerBinaryResponse compiled[PROBE_LINKED_COMPILE_SLOTS];
+    UnityCompilerToolchainProvenance provenance[PROBE_LINKED_COMPILE_SLOTS];
+    DXBCContainerView containers[PROBE_LINKED_COMPILE_SLOTS] = {0};
+    ProbeLinkedInterface interfaces[PROBE_LINKED_STAGE_COUNT] = {0};
+    OwnedLiteralMutation maximum_mutation = {0}, domain_mutation = {0}, icb_mutation = {0};
+    StringBuilder source, hull, domain, wrapper, changed, changed_wrapper;
+    sb_init(&source);
+    sb_init(&hull);
+    sb_init(&domain);
+    sb_init(&wrapper);
+    sb_init(&changed);
+    sb_init(&changed_wrapper);
+    for (unsigned slot = 0; slot < (unsigned)PROBE_LINKED_COMPILE_SLOTS; ++slot) {
+        unity_compiler_preprocess_response_init(&preprocessing[slot]);
+        unity_compiler_binary_response_init(&compiled[slot]);
+    }
+    char directory[PROBE_DIRECTORY_LIMIT];
+    UnityCompilerSessionCapabilities capabilities, cold_capabilities;
+    uint32_t valid_apis = 0, cold_valid_apis = 0;
+    bool reconstructed = false, cold_exact = false;
+    unsigned warm_cycles = 0;
+    int result = 1;
+    puts("scope=selected-native-paired-hull-domain authored_stubs=vertex,fragment "
+         "editor=not-run import=not-run semantic_certificate=not-run native_D3D11=not-run "
+         "linked_stage_certificate=not-run exported_source=none exported_binary=none");
+    printf("metadata_authority=%s player_metadata=not-supplied compile_response_limit=%d\n",
+           scalar_fixture ? "controlled-API-fixture" : "none-required", PROBE_LINKED_COMPILE_SLOTS);
+    if (common_file_read_regular_terminated(argv[1], PROBE_SOURCE_LIMIT, &authored) != COMMON_FILE_OK ||
+        !authored.data || memchr(authored.data, 0, authored.size) ||
+        !source_directory(argv[1], directory)) goto done;
+    sb_append_len(&source, (char *)authored.data, authored.size);
+    print_hash("paired_authored_source_sha256", authored.data, authored.size);
+    if (!sb_ok(&source) || !unity_compiler_start_lazy(&channel, argv[2],
+            !strcmp(argv[3], "-") ? NULL : argv[3]) ||
+        !unity_compiler_capture_session_capabilities(&channel, &capabilities) ||
+        !unity_compiler_session_capabilities_valid_apis(&capabilities, &valid_apis) ||
+        !(valid_apis & (UINT32_C(1) << 4)) ||
+        !unity_compiler_set_expected_valid_apis(&channel, valid_apis) ||
+        !compile_linked_pair(&channel, "authored-target", &source, directory, shader_name,
+            valid_apis, scalar_fixture, &preprocessing[0], &requests[0], &compiled[0],
+            &provenance[0], &containers[0])) goto done;
+    if (!reconstruct_hull(&containers[0], scalar_fixture ? parameters : NULL, &hull,
+            icb_fixture, icb_fixture ? &icb_mutation : NULL, &interfaces[0], &maximum_mutation) ||
+        !inspect_domain(&containers[1], &domain, &domain_mutation, &interfaces[1]) ||
+        !linked_interfaces_match(&interfaces[0], &interfaces[1]) ||
+        !candidate_wrapper(&hull, &wrapper, shader_name, false, &domain)) goto done;
+    reconstructed = true;
+    print_hash("paired_reconstructed_hull_sha256", hull.buf, hull.len);
+    print_hash("paired_reconstructed_domain_sha256", domain.buf, domain.len);
+    print_hash("paired_candidate_source_sha256", wrapper.buf, wrapper.len);
+    puts("paired_interface_match=1 point_semantic=POINTVALUE point_components=3 "
+         "hull_input_rw=7 hull_output_rw=8 domain_input_rw=7 hull_patch_rw=14 domain_patch_rw=0 "
+         "control_points=3 generated_stage_text_unchanged=1 distinct_generated_types=1 "
+         "source_quality=not-promoted");
+    /* Both actual target containers and contracts outlive the original process. */
+    unity_compiler_shutdown(&channel);
+    channel = (UnityCompilerChannel){.socket_fd = -1};
+    if (!unity_compiler_start_lazy(&channel, argv[2], !strcmp(argv[3], "-") ? NULL : argv[3]) ||
+        !unity_compiler_capture_session_capabilities(&channel, &cold_capabilities) ||
+        !unity_compiler_session_capabilities_valid_apis(&cold_capabilities, &cold_valid_apis) ||
+        cold_valid_apis != valid_apis ||
+        !unity_compiler_session_capabilities_equal(&capabilities, &cold_capabilities) ||
+        !unity_compiler_set_expected_valid_apis(&channel, valid_apis) ||
+        !compile_linked_pair(&channel, "cold-generated-pair", &wrapper, directory, shader_name,
+            valid_apis, scalar_fixture, &preprocessing[2], &requests[2], &compiled[2],
+            &provenance[2], &containers[2])) goto done;
+    const pid_t cold_process = channel.process_id;
+    if (!cold_process) goto done;
+    cold_exact = true;
+    for (unsigned stage = 0; stage < (unsigned)PROBE_LINKED_STAGE_COUNT; ++stage) {
+        DXBCCompareResult comparison;
+        const DXBCCompareStatus status = dxbc_compare_exact(containers[stage].data,
+            containers[stage].size, containers[2 + stage].data, containers[2 + stage].size, &comparison);
+        const bool controls = selected_controls_equal(&requests[stage], &requests[2 + stage]);
+        const bool environment = compiler_environment_equal(&provenance[stage], &provenance[2 + stage]);
+        printf("paired_cold stage=%s complete_comparison=%s expected_bytes=%zu actual_bytes=%zu "
+               "selected_controls_equal=%d compiler_environment_equal=%d chunk=%u instruction=%u token=%u\n",
+               stage ? "domain" : "hull", dxbc_compare_status_name(status),
+               containers[stage].size, containers[2 + stage].size, controls, environment,
+               comparison.chunk_index, comparison.instruction_index, comparison.token_index);
+        cold_exact = cold_exact && status == DXBC_COMPARE_EQUAL && controls && environment;
+    }
+    if (!cold_exact) goto done;
+    puts("paired_cold_exact=1 process_count=2 candidate_cold=1 session_capabilities_identical=1");
+    /* Independent source changes: maximum32->16, then W1->2. The unchanged
+     * sibling is compiled from the same joint source and must remain exact. */
+    for (unsigned mutation_stage = 0; mutation_stage < (unsigned)PROBE_LINKED_STAGE_COUNT; ++mutation_stage) {
+        const unsigned mutation_slot = 4 + mutation_stage * 4;
+        const unsigned restore_slot = mutation_slot + 2;
+        const StringBuilder *original = mutation_stage ? &domain : &hull;
+        const OwnedLiteralMutation *mutation = mutation_stage ? &domain_mutation : &maximum_mutation;
+        const uint32_t changed_bits = mutation_stage ? UINT32_C(0x40000000) : UINT32_C(0x41800000);
+        if (mutation->original_bits != (mutation_stage ? UINT32_C(0x3f800000) : UINT32_C(0x42000000)) ||
+            !mutate_owned_literal(original, mutation, changed_bits, &changed) ||
+            !candidate_wrapper(mutation_stage ? &hull : &changed, &changed_wrapper, shader_name,
+                false, mutation_stage ? &changed : &domain)) goto done;
+        print_hash("paired_mutated_source_sha256", changed_wrapper.buf, changed_wrapper.len);
+        if (!compile_linked_pair(&channel, mutation_stage ? "warm-domain-w-mutated" : "warm-hull-maximum-mutated",
+            &changed_wrapper, directory, shader_name, valid_apis, scalar_fixture,
+            &preprocessing[mutation_slot], &requests[mutation_slot], &compiled[mutation_slot],
+            &provenance[mutation_slot], &containers[mutation_slot])) goto done;
+        for (unsigned stage = 0; stage < (unsigned)PROBE_LINKED_STAGE_COUNT; ++stage) {
+            DXBCCompareResult comparison;
+            const unsigned slot = mutation_slot + stage, cold_slot = 2 + stage;
+            const DXBCCompareStatus status = dxbc_compare_exact(containers[stage].data,
+                containers[stage].size, containers[slot].data, containers[slot].size, &comparison);
+            const bool differs = status != DXBC_COMPARE_EQUAL && status != DXBC_COMPARE_INVALID_ARGUMENT &&
+                status != DXBC_COMPARE_EXPECTED_INVALID && status != DXBC_COMPARE_ACTUAL_INVALID;
+            const bool authority = selected_controls_equal(&requests[cold_slot], &requests[slot]) &&
+                compiler_environment_equal(&provenance[cold_slot], &provenance[slot]) &&
+                provenance[cold_slot].source_authority_revision == provenance[slot].source_authority_revision &&
+                cold_process == channel.process_id;
+            printf("paired_warm_mutation changed_stage=%s compiled_stage=%s complete_comparison=%s "
+                   "expected_relation=%s authority_equal=%d same_process=%d\n",
+                   mutation_stage ? "domain" : "hull", stage ? "domain" : "hull",
+                   dxbc_compare_status_name(status), stage == mutation_stage ? "different" : "exact-sibling",
+                   authority, cold_process == channel.process_id);
+            if (!authority || (stage == mutation_stage ? !differs : status != DXBC_COMPARE_EQUAL)) goto done;
+        }
+        if (!compile_linked_pair(&channel, mutation_stage ? "warm-domain-original-restored" : "warm-hull-original-restored",
+            &wrapper, directory, shader_name, valid_apis, scalar_fixture,
+            &preprocessing[restore_slot], &requests[restore_slot], &compiled[restore_slot],
+            &provenance[restore_slot], &containers[restore_slot])) goto done;
+        for (unsigned stage = 0; stage < (unsigned)PROBE_LINKED_STAGE_COUNT; ++stage) {
+            DXBCCompareResult comparison;
+            const unsigned slot = restore_slot + stage, cold_slot = 2 + stage;
+            const DXBCCompareStatus status = dxbc_compare_exact(containers[stage].data,
+                containers[stage].size, containers[slot].data, containers[slot].size, &comparison);
+            const bool identity = !memcmp(compiled[cold_slot].request_digest, compiled[slot].request_digest, 32) &&
+                !memcmp(compiled[cold_slot].controls_digest, compiled[slot].controls_digest, 32);
+            const bool authority = selected_controls_equal(&requests[cold_slot], &requests[slot]) &&
+                compiler_environment_equal(&provenance[cold_slot], &provenance[slot]) &&
+                provenance[cold_slot].source_authority_revision == provenance[slot].source_authority_revision &&
+                cold_process == channel.process_id;
+            printf("paired_warm_restore changed_stage=%s compiled_stage=%s reference=original-target "
+                   "complete_comparison=%s canonical_identity_equal=%d authority_equal=%d same_process=%d\n",
+                   mutation_stage ? "domain" : "hull", stage ? "domain" : "hull",
+                   dxbc_compare_status_name(status), identity, authority, cold_process == channel.process_id);
+            if (status != DXBC_COMPARE_EQUAL || !identity || !authority) goto done;
+        }
+        ++warm_cycles;
+        sb_free(&changed);
+        sb_init(&changed);
+        sb_free(&changed_wrapper);
+        sb_init(&changed_wrapper);
+    }
+    result = 0;
+done:
+    printf("paired_generated_sources=%s paired_cold_comparison=%s paired_warm_cycles=%u paired_warm_comparison=%s "
+           "paired_source_native_stage_exact=%d linked_stage_certificate=not-run "
+           "editor=not-run import=not-run semantic_certificate=not-run native_D3D11=not-run\n",
+           reconstructed ? "complete" : "unavailable-or-failed",
+           cold_exact ? "exact" : "not-qualified", warm_cycles,
+           !cold_exact ? "not-run" : warm_cycles == 2 ? "qualified" : "not-qualified", !result);
+    for (unsigned slot = 0; slot < (unsigned)PROBE_LINKED_COMPILE_SLOTS; ++slot) {
+        unity_compiler_binary_response_free(&compiled[slot]);
+        unity_compiler_preprocess_response_free(&preprocessing[slot]);
+    }
+    unity_compiler_shutdown(&channel);
+    common_file_bytes_dispose(&authored);
+    sb_free(&source);
+    sb_free(&hull);
+    sb_free(&domain);
+    sb_free(&wrapper);
+    sb_free(&changed);
+    sb_free(&changed_wrapper);
+    return result;
+}
+
 static void usage(const char *name) {
     fprintf(
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]] [--domain-fixture]\n"
+        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture]\n"
         "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -962,6 +1328,12 @@ static void usage(const char *name) {
         "enables an owned W-literal mutation and exact warm restoration. "
         "It prints no source and grants no linked HULL/DOMAIN certificate. "
         "It cannot be combined with a HULL source calibration.\n"
+        "--linked-fixture reconstructs the actual HULL and DOMAIN targets together; "
+        "only vertex/fragment are authored stubs. Typed triangle/FLOAT3 interfaces "
+        "must match. Both cold full-container comparisons must be exact before "
+        "independent owned maximum/W mutations and exact sibling/restoration checks. "
+        "This summary-only experiment grants no runtime or semantic certificate "
+        "and cannot be combined with a source calibration.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -981,6 +1353,10 @@ int main(int argc, char **argv) {
         (argc == 5 && !strcmp(argv[4], "--domain-fixture")) ||
         (argc == 6 && (scalar_fixture || icb_fixture) &&
          !strcmp(argv[5], "--domain-fixture"));
+    const bool linked_fixture =
+        (argc == 5 && !strcmp(argv[4], "--linked-fixture")) ||
+        (argc == 6 && (scalar_fixture || icb_fixture) &&
+         !strcmp(argv[5], "--linked-fixture"));
     const bool calibrate_static_factors = argc == 6 && scalar_fixture &&
         !strcmp(argv[5], "--static-factor-calibration");
     const bool calibrate_explicit_packoffset = argc == 6 && scalar_fixture &&
@@ -989,7 +1365,7 @@ int main(int argc, char **argv) {
         !strcmp(argv[5], "--inner-factor-brace-calibration");
     const bool calibrate_source_shape = calibrate_static_factors ||
         calibrate_explicit_packoffset || calibrate_inner_factor_brace;
-    if (argc != 4 && !domain_fixture && !(icb_fixture && argc == 5) &&
+    if (argc != 4 && !domain_fixture && !linked_fixture && !(icb_fixture && argc == 5) &&
         !(scalar_fixture && (argc == 5 || calibrate_source_shape))) {
         usage(argv[0]);
         return 2;
@@ -1006,6 +1382,8 @@ int main(int argc, char **argv) {
         .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER, .array_size = 1};
     SerializedProgramParameters parameters = {.constant_buffers = &buffer,
         .cb_count = 1, .resources = &binding, .res_count = 1};
+    if (linked_fixture)
+        return run_linked_fixture(argv, shader_name, scalar_fixture, icb_fixture, &parameters);
     UnityCompilerChannel channel = {.socket_fd = -1};
     UnityCompilerPreprocessResponse preprocessing[PROBE_COMPILE_SLOTS];
     UnityCompilerBinaryResponse compiled[PROBE_COMPILE_SLOTS];
@@ -1058,8 +1436,8 @@ int main(int argc, char **argv) {
         if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
             goto done;
         print_hash("target_complete_dxbc_sha256", target.data, target.size);
-        if (!inspect_domain(&target, &hull, &domain_mutation) ||
-            !candidate_wrapper(&hull, &wrapper, shader_name, true))
+        if (!inspect_domain(&target, &hull, &domain_mutation, NULL) ||
+            !candidate_wrapper(&hull, &wrapper, shader_name, true, NULL))
             goto done;
         puts("stage_comparison=isolated-domain authored_stubs=vertex,hull,fragment "
              "linked_hull_domain_reconstruction=not-run linked_stage_certificate=not-run");
@@ -1074,8 +1452,8 @@ int main(int argc, char **argv) {
             goto done;
         print_hash("target_complete_dxbc_sha256", target.data, target.size);
         if (!reconstruct_hull(&target, scalar_fixture ? &parameters : NULL, &hull,
-                          icb_fixture, icb_fixture ? &icb_mutation : NULL) ||
-            !candidate_wrapper(&hull, &wrapper, shader_name, false))
+                          icb_fixture, icb_fixture ? &icb_mutation : NULL, NULL, NULL) ||
+            !candidate_wrapper(&hull, &wrapper, shader_name, false, NULL))
             goto done;
         print_hash("reconstructed_hull_sha256", hull.buf, hull.len);
         printf("generated_hull_begin\n%s\ngenerated_hull_end\n", hull.buf);
@@ -1244,7 +1622,7 @@ int main(int argc, char **argv) {
             const bool transformed = calibrate_explicit_packoffset
                 ? explicit_packoffset_calibration(&hull, &changed_wrapper)
                 : inner_factor_brace_calibration(&hull, &changed_wrapper);
-            if (!transformed || !candidate_wrapper(&changed_wrapper, &calibration_wrapper, shader_name, false))
+            if (!transformed || !candidate_wrapper(&changed_wrapper, &calibration_wrapper, shader_name, false, NULL))
                 goto done;
         }
         unity_compiler_shutdown(&channel);

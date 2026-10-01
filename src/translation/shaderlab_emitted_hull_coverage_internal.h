@@ -16,9 +16,10 @@ typedef struct {
     HLSLHullWholeRange *roots;
     HLSLHullWholeRange units[3];
     HLSLHullWholeRange icb_declaration;
+    HLSLHullWholeRange domain_return;
     size_t *syntax_ends;
     size_t root_count, unit_count, syntax_count, line_cursor;
-    bool has_icb_declaration, rebased, offset;
+    bool has_icb_declaration, has_domain_return, rebased, offset;
 } HLSLHullWholePlacement;
 
 typedef struct HLSLHullCoverageCapture {
@@ -34,8 +35,10 @@ struct ShaderLabEmittedHullCoverage {
     StringBuilder source;
     ShaderLabSourceQualityInventory inventory;
     HLSLHullCoverageCapture *entries;
+    /* The private array counts both captured stages; public HULL ordinals
+     * and totals continue to select only stage 3 entries. */
     size_t entry_count, owned_input_bytes, owned_stage_node_count, owned_stage_event_count;
-    bool sealed;
+    bool capture_domain, sealed;
 };
 
 bool shaderlab_hull_coverage_begin(ShaderLabEmittedHullCoverage *owned,

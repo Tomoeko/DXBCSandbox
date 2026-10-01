@@ -8,6 +8,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+static bool stage_coverage_matches(const HLSLHullCoverageCapture *entry) {
+    const HLSLStageCoverage *coverage = &entry->coverage;
+    return entry->observation.stage_index == 3
+        ? coverage->stage == DXBC_PROGRAM_TYPE_HULL &&
+          coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT && coverage->unit_count == 3
+        : entry->observation.stage_index == 4 && coverage->stage == DXBC_PROGRAM_TYPE_DOMAIN &&
+          coverage->schema == HLSL_STAGE_COVERAGE_ORDINARY_ENTRY && coverage->unit_count == 1;
+}
+
 static void entry_dispose(HLSLHullCoverageCapture *entry) {
     hlsl_owned_stage_inputs_dispose(&entry->inputs);
     hlsl_stage_coverage_dispose(&entry->coverage);
@@ -30,7 +39,8 @@ bool shaderlab_hull_coverage_begin(ShaderLabEmittedHullCoverage *owned,
     const uint8_t *target, size_t target_size, const uint8_t *payload, size_t payload_size,
     const SerializedProgramParameters *current, const SerializedProgramParameters *common,
     HLSLHullCoverageCapture **capture) {
-    if (!owned || !owned->entries || owned->sealed || !record || record->stage_index != 3 ||
+    if (!owned || !owned->entries || owned->sealed || !record ||
+        (record->stage_index != 3 && !(owned->capture_domain && record->stage_index == 4)) ||
         record_index >= HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT ||
         owned->entry_count >= HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT || !capture || *capture) return false;
     HLSLHullCoverageCapture *entry = &owned->entries[owned->entry_count];
@@ -54,16 +64,18 @@ bool shaderlab_hull_coverage_finish(HLSLHullCoverageCapture *entry,
     if (!entry || entry->finished || !map || !map->complete ||
         map->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT || map->count != entry->coverage.instruction_count ||
         !hlsl_stage_coverage_validate(&entry->coverage, source) ||
-        entry->coverage.schema != HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT ||
-        entry->coverage.unit_count != 3) return false;
+        !stage_coverage_matches(entry)) return false;
     entry->raw_map = *map;
     HLSLHullWholePlacement *placement = &entry->placement;
     placement->root_count = entry->coverage.root_count;
     placement->unit_count = entry->coverage.unit_count;
     placement->syntax_count = entry->coverage.syntax_count;
     placement->has_icb_declaration = entry->coverage.hull_icb.plan.present;
+    placement->has_domain_return = entry->coverage.domain_output.plan.present;
     if (placement->has_icb_declaration)
         placement->icb_declaration = (HLSLHullWholeRange){SIZE_MAX, SIZE_MAX};
+    if (placement->has_domain_return)
+        placement->domain_return = (HLSLHullWholeRange){SIZE_MAX, SIZE_MAX};
     if (placement->root_count) {
         placement->roots = malloc(placement->root_count * sizeof(*placement->roots));
         if (!placement->roots) return false;
@@ -105,8 +117,9 @@ bool shaderlab_hull_coverage_rebase_line(HLSLHullCoverageCapture *entry,
         line_begin != placement->line_cursor || line_begin >= line_end ||
         line_end > coverage->source_size || output_begin > SIZE_MAX - (line_end - line_begin) ||
         placement->root_count != coverage->root_count || placement->unit_count != coverage->unit_count ||
-        placement->syntax_count != coverage->syntax_count || placement->unit_count != 3 ||
+        placement->syntax_count != coverage->syntax_count || !stage_coverage_matches(entry) ||
         placement->has_icb_declaration != coverage->hull_icb.plan.present ||
+        placement->has_domain_return != coverage->domain_output.plan.present ||
         placement->root_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
         placement->syntax_count > HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
         (placement->root_count && (!placement->roots || !coverage->roots)) ||
@@ -120,6 +133,9 @@ bool shaderlab_hull_coverage_rebase_line(HLSLHullCoverageCapture *entry,
     if (placement->has_icb_declaration)
         rebase_range(&placement->icb_declaration, coverage->hull_icb.declaration_begin,
             coverage->hull_icb.declaration_end, line_begin, line_end, output_begin);
+    if (placement->has_domain_return)
+        rebase_range(&placement->domain_return, coverage->domain_output.return_begin,
+            coverage->domain_output.return_end, line_begin, line_end, output_begin);
     for (size_t index = 0; index < placement->syntax_count; ++index) {
         const HLSLStageOwnedSyntax *syntax = &coverage->syntax[index];
         const size_t end = syntax->source_end;
@@ -152,7 +168,10 @@ bool shaderlab_hull_coverage_offset(ShaderLabEmittedHullCoverage *owned,
         const HLSLHullWholePlacement *placement = &entry->placement;
         if (!entry->finished || !placement->rebased || placement->offset ||
             placement->root_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
-            placement->unit_count != 3 || placement->syntax_count > HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
+            !stage_coverage_matches(entry) || placement->unit_count != entry->coverage.unit_count ||
+            placement->syntax_count > HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
+            placement->has_icb_declaration != entry->coverage.hull_icb.plan.present ||
+            placement->has_domain_return != entry->coverage.domain_output.plan.present ||
             (placement->root_count && !placement->roots) || (placement->syntax_count && !placement->syntax_ends))
             return false;
         for (size_t root = 0; root < placement->root_count; ++root)
@@ -160,6 +179,8 @@ bool shaderlab_hull_coverage_offset(ShaderLabEmittedHullCoverage *owned,
         for (size_t unit = 0; unit < placement->unit_count; ++unit)
             if (!range_can_offset(&placement->units[unit], offset)) return false;
         if (placement->has_icb_declaration && !range_can_offset(&placement->icb_declaration, offset))
+            return false;
+        if (placement->has_domain_return && !range_can_offset(&placement->domain_return, offset))
             return false;
         for (size_t syntax = 0; syntax < placement->syntax_count; ++syntax)
             if (placement->syntax_ends[syntax] == SIZE_MAX || placement->syntax_ends[syntax] > SIZE_MAX - offset)
@@ -180,6 +201,10 @@ bool shaderlab_hull_coverage_offset(ShaderLabEmittedHullCoverage *owned,
         if (placement->has_icb_declaration) {
             placement->icb_declaration.begin += offset;
             placement->icb_declaration.end += offset;
+        }
+        if (placement->has_domain_return) {
+            placement->domain_return.begin += offset;
+            placement->domain_return.end += offset;
         }
         for (size_t syntax = 0; syntax < placement->syntax_count; ++syntax)
             placement->syntax_ends[syntax] += offset;
@@ -204,9 +229,10 @@ static bool placements_valid(const HLSLHullCoverageCapture *entry, const StringB
         .capacity = coverage->source_size + 1};
     if (!hlsl_stage_coverage_validate(coverage, &local) || !placement->rebased || !placement->offset ||
         placement->line_cursor != coverage->source_size || placement->root_count != coverage->root_count ||
-        placement->unit_count != coverage->unit_count || placement->unit_count != 3 ||
+        placement->unit_count != coverage->unit_count || !stage_coverage_matches(entry) ||
         placement->syntax_count != coverage->syntax_count ||
         placement->has_icb_declaration != coverage->hull_icb.plan.present ||
+        placement->has_domain_return != coverage->domain_output.plan.present ||
         (placement->root_count && !placement->roots) || (placement->syntax_count && !placement->syntax_ends)) return false;
     size_t previous = body->source_begin;
     for (size_t unit = 0; unit < placement->unit_count; ++unit) {
@@ -219,6 +245,24 @@ static bool placements_valid(const HLSLHullCoverageCapture *entry, const StringB
         if (declaration->begin < placement->units[0].begin || declaration->begin >= declaration->end ||
             declaration->end > placement->units[0].end) return false;
     } else if (placement->icb_declaration.begin || placement->icb_declaration.end) return false;
+    if (placement->has_domain_return) {
+        const HLSLHullWholeRange *range = &placement->domain_return;
+        const size_t root_index = coverage->domain_output.root_index;
+        if (root_index >= placement->root_count || range->begin < placement->units[0].begin ||
+            range->begin >= range->end || range->end != placement->units[0].end ||
+            range->end - range->begin < 15 ||
+            placement->roots[root_index].begin != range->begin + 11 ||
+            placement->roots[root_index].end > range->end - 4 ||
+            memcmp(source->buf + range->begin, "    return ", 11) ||
+            memcmp(source->buf + placement->roots[root_index].end, ";\n", 2) ||
+            memcmp(source->buf + range->end - 2, "}\n", 2)) return false;
+        /* The normal line-copy path inserts wrapper indentation before the
+         * closing line. Local syntax remains exact and immutable; whole-source
+         * replay must account for those inserted spaces rather than changing
+         * the local receipt's two-line return spelling. */
+        for (size_t index = placement->roots[root_index].end + 2; index < range->end - 2; ++index)
+            if (source->buf[index] != ' ') return false;
+    } else if (placement->domain_return.begin || placement->domain_return.end) return false;
     for (size_t index = 0; index < placement->root_count; ++index) {
         const HLSLStageOwnedRoot *root = &coverage->roots[index];
         const HLSLHullWholeRange *range = &placement->roots[index];
@@ -247,10 +291,12 @@ static bool seal(ShaderLabEmittedHullCoverage *owned) {
         owned->inventory.receipt_count > owned->inventory.receipt_capacity || !owned->inventory.receipts ||
         !owned->entry_count || owned->entry_count > HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT) return false;
     bool seen[HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT] = {false};
-    size_t hull_count = 0;
+    size_t hull_count = 0, domain_count = 0;
     for (size_t index = 0; index < owned->inventory.entries.count; ++index)
         if (owned->inventory.entries.records[index].stage_index == 3) ++hull_count;
-    if (hull_count != owned->entry_count) return false;
+        else if (owned->capture_domain && owned->inventory.entries.records[index].stage_index == 4) ++domain_count;
+    if (!hull_count || (owned->capture_domain && !domain_count) ||
+        hull_count + domain_count != owned->entry_count) return false;
     for (size_t index = 0; index < owned->entry_count; ++index) {
         HLSLHullCoverageCapture *entry = &owned->entries[index];
         const size_t ordinal = entry->observation.entry_record_index;
@@ -269,7 +315,9 @@ static bool seal(ShaderLabEmittedHullCoverage *owned) {
         }
         if (!body || body->source_begin >= body->source_end || body->source_end > owned->source.len ||
             body->subshader_index != entry->observation.subshader_index ||
-            body->pass_index != entry->observation.pass_index || body->stage_index != 3 ||
+            body->pass_index != entry->observation.pass_index ||
+            body->stage_index != entry->observation.stage_index ||
+            (body->stage_index != 3 && !(owned->capture_domain && body->stage_index == 4)) ||
             !placements_valid(entry, &owned->source, body)) return false;
         entry->observation.source_begin = body->source_begin;
         entry->observation.source_end = body->source_end;
@@ -292,10 +340,11 @@ static bool initial_scope(const ShaderLabSourceQualityRequest *request) {
 }
 
 static ShaderLabHullCoverageStatus capture_once(const ShaderLabSourceQualityRequest *request,
-    ShaderLabEmittedHullCoverage **output) {
+    ShaderLabEmittedHullCoverage **output, bool capture_domain) {
     if (!initial_scope(request)) return SHADERLAB_HULL_COVERAGE_SCOPE_UNAVAILABLE;
     ShaderLabEmittedHullCoverage *owned = calloc(1, sizeof(*owned));
     if (!owned) return SHADERLAB_HULL_COVERAGE_ALLOCATION_FAILED;
+    owned->capture_domain = capture_domain;
     sb_init(&owned->source);
     owned->entries = calloc(HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT, sizeof(*owned->entries));
     if (!owned->entries) {
@@ -322,12 +371,20 @@ static bool maps_equal(const HLSLExpressionSourceMap *a, const HLSLExpressionSou
     return true;
 }
 
-static bool placements_equal(const HLSLHullWholePlacement *a, const HLSLHullWholePlacement *b) {
+static bool placements_equal(const HLSLHullCoverageCapture *left, const HLSLHullCoverageCapture *right) {
+    const HLSLHullWholePlacement *a = &left->placement, *b = &right->placement;
+    if (!stage_coverage_matches(left) || !stage_coverage_matches(right) ||
+        a->root_count != left->coverage.root_count || a->unit_count != left->coverage.unit_count ||
+        a->syntax_count != left->coverage.syntax_count ||
+        b->root_count != right->coverage.root_count || b->unit_count != right->coverage.unit_count ||
+        b->syntax_count != right->coverage.syntax_count) return false;
     if (a->root_count != b->root_count || a->unit_count != b->unit_count || a->syntax_count != b->syntax_count ||
         a->line_cursor != b->line_cursor || !a->rebased || !b->rebased || !a->offset || !b->offset ||
         a->has_icb_declaration != b->has_icb_declaration ||
+        a->has_domain_return != b->has_domain_return ||
         a->icb_declaration.begin != b->icb_declaration.begin || a->icb_declaration.end != b->icb_declaration.end ||
-        a->root_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT || a->unit_count != 3 ||
+        a->domain_return.begin != b->domain_return.begin || a->domain_return.end != b->domain_return.end ||
+        a->root_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT || a->unit_count > 3 ||
         a->syntax_count > HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
         (a->root_count && (!a->roots || !b->roots)) || (a->syntax_count && (!a->syntax_ends || !b->syntax_ends))) return false;
     for (size_t index = 0; index < a->root_count; ++index)
@@ -342,13 +399,15 @@ static bool placements_equal(const HLSLHullWholePlacement *a, const HLSLHullWhol
 static bool observations_equal(const ShaderLabEmittedHullCoverage *a, const ShaderLabEmittedHullCoverage *b) {
     if (!a->sealed || !b->sealed || a->entry_count != b->entry_count || !a->entry_count ||
         a->entry_count > HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT || !a->entries || !b->entries ||
+        a->capture_domain != b->capture_domain ||
         a->source.len != b->source.len || !a->source.buf || !b->source.buf ||
         a->owned_input_bytes != b->owned_input_bytes || a->owned_stage_node_count != b->owned_stage_node_count ||
         a->owned_stage_event_count != b->owned_stage_event_count || memcmp(a->source.buf, b->source.buf, a->source.len)) return false;
     for (size_t index = 0; index < a->entry_count; ++index) {
         const HLSLHullCoverageCapture *left = &a->entries[index], *right = &b->entries[index];
         const ShaderLabEmittedHullEntry *x = &left->observation, *y = &right->observation;
-        if (!left->finished || !right->finished || x->entry_record_index != y->entry_record_index ||
+        if (!left->finished || !right->finished || !stage_coverage_matches(left) || !stage_coverage_matches(right) ||
+            x->entry_record_index != y->entry_record_index ||
             x->entry_record_index >= b->inventory.entries.count ||
             !coordinates_match(x, &b->inventory.entries.records[x->entry_record_index]) ||
             x->source_begin != y->source_begin || x->source_end != y->source_end ||
@@ -358,17 +417,17 @@ static bool observations_equal(const ShaderLabEmittedHullCoverage *a, const Shad
             !hlsl_owned_stage_inputs_equal(&left->inputs, &right->inputs) ||
             !maps_equal(&left->raw_map, &right->raw_map) ||
             !hlsl_stage_coverage_equal(&left->coverage, &right->coverage) ||
-            !placements_equal(&left->placement, &right->placement)) return false;
+            !placements_equal(left, right)) return false;
     }
     return true;
 }
 
-ShaderLabHullCoverageStatus shaderlab_emitted_hull_coverage_capture(
-    const ShaderLabSourceQualityRequest *request, ShaderLabEmittedHullCoverage **output) {
+static ShaderLabHullCoverageStatus capture_stages(const ShaderLabSourceQualityRequest *request,
+    ShaderLabEmittedHullCoverage **output, bool capture_domain) {
     if (!output || *output || !request || !request->shader || !request->archive)
         return SHADERLAB_HULL_COVERAGE_INVALID_ARGUMENT;
     ShaderLabEmittedHullCoverage *owned = NULL;
-    ShaderLabHullCoverageStatus status = capture_once(request, &owned);
+    ShaderLabHullCoverageStatus status = capture_once(request, &owned, capture_domain);
     if (status != SHADERLAB_HULL_COVERAGE_OK) return status;
     /* Syntax observers run after ordinary stage emission. Independently rebuild
      * the current model afterward: a callback cannot publish stale input bytes,
@@ -380,7 +439,7 @@ ShaderLabHullCoverageStatus shaderlab_emitted_hull_coverage_capture(
     ShaderLabEmittedHullCoverage *current = NULL;
     if (shaderlab_source_quality_inventory_analyze(&stable, &owned->source, &owned->inventory, &quality, NULL) !=
             SHADERLAB_SOURCE_QUALITY_OK ||
-        capture_once(&stable, &current) != SHADERLAB_HULL_COVERAGE_OK || !observations_equal(owned, current)) {
+        capture_once(&stable, &current, capture_domain) != SHADERLAB_HULL_COVERAGE_OK || !observations_equal(owned, current)) {
         status = SHADERLAB_HULL_COVERAGE_CAPTURE_FAILED;
         shaderlab_emitted_hull_coverage_free(owned);
     } else {
@@ -388,6 +447,16 @@ ShaderLabHullCoverageStatus shaderlab_emitted_hull_coverage_capture(
     }
     shaderlab_emitted_hull_coverage_free(current);
     return status;
+}
+
+ShaderLabHullCoverageStatus shaderlab_emitted_hull_coverage_capture(
+    const ShaderLabSourceQualityRequest *request, ShaderLabEmittedHullCoverage **output) {
+    return capture_stages(request, output, false);
+}
+
+ShaderLabHullCoverageStatus shaderlab_emitted_hull_coverage_capture_paired(
+    const ShaderLabSourceQualityRequest *request, ShaderLabEmittedHullCoverage **output) {
+    return capture_stages(request, output, true);
 }
 
 bool shaderlab_emitted_hull_coverage_replay(
@@ -400,7 +469,7 @@ bool shaderlab_emitted_hull_coverage_replay(
     stable.observer = NULL;
     stable.observer_context = NULL;
     ShaderLabEmittedHullCoverage *current = NULL;
-    if (capture_once(&stable, &current) != SHADERLAB_HULL_COVERAGE_OK) return false;
+    if (capture_once(&stable, &current, owned->capture_domain) != SHADERLAB_HULL_COVERAGE_OK) return false;
     bool equal = observations_equal(owned, current);
     shaderlab_emitted_hull_coverage_free(current);
     return equal;
@@ -408,25 +477,53 @@ bool shaderlab_emitted_hull_coverage_replay(
 
 bool shaderlab_emitted_hull_coverage_describe(
     const ShaderLabEmittedHullCoverage *owned, ShaderLabEmittedHullSummary *summary) {
-    if (!owned || !owned->sealed || !summary) return false;
-    ShaderLabEmittedHullSummary result = {.source_size = owned->source.len, .entry_count = owned->entry_count,
+    if (!owned || !owned->sealed || !summary || owned->entry_count > HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT ||
+        (owned->entry_count && !owned->entries)) return false;
+    ShaderLabEmittedHullSummary result = {.source_size = owned->source.len,
         .linked_entry_count = owned->inventory.entries.count, .base_quality = owned->inventory.quality};
     memcpy(result.source_digest, owned->inventory.source_digest, 32);
     memcpy(result.modeled_input_digest, owned->inventory.modeled_input_digest, 32);
     for (size_t index = 0; index < owned->entry_count; ++index) {
-        result.unit_count += owned->entries[index].coverage.unit_count;
-        result.root_count += owned->entries[index].coverage.root_count;
-        result.syntax_count += owned->entries[index].coverage.syntax_count;
+        const HLSLHullCoverageCapture *entry = &owned->entries[index];
+        if (entry->observation.stage_index == 3) {
+            ++result.entry_count;
+            result.unit_count += entry->coverage.unit_count;
+            result.root_count += entry->coverage.root_count;
+            result.syntax_count += entry->coverage.syntax_count;
+        } else if (entry->observation.stage_index == 4 && owned->capture_domain) {
+            ++result.domain_entry_count;
+            result.domain_unit_count += entry->coverage.unit_count;
+            result.domain_root_count += entry->coverage.root_count;
+            result.domain_syntax_count += entry->coverage.syntax_count;
+        } else return false;
     }
     *summary = result;
     return true;
 }
 
+static bool describe_entry(const ShaderLabEmittedHullCoverage *owned, size_t ordinal,
+    int stage, ShaderLabEmittedHullEntry *entry) {
+    if (!owned || !owned->sealed || !entry || ordinal >= owned->entry_count ||
+        owned->entry_count > HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT || !owned->entries) return false;
+    for (size_t index = 0; index < owned->entry_count; ++index) {
+        if (owned->entries[index].observation.stage_index != stage) continue;
+        if (!ordinal) {
+            *entry = owned->entries[index].observation;
+            return true;
+        }
+        --ordinal;
+    }
+    return false;
+}
+
 bool shaderlab_emitted_hull_coverage_entry(
     const ShaderLabEmittedHullCoverage *owned, size_t index, ShaderLabEmittedHullEntry *entry) {
-    if (!owned || !owned->sealed || !entry || index >= owned->entry_count) return false;
-    *entry = owned->entries[index].observation;
-    return true;
+    return describe_entry(owned, index, 3, entry);
+}
+
+bool shaderlab_emitted_hull_coverage_domain_entry(
+    const ShaderLabEmittedHullCoverage *owned, size_t index, ShaderLabEmittedHullEntry *entry) {
+    return owned && owned->capture_domain && describe_entry(owned, index, 4, entry);
 }
 
 bool shaderlab_emitted_hull_coverage_source(

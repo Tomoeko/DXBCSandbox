@@ -879,7 +879,7 @@ static bool translate_stage_to_hlsl(
     goto cleanup;
   }
   HLSLHullCoverageCapture *hull_capture = NULL;
-  if (hull_coverage && stage_index == 3 &&
+  if (hull_coverage && (stage_index == 3 || (hull_coverage->capture_domain && stage_index == 4)) &&
       (!hull_capture_output || *hull_capture_output ||
        !shaderlab_hull_coverage_begin(hull_coverage, record, record_index,
           raw_view.data, raw_view.size, payload, payload_length, selected_parameters,

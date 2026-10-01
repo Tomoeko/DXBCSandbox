@@ -22,6 +22,9 @@ typedef struct {
     uint8_t source_digest[32], modeled_input_digest[32];
     /* The ordinary inventory's historical classification and gaps. */
     ShaderLabSourceQualityResult base_quality;
+    /* Explicit paired captures retain DOMAIN rows separately. Existing HULL
+     * totals above remain unchanged; ordinary capture leaves these zero. */
+    size_t domain_entry_count, domain_unit_count, domain_root_count, domain_syntax_count;
 } ShaderLabEmittedHullSummary;
 
 typedef struct {
@@ -48,13 +51,24 @@ typedef struct {
 ShaderLabHullCoverageStatus shaderlab_emitted_hull_coverage_capture(
     const ShaderLabSourceQualityRequest *current, ShaderLabEmittedHullCoverage **output);
 
-/* Regenerates normal inventory and fresh owned HULL coverage against current
- * inputs. Public descriptions and matching hashes alone cannot supply replay. */
+/* The same complete-source scope, additionally retaining every selected
+ * bounded DOMAIN row through the existing ordinary or constructed output
+ * producer. Both stages share the capture's input/node/event limits. This
+ * records source integrity and does not certify linked stage compatibility. */
+ShaderLabHullCoverageStatus shaderlab_emitted_hull_coverage_capture_paired(
+    const ShaderLabSourceQualityRequest *current, ShaderLabEmittedHullCoverage **output);
+
+/* Regenerates normal inventory and fresh owned stage coverage against current
+ * inputs, including DOMAIN only when explicitly captured. Public descriptions
+ * and matching hashes alone cannot supply replay. */
 bool shaderlab_emitted_hull_coverage_replay(
     const ShaderLabSourceQualityRequest *current, const ShaderLabEmittedHullCoverage *owned);
 bool shaderlab_emitted_hull_coverage_describe(
     const ShaderLabEmittedHullCoverage *owned, ShaderLabEmittedHullSummary *summary);
 bool shaderlab_emitted_hull_coverage_entry(
+    const ShaderLabEmittedHullCoverage *owned, size_t index, ShaderLabEmittedHullEntry *entry);
+/* A separate DOMAIN ordinal; the returned description carries stage_index 4. */
+bool shaderlab_emitted_hull_coverage_domain_entry(
     const ShaderLabEmittedHullCoverage *owned, size_t index, ShaderLabEmittedHullEntry *entry);
 bool shaderlab_emitted_hull_coverage_source(
     const ShaderLabEmittedHullCoverage *owned, const char **source, size_t *size);

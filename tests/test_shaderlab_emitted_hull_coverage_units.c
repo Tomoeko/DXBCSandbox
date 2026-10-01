@@ -3,8 +3,11 @@
 #include "translation/shaderlab_emitted_hull_coverage.h"
 #include "translation/shaderlab_emitted_hull_coverage_internal.h"
 #include "translation/hlsl_source_quality_internal.h"
+#include "translation/usil_validation.h"
 #include "translation/shaderlab_emitter_internal.h"
 #include "common/file_io.h"
+#include "dxbc/dxbc_document.h"
+#include "dxbc/dxbc_stage_contract.h"
 #include "dxbc/usbd.h"
 #include "test_geometry_fixture.h"
 #include "test_shaderlab_fixture.h"
@@ -173,6 +176,27 @@ static bool fixture_init_icb(Fixture *fixture, bool scalar) {
     return true;
 }
 
+/* Pair two independently parsed stage targets. The whole-source receipt does
+ * not infer a linked-stage or runtime certificate from matching semantics. */
+static bool fixture_init_float3(Fixture *fixture, bool scalar, bool icb,
+                               const char *semantic) {
+    CHECK(fixture_init(fixture, false, scalar));
+    size_t size = 0;
+    const uint32_t values[] = {UINT32_C(0x3fa00000), UINT32_C(0x40200000), UINT32_C(0x40700000)};
+    CHECK(!icb || !strcmp(semantic, "POINTVALUE"));
+    uint8_t *hull = icb
+        ? test_tessellation_hull_icb_dxbc(3, 2, 3, 3, true, scalar, true, values, &size)
+        : scalar ? test_tessellation_hull_scalar_cbuffer_dxbc(3, 3, true, semantic, &size)
+        : test_tessellation_hull_float3_dxbc(3, 3, 0, semantic, &size);
+    free(fixture->segments[HULL_STAGE]); fixture->segments[HULL_STAGE] = NULL;
+    CHECK(fixture_stage(fixture, HULL_STAGE, hull, size));
+    uint8_t *domain = test_tessellation_domain_float3_dxbc(3, semantic,
+        TEST_DOMAIN_FLOAT3_VALID, &size);
+    free(fixture->segments[DOMAIN_STAGE]); fixture->segments[DOMAIN_STAGE] = NULL;
+    CHECK(fixture_stage(fixture, DOMAIN_STAGE, domain, size));
+    return true;
+}
+
 static bool fixture_second_state(Fixture *fixture, bool unsupported_hull) {
     const char *name = NULL;
     CHECK(serialized_string_pool_copy(&fixture->strings, "FEATURE", &name));
@@ -278,7 +302,8 @@ static bool check_placements(const ShaderLabEmittedHullCoverage *owned,
                              const HLSLHullCoverageCapture *entry) {
     const HLSLStageCoverage *coverage = &entry->coverage;
     const HLSLHullWholePlacement *placement = &entry->placement;
-    CHECK(placement->rebased && placement->offset && placement->unit_count == 3);
+    CHECK(placement->rebased && placement->offset && placement->unit_count == coverage->unit_count &&
+          placement->unit_count == (entry->observation.stage_index == HULL_STAGE ? 3u : 1u));
     CHECK(placement->root_count == coverage->root_count &&
           placement->syntax_count == coverage->syntax_count);
     const size_t body_begin = entry->observation.source_begin;
@@ -303,7 +328,7 @@ static bool check_placements(const ShaderLabEmittedHullCoverage *owned,
         CHECK(placement->roots[index].begin >= body_begin &&
               placement->roots[index].end <= entry->observation.source_end);
     }
-    for (size_t index = 0; index < 3; ++index) {
+    for (size_t index = 0; index < placement->unit_count; ++index) {
         CHECK(placement->units[index].begin == whole_coordinate(coverage, body_begin, coverage->units[index].begin, false));
         CHECK(placement->units[index].end == whole_coordinate(coverage, body_begin, coverage->units[index].end, true));
     }
@@ -324,6 +349,16 @@ static bool check_placements(const ShaderLabEmittedHullCoverage *owned,
               placement->icb_declaration.begin < placement->icb_declaration.end &&
               placement->icb_declaration.end <= placement->units[0].end);
     } else CHECK(!placement->icb_declaration.begin && !placement->icb_declaration.end);
+    CHECK(placement->has_domain_return == coverage->domain_output.plan.present);
+    if (placement->has_domain_return) {
+        CHECK(placement->domain_return.begin == whole_coordinate(coverage, body_begin,
+              coverage->domain_output.return_begin, false));
+        CHECK(placement->domain_return.end == whole_coordinate(coverage, body_begin,
+              coverage->domain_output.return_end, true));
+        CHECK(placement->domain_return.begin >= placement->units[0].begin &&
+              placement->domain_return.begin < placement->domain_return.end &&
+              placement->domain_return.end <= placement->units[0].end);
+    } else CHECK(!placement->domain_return.begin && !placement->domain_return.end);
     return true;
 }
 
@@ -491,10 +526,173 @@ static bool check_selected_stage(const Fixture *fixture, const ShaderLabEmittedH
     return true;
 }
 
-static bool positive_capture_names(bool control_point, bool scalar, bool two_states, bool icb,
-                                   EmptyRoute route, bool renamed) {
+static bool check_paired_domain(const Fixture *fixture, const ShaderLabEmittedHullCoverage *owned,
+                                const ShaderLabSourceQualityInventory *normal, const char *semantic) {
+    size_t domains = 0;
+    CHECK(normal->entries.count == owned->inventory.entries.count);
+    for (size_t index = 0; index < owned->inventory.entries.count; ++index) {
+        const ShaderLabExpressionSourceRecord *record = &owned->inventory.entries.records[index];
+        if (record->stage_index != DOMAIN_STAGE) continue;
+        ++domains;
+        const ShaderLabExpressionSourceRecord *ordinary = &normal->entries.records[index];
+        CHECK(ordinary->stage_index == DOMAIN_STAGE && ordinary->subprogram_index == record->subprogram_index &&
+              ordinary->serialized_state == record->serialized_state && ordinary->blob_index == record->blob_index &&
+              !memcmp(ordinary->target_digest, record->target_digest, sizeof(record->target_digest)) &&
+              record->has_source_quality && ordinary->has_source_quality &&
+              hlsl_source_quality_results_equal(&ordinary->source_quality, &record->source_quality) &&
+              record->source_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+              !record->source_quality.counts.residual_total && !record->source_quality.counts.incomplete_units &&
+              !record->source_quality.counts.unknown_provenance && record->source_quality.counts.inspected_units == 1 &&
+              record->instructions.complete && ordinary->instructions.complete &&
+              record->instructions.count == 5 && ordinary->instructions.count == 5);
+        const ShaderLabSourceSyntaxReceipt *body = NULL;
+        for (size_t receipt = 0; receipt < owned->inventory.receipt_count; ++receipt) {
+            const ShaderLabSourceSyntaxReceipt *candidate = &owned->inventory.receipts[receipt];
+            if (candidate->kind != SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY || candidate->entry_record_index != index) continue;
+            CHECK(!body); body = candidate;
+        }
+        CHECK(body && body->stage_index == DOMAIN_STAGE && body->source_begin < body->source_end &&
+              body->source_end <= owned->source.len && record->blob_index >= 0 &&
+              record->blob_index < fixture->archive.segment_count);
+
+        ByteStream stream;
+        stream_init(&stream, fixture->segments[record->blob_index], (size_t)fixture->lengths[record->blob_index]);
+        stream_set_endian(&stream, false);
+        PlayerSubProgramMetadata player = {0};
+        CHECK(subprogram_metadata_parse_variant(&stream, &player));
+        DXBCDocument document;
+        DXBCContainer decoded = {0};
+        DXBCStageContract contract;
+        USILProgram program;
+        dxbc_document_init(&document); dxbc_stage_contract_init(&contract);
+        CHECK(dxbc_document_parse(&document, player.bytecode, player.bytecode_length, NULL) &&
+              dxbc_document_decode_semantic(&document, &decoded) &&
+              dxbc_stage_contract_decode(&document, &decoded, &contract, NULL) &&
+              usil_translate_with_stage_contract(&program, &decoded, &contract));
+        CHECK(usil_signature_authority_is_valid(&program) && program.instruction_count == 5 &&
+              program.tessellation.domain == DXBC_TESSELLATOR_DOMAIN_TRIANGLE &&
+              program.tessellation.input_control_point_count == 3 &&
+              program.input_count == 1 && program.inputs[0].mask == 7 && program.inputs[0].rw_mask == 7 &&
+              !program.inputs[0].system_value && !program.inputs[0].semantic_index &&
+              !strcmp(dxbc_signature_semantic_name(&program.inputs[0]), semantic) &&
+              program.output_count == 1 && program.outputs[0].mask == 15 && !program.outputs[0].rw_mask &&
+              program.outputs[0].system_value == 1);
+        uint8_t target_digest[32];
+        common_sha256(player.bytecode, player.bytecode_length, target_digest);
+        CHECK(!memcmp(target_digest, record->target_digest, sizeof(target_digest)));
+        const HLSLEmitNames names = {.entry_point = "ds", .input_struct = "unused_input", .output_struct = "unused_output"};
+        HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+        HLSLSourceQualityResult quality;
+        HLSLExpressionSourceMap map = {0};
+        options.source_quality = &quality; options.expression_source_map = &map;
+        options.source_quality_pass_index = (uint32_t)record->pass_index;
+        options.source_quality_entry_point_index = (uint32_t)record->subprogram_index;
+        options.omit_unity_builtin_declarations = true;
+        options.reserved_preprocessor_identifiers = (const char *const *)fixture->shader.keyword_names.keywords;
+        options.reserved_preprocessor_identifier_count = (size_t)fixture->shader.keyword_names.count;
+        const SerializedProgramParameters *parameters = &fixture->pass.common_parameters[DOMAIN_STAGE];
+        HLSLStageCoverage coverage = {0};
+        StringBuilder local, indented;
+        sb_init(&local); sb_init(&indented);
+        CHECK(hlsl_emit_with_stage_coverage(&program, &local, parameters, parameters, &names, &options, &coverage, NULL) &&
+              hlsl_stage_coverage_validate(&coverage, &local) &&
+              hlsl_source_quality_results_equal(&quality, &record->source_quality) &&
+              map.complete && map.count == 5 && coverage.domain_output.plan.present &&
+              coverage.domain_output.return_emitted && coverage.domain_output.root_captured);
+        size_t position = 0;
+        while (position < local.len) {
+            sb_append(&indented, "            ");
+            do sb_append_char(&indented, local.buf[position++]);
+            while (position < local.len && local.buf[position - 1] != '\n');
+        }
+        CHECK(sb_ok(&indented) && indented.len == body->source_end - body->source_begin &&
+              !memcmp(indented.buf, owned->source.buf + body->source_begin, indented.len) &&
+              strstr(indented.buf, "return float4(") && strstr(indented.buf, semantic) &&
+              !strstr(indented.buf, ".xyzx") && !strstr(indented.buf, ".yyyy") && !strstr(indented.buf, ".zzzz"));
+        for (size_t instruction = 0; instruction < map.count; ++instruction) {
+            HLSLExpressionOrigin expected = map.origins[instruction];
+            CHECK(!expected.definition_begin && !expected.definition_end &&
+                  expected.source_instruction_index == 7 + instruction);
+            expected.source_begin = whole_coordinate(&coverage, body->source_begin, expected.source_begin, false);
+            expected.source_end = whole_coordinate(&coverage, body->source_begin, expected.source_end, true);
+            CHECK(hlsl_expression_origins_equal(&expected, &record->instructions.origins[instruction]) &&
+                  hlsl_expression_origins_equal(&ordinary->instructions.origins[instruction],
+                                                &record->instructions.origins[instruction]) &&
+                  hlsl_expression_origin_ranges_valid(&expected, owned->source.len));
+        }
+        const HLSLStageOwnedRoot *constructor = &coverage.roots[coverage.domain_output.root_index];
+        const size_t constructor_begin = whole_coordinate(&coverage, body->source_begin, constructor->begin, false);
+        const size_t constructor_end = whole_coordinate(&coverage, body->source_begin, constructor->end, true);
+        const HLSLExpressionOrigin *ret = &record->instructions.origins[4];
+        CHECK(constructor->owner.kind == HLSL_STAGE_ROOT_DOMAIN_OUTPUT_CONSTRUCTION && constructor->instruction == -1 &&
+              ret->kind == HLSL_EXPRESSION_ORIGIN_RETURN && ret->source_begin < constructor_begin &&
+              constructor_begin < constructor_end && constructor_end < ret->source_end && ret->source_end <= body->source_end &&
+              record->instructions.origins[2].destination_lanes == 7 && record->instructions.origins[3].destination_lanes == 8 &&
+              !memcmp(owned->source.buf + ret->source_begin, "return ", strlen("return ")) &&
+              !memcmp(owned->source.buf + constructor_begin, "float4(", strlen("float4(")));
+        usil_free(&program); dxbc_stage_contract_free(&contract); dxbc_free(&decoded);
+        dxbc_document_free(&document); subprogram_metadata_free_variant(&player);
+        CHECK(hlsl_stage_coverage_validate(&coverage, &local));
+        hlsl_stage_coverage_dispose(&coverage); sb_free(&local); sb_free(&indented);
+    }
+    CHECK(domains == owned->entry_count);
+    return true;
+}
+
+static bool paired_domain_mutations(Fixture *fixture, const ShaderLabSourceQualityRequest *request,
+                                   ShaderLabEmittedHullCoverage *owned, const char *semantic) {
+    size_t ordinal = SIZE_MAX;
+    for (size_t index = 0; index < owned->inventory.entries.count; ++index)
+        if (owned->inventory.entries.records[index].stage_index == DOMAIN_STAGE) { ordinal = index; break; }
+    CHECK(ordinal != SIZE_MAX);
+    ShaderLabExpressionSourceRecord *record = &owned->inventory.entries.records[ordinal];
+    const HLSLExpressionOrigin *literal = &record->instructions.origins[3];
+    CHECK(literal->source_begin < literal->source_end && literal->source_end <= owned->source.len);
+    owned->source.buf[literal->source_begin] ^= 1;
+    CHECK(!shaderlab_emitted_hull_coverage_replay(request, owned));
+    owned->source.buf[literal->source_begin] ^= 1;
+    CHECK(replay_restored(request, owned));
+    ++record->instructions.origins[3].source_instruction_index;
+    CHECK(!shaderlab_emitted_hull_coverage_replay(request, owned));
+    --record->instructions.origins[3].source_instruction_index;
+    CHECK(replay_restored(request, owned));
+    fixture->programs[DOMAIN_STAGE][0].shader_requirements ^= 1;
+    CHECK(!shaderlab_emitted_hull_coverage_replay(request, owned));
+    fixture->programs[DOMAIN_STAGE][0].shader_requirements ^= 1;
+    CHECK(replay_restored(request, owned));
+    /* Empty DOMAIN metadata is a complete owned input only in paired mode;
+     * ordinary HULL capture retains the sibling's modeled source facts. */
+    if (owned->capture_domain) {
+        ++fixture->pass.common_parameters[DOMAIN_STAGE].version;
+        CHECK(!shaderlab_emitted_hull_coverage_replay(request, owned));
+        --fixture->pass.common_parameters[DOMAIN_STAGE].version;
+        CHECK(replay_restored(request, owned));
+    }
+
+    /* The changed sibling is independently supported, but differs from this
+     * receipt. No new cross-stage semantic mismatch gate is inferred here. */
+    const int blob = fixture->programs[DOMAIN_STAGE][0].blob_index;
+    uint8_t *saved_segment = fixture->segments[blob];
+    const int saved_length = fixture->lengths[blob];
+    const BlobEntry saved_entry = fixture->entries[blob];
+    size_t size = 0;
+    uint8_t *different = test_tessellation_domain_float3_dxbc(3,
+        !strcmp(semantic, "OBJECTCOORD") ? "POINTVALUE" : "OBJECTCOORD", TEST_DOMAIN_FLOAT3_VALID, &size);
+    CHECK(different && fixture_blob(fixture, blob, different, size, 22, NULL));
+    free(different);
+    CHECK(!shaderlab_emitted_hull_coverage_replay(request, owned));
+    free(fixture->segments[blob]); fixture->segments[blob] = saved_segment;
+    fixture->lengths[blob] = saved_length; fixture->entries[blob] = saved_entry;
+    CHECK(replay_restored(request, owned));
+    return true;
+}
+
+static bool positive_capture_shape(bool control_point, bool scalar, bool two_states, bool icb,
+                                   EmptyRoute route, bool renamed, const char *semantic) {
     Fixture fixture, replacement;
-    CHECK(icb ? fixture_init_icb(&fixture, scalar) : fixture_init(&fixture, control_point, scalar));
+    CHECK(!semantic || (!control_point && route == EMPTY_ROUTE_ABSENT));
+    CHECK(semantic ? fixture_init_float3(&fixture, scalar, icb, semantic) :
+          icb ? fixture_init_icb(&fixture, scalar) : fixture_init(&fixture, control_point, scalar));
     CHECK(!renamed || scalar);
     CHECK(fixture_scalar_names(&fixture, renamed));
     if (two_states) CHECK(fixture_second_state(&fixture, false));
@@ -530,6 +728,7 @@ static bool positive_capture_names(bool control_point, bool scalar, bool two_sta
           normal_result.classification == owned_result.classification &&
           normal_result.observed_stage_incomplete_units == owned_result.observed_stage_incomplete_units);
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &independent) == SHADERLAB_HULL_COVERAGE_OK);
+    if (semantic) CHECK(check_paired_domain(&fixture, owned, &normal_inventory, semantic));
     if (scalar || route != EMPTY_ROUTE_ABSENT) CHECK(check_selected_stage(&fixture, owned));
     for (size_t index = 0; index < owned->entry_count; ++index) {
         HLSLHullCoverageCapture *entry = &owned->entries[index];
@@ -542,6 +741,17 @@ static bool positive_capture_names(bool control_point, bool scalar, bool two_sta
         CHECK(hlsl_source_quality_results_equal(&observation.base_quality,
               &normal_inventory.entries.records[observation.entry_record_index].source_quality));
         CHECK(hlsl_stage_coverage_equal(&entry->coverage, &independent->entries[index].coverage));
+        if (semantic) {
+            const HLSLStageHullContract *contract = &entry->coverage.hull_contract;
+            CHECK(contract->input.mask == 7 && contract->input.rw_mask == 7 &&
+                  contract->output.mask == 7 && contract->output.rw_mask == 8 &&
+                  !contract->input.system_value && !contract->output.system_value &&
+                  !strcmp(dxbc_signature_semantic_name(&contract->input), semantic) &&
+                  !strcmp(dxbc_signature_semantic_name(&contract->output), semantic) &&
+                  contract->tessellation.input_control_point_count == 3 &&
+                  contract->tessellation.output_control_point_count == 3 &&
+                  strstr(entry->coverage.source, "float3 "));
+        }
         CHECK(entry->inputs.target != independent->entries[index].inputs.target &&
               entry->inputs.player_payload != independent->entries[index].inputs.player_payload);
         const bool parsed = route >= EMPTY_ROUTE_PARSED_ZERO;
@@ -613,11 +823,13 @@ static bool positive_capture_names(bool control_point, bool scalar, bool two_sta
      * row; the multi-state fixture separately exercises complete denominators. */
     if (!two_states || route != EMPTY_ROUTE_ABSENT) CHECK(owned_mutations(&request, owned));
     CHECK(current_mutations(&fixture, &request, owned));
+    if (semantic) CHECK(paired_domain_mutations(&fixture, &request, owned, semantic));
     ShaderLabEmittedHullCoverage *same = owned;
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &same) == SHADERLAB_HULL_COVERAGE_INVALID_ARGUMENT && same == owned);
     CHECK(!shaderlab_emitted_hull_coverage_entry(owned, owned->entry_count, &(ShaderLabEmittedHullEntry){0}));
 
-    CHECK(icb ? fixture_init_icb(&replacement, scalar) : fixture_init(&replacement, control_point, scalar));
+    CHECK(semantic ? fixture_init_float3(&replacement, scalar, icb, semantic) :
+          icb ? fixture_init_icb(&replacement, scalar) : fixture_init(&replacement, control_point, scalar));
     CHECK(fixture_scalar_names(&replacement, renamed));
     if (two_states) CHECK(fixture_second_state(&replacement, false));
     CHECK(fixture_empty_route(&replacement, route));
@@ -641,8 +853,202 @@ static bool positive_capture_names(bool control_point, bool scalar, bool two_sta
     return true;
 }
 
+static bool positive_capture_names(bool control_point, bool scalar, bool two_states, bool icb,
+                                   EmptyRoute route, bool renamed) {
+    return positive_capture_shape(control_point, scalar, two_states, icb, route, renamed, NULL);
+}
+
 static bool positive_capture(bool control_point, bool scalar, bool two_states, bool icb, EmptyRoute route) {
     return positive_capture_names(control_point, scalar, two_states, icb, route, false);
+}
+
+static bool paired_fixture(Fixture *fixture, bool float3, bool scalar, bool icb, bool asymmetric) {
+    CHECK(float3 ? fixture_init_float3(fixture, scalar, icb, "POINTVALUE") : fixture_init(fixture, false, false));
+    CHECK(fixture_second_state(fixture, false));
+    /* Keep an actual stage-only FEATURE axis in HULL. Partial sharing across
+     * V/F/HULL without DOMAIN would fail the existing pragma-coherence gate. */
+    if (asymmetric) {
+        fixture->pass.subprogram_count[0] = fixture->pass.subprogram_count[1] = 1;
+        fixture->pass.subprogram_count[DOMAIN_STAGE] = 1;
+        ShaderLabVariantPlan plan;
+        shaderlab_variant_plan_init(&plan);
+        CHECK(shaderlab_variant_plan_build(&fixture->shader, &fixture->pass, &plan, NULL) == SHADERLAB_VARIANT_PLAN_OK &&
+              plan.stages[HULL_STAGE].state_count == 2 && plan.stages[HULL_STAGE].generated_state_count == 2 &&
+              plan.stages[HULL_STAGE].axis_count == 1 && plan.stages[DOMAIN_STAGE].state_count == 1 &&
+              plan.stages[DOMAIN_STAGE].generated_state_count == 1 && !plan.stages[DOMAIN_STAGE].axis_count);
+        shaderlab_variant_plan_free(&plan);
+    }
+    return true;
+}
+
+static bool paired_owned_domain_mutations(const ShaderLabSourceQualityRequest *request,
+                                         ShaderLabEmittedHullCoverage *owned, HLSLHullCoverageCapture *entry) {
+    HLSLStageCoverage *coverage = &entry->coverage;
+    HLSLHullWholePlacement *placement = &entry->placement;
+#define REJECT_RESTORE(change, restore) do { \
+    change; CHECK(!shaderlab_emitted_hull_coverage_replay(request, owned)); \
+    restore; CHECK(replay_restored(request, owned)); \
+} while (0)
+    REJECT_RESTORE(owned->capture_domain = false, owned->capture_domain = true);
+    REJECT_RESTORE(entry->inputs.target[4] ^= 1, entry->inputs.target[4] ^= 1);
+    REJECT_RESTORE(entry->inputs.player_payload[8] ^= 1, entry->inputs.player_payload[8] ^= 1);
+    REJECT_RESTORE(entry->inputs.current.version ^= 1, entry->inputs.current.version ^= 1);
+    REJECT_RESTORE(entry->inputs.common.version ^= 1, entry->inputs.common.version ^= 1);
+    REJECT_RESTORE(coverage->domain_owner_digest[0] ^= 1, coverage->domain_owner_digest[0] ^= 1);
+    REJECT_RESTORE(coverage->recorded_domain_owner_digest[0] ^= 1, coverage->recorded_domain_owner_digest[0] ^= 1);
+    REJECT_RESTORE(++entry->raw_map.origins[0].source_instruction_index,
+                   --entry->raw_map.origins[0].source_instruction_index);
+    REJECT_RESTORE(++placement->roots[0].begin, --placement->roots[0].begin);
+    REJECT_RESTORE(--placement->units[0].end, ++placement->units[0].end);
+    REJECT_RESTORE(++placement->syntax_ends[0], --placement->syntax_ends[0]);
+    const size_t actual_ordinal = entry->observation.entry_record_index;
+    REJECT_RESTORE(entry->observation.entry_record_index = owned->entries[0].observation.entry_record_index,
+                   entry->observation.entry_record_index = actual_ordinal);
+    const bool has_return = placement->has_domain_return;
+    REJECT_RESTORE(placement->has_domain_return = !has_return, placement->has_domain_return = has_return);
+    if (has_return) {
+        REJECT_RESTORE(++placement->domain_return.begin, --placement->domain_return.begin);
+        REJECT_RESTORE(--placement->domain_return.end, ++placement->domain_return.end);
+        const HLSLHullWholeRange range = placement->domain_return;
+        REJECT_RESTORE(placement->domain_return = ((HLSLHullWholeRange){0, 1}), placement->domain_return = range);
+        REJECT_RESTORE(++coverage->domain_output.recorded_return_begin, --coverage->domain_output.recorded_return_begin);
+        REJECT_RESTORE(coverage->domain_output.plan.pieces[1].immediate_bits ^= 1,
+                       coverage->domain_output.plan.pieces[1].immediate_bits ^= 1);
+        HLSLStageOwnedRoot *constructor = &coverage->roots[coverage->domain_output.root_index];
+        REJECT_RESTORE(constructor->tree->logical_origin.instruction_index = 3,
+                       constructor->tree->logical_origin.instruction_index = -1);
+        REJECT_RESTORE(++placement->roots[coverage->domain_output.root_index].end,
+                       --placement->roots[coverage->domain_output.root_index].end);
+    } else {
+        REJECT_RESTORE(placement->domain_return.begin = 1, placement->domain_return.begin = 0);
+        REJECT_RESTORE(placement->domain_return.end = 1, placement->domain_return.end = 0);
+    }
+#undef REJECT_RESTORE
+    return true;
+}
+
+typedef struct {
+    Fixture *fixture;
+    bool mutate, called;
+} DomainObserver;
+
+static bool observe_paired_domain(void *context, const ShaderLabSourceSyntaxReceipt *receipt) {
+    DomainObserver *observer = context;
+    if (receipt->stage_index != DOMAIN_STAGE || receipt->kind != SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY || observer->called)
+        return true;
+    observer->called = true;
+    if (!observer->mutate) return false;
+    observer->fixture->programs[DOMAIN_STAGE][0].shader_requirements ^= 1;
+    return true;
+}
+
+static bool paired_capture(bool float3, bool scalar, bool icb, bool asymmetric) {
+    Fixture fixture, replacement;
+    CHECK(paired_fixture(&fixture, float3, scalar, icb, asymmetric));
+    ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
+    ShaderLabEmittedHullCoverage *ordinary = NULL, *owned = NULL, *independent = NULL;
+    const ShaderLabHullCoverageStatus ordinary_status = shaderlab_emitted_hull_coverage_capture(&request, &ordinary);
+    const ShaderLabHullCoverageStatus paired_status = shaderlab_emitted_hull_coverage_capture_paired(&request, &owned);
+    const ShaderLabHullCoverageStatus independent_status = shaderlab_emitted_hull_coverage_capture_paired(&request, &independent);
+    const bool ordinary_replay = ordinary && shaderlab_emitted_hull_coverage_replay(&request, ordinary);
+    const bool paired_replay = owned && shaderlab_emitted_hull_coverage_replay(&request, owned);
+    if (ordinary_status != SHADERLAB_HULL_COVERAGE_OK || paired_status != SHADERLAB_HULL_COVERAGE_OK ||
+        independent_status != SHADERLAB_HULL_COVERAGE_OK || !ordinary_replay || !paired_replay)
+        fprintf(stderr, "Paired factory failed: float3=%d scalar=%d icb=%d asymmetric=%d "
+            "ordinary_status=%d paired_status=%d independent_status=%d ordinary_replay=%d paired_replay=%d\n",
+            float3, scalar, icb, asymmetric, ordinary_status, paired_status, independent_status, ordinary_replay, paired_replay);
+    CHECK(ordinary_status == SHADERLAB_HULL_COVERAGE_OK && paired_status == SHADERLAB_HULL_COVERAGE_OK &&
+          independent_status == SHADERLAB_HULL_COVERAGE_OK && ordinary_replay && paired_replay);
+    ShaderLabEmittedHullSummary normal_summary, summary;
+    CHECK(shaderlab_emitted_hull_coverage_describe(ordinary, &normal_summary) &&
+          shaderlab_emitted_hull_coverage_describe(owned, &summary));
+    const size_t domains = asymmetric ? 1u : 2u;
+    CHECK(normal_summary.entry_count == 2 && !normal_summary.domain_entry_count && !normal_summary.domain_unit_count &&
+          !normal_summary.domain_root_count && !normal_summary.domain_syntax_count &&
+          summary.entry_count == 2 && summary.unit_count == 6 && summary.domain_entry_count == domains &&
+          summary.domain_unit_count == domains && summary.domain_root_count && summary.domain_syntax_count &&
+          summary.linked_entry_count == (asymmetric ? 5u : 8u) && summary.root_count == normal_summary.root_count &&
+          summary.syntax_count == normal_summary.syntax_count && summary.base_quality.classification == HLSL_SOURCE_QUALITY_MIXED &&
+          summary.base_quality.gaps == normal_summary.base_quality.gaps &&
+          (summary.base_quality.gaps & (SHADERLAB_SOURCE_GAP_EXTERNAL_INCLUDE | SHADERLAB_SOURCE_GAP_DEPENDENCY_INVENTORY)) ==
+              (SHADERLAB_SOURCE_GAP_EXTERNAL_INCLUDE | SHADERLAB_SOURCE_GAP_DEPENDENCY_INVENTORY) &&
+          !memcmp(summary.source_digest, normal_summary.source_digest, sizeof(summary.source_digest)) &&
+          !memcmp(summary.modeled_input_digest, normal_summary.modeled_input_digest, sizeof(summary.modeled_input_digest)) &&
+          owned->capture_domain && owned->entry_count == 2 + domains &&
+          owned->source.len == ordinary->source.len && owned->source.len == independent->source.len &&
+          !memcmp(owned->source.buf, ordinary->source.buf, owned->source.len + 1) &&
+          !memcmp(owned->source.buf, independent->source.buf, owned->source.len + 1));
+    ShaderLabEmittedHullEntry description = {.stage_index = -1};
+    CHECK(!shaderlab_emitted_hull_coverage_domain_entry(ordinary, 0, &description) && description.stage_index == -1);
+    size_t hull_ordinal = 0, domain_ordinal = 0, domain_roots = 0, domain_syntax = 0;
+    HLSLHullCoverageCapture *first_domain = NULL;
+    for (size_t index = 0; index < owned->entry_count; ++index) {
+        HLSLHullCoverageCapture *entry = &owned->entries[index];
+        HLSLHullCoverageCapture *other = &independent->entries[index];
+        const bool domain = entry->observation.stage_index == DOMAIN_STAGE;
+        CHECK(domain || entry->observation.stage_index == HULL_STAGE);
+        CHECK(domain ? shaderlab_emitted_hull_coverage_domain_entry(owned, domain_ordinal++, &description) :
+              shaderlab_emitted_hull_coverage_entry(owned, hull_ordinal++, &description));
+        CHECK(description.stage_index == entry->observation.stage_index &&
+              description.entry_record_index == entry->observation.entry_record_index &&
+              description.entry_record_index != index && description.entry_record_index < owned->inventory.entries.count &&
+              entry->inputs.target != other->inputs.target && entry->inputs.player_payload != other->inputs.player_payload &&
+              hlsl_owned_stage_inputs_equal(&entry->inputs, &other->inputs) &&
+              hlsl_stage_coverage_equal(&entry->coverage, &other->coverage) && check_placements(owned, entry));
+        if (!domain) continue;
+        if (!first_domain) first_domain = entry;
+        domain_roots += description.root_count; domain_syntax += description.syntax_count;
+        CHECK(description.unit_count == 1 && description.base_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+              !description.base_quality.counts.incomplete_units && !description.base_quality.counts.residual_total &&
+              !description.base_quality.counts.unknown_provenance &&
+              hlsl_source_quality_results_equal(&description.base_quality,
+                  &ordinary->inventory.entries.records[description.entry_record_index].source_quality) &&
+              entry->coverage.stage == DXBC_PROGRAM_TYPE_DOMAIN &&
+              entry->coverage.schema == HLSL_STAGE_COVERAGE_ORDINARY_ENTRY &&
+              entry->coverage.domain_output.plan.present == float3 && entry->placement.has_domain_return == float3);
+        if (float3) {
+            const HLSLStageOwnedRoot *constructor = &entry->coverage.roots[entry->coverage.domain_output.root_index];
+            const HLSLHullWholeRange whole = entry->placement.roots[entry->coverage.domain_output.root_index];
+            CHECK(constructor->owner.kind == HLSL_STAGE_ROOT_DOMAIN_OUTPUT_CONSTRUCTION && constructor->instruction == -1 &&
+                  entry->coverage.domain_output.plan.pieces[0].mask == 7 &&
+                  entry->coverage.domain_output.plan.pieces[1].mask == 8 &&
+                  entry->coverage.domain_output.plan.pieces[1].immediate_bits == UINT32_C(0x3f800000) &&
+                  whole.begin < whole.end && whole.begin > entry->placement.domain_return.begin &&
+                  whole.end < entry->placement.domain_return.end &&
+                  !memcmp(owned->source.buf + whole.begin, "float4(", strlen("float4(")));
+        } else CHECK(hlsl_stage_coverage_domain_output_empty(&entry->coverage.domain_output));
+    }
+    CHECK(hull_ordinal == 2 && domain_ordinal == domains && domain_roots == summary.domain_root_count &&
+          domain_syntax == summary.domain_syntax_count && first_domain);
+    CHECK(!shaderlab_emitted_hull_coverage_entry(owned, summary.entry_count, &description) &&
+          !shaderlab_emitted_hull_coverage_domain_entry(owned, domains, &description));
+    CHECK(paired_owned_domain_mutations(&request, owned, first_domain));
+    if (float3) CHECK(paired_domain_mutations(&fixture, &request, owned, "POINTVALUE"));
+    for (unsigned mutation = 0; mutation < 2; ++mutation) {
+        DomainObserver observer = {.fixture = &fixture, .mutate = mutation != 0};
+        request.observer = observe_paired_domain; request.observer_context = &observer;
+        ShaderLabEmittedHullCoverage *rejected = NULL;
+        CHECK(shaderlab_emitted_hull_coverage_capture_paired(&request, &rejected) != SHADERLAB_HULL_COVERAGE_OK &&
+              !rejected && observer.called);
+        if (observer.mutate) fixture.programs[DOMAIN_STAGE][0].shader_requirements ^= 1;
+        request.observer = NULL; request.observer_context = NULL;
+        CHECK(replay_restored(&request, owned));
+    }
+    ShaderLabEmittedHullCoverage *same = owned;
+    CHECK(shaderlab_emitted_hull_coverage_capture_paired(&request, &same) == SHADERLAB_HULL_COVERAGE_INVALID_ARGUMENT && same == owned);
+    CHECK(paired_fixture(&replacement, float3, scalar, icb, asymmetric));
+    fixture_dispose(&fixture);
+    request.shader = &replacement.shader; request.archive = &replacement.archive;
+    CHECK(shaderlab_emitted_hull_coverage_replay(&request, owned) &&
+          shaderlab_emitted_hull_coverage_replay(&request, ordinary));
+    for (size_t index = 0; index < owned->entry_count; ++index) {
+        StringBuilder local = local_source(&owned->entries[index].coverage);
+        CHECK(hlsl_stage_coverage_validate(&owned->entries[index].coverage, &local) &&
+              hlsl_stage_coverage_equal(&owned->entries[index].coverage, &independent->entries[index].coverage));
+    }
+    shaderlab_emitted_hull_coverage_free(independent); shaderlab_emitted_hull_coverage_free(owned);
+    shaderlab_emitted_hull_coverage_free(ordinary); fixture_dispose(&replacement);
+    return true;
 }
 
 typedef struct {
@@ -814,6 +1220,15 @@ int main(void) {
             if (!positive_capture(false, false, true, icb, route)) return 1;
         if (!empty_route_rejections(icb)) return 1;
     }
+    if (!positive_capture_shape(false, false, false, false, EMPTY_ROUTE_ABSENT, false, "POINTVALUE") ||
+        !positive_capture_shape(false, false, true, false, EMPTY_ROUTE_ABSENT, false, "OBJECTCOORD") ||
+        !positive_capture_shape(false, true, true, false, EMPTY_ROUTE_ABSENT, false, "POINTVALUE") ||
+        !positive_capture_shape(false, true, true, false, EMPTY_ROUTE_ABSENT, true, "OBJECTCOORD") ||
+        !positive_capture_shape(false, false, false, true, EMPTY_ROUTE_ABSENT, false, "POINTVALUE") ||
+        !positive_capture_shape(false, true, true, true, EMPTY_ROUTE_ABSENT, false, "POINTVALUE")) return 1;
+    if (!paired_capture(false, false, false, false) || !paired_capture(true, false, false, false) ||
+        !paired_capture(true, true, false, false) || !paired_capture(true, true, true, false) ||
+        !paired_capture(true, false, false, true)) return 1;
     if (g_allocations_count != allocations || g_allocated_bytes != bytes) {
         fprintf(stderr, "allocation leak: %zu/%zu -> %zu/%zu\n",
             allocations, bytes, g_allocations_count, g_allocated_bytes);
