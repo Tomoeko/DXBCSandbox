@@ -5,6 +5,7 @@
 #include "translation/shaderlab_emitted_matrix_uses.h"
 #include "translation/hlsl_matrix_lift.h"
 #include "translation/hlsl_stage_coverage_internal.h"
+#include "translation/hlsl_owned_stage_inputs_internal.h"
 
 struct HLSLEmitterContext;
 typedef struct {
@@ -18,10 +19,7 @@ typedef struct {
 
 typedef struct HLSLMatrixUseCapture {
     ShaderLabEmittedMatrixEntry observation;
-    uint8_t *target, *player_payload;
-    size_t target_size, player_payload_size;
-    PlayerSubProgramMetadata player;
-    SerializedProgramParameters current, common;
+    HLSLOwnedStageInputs inputs;
     HLSLCurrentMatrixReads reads;
     HLSLEmittedMatrixUse *uses;
     size_t use_count;

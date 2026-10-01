@@ -8,8 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { MATRIX_ENTRY_LIMIT = 32, MATRIX_TREE_LIMIT = 512, MATRIX_TREE_DEPTH = 64,
-       MATRIX_INPUT_BYTE_LIMIT = 4 * 1024 * 1024 };
+enum { MATRIX_TREE_LIMIT = 512, MATRIX_TREE_DEPTH = 64 };
 
 /* Mechanical bounded tree copy shared by matrix and stage observations.
  * It copies syntax and owned origins, never recovers or invents provenance. */
@@ -260,10 +259,8 @@ static bool tree_has_field(const ASTExpr *tree, const HLSLCurrentMatrixField *fi
 static void entry_dispose(HLSLMatrixUseCapture *entry) {
     hlsl_stage_coverage_dispose(&entry->coverage);
     for (size_t index = 0; index < entry->use_count; ++index) ast_free_expr(entry->uses[index].tree);
-    free(entry->uses); free(entry->target);
-    subprogram_metadata_free_variant(&entry->player); free(entry->player_payload);
-    serialized_program_parameters_free(&entry->current);
-    serialized_program_parameters_free(&entry->common);
+    free(entry->uses);
+    hlsl_owned_stage_inputs_dispose(&entry->inputs);
     hlsl_current_matrix_reads_dispose(&entry->reads);
     memset(entry, 0, sizeof(*entry));
 }
@@ -282,33 +279,29 @@ bool shaderlab_matrix_uses_begin(ShaderLabEmittedMatrixUses *owned,
     const uint8_t *target, size_t target_size, const uint8_t *payload, size_t payload_size,
     const SerializedProgramParameters *current, const SerializedProgramParameters *common,
     HLSLMatrixUseCapture **capture) {
-    if (!owned || owned->sealed || !record || !program || !target || !target_size ||
-        !payload || !payload_size || owned->entry_count == MATRIX_ENTRY_LIMIT || !capture ||
-        target_size > MATRIX_INPUT_BYTE_LIMIT || payload_size > MATRIX_INPUT_BYTE_LIMIT - target_size ||
-        owned->owned_input_bytes > MATRIX_INPUT_BYTE_LIMIT - target_size - payload_size) return false;
-    owned->owned_input_bytes += target_size + payload_size;
-    HLSLMatrixUseCapture *entry = &owned->entries[owned->entry_count++];
+    if (!owned || owned->sealed || !owned->entries || !record || !program || !capture || *capture ||
+        owned->entry_count >= HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT) return false;
+    HLSLMatrixUseCapture *entry = &owned->entries[owned->entry_count];
+    const size_t previous_input_bytes = owned->owned_input_bytes;
+    if (!hlsl_owned_stage_inputs_capture(&entry->inputs, target, target_size, payload, payload_size,
+            current, common, &owned->owned_input_bytes)) return false;
+    HLSLCurrentMatrixStatus status = hlsl_current_matrix_reads_build(program, current, common, &entry->reads);
+    if (status != HLSL_CURRENT_MATRIX_OK && status != HLSL_CURRENT_MATRIX_NOT_APPLICABLE) {
+        entry_dispose(entry);
+        owned->owned_input_bytes = previous_input_bytes;
+        return false;
+    }
     entry->observation = (ShaderLabEmittedMatrixEntry){
         .subshader_index = record->subshader_index, .pass_index = record->pass_index,
         .stage_index = record->stage_index, .subprogram_index = record->subprogram_index,
         .blob_index = record->blob_index, .hardware_tier_group = record->hardware_tier_group,
-        .serialized_state = record->serialized_state, .entry_record_index = owned->entry_count - 1};
-    entry->target = malloc(target_size); entry->player_payload = malloc(payload_size);
-    if (!entry->target || !entry->player_payload) return false;
-    entry->target_size = target_size; memcpy(entry->target, target, target_size);
-    entry->player_payload_size = payload_size; memcpy(entry->player_payload, payload, payload_size);
+        .serialized_state = record->serialized_state, .entry_record_index = owned->entry_count};
     common_sha256(target, target_size, entry->observation.target_digest);
-    ByteStream stream; stream_init(&stream, entry->player_payload, payload_size);
-    stream_set_endian(&stream, false);
-    if (!subprogram_metadata_parse_variant(&stream, &entry->player) ||
-        (current && !serialized_program_parameters_copy(&entry->current, current)) ||
-        (common && !serialized_program_parameters_copy(&entry->common, common))) return false;
-    HLSLCurrentMatrixStatus status = hlsl_current_matrix_reads_build(program, current, common, &entry->reads);
-    if (status != HLSL_CURRENT_MATRIX_OK && status != HLSL_CURRENT_MATRIX_NOT_APPLICABLE) return false;
     entry->coverage.global_node_count = &owned->owned_stage_node_count;
     entry->coverage.global_event_count = &owned->owned_stage_event_count;
     entry->observation.field_count = entry->reads.field_count;
     entry->observation.read_count = entry->reads.read_count;
+    ++owned->entry_count;
     *capture = entry;
     return true;
 }
@@ -488,7 +481,7 @@ ShaderLabMatrixUsesStatus shaderlab_emitted_matrix_uses_capture(
     ShaderLabEmittedMatrixUses *owned = calloc(1, sizeof(*owned));
     if (!owned) return SHADERLAB_MATRIX_USES_ALLOCATION_FAILED;
     sb_init(&owned->source);
-    owned->entries = calloc(MATRIX_ENTRY_LIMIT, sizeof(*owned->entries));
+    owned->entries = calloc(HLSL_OWNED_STAGE_INPUT_ENTRY_LIMIT, sizeof(*owned->entries));
     if (!owned->entries) {
         shaderlab_emitted_matrix_uses_free(owned);
         return SHADERLAB_MATRIX_USES_ALLOCATION_FAILED;
@@ -553,12 +546,7 @@ static bool observations_equal(const ShaderLabEmittedMatrixUses *a, const Shader
             left->observation.source_begin != right->observation.source_begin ||
             left->observation.source_end != right->observation.source_end ||
             memcmp(left->observation.body_digest, right->observation.body_digest, 32) ||
-            left->target_size != right->target_size || left->player_payload_size != right->player_payload_size ||
-            memcmp(left->target, right->target, left->target_size) ||
-            memcmp(left->player_payload, right->player_payload, left->player_payload_size) ||
-            !subprogram_metadata_variant_equal(&left->player, &right->player) ||
-            !serialized_program_parameters_equal(&left->current, &right->current) ||
-            !serialized_program_parameters_equal(&left->common, &right->common) ||
+            !hlsl_owned_stage_inputs_equal(&left->inputs, &right->inputs) ||
             left->reads.field_count != right->reads.field_count || left->reads.read_count != right->reads.read_count ||
             left->observation.field_count != right->observation.field_count ||
             left->observation.read_count != right->observation.read_count ||

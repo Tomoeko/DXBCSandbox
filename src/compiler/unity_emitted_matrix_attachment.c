@@ -114,11 +114,11 @@ static bool observe_request(void *context, const UnityGeneratedOwnedRequest *act
     }
     if (entry_index == SIZE_MAX) return false;
     HLSLMatrixUseCapture *entry = &owned->emitted->entries[entry_index];
-    if (!entry->finished || entry->target_size != actual->target_size ||
-        memcmp(entry->target, actual->target, entry->target_size) ||
-        !subprogram_metadata_variant_equal(&entry->player, actual->player) ||
-        !serialized_program_parameters_equal(&entry->current, actual->current) ||
-        !serialized_program_parameters_equal(&entry->common, actual->common)) return false;
+    if (!entry->finished || entry->inputs.target_size != actual->target_size ||
+        memcmp(entry->inputs.target, actual->target, entry->inputs.target_size) ||
+        !subprogram_metadata_variant_equal(&entry->inputs.player, actual->player) ||
+        !serialized_program_parameters_equal(&entry->inputs.current, actual->current) ||
+        !serialized_program_parameters_equal(&entry->inputs.common, actual->common)) return false;
     for (size_t index = 0; index < owned->request_count; ++index)
         if (coordinate_matches(&owned->requests[index].observation, actual, entry_index)) return false;
 

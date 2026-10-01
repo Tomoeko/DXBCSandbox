@@ -80,6 +80,7 @@ set(DXBC_SOURCES
     src/translation/hlsl_source_quality.c
     src/translation/hlsl_cbuffer_source_quality.c
     src/translation/hlsl_stage_coverage.c
+    src/translation/hlsl_owned_stage_inputs.c
     src/translation/hlsl_source_quality_report.c
     src/translation/hlsl_current_matrix_reads.c
     src/translation/hlsl_matrix_lift.c
@@ -109,6 +110,7 @@ set(DXBC_SOURCES
     src/translation/shaderlab_source_map.c
     src/translation/shaderlab_source_quality.c
     src/translation/shaderlab_emitted_matrix_uses.c
+    src/translation/shaderlab_emitted_hull_coverage.c
     src/translation/shaderlab_stage.c
     src/translation/shaderlab_state.c
     src/translation/shaderlab_structural_certificate.c

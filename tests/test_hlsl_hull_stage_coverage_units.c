@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "dxbc/dxbc_document.h"
-#include "dxbc/dxbc_hash.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "test_tessellation_fixture.h"
 #include "translation/hlsl_emitter_internal.h"
@@ -19,8 +18,6 @@
         return false; \
     } \
 } while (0)
-#define WORD(opcode, length) \
-    ((uint32_t)(opcode) | (uint32_t)(length) << 24)
 
 typedef struct {
     DXBCDocument document;
@@ -33,92 +30,15 @@ typedef struct {
     SerializedProgramParameters parameters;
 } HullFixture;
 
-static uint32_t read_u32(const uint8_t *bytes) {
-    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 |
-        (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
-}
-
-static void write_u32(uint8_t *bytes, uint32_t value) {
-    for (unsigned byte = 0; byte < 4; ++byte)
-        bytes[byte] = (uint8_t)(value >> (byte * 8));
-}
-
-/* Reuse the shared authored signatures and instruction grammar. The existing
- * lossless decoder supplies bounded instruction coordinates; this author adds
- * one scalar buffer and two final clamps without another token parser. */
-static bool author_scalar_clamps(uint8_t **bytes, size_t *size) {
-    DXBCDocument document;
-    DXBCDocumentDiagnostic diagnostic;
-    dxbc_document_init(&document);
-    CHECK(dxbc_document_parse(&document, *bytes, *size, &diagnostic));
-    CHECK(document.instruction_count > 0);
-    const DXBCDocumentChunk *chunk =
-        &document.chunks[document.instructions[0].chunk_index];
-    CHECK(chunk->kind == DXBC_DOCUMENT_CHUNK_EXECUTABLE &&
-          chunk->offset + chunk->raw_size == *size);
-    uint32_t words[128];
-    size_t count = 0;
-    bool declared = false;
-    unsigned clamps = 0;
-    for (size_t index = 0; index < document.instruction_count; ++index) {
-        const DXBCDocumentInstruction *instruction = &document.instructions[index];
-        CHECK(instruction->chunk_index == document.instructions[0].chunk_index &&
-              instruction->token_count < 32 && count + instruction->token_count + 8 < 128);
-        if (instruction->opcode == 115 && !declared) {
-            words[count++] = WORD(89, 4);
-            words[count++] = UINT32_C(0x00208000);
-            words[count++] = 0;
-            words[count++] = 1;
-            declared = true;
-        }
-        const uint32_t destination = instruction->token_count > 1
-            ? read_u32(instruction->raw_bytes + 4) : 0;
-        if (instruction->opcode == 54 &&
-            (destination == UINT32_C(0x00902012) ||
-             destination == UINT32_C(0x00102012))) {
-            CHECK(instruction->token_count == (destination == UINT32_C(0x00902012) ? 6u : 5u));
-            words[count++] = WORD(51, instruction->token_count + 3);
-            for (uint32_t word = 1; word < instruction->token_count - 2; ++word)
-                words[count++] = read_u32(instruction->raw_bytes + word * 4);
-            words[count++] = UINT32_C(0x0020800a);
-            words[count++] = 0;
-            words[count++] = 0;
-            words[count++] = UINT32_C(0x00004001);
-            words[count++] = UINT32_C(0x42000000);
-            ++clamps;
-        } else {
-            for (uint32_t word = 0; word < instruction->token_count; ++word)
-                words[count++] = read_u32(instruction->raw_bytes + word * 4);
-        }
-    }
-    CHECK(declared && clamps == 2);
-    const size_t instruction_offset = (size_t)chunk->offset + 16;
-    const size_t authored_size = instruction_offset + count * 4;
-    uint8_t *authored = calloc(authored_size, 1);
-    CHECK(authored);
-    memcpy(authored, *bytes, instruction_offset);
-    write_u32(authored + 24, (uint32_t)authored_size);
-    write_u32(authored + chunk->offset + 4, (uint32_t)(count * 4 + 8));
-    write_u32(authored + chunk->offset + 12, (uint32_t)(count + 2));
-    for (size_t word = 0; word < count; ++word)
-        write_u32(authored + instruction_offset + word * 4, words[word]);
-    CHECK(dxbc_compute_hash(authored, authored_size, authored + 4));
-    dxbc_document_free(&document);
-    free(*bytes);
-    *bytes = authored;
-    *size = authored_size;
-    return true;
-}
-
 static bool fixture_init(HullFixture *fixture, bool float3,
                           bool control_point, bool clamps) {
     memset(fixture, 0, sizeof(*fixture));
     size_t size = 0;
-    uint8_t *bytes = float3
-        ? test_tessellation_hull_float3_dxbc(3, 3, 0, "POINTVALUE", &size)
-        : test_tessellation_hull_dxbc(3, 3, control_point ? 4 : 0, &size);
+    uint8_t *bytes = clamps
+        ? test_tessellation_hull_scalar_cbuffer_dxbc(3, 3, float3, "POINTVALUE", &size)
+        : float3 ? test_tessellation_hull_float3_dxbc(3, 3, 0, "POINTVALUE", &size)
+                 : test_tessellation_hull_dxbc(3, 3, control_point ? 4 : 0, &size);
     CHECK(bytes);
-    if (clamps) CHECK(author_scalar_clamps(&bytes, &size));
     dxbc_document_init(&fixture->document);
     dxbc_stage_contract_init(&fixture->contract);
     DXBCDocumentDiagnostic document_diagnostic;

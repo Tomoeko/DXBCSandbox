@@ -12,6 +12,7 @@
 #include "translation/shaderlab_emitter_internal.h"
 #include "translation/shaderlab_source_quality_internal.h"
 #include "translation/hlsl_emitted_matrix_uses_internal.h"
+#include "translation/shaderlab_emitted_hull_coverage_internal.h"
 #include "translation/usil.h"
 
 #include <inttypes.h>
@@ -652,6 +653,8 @@ static bool translate_stage_to_hlsl(
     size_t reserved_preprocessor_identifier_count, bool high_level,
     bool unity_uv_helpers, bool *unity_uv_used,
     ShaderLabExpressionSourceRecord *record, ShaderLabEmittedMatrixUses *matrix_uses,
+    ShaderLabEmittedHullCoverage *hull_coverage, size_t record_index,
+    HLSLHullCoverageCapture **hull_capture_output,
     ShaderLabStageDiagnostic *diagnostic) {
   if (!pass || !out_hlsl || !names || stage_index < 0 || stage_index >= 6 ||
       subprogram_index < 0 ||
@@ -852,14 +855,30 @@ static bool translate_stage_to_hlsl(
     usil_free(&usil);
     goto cleanup;
   }
+  HLSLHullCoverageCapture *hull_capture = NULL;
+  if (hull_coverage && stage_index == 3 &&
+      (!hull_capture_output || *hull_capture_output ||
+       !shaderlab_hull_coverage_begin(hull_coverage, record, record_index,
+          raw_view.data, raw_view.size, payload, payload_length, selected_parameters,
+          &pass->common_parameters[stage_index], &hull_capture))) {
+    set_diagnostic(diagnostic, SHADERLAB_STAGE_HLSL_EMISSION_FAILED,
+                   stage_index, subprogram_index, -1);
+    usil_free(&usil);
+    goto cleanup;
+  }
   HLSLEmitDiagnostic hlsl_diagnostic;
   bool emitted = matrix_capture ? hlsl_emit_with_matrix_capture(
           &usil, out_hlsl, selected_parameters, &pass->common_parameters[stage_index],
           names, &emit_options, matrix_capture, &hlsl_diagnostic) :
+      hull_capture ? hlsl_emit_with_stage_coverage(
+          &usil, out_hlsl, selected_parameters, &pass->common_parameters[stage_index],
+          names, &emit_options, &hull_capture->coverage, &hlsl_diagnostic) :
       hlsl_emit_with_options_diagnostic(&usil, out_hlsl, selected_parameters,
           &pass->common_parameters[stage_index], names, &emit_options, &hlsl_diagnostic);
   if (!emitted || (matrix_capture && !shaderlab_matrix_uses_finish(
-          matrix_capture, out_hlsl, &record->instructions))) {
+          matrix_capture, out_hlsl, &record->instructions)) ||
+      (hull_capture && !shaderlab_hull_coverage_finish(
+          hull_capture, out_hlsl, &record->instructions))) {
     set_diagnostic(diagnostic, SHADERLAB_STAGE_HLSL_EMISSION_FAILED,
                    stage_index, subprogram_index, -1);
     if (diagnostic) diagnostic->hlsl = hlsl_diagnostic;
@@ -873,6 +892,7 @@ static bool translate_stage_to_hlsl(
       common_sha256(raw_view.data, raw_view.size, record->target_digest);
       record->has_source_quality = true;
     }
+    if (hull_capture) *hull_capture_output = hull_capture;
     success = true;
   }
   usil_free(&usil);
@@ -945,7 +965,8 @@ static void emit_variant_predicate(const ShaderLabStagePlan *plan,
 
 static void append_indented_source(StringBuilder *output,
                                    const StringBuilder *source,
-                                   HLSLExpressionSourceMap *map) {
+                                   HLSLExpressionSourceMap *map,
+                                   HLSLHullCoverageCapture *hull_capture) {
   HLSLExpressionSourceMap original = {0};
   if (map) {
     if (!map->complete || map->count > HLSL_HIGH_LEVEL_INSTRUCTION_LIMIT) {
@@ -968,6 +989,10 @@ static void append_indented_source(StringBuilder *output,
     if (!sb_ok(output)) return;
     if (map && !hlsl_expression_source_map_rebase_line(map, &original, line_begin, line_end,
                                                        output_begin)) {
+      output->failed = true;
+      return;
+    }
+    if (!shaderlab_hull_coverage_rebase_line(hull_capture, line_begin, line_end, output_begin)) {
       output->failed = true;
       return;
     }
@@ -1038,6 +1063,7 @@ bool emit_stage_hlsl(const SerializedPass *pass, int stage_index,
             entry_count, segments, segment_lengths, segment_count,
             &variant_hlsl, &names,
             (const char *const *)plan.keywords, plan.keyword_count, false, false, NULL, NULL, NULL,
+            NULL, SIZE_MAX, NULL,
             diagnostic)) {
       sb_free(&variant_hlsl);
       sb_free(&stage_output);
@@ -1055,7 +1081,7 @@ bool emit_stage_hlsl(const SerializedPass *pass, int stage_index,
       append_indent(&stage_output, 3);
       sb_append(&stage_output, "// Single exact variant\n");
     }
-    append_indented_source(&stage_output, &variant_hlsl, NULL);
+    append_indented_source(&stage_output, &variant_hlsl, NULL, NULL);
     sb_free(&variant_hlsl);
     if (!sb_ok(&stage_output)) {
       set_diagnostic(diagnostic, SHADERLAB_STAGE_OUTPUT_FAILED, stage_index,
@@ -1741,6 +1767,7 @@ bool emit_stage_hlsl_with_variant_plan_mode(
       record.serialized_state = original_state;
       StringBuilder variant_hlsl;
       sb_init_with_capacity(&variant_hlsl, 4096);
+      HLSLHullCoverageCapture *hull_capture = NULL;
       if (!translate_stage_to_hlsl(
               variant_plan->pass, stage_index, subprogram_index, blob_entries,
               entry_count, segments, segment_lengths, segment_count,
@@ -1749,7 +1776,9 @@ bool emit_stage_hlsl_with_variant_plan_mode(
                   variant_plan->shader->keyword_names.keywords,
               (size_t)variant_plan->shader->keyword_names.count, high_level,
               trace && trace->unity_uv_helpers, trace ? trace->unity_uv_used : NULL,
-              source_map ? &record : NULL, quality_capture ? quality_capture->matrix_uses : NULL, diagnostic)) {
+              source_map ? &record : NULL, quality_capture ? quality_capture->matrix_uses : NULL,
+              quality_capture ? quality_capture->hull_coverage : NULL,
+              source_map ? source_map->count : SIZE_MAX, &hull_capture, diagnostic)) {
         sb_free(&variant_hlsl);
         sb_free(&stage_output);
         mem_free(generated_used,
@@ -1781,7 +1810,7 @@ bool emit_stage_hlsl_with_variant_plan_mode(
       }
       const size_t quality_body_begin = stage_output.len;
       append_indented_source(&stage_output, &variant_hlsl,
-                             source_map ? &record.instructions : NULL);
+                             source_map ? &record.instructions : NULL, hull_capture);
       if (!shaderlab_source_quality_capture_body(quality_capture, quality_body_begin,
             stage_output.len, source_map ? source_map->count : SIZE_MAX))
         stage_output.failed = true;
@@ -1825,6 +1854,8 @@ bool emit_stage_hlsl_with_variant_plan_mode(
   sb_append_len(output, stage_output.buf, stage_output.len);
   const bool success = sb_ok(output) &&
       shaderlab_expression_source_map_offset(source_map, first_record, stage_begin) &&
+      shaderlab_hull_coverage_offset(quality_capture ? quality_capture->hull_coverage : NULL,
+          first_record, stage_begin) &&
       shaderlab_source_quality_capture_stage(quality_capture, output, stage_begin,
           first_quality_body, trace ? trace->subshader_index : -1,
           trace ? trace->pass_index : -1, stage_index);

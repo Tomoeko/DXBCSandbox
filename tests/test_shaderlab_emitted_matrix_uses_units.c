@@ -27,6 +27,62 @@ static void fixture_dispose(Fixture *fixture) {
     test_shaderlab_matrix_fixture_dispose(fixture);
 }
 
+static bool owned_input_guarantees(const HLSLOwnedStageInputs *original) {
+    HLSLOwnedStageInputs retained = {0};
+    size_t aggregate = 0;
+    CHECK(hlsl_owned_stage_inputs_capture(&retained, original->target, original->target_size,
+        original->player_payload, original->player_payload_size, &original->current, &original->common, &aggregate));
+    CHECK(aggregate == original->target_size + original->player_payload_size);
+    CHECK(retained.target != original->target && retained.player_payload != original->player_payload);
+    CHECK(hlsl_owned_stage_inputs_equal(original, &retained));
+    ++retained.player.source_map;
+    CHECK(!hlsl_owned_stage_inputs_equal(original, &retained));
+    --retained.player.source_map;
+    CHECK(hlsl_owned_stage_inputs_equal(original, &retained));
+    const size_t captured_bytes = aggregate;
+    uint8_t *captured_target = retained.target, *captured_payload = retained.player_payload;
+    CHECK(!hlsl_owned_stage_inputs_capture(&retained, original->target, original->target_size,
+        original->player_payload, original->player_payload_size, &original->current, &original->common, &aggregate));
+    CHECK(aggregate == captured_bytes && retained.target == captured_target && retained.player_payload == captured_payload);
+    CHECK(hlsl_owned_stage_inputs_equal(original, &retained));
+    hlsl_owned_stage_inputs_dispose(&retained);
+    CHECK(!retained.target && !retained.player_payload && !retained.target_size && !retained.player_payload_size);
+    CHECK(!hlsl_owned_stage_inputs_equal(original, &retained));
+    CHECK(!hlsl_owned_stage_inputs_equal(NULL, original));
+
+    /* All rejected acquisitions retain an empty destination and the original
+     * aggregate reservation, including errors after the first metadata copy. */
+    const SerializedProgramParameters invalid_parameters = {.cb_count = -1};
+    for (unsigned failure = 0; failure < 7; ++failure) {
+        const uint8_t *target = original->target, *payload = original->player_payload;
+        size_t target_size = original->target_size, payload_size = original->player_payload_size;
+        const SerializedProgramParameters *current = &original->current, *common = &original->common;
+        aggregate = 17;
+        switch (failure) {
+        case 0: target_size = HLSL_OWNED_STAGE_INPUT_BYTE_LIMIT + 1; break;
+        case 1: payload_size = HLSL_OWNED_STAGE_INPUT_BYTE_LIMIT; break;
+        case 2: aggregate = HLSL_OWNED_STAGE_INPUT_BYTE_LIMIT; break;
+        case 3: payload_size = 1; break;
+        case 4: current = &invalid_parameters; break;
+        case 5: common = &invalid_parameters; break;
+        case 6: target = NULL; break;
+        }
+        const size_t previous_bytes = aggregate;
+        CHECK(!hlsl_owned_stage_inputs_capture(&retained, target, target_size, payload, payload_size,
+            current, common, &aggregate));
+        CHECK(aggregate == previous_bytes && !retained.target && !retained.target_size &&
+            !retained.player_payload && !retained.player_payload_size && !retained.player.version &&
+            !retained.player.local_keywords && !retained.current.constant_buffers && !retained.common.constant_buffers);
+        hlsl_owned_stage_inputs_dispose(&retained);
+    }
+    aggregate = 0;
+    CHECK(hlsl_owned_stage_inputs_capture(&retained, original->target, original->target_size,
+        original->player_payload, original->player_payload_size, &original->current, &original->common, &aggregate));
+    CHECK(hlsl_owned_stage_inputs_equal(original, &retained));
+    hlsl_owned_stage_inputs_dispose(&retained);
+    return true;
+}
+
 static bool reject_entry(void *context, const ShaderLabSourceSyntaxReceipt *receipt) {
     (void)context;
     return receipt->kind != SHADERLAB_SOURCE_SYNTAX_LINKED_ENTRY;
@@ -97,7 +153,7 @@ static bool opcode_owner_drift(const HLSLMatrixUseCapture *entry) {
     DXBCStageContractDiagnostic contract_diagnostic;
     dxbc_document_init(&document);
     dxbc_stage_contract_init(&contract);
-    CHECK(dxbc_document_parse(&document, entry->target, entry->target_size, &document_diagnostic));
+    CHECK(dxbc_document_parse(&document, entry->inputs.target, entry->inputs.target_size, &document_diagnostic));
     CHECK(dxbc_document_decode_semantic(&document, &semantic));
     CHECK(dxbc_stage_contract_decode(&document, &semantic, &contract, &contract_diagnostic));
     CHECK(usil_translate_with_stage_contract(&program, &semantic, &contract));
@@ -176,6 +232,7 @@ static bool positive_and_mutations(void) {
 
     ShaderLabEmittedMatrixUses *independent = NULL;
     CHECK(shaderlab_emitted_matrix_uses_capture(&request, &independent) == SHADERLAB_MATRIX_USES_OK);
+    CHECK(owned_input_guarantees(&owned->entries[0].inputs));
     CHECK(opcode_ledger_mutations(&request, owned, independent));
     CHECK(opcode_owner_drift(&owned->entries[0]));
     ASTExpr *left_tree = owned->entries[0].uses[0].tree;
@@ -222,15 +279,15 @@ static bool positive_and_mutations(void) {
     ++entry->reads.fields[0].declared_byte_size;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
     --entry->reads.fields[0].declared_byte_size;
-    entry->target[4] ^= 1;
+    entry->inputs.target[4] ^= 1;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
-    entry->target[4] ^= 1;
-    entry->player_payload[8] ^= 1;
+    entry->inputs.target[4] ^= 1;
+    entry->inputs.player_payload[8] ^= 1;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
-    entry->player_payload[8] ^= 1;
-    ++entry->current.constant_buffers[0].size;
+    entry->inputs.player_payload[8] ^= 1;
+    ++entry->inputs.current.constant_buffers[0].size;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
-    --entry->current.constant_buffers[0].size;
+    --entry->inputs.current.constant_buffers[0].size;
     --entry->use_count;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
     ++entry->use_count;
@@ -250,9 +307,9 @@ static bool positive_and_mutations(void) {
     ++entry->raw_map.origins[0].source_instruction_index;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
     --entry->raw_map.origins[0].source_instruction_index;
-    ++entry->player.source_map;
+    ++entry->inputs.player.source_map;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
-    --entry->player.source_map;
+    --entry->inputs.player.source_map;
     fixture.segments[0][8] ^= 1;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
     fixture.segments[0][8] ^= 1;
@@ -265,9 +322,9 @@ static bool positive_and_mutations(void) {
     fixture.buffer.has_is_partial = true;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
     fixture.buffer.has_is_partial = false;
-    ++entry->common.constant_buffers[0].size;
+    ++entry->inputs.common.constant_buffers[0].size;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
-    --entry->common.constant_buffers[0].size;
+    --entry->inputs.common.constant_buffers[0].size;
     ++fixture.identities[0].hardware_tier_group;
     CHECK(!shaderlab_emitted_matrix_uses_replay(&request, owned));
     --fixture.identities[0].hardware_tier_group;

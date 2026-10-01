@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "test_tessellation_fixture.h"
+#include "dxbc/dxbc_document.h"
 #include "dxbc/dxbc_hash.h"
 
 #include <stdlib.h>
@@ -12,6 +13,11 @@
 static void write_u32(uint8_t *bytes, uint32_t value) {
     for (unsigned byte = 0; byte < 4; ++byte)
         bytes[byte] = (uint8_t)(value >> (8 * byte));
+}
+
+static uint32_t read_u32(const uint8_t *bytes) {
+    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 |
+        (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
 }
 
 /* Authored token grammar and signatures, with no captured byte array. */
@@ -203,6 +209,80 @@ uint8_t *test_tessellation_hull_dxbc(uint32_t points, uint32_t output_points, ui
 uint8_t *test_tessellation_hull_float3_dxbc(uint32_t points, uint32_t output_points,
     uint8_t scenario, const char *semantic, size_t *size) {
     return make_hull_dxbc(points, output_points, scenario, semantic, true, size);
+}
+
+/* Reuse the authored signatures and instruction grammar above. The lossless
+ * decoder supplies bounded instruction coordinates; this existing transform
+ * adds one scalar buffer and two final clamps without another token parser. */
+uint8_t *test_tessellation_hull_scalar_cbuffer_dxbc(uint32_t input_points,
+    uint32_t output_points, bool float3, const char *semantic, size_t *size) {
+    if (!size) return NULL;
+    size_t original_size = 0;
+    uint8_t *bytes = float3
+        ? test_tessellation_hull_float3_dxbc(input_points, output_points, 0, semantic, &original_size)
+        : test_tessellation_hull_dxbc(input_points, output_points, 0, &original_size);
+    if (!bytes) return NULL;
+    DXBCDocument document;
+    DXBCDocumentDiagnostic diagnostic;
+    dxbc_document_init(&document);
+    uint8_t *authored = NULL;
+    if (!dxbc_document_parse(&document, bytes, original_size, &diagnostic) || !document.instruction_count) goto fail;
+    const DXBCDocumentChunk *chunk = &document.chunks[document.instructions[0].chunk_index];
+    if (chunk->kind != DXBC_DOCUMENT_CHUNK_EXECUTABLE || chunk->offset + chunk->raw_size != original_size) goto fail;
+    uint32_t words[128];
+    size_t count = 0;
+    bool declared = false;
+    unsigned clamps = 0;
+    for (size_t index = 0; index < document.instruction_count; ++index) {
+        const DXBCDocumentInstruction *instruction = &document.instructions[index];
+        if (instruction->chunk_index != document.instructions[0].chunk_index ||
+            instruction->token_count >= 32 || count + instruction->token_count + 8 >= 128) goto fail;
+        if (instruction->opcode == 115 && !declared) {
+            words[count++] = INSTRUCTION(89, 4);
+            words[count++] = UINT32_C(0x00208000);
+            words[count++] = 0;
+            words[count++] = 1;
+            declared = true;
+        }
+        const uint32_t destination = instruction->token_count > 1 ? read_u32(instruction->raw_bytes + 4) : 0;
+        if (instruction->opcode == 54 &&
+            (destination == UINT32_C(0x00902012) || destination == UINT32_C(0x00102012))) {
+            if (instruction->token_count != (destination == UINT32_C(0x00902012) ? 6u : 5u)) goto fail;
+            words[count++] = INSTRUCTION(51, instruction->token_count + 3);
+            for (uint32_t word = 1; word < instruction->token_count - 2; ++word)
+                words[count++] = read_u32(instruction->raw_bytes + word * 4);
+            words[count++] = UINT32_C(0x0020800a);
+            words[count++] = 0;
+            words[count++] = 0;
+            words[count++] = UINT32_C(0x00004001);
+            words[count++] = UINT32_C(0x42000000);
+            ++clamps;
+        } else {
+            for (uint32_t word = 0; word < instruction->token_count; ++word)
+                words[count++] = read_u32(instruction->raw_bytes + word * 4);
+        }
+    }
+    if (!declared || clamps != 2) goto fail;
+    const size_t instruction_offset = (size_t)chunk->offset + 16;
+    const size_t authored_size = instruction_offset + count * 4;
+    authored = calloc(authored_size, 1);
+    if (!authored) goto fail;
+    memcpy(authored, bytes, instruction_offset);
+    write_u32(authored + 24, (uint32_t)authored_size);
+    write_u32(authored + chunk->offset + 4, (uint32_t)(count * 4 + 8));
+    write_u32(authored + chunk->offset + 12, (uint32_t)(count + 2));
+    for (size_t word = 0; word < count; ++word)
+        write_u32(authored + instruction_offset + word * 4, words[word]);
+    if (!dxbc_compute_hash(authored, authored_size, authored + 4)) goto fail;
+    dxbc_document_free(&document);
+    free(bytes);
+    *size = authored_size;
+    return authored;
+fail:
+    dxbc_document_free(&document);
+    free(bytes);
+    free(authored);
+    return NULL;
 }
 
 

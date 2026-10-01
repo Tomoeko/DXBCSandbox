@@ -128,9 +128,13 @@ producers or enlarge the closed whole-shader scope above.
 Private HULL coverage records configuration, patch helper and entry-point units
 separately, including owned expression trees, source spans and typed phase or
 signature owners for structural values. It preserves the normal emitted source
-and classification. Body and declaration obligations remain open until a separate
-factory replays immutable target bytes and current metadata through the complete
-ShaderLab producer. Local capture integrity does not supply that receipt.
+and classification. A separate owned HULL factory captures every selected HULL
+entry in one complete vertex/fragment plus paired hull/domain pass through the
+normal ShaderLab producer. It owns target/player bytes and current/common metadata,
+binds local roots, units and syntax to separate whole-source placements, and
+replays the normal inventory plus fresh typed capture. Body and declaration gaps
+remain open. This source-integrity receipt does not prove linked compilation,
+exact DXBC, original source identity or runtime acceptance.
 
 Native compute preprocessing and kernel responses remain compiler observations.
 Their canonical identities retain every ordered request field and current
