@@ -136,6 +136,19 @@ replays the normal inventory plus fresh typed capture. Body and declaration gaps
 remain open. This source-integrity receipt does not prove linked compilation,
 exact DXBC, original source identity or runtime acceptance.
 
+The bounded parsed HULL immediate-constant lift emits one `static const float`
+array of two through four rows. It retains every DWORD and the actual raw
+declaration, selected column, consuming phase, demanded operands and declared
+ForkID or earlier singleton SSA MOV chain. Unused columns must contain exact
+positive zero; nonfinite values, dead consumers, mixed phases or columns and
+offset addressing reject. Each literal and access has a separately owned AST
+and source span, and the whole-source receipt retains the declaration placement.
+Ordinary emission and fresh capture share the same admission checks. Configuration
+coverage remains incomplete, so this array lift remains MIXED. A controlled native
+one-column experiment matches its complete container; compiler packing outside
+the admitted column remains unsupported. This does not establish stage-wide
+array support, linked-stage compilation or a runtime certificate.
+
 Native compute preprocessing and kernel responses remain compiler observations.
 Their canonical identities retain every ordered request field and current
 compiler/include authority. Malformed or over-budget responses discard partial

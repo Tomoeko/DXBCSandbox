@@ -18,6 +18,12 @@
 
 enum { PROBE_SOURCE_LIMIT = 1024 * 1024, PROBE_DIRECTORY_LIMIT = 4096 };
 
+typedef struct {
+    size_t begin, end;
+    uint32_t original_bits;
+    bool valid;
+} OwnedLiteralMutation;
+
 /* Manual selected-native HULL comparison. V/D/F are authored compilation
  * stubs. It grants no Editor, import, linked-stage or runtime certificate. */
 static const char *const default_shader_name =
@@ -224,7 +230,8 @@ static bool compile_source(UnityCompilerChannel *channel, const char *role,
  */
 static bool reconstruct_hull(const DXBCContainerView *target,
                              const SerializedProgramParameters *parameters,
-                             StringBuilder *source) {
+                             StringBuilder *source, bool icb_fixture,
+                             OwnedLiteralMutation *icb_mutation) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -246,6 +253,11 @@ static bool reconstruct_hull(const DXBCContainerView *target,
         program.input_count != 1 || program.output_count != 1 ||
         program.inputs[0].mask != 7 || program.outputs[0].mask != 7)
         goto done;
+    if (icb_fixture && (!icb_mutation || !program.icb_value_count ||
+                        !usil_icb_declaration_is_valid(&program))) {
+        fputs("Requested native ICB grammar was not produced.\n", stderr);
+        goto done;
+    }
     HLSLExpressionSourceMap map = {0};
     HLSLSourceQualityResult quality = {0};
     HLSLEmitDiagnostic diagnostic;
@@ -253,22 +265,39 @@ static bool reconstruct_hull(const DXBCContainerView *target,
     options.expression_source_map = &map;
     options.source_quality = &quality;
     const HLSLEmitNames names = {.entry_point = "hull"};
-    if (parameters) {
-        printf("scalar_target phases=%zu cbuffers=%d icb_words=%d instructions=%d\n",
+    if (parameters || icb_fixture) {
+        const char *kind = icb_fixture ? "icb" : "scalar";
+        printf("%s_target phases=%zu cbuffers=%d icb_words=%d instructions=%d\n", kind,
                program.tessellation.phase_count, program.cbuffer_count,
                program.icb_value_count, program.instruction_count);
         for (size_t index = 0; index < program.tessellation.phase_count; ++index) {
             const USILHullPhase *phase = &program.tessellation.phases[index];
-            printf("scalar_phase=%zu kind=%u instances=%u first=%d end=%d\n",
-                   index, (unsigned)phase->kind, phase->instance_count,
+            printf("%s_phase=%zu kind=%u instances=%u first=%d end=%d\n",
+                   kind, index, (unsigned)phase->kind, phase->instance_count,
                    phase->first_instruction_index, phase->end_instruction_index);
         }
         for (int index = 0; index < program.instruction_count; ++index) {
             const USILInstruction *instruction = &program.instructions[index];
-            printf("scalar_instruction=%d opcode=%u operands=%d destination_mask=%u\n",
-                   index, (unsigned)instruction->opcode, instruction->operand_count,
+            printf("%s_instruction=%d opcode=%u operands=%d destination_mask=%u\n",
+                   kind, index, (unsigned)instruction->opcode, instruction->operand_count,
                    instruction->operand_count ? usil_operand_destination_lane_mask(
                        &instruction->operands[0]) : 0);
+        }
+        if (icb_fixture) {
+            for (int word = 0; word < program.icb_value_count && word < HLSL_HULL_ICB_WORD_LIMIT; ++word)
+                printf("icb_word=%d bits=0x%08" PRIx32 "\n", word, program.icb_values[word]);
+            for (int index = 0; index < program.instruction_count && index < HLSL_HULL_ICB_CONSUMER_LIMIT; ++index) {
+                const USILInstruction *instruction = &program.instructions[index];
+                for (int operand = 1; operand < instruction->operand_count; ++operand) {
+                    const DXBCOperand *source_operand = &instruction->operands[operand];
+                    if (source_operand->type != OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER) continue;
+                    printf("icb_consumer instruction=%d operand=%d dimensions=%d base=%d "
+                           "swizzle_mode=%u column=%u relative_type=%u\n", index, operand,
+                           source_operand->register_index_dim, source_operand->register_index,
+                           source_operand->swizzle_mode, source_operand->swizzle[0],
+                           source_operand->rel_op0 ? (unsigned)source_operand->rel_op0->type : UINT32_MAX);
+                }
+            }
         }
     }
     if (!hlsl_emit_with_options_diagnostic(&program, source, parameters, NULL, &names,
@@ -286,13 +315,17 @@ static bool reconstruct_hull(const DXBCContainerView *target,
     for (size_t index = 0; index < map.count; ++index)
         if (map.origins[index].kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP)
             ++compiler_clamps;
-    accepted = quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
-               !quality.counts.unknown_provenance &&
-               !quality.counts.incomplete_units && map_valid;
+    const bool quality_observed = icb_fixture
+        ? quality.classification == HLSL_SOURCE_QUALITY_MIXED &&
+          quality.counts.incomplete_units == 1
+        : quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+          !quality.counts.incomplete_units;
+    accepted = quality_observed && !quality.counts.unknown_provenance && map_valid;
     printf("source scope=%s quality=%s map_valid=%d "
            "instructions=%d units=%zu compiler_clamps=%zu "
            "input_mask=%u input_rw=%u output_mask=%u output_rw=%u\n",
-           parameters ? "controlled-scalar-API-calibration" : "target-only-hull",
+           icb_fixture ? "target-only-icb-hull-configuration-gap"
+                       : parameters ? "controlled-scalar-API-calibration" : "target-only-hull",
            hlsl_source_quality_class_name(quality.classification), map_valid,
            program.instruction_count, quality.counts.inspected_units, compiler_clamps,
            program.inputs[0].mask, program.inputs[0].rw_mask,
@@ -323,6 +356,27 @@ static bool reconstruct_hull(const DXBCContainerView *target,
            coverage.syntax_count, coverage.obligations, unchanged);
     accepted = accepted && coverage_valid && unchanged && coverage.unit_count == 3 &&
         (coverage.obligations & HLSL_STAGE_COVERAGE_BODY);
+    if (icb_fixture) {
+        const HLSLHullICBPlan *plan = &coverage.hull_icb.plan;
+        const size_t root_index = coverage.hull_icb.literal_root_indices[0];
+        accepted = accepted && plan->present && plan->row_count == 3 &&
+            plan->consumer_count && root_index < coverage.root_count;
+        if (accepted) {
+            const HLSLStageOwnedRoot *literal = &coverage.roots[root_index];
+            accepted = literal->begin < literal->end && literal->end <= source->len;
+            if (accepted) {
+                *icb_mutation = (OwnedLiteralMutation){literal->begin, literal->end,
+                    plan->payload[plan->physical_column], true};
+                printf("icb_target words=%zu rows=%zu column=%u consumers=%zu transports=%zu "
+                       "declaration=%u token=0x%x block_words=%u configuration_gap=retained\n",
+                       (size_t)plan->payload_count, (size_t)plan->row_count,
+                       (unsigned)plan->physical_column,
+                       (size_t)plan->consumer_count, (size_t)plan->transport_count,
+                       plan->declaration_source_instruction_index, plan->declaration_token,
+                       plan->declaration_word_count);
+            }
+        }
+    }
     hlsl_stage_coverage_dispose(&coverage);
     sb_free(&owned_source);
 done:
@@ -364,11 +418,32 @@ static bool candidate_wrapper(const StringBuilder *hull,
 
 static bool changed_factor_wrapper(const StringBuilder *hull,
                                    StringBuilder *wrapper, const char *shader_name,
-                                   bool scalar_fixture) {
+                                   bool scalar_fixture, const OwnedLiteralMutation *icb_mutation) {
     /* Match exactly one owned factor assignment in either controlled fixture.
      * A failed cold comparison remains a failure after this replay check. */
     if (!sb_ok(hull) || !hull->buf || hull->len > PROBE_SOURCE_LIMIT)
         return false;
+    if (icb_mutation) {
+        if (!icb_mutation->valid || icb_mutation->begin >= icb_mutation->end ||
+            icb_mutation->end > hull->len) return false;
+        const uint32_t changed_bits = icb_mutation->original_bits == UINT32_C(0x40200000)
+            ? UINT32_C(0x40700000) : UINT32_C(0x40200000);
+        ASTExpr *literal = ast_create_literal_bits(&changed_bits, 1, AST_SCALAR_FLOAT32);
+        if (!literal) return false;
+        StringBuilder mutated;
+        sb_init(&mutated);
+        sb_append_len(&mutated, hull->buf, icb_mutation->begin);
+        ast_format_expr(literal, &mutated);
+        sb_append_len(&mutated, hull->buf + icb_mutation->end, hull->len - icb_mutation->end);
+        ast_free_expr(literal);
+        const bool built = sb_ok(&mutated) && candidate_wrapper(&mutated, wrapper, shader_name);
+        if (built) {
+            puts("warm_mutation owned_icb_literal_span=1 classification=not-promoted");
+            print_hash("mutated_hull_sha256", mutated.buf, mutated.len);
+        }
+        sb_free(&mutated);
+        return built;
+    }
     const char *original = "factors.outer[factorIndex] = 3.0f;";
     const char *changed = "factors.outer[factorIndex] = 5.0f;";
     if (scalar_fixture) {
@@ -519,12 +594,14 @@ compiler_environment_equal(const UnityCompilerToolchainProvenance *left,
 static void usage(const char *name) {
     fprintf(
         stderr,
-        "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--scalar-fixture "
-        "[--static-factor-calibration]]\n"
+        "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
+        "--scalar-fixture [--static-factor-calibration]]\n"
         "Use '-' for no additional includes. Selected-native HULL comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
         "validated against native reflection; no player metadata authority.\n"
+        "--icb-fixture requires an actual parsed scalar table; its configuration "
+        "gap remains MIXED.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n",
         name);
@@ -535,17 +612,19 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
-    if (argc != 4 && ((argc != 5 && argc != 6) ||
-        strcmp(argv[4], "--scalar-fixture") ||
-        (argc == 6 && strcmp(argv[5], "--static-factor-calibration")))) {
+    const bool scalar_fixture = argc >= 5 && !strcmp(argv[4], "--scalar-fixture");
+    const bool icb_fixture = argc == 5 && !strcmp(argv[4], "--icb-fixture");
+    const bool calibrate_static_factors = argc == 6 && scalar_fixture &&
+        !strcmp(argv[5], "--static-factor-calibration");
+    if (argc != 4 && !icb_fixture &&
+        !(scalar_fixture && (argc == 5 || calibrate_static_factors))) {
         usage(argv[0]);
         return 2;
     }
     CommonFileBytes authored = {0};
-    const bool scalar_fixture = argc >= 5;
-    const bool calibrate_static_factors = argc == 6;
     const char *shader_name = scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
-                                            : default_shader_name;
+        : icb_fixture ? "Fixture/HighLevel/HullFloat3ICB" : default_shader_name;
+    OwnedLiteralMutation icb_mutation = {0};
     SerializedVariable field = {.name = "_Factor", .layout = {0, 0, 0, 1, 0, 0}};
     SerializedConstantBuffer buffer = {.name = "FactorInputs", .size = 16,
         .role = SERIALIZED_CBUFFER_NAMED, .variables = &field, .var_count = 1};
@@ -602,12 +681,13 @@ int main(int argc, char **argv) {
         goto done;
     }
     if (scalar_fixture) printf("controlled_API_layout_native_reflection_checked=1\n");
-    if (!dxbc_container_view_first(compiled[0].data, compiled[0].size,
-                                   &target) ||
-        !reconstruct_hull(&target, scalar_fixture ? &parameters : NULL, &hull) ||
-        !candidate_wrapper(&hull, &wrapper, shader_name))
+    if (!dxbc_container_view_first(compiled[0].data, compiled[0].size, &target))
         goto done;
     print_hash("target_complete_dxbc_sha256", target.data, target.size);
+    if (!reconstruct_hull(&target, scalar_fixture ? &parameters : NULL, &hull,
+                          icb_fixture, icb_fixture ? &icb_mutation : NULL) ||
+        !candidate_wrapper(&hull, &wrapper, shader_name))
+        goto done;
     print_hash("reconstructed_hull_sha256", hull.buf, hull.len);
     printf("generated_hull_begin\n%s\ngenerated_hull_end\n", hull.buf);
     /* Retain the owned target response and contract, but remove all native
@@ -665,7 +745,7 @@ int main(int argc, char **argv) {
            comparison.instruction_index, comparison.token_index,
            comparison.expected_value, comparison.actual_value);
     const bool cold_equal = status == DXBC_COMPARE_EQUAL;
-    if (!controls_equal || !toolchain_equal || (!cold_equal && !scalar_fixture))
+    if (!controls_equal || !toolchain_equal || (!cold_equal && !scalar_fixture && !icb_fixture))
         goto done;
 
     /* A changed source must affect a warm compiler, and returning to the
@@ -673,7 +753,8 @@ int main(int argc, char **argv) {
     const pid_t candidate_process = channel.process_id;
     DXBCContainerView changed = {0}, repeated = {0};
     if (!candidate_process ||
-        !changed_factor_wrapper(&hull, &changed_wrapper, shader_name, scalar_fixture) ||
+        !changed_factor_wrapper(&hull, &changed_wrapper, shader_name, scalar_fixture,
+                                icb_fixture ? &icb_mutation : NULL) ||
         !compile_source(&channel, "warm-mutated-hull", changed_wrapper.buf,
                         directory, shader_name, valid_apis, &preprocessing[2], &requests[2],
                         &compiled[2], &provenance[2]) ||

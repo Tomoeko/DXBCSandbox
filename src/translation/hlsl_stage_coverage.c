@@ -5,6 +5,7 @@
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
 #include "translation/hlsl_source_quality_internal.h"
+#include "translation/hlsl_source_identifier.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,76 @@ static bool declaration_equal(const USILSignatureDeclaration *a, const USILSigna
         a->has_system_value == b->has_system_value && a->system_value_name == b->system_value_name &&
         a->has_interpolation == b->has_interpolation && a->interpolation_mode == b->interpolation_mode &&
         a->source_instruction_index == b->source_instruction_index;
+}
+
+bool hlsl_hull_icb_operands_equal(const HLSLHullICBOperandSnapshot *a, const HLSLHullICBOperandSnapshot *b) {
+    if (!a || !b) return false;
+    if (a->type != b->type || a->raw_token != b->raw_token || a->register_index != b->register_index ||
+        a->register_index_dim != b->register_index_dim || a->swizzle_mode != b->swizzle_mode ||
+        a->destination_mask != b->destination_mask) return false;
+    for (size_t lane = 0; lane < 4; ++lane)
+        if (a->swizzle[lane] != b->swizzle[lane]) return false;
+    for (size_t dimension = 0; dimension < 3; ++dimension)
+        if (a->rel_offsets[dimension] != b->rel_offsets[dimension] ||
+            a->index_values[dimension] != b->index_values[dimension] ||
+            a->index_representations[dimension] != b->index_representations[dimension] ||
+            a->index_has_immediate[dimension] != b->index_has_immediate[dimension] ||
+            a->index_value_exceeds_int[dimension] != b->index_value_exceeds_int[dimension]) return false;
+    return true;
+}
+
+bool hlsl_hull_icb_consumers_equal(const HLSLHullICBConsumer *a, const HLSLHullICBConsumer *b) {
+    return a && b && a->instruction_index == b->instruction_index && a->source_instruction_index == b->source_instruction_index &&
+        a->operand_index == b->operand_index && a->demanded_lanes == b->demanded_lanes &&
+        a->physical_column == b->physical_column && a->direct_fork_id == b->direct_fork_id &&
+        a->transport_tail == b->transport_tail && hlsl_hull_icb_operands_equal(&a->operand, &b->operand) &&
+        hlsl_hull_icb_operands_equal(&a->relative, &b->relative);
+}
+
+static bool icb_transports_equal(const HLSLHullICBTransport *a, const HLSLHullICBTransport *b) {
+    return a->instruction_index == b->instruction_index && a->source_instruction_index == b->source_instruction_index &&
+        a->destination_lane == b->destination_lane && a->source_lane == b->source_lane &&
+        a->predecessor_transport == b->predecessor_transport &&
+        hlsl_hull_icb_operands_equal(&a->destination, &b->destination) && hlsl_hull_icb_operands_equal(&a->source, &b->source);
+}
+
+bool hlsl_hull_icb_plans_equal(const HLSLHullICBPlan *a, const HLSLHullICBPlan *b) {
+    if (!a || !b || a->payload_count > HLSL_HULL_ICB_WORD_LIMIT || b->payload_count > HLSL_HULL_ICB_WORD_LIMIT ||
+        a->row_count > HLSL_HULL_ICB_ROW_LIMIT || b->row_count > HLSL_HULL_ICB_ROW_LIMIT ||
+        a->consumer_count > HLSL_HULL_ICB_CONSUMER_LIMIT || b->consumer_count > HLSL_HULL_ICB_CONSUMER_LIMIT ||
+        a->transport_count > HLSL_HULL_ICB_TRANSPORT_LIMIT || b->transport_count > HLSL_HULL_ICB_TRANSPORT_LIMIT ||
+        a->present != b->present || a->declaration_source_instruction_index != b->declaration_source_instruction_index ||
+        a->declaration_token != b->declaration_token || a->declaration_word_count != b->declaration_word_count ||
+        a->payload_count != b->payload_count || a->row_count != b->row_count || a->physical_column != b->physical_column ||
+        a->phase_index != b->phase_index || !phase_equal(&a->phase, &b->phase) ||
+        a->fork_declaration_index != b->fork_declaration_index || !declaration_equal(&a->fork_declaration, &b->fork_declaration) ||
+        a->consumer_count != b->consumer_count || a->transport_count != b->transport_count ||
+        memcmp(a->array_name, b->array_name, sizeof(a->array_name)) ||
+        memcmp(a->index_name, b->index_name, sizeof(a->index_name))) return false;
+    for (size_t word = 0; word < HLSL_HULL_ICB_WORD_LIMIT; ++word)
+        if (a->payload[word] != b->payload[word]) return false;
+    /* Unused slots remain canonical too, so partial or mutated retained plans
+     * cannot hide ownership outside their advertised counts. */
+    for (size_t index = 0; index < HLSL_HULL_ICB_CONSUMER_LIMIT; ++index)
+        if (!hlsl_hull_icb_consumers_equal(&a->consumers[index], &b->consumers[index])) return false;
+    for (size_t index = 0; index < HLSL_HULL_ICB_TRANSPORT_LIMIT; ++index)
+        if (!icb_transports_equal(&a->transports[index], &b->transports[index])) return false;
+    return true;
+}
+
+bool hlsl_stage_coverage_hull_icb_empty(const HLSLStageHullICB *icb) {
+    const HLSLHullICBPlan empty = {0};
+    if (!icb || icb->plan_captured || icb->recorded_plan_captured || icb->declaration_emitted ||
+        icb->recorded_declaration_emitted || icb->declaration_begin || icb->declaration_end ||
+        icb->recorded_declaration_begin || icb->recorded_declaration_end ||
+        icb->literal_root_count || icb->recorded_literal_root_count ||
+        icb->access_root_count || icb->recorded_access_root_count ||
+        !hlsl_hull_icb_plans_equal(&icb->plan, &empty) || !hlsl_hull_icb_plans_equal(&icb->recorded_plan, &empty)) return false;
+    for (size_t row = 0; row < HLSL_HULL_ICB_ROW_LIMIT; ++row)
+        if (icb->literal_root_indices[row] || icb->recorded_literal_root_indices[row]) return false;
+    for (size_t consumer = 0; consumer < HLSL_HULL_ICB_CONSUMER_LIMIT; ++consumer)
+        if (icb->access_root_indices[consumer] || icb->recorded_access_root_indices[consumer]) return false;
+    return true;
 }
 
 static bool hull_contract_view(HLSLStageHullContract *view, const USILProgram *program) {
@@ -164,7 +235,8 @@ static bool omitted_matrix_block_supported(const HLSLEmitterContext *ctx, int in
 bool hlsl_stage_coverage_begin(HLSLEmitterContext *ctx) {
     HLSLStageCoverage *coverage = current_coverage(ctx);
     if (!coverage) return true;
-    if (coverage->began || !ctx->program || !ctx->program->instructions || ctx->program->instruction_count < 1 ||
+    if (coverage->began || !hlsl_stage_coverage_hull_icb_empty(&coverage->hull_icb) ||
+        !ctx->program || !ctx->program->instructions || ctx->program->instruction_count < 1 ||
         ctx->program->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT) return false;
     coverage->began = true;
     coverage->stage = ctx->program->program_type;
@@ -262,16 +334,142 @@ static int instruction_phase(const HLSLStageCoverage *coverage, int instruction)
     return -1;
 }
 
+static bool icb_plan_valid(const HLSLStageCoverage *coverage) {
+    const HLSLStageHullICB *icb = &coverage->hull_icb;
+    const HLSLHullICBPlan *plan = &icb->plan;
+    if (!icb->plan_captured || !icb->recorded_plan_captured ||
+        !hlsl_hull_icb_plans_equal(plan, &icb->recorded_plan)) return false;
+    if (!plan->present) {
+        const HLSLHullICBPlan empty = {0};
+        return hlsl_hull_icb_plans_equal(plan, &empty);
+    }
+    const HLSLStageHullContract *contract = &coverage->hull_contract;
+    if (coverage->schema != HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT ||
+        !contract->tessellation.phase_count || contract->tessellation.phase_count > 3 ||
+        contract->signature_declaration_count < 1 || contract->signature_declaration_count > 11 ||
+        !coverage->instruction_count || coverage->instruction_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
+        plan->row_count < 2 || plan->row_count > HLSL_HULL_ICB_ROW_LIMIT ||
+        plan->payload_count != plan->row_count * 4 || plan->physical_column >= 4 ||
+        plan->declaration_word_count != plan->payload_count + 2 ||
+        plan->phase_index < 0 || (size_t)plan->phase_index >= contract->tessellation.phase_count ||
+        contract->phases[0].kind == DXBC_HULL_PHASE_CONTROL_POINT ||
+        !phase_equal(&plan->phase, &contract->phases[plan->phase_index]) ||
+        plan->phase.kind != DXBC_HULL_PHASE_FORK || plan->phase.instance_count != plan->row_count ||
+        plan->phase.first_instruction_index < 0 || plan->phase.end_instruction_index <= plan->phase.first_instruction_index ||
+        plan->phase.end_instruction_index > (int)coverage->instruction_count ||
+        plan->declaration_source_instruction_index >= contract->phases[0].marker_source_instruction_index ||
+        plan->fork_declaration_index >= (size_t)contract->signature_declaration_count ||
+        !declaration_equal(&plan->fork_declaration, &contract->signature_declarations[plan->fork_declaration_index]) ||
+        plan->fork_declaration.operand_type != OPERAND_TYPE_FORK_INSTANCE_ID ||
+        !plan->consumer_count || plan->consumer_count > HLSL_HULL_ICB_CONSUMER_LIMIT ||
+        plan->transport_count > HLSL_HULL_ICB_TRANSPORT_LIMIT ||
+        !memchr(plan->array_name, 0, sizeof(plan->array_name)) ||
+        !memchr(plan->index_name, 0, sizeof(plan->index_name)) ||
+        !hlsl_source_identifier_valid(plan->array_name) || !hlsl_source_identifier_valid(plan->index_name) ||
+        !strcmp(plan->array_name, plan->index_name)) return false;
+    for (size_t word = 0; word < HLSL_HULL_ICB_WORD_LIMIT; ++word) {
+        const bool selected = word < plan->payload_count && word % 4 == plan->physical_column;
+        if (selected ? (plan->payload[word] & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000) : plan->payload[word] != 0)
+            return false;
+    }
+    for (size_t index = 0; index < plan->transport_count; ++index) {
+        const HLSLHullICBTransport *edge = &plan->transports[index];
+        const int instruction = edge->instruction_index;
+        if (instruction < plan->phase.first_instruction_index || instruction >= plan->phase.end_instruction_index ||
+            instruction < 0 || (size_t)instruction >= coverage->instruction_count ||
+            coverage->opcodes[instruction] != USIL_OP_MOV || coverage->operand_counts[instruction] != 2 ||
+            edge->source_instruction_index != coverage->source_instructions[instruction] ||
+            edge->destination.type != OPERAND_TYPE_TEMP || edge->destination_lane >= 4 || edge->source_lane >= 4 ||
+            coverage->destination_lanes[instruction] != (uint8_t)(1u << edge->destination_lane) ||
+            !coverage->operand_uses[instruction][1].is_source ||
+            edge->source.type != coverage->operand_uses[instruction][1].type) return false;
+        for (size_t previous = 0; previous < index; ++previous)
+            if (plan->transports[previous].instruction_index == instruction &&
+                plan->transports[previous].destination_lane == edge->destination_lane) return false;
+        if (edge->predecessor_transport == -1) {
+            if (edge->source.type != OPERAND_TYPE_FORK_INSTANCE_ID || edge->source_lane) return false;
+        } else {
+            if (edge->predecessor_transport < 0 || (size_t)edge->predecessor_transport >= plan->transport_count ||
+                edge->source.type != OPERAND_TYPE_TEMP) return false;
+            const HLSLHullICBTransport *previous = &plan->transports[edge->predecessor_transport];
+            if (previous->instruction_index >= instruction || previous->destination.register_index != edge->source.register_index ||
+                previous->destination_lane != edge->source_lane) return false;
+        }
+    }
+    bool used[HLSL_HULL_ICB_TRANSPORT_LIMIT] = {false};
+    for (size_t index = 0; index < plan->consumer_count; ++index) {
+        const HLSLHullICBConsumer *consumer = &plan->consumers[index];
+        const int instruction = consumer->instruction_index, operand = consumer->operand_index;
+        if (instruction < plan->phase.first_instruction_index || instruction >= plan->phase.end_instruction_index ||
+            instruction < 0 || (size_t)instruction >= coverage->instruction_count || operand < 1 ||
+            coverage->operand_counts[instruction] > DXBC_MAX_OPERANDS ||
+            operand >= (int)coverage->operand_counts[instruction] ||
+            consumer->source_instruction_index != coverage->source_instructions[instruction] ||
+            consumer->physical_column != plan->physical_column || !consumer->demanded_lanes ||
+            consumer->demanded_lanes & ~15u || consumer->operand.type != OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER ||
+            consumer->operand.swizzle_mode != 2 || consumer->operand.swizzle[0] != plan->physical_column ||
+            !coverage->operand_uses[instruction][operand].is_source ||
+            coverage->operand_uses[instruction][operand].type != OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER ||
+            coverage->operand_uses[instruction][operand].source_lanes != consumer->demanded_lanes ||
+            (index && (instruction < plan->consumers[index - 1].instruction_index ||
+                (instruction == plan->consumers[index - 1].instruction_index && operand <= plan->consumers[index - 1].operand_index))))
+            return false;
+        if (consumer->direct_fork_id) {
+            if (consumer->transport_tail != -1 || consumer->relative.type != OPERAND_TYPE_FORK_INSTANCE_ID) return false;
+            continue;
+        }
+        if (consumer->relative.type != OPERAND_TYPE_TEMP || consumer->relative.swizzle_mode != 2 ||
+            consumer->transport_tail < 0 || (size_t)consumer->transport_tail >= plan->transport_count) return false;
+        const HLSLHullICBTransport *tail = &plan->transports[consumer->transport_tail];
+        if (tail->instruction_index >= instruction || tail->destination.register_index != consumer->relative.register_index ||
+            tail->destination_lane != consumer->relative.swizzle[0]) return false;
+        int edge = consumer->transport_tail;
+        for (size_t depth = 0; edge >= 0; ++depth) {
+            if (depth >= HLSL_HULL_ICB_TRANSPORT_LIMIT || (size_t)edge >= plan->transport_count) return false;
+            used[edge] = true;
+            edge = plan->transports[edge].predecessor_transport;
+        }
+    }
+    for (size_t index = 0; index < plan->transport_count; ++index)
+        if (!used[index]) return false;
+    return true;
+}
+
+bool hlsl_stage_coverage_hull_icb_plan(HLSLEmitterContext *ctx, const HLSLHullICBPlan *plan) {
+    HLSLStageCoverage *coverage = current_coverage(ctx);
+    if (!coverage) return true;
+    if (!coverage->began || coverage->finished || coverage->schema != HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT ||
+        coverage->unit_count || coverage->root_count || coverage->syntax_count || !plan ||
+        !hlsl_stage_coverage_hull_icb_empty(&coverage->hull_icb) || !hlsl_hull_icb_plan_matches(ctx->program, plan)) return false;
+    coverage->hull_icb.plan = *plan;
+    coverage->hull_icb.recorded_plan = *plan;
+    coverage->hull_icb.plan_captured = coverage->hull_icb.recorded_plan_captured = true;
+    return icb_plan_valid(coverage);
+}
+
 static bool root_owners_equal(const HLSLStageRootOwner *a, const HLSLStageRootOwner *b) {
     return a->kind == b->kind && a->phase_index == b->phase_index &&
         a->source_instruction_index == b->source_instruction_index && a->value_bits == b->value_bits &&
         a->instance_count == b->instance_count && a->input_signature_index == b->input_signature_index &&
-        a->output_signature_index == b->output_signature_index;
+        a->output_signature_index == b->output_signature_index && a->icb_index == b->icb_index;
 }
 
 static bool root_owner_valid(const HLSLStageCoverage *coverage, const HLSLStageRootOwner *owner,
     int instruction, uint32_t unit) {
     if (!owner || owner->input_signature_index || owner->output_signature_index) return false;
+    if (owner->kind == HLSL_STAGE_ROOT_HULL_ICB_LITERAL || owner->kind == HLSL_STAGE_ROOT_HULL_ICB_ACCESS) {
+        const HLSLHullICBPlan *plan = &coverage->hull_icb.plan;
+        if (!icb_plan_valid(coverage) || !plan->present || owner->phase_index != plan->phase_index || owner->instance_count)
+            return false;
+        if (owner->kind == HLSL_STAGE_ROOT_HULL_ICB_LITERAL)
+            return unit == 0 && instruction == -1 && owner->icb_index < plan->row_count &&
+                owner->source_instruction_index == plan->declaration_source_instruction_index &&
+                owner->value_bits == plan->payload[owner->icb_index * 4 + plan->physical_column];
+        if (unit != 1 || owner->icb_index >= plan->consumer_count || owner->value_bits) return false;
+        const HLSLHullICBConsumer *consumer = &plan->consumers[owner->icb_index];
+        return instruction == consumer->instruction_index && owner->source_instruction_index == consumer->source_instruction_index;
+    }
+    if (owner->icb_index) return false;
     if (owner->kind == HLSL_STAGE_ROOT_INSTRUCTION) {
         if (instruction < 0 || (size_t)instruction >= coverage->instruction_count || owner->value_bits || owner->instance_count ||
             owner->source_instruction_index != coverage->source_instructions[instruction] ||
@@ -355,6 +553,92 @@ bool hlsl_stage_coverage_root(HLSLEmitterContext *ctx, const ASTExpr *root, int 
     return hlsl_stage_coverage_owned_root(ctx, root, instruction, &owner);
 }
 
+bool hlsl_stage_coverage_hull_icb_literal(HLSLEmitterContext *ctx, const ASTExpr *root, size_t row) {
+    HLSLStageCoverage *coverage = current_coverage(ctx);
+    if (!coverage) return true;
+    HLSLStageHullICB *icb = &coverage->hull_icb;
+    if (!icb_plan_valid(coverage) || !icb->plan.present || coverage->finished || !coverage->unit_count ||
+        coverage->unit_count != 1 || icb->declaration_emitted || row != icb->literal_root_count ||
+        row >= icb->plan.row_count || !root || root->kind != AST_EXPR_LITERAL ||
+        root->u.literal.components != 1 || root->u.literal.scalar_type != AST_SCALAR_FLOAT32 ||
+        root->u.literal.val[0] != icb->plan.payload[row * 4 + icb->plan.physical_column]) return false;
+    const HLSLStageRootOwner owner = {.kind = HLSL_STAGE_ROOT_HULL_ICB_LITERAL, .phase_index = icb->plan.phase_index,
+        .source_instruction_index = icb->plan.declaration_source_instruction_index,
+        .value_bits = root->u.literal.val[0], .icb_index = (uint32_t)row};
+    const size_t index = coverage->root_count;
+    if (!hlsl_stage_coverage_owned_root(ctx, root, -1, &owner)) return false;
+    icb->literal_root_indices[row] = icb->recorded_literal_root_indices[row] = index;
+    ++icb->literal_root_count;
+    ++icb->recorded_literal_root_count;
+    return true;
+}
+
+static bool icb_access_tree_valid(const HLSLStageCoverage *coverage, const ASTExpr *tree, size_t index) {
+    const HLSLHullICBPlan *plan = &coverage->hull_icb.plan;
+    if (!plan->present || index >= plan->consumer_count || !tree || tree->kind != AST_EXPR_EMITTER_OPERAND ||
+        !tree->u.emitter_operand) return false;
+    const HLSLHullICBConsumer *consumer = &plan->consumers[index];
+    const ASTOperandProvenance *origin = &tree->operand_provenance;
+    if (!origin->complete || origin->value_role != AST_OPERAND_VALUE_LOGICAL ||
+        origin->logical_value_id != (HLSL_HULL_ICB_ACCESS_LOGICAL_ID_BASE | index) ||
+        origin->natural_components != 1 || origin->result_components != 1 ||
+        origin->selection_role != AST_COMPONENT_SELECTION_NONE || origin->bitcast_role != AST_OPERAND_BITCAST_NONE ||
+        origin->raw_buffer_reconstruction || origin->synthetic_interface ||
+        origin->instruction_index != consumer->instruction_index || origin->source_instruction_index != consumer->source_instruction_index ||
+        origin->operand_index != consumer->operand_index || origin->destination_lanes != consumer->demanded_lanes) return false;
+    for (size_t lane = 0; lane < 4; ++lane)
+        if (origin->selected_components[lane]) return false;
+    const size_t array_length = strlen(plan->array_name), index_length = strlen(plan->index_name);
+    return strlen(tree->u.emitter_operand) == array_length + index_length + 2 &&
+        !memcmp(tree->u.emitter_operand, plan->array_name, array_length) &&
+        tree->u.emitter_operand[array_length] == '[' &&
+        !memcmp(tree->u.emitter_operand + array_length + 1, plan->index_name, index_length) &&
+        tree->u.emitter_operand[array_length + index_length + 1] == ']';
+}
+
+bool hlsl_stage_coverage_hull_icb_access(HLSLEmitterContext *ctx, const ASTExpr *root, size_t consumer) {
+    HLSLStageCoverage *coverage = current_coverage(ctx);
+    if (!coverage) return true;
+    HLSLStageHullICB *icb = &coverage->hull_icb;
+    if (!icb_plan_valid(coverage) || !icb->plan.present || coverage->finished || coverage->unit_count != 2 ||
+        !icb->declaration_emitted || consumer >= icb->plan.consumer_count ||
+        icb->access_root_count >= icb->plan.consumer_count || !icb_access_tree_valid(coverage, root, consumer)) return false;
+    /* Access construction can follow inlining order rather than raw program
+     * order. One actual consumer coordinate still acquires exactly one root. */
+    for (size_t index = 0; index < coverage->root_count; ++index)
+        if (coverage->roots[index].owner.kind == HLSL_STAGE_ROOT_HULL_ICB_ACCESS &&
+            coverage->roots[index].owner.icb_index == consumer) return false;
+    const HLSLHullICBConsumer *use = &icb->plan.consumers[consumer];
+    const HLSLStageRootOwner owner = {.kind = HLSL_STAGE_ROOT_HULL_ICB_ACCESS, .phase_index = icb->plan.phase_index,
+        .source_instruction_index = use->source_instruction_index, .icb_index = (uint32_t)consumer};
+    const size_t index = coverage->root_count;
+    if (!hlsl_stage_coverage_owned_root(ctx, root, use->instruction_index, &owner)) return false;
+    icb->access_root_indices[consumer] = icb->recorded_access_root_indices[consumer] = index;
+    ++icb->access_root_count;
+    ++icb->recorded_access_root_count;
+    return true;
+}
+
+bool hlsl_stage_coverage_hull_icb_declaration(HLSLEmitterContext *ctx, size_t begin, size_t end) {
+    HLSLStageCoverage *coverage = current_coverage(ctx);
+    if (!coverage) return true;
+    HLSLStageHullICB *icb = &coverage->hull_icb;
+    if (!icb_plan_valid(coverage) || !icb->plan.present || coverage->finished || coverage->unit_count != 1 ||
+        !ctx->sb || !sb_ok(ctx->sb) || icb->declaration_emitted || begin >= end || end > ctx->sb->len ||
+        begin < coverage->units[0].begin || icb->literal_root_count != icb->plan.row_count ||
+        icb->literal_root_count != icb->recorded_literal_root_count) return false;
+    for (size_t row = 0; row < icb->literal_root_count; ++row) {
+        const size_t index = icb->literal_root_indices[row];
+        if (index != icb->recorded_literal_root_indices[row] || index >= coverage->root_count ||
+            !coverage->roots[index].emitted || coverage->roots[index].live_tree ||
+            coverage->roots[index].begin < begin || coverage->roots[index].end > end) return false;
+    }
+    icb->declaration_begin = icb->recorded_declaration_begin = begin;
+    icb->declaration_end = icb->recorded_declaration_end = end;
+    icb->declaration_emitted = icb->recorded_declaration_emitted = true;
+    return true;
+}
+
 bool hlsl_stage_coverage_observation(HLSLEmitterContext *ctx, const HLSLSourceQualityObservation *observation) {
     HLSLStageCoverage *coverage = current_coverage(ctx);
     if (!coverage || (observation->kind != HLSL_SOURCE_OBSERVATION_EMISSION &&
@@ -391,6 +675,25 @@ bool hlsl_stage_coverage_observation(HLSLEmitterContext *ctx, const HLSLSourceQu
 
 bool hlsl_stage_coverage_span(HLSLStageCoverage *coverage, const ASTExpr *root, size_t begin, size_t end) {
     if (!coverage) return true;
+    const bool icb_access = root && root->kind == AST_EXPR_EMITTER_OPERAND &&
+        (root->operand_provenance.logical_value_id & ~UINT64_C(63)) == HLSL_HULL_ICB_ACCESS_LOGICAL_ID_BASE;
+    if (icb_access) {
+        const size_t consumer = (size_t)(root->operand_provenance.logical_value_id & UINT64_C(63));
+        if (!coverage->began || coverage->finished || !icb_plan_valid(coverage) ||
+            !icb_access_tree_valid(coverage, root, consumer) || begin >= end) return false;
+        size_t matches = 0;
+        for (size_t index = 0; index < coverage->root_count; ++index) {
+            const HLSLStageOwnedRoot *owned = &coverage->roots[index];
+            if (owned->owner.kind != HLSL_STAGE_ROOT_HULL_ICB_ACCESS || owned->owner.icb_index != consumer) continue;
+            if (owned->live_tree != root || owned->emitted ||
+                coverage->hull_icb.access_root_indices[consumer] != index ||
+                coverage->hull_icb.recorded_access_root_indices[consumer] != index) return false;
+            ++matches;
+        }
+        /* Clearing the first live pointer must not make a second spelling,
+         * copied child or unregistered access invisible to the trace. */
+        if (matches != 1) return false;
+    }
     for (size_t index = 0; index < coverage->root_count; ++index) {
         HLSLStageOwnedRoot *owned = &coverage->roots[index];
         if (owned->live_tree != root) continue;
@@ -400,6 +703,81 @@ bool hlsl_stage_coverage_span(HLSLStageCoverage *coverage, const ASTExpr *root, 
         owned->emitted = true;
         owned->live_tree = NULL;
     }
+    return true;
+}
+
+static bool icb_emission_valid(const HLSLStageCoverage *coverage) {
+    const HLSLStageHullICB *icb = &coverage->hull_icb;
+    const HLSLHullICBPlan *plan = &icb->plan;
+    if (coverage->root_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT || (coverage->root_count && !coverage->roots) ||
+        !icb_plan_valid(coverage) || icb->declaration_emitted != icb->recorded_declaration_emitted ||
+        icb->declaration_begin != icb->recorded_declaration_begin || icb->declaration_end != icb->recorded_declaration_end ||
+        icb->literal_root_count != icb->recorded_literal_root_count ||
+        icb->access_root_count != icb->recorded_access_root_count ||
+        icb->literal_root_count > HLSL_HULL_ICB_ROW_LIMIT || icb->access_root_count > HLSL_HULL_ICB_CONSUMER_LIMIT) return false;
+    for (size_t row = 0; row < HLSL_HULL_ICB_ROW_LIMIT; ++row)
+        if (icb->literal_root_indices[row] != icb->recorded_literal_root_indices[row] ||
+            (row >= icb->literal_root_count && icb->literal_root_indices[row])) return false;
+    for (size_t index = 0; index < HLSL_HULL_ICB_CONSUMER_LIMIT; ++index)
+        if (icb->access_root_indices[index] != icb->recorded_access_root_indices[index] ||
+            (index >= plan->consumer_count && icb->access_root_indices[index])) return false;
+    if (!plan->present)
+        return !icb->declaration_emitted && !icb->declaration_begin && !icb->declaration_end &&
+            !icb->literal_root_count && !icb->access_root_count;
+    if (!icb->declaration_emitted || icb->literal_root_count != plan->row_count ||
+        icb->access_root_count != plan->consumer_count || coverage->unit_count != 3 ||
+        icb->declaration_begin < coverage->units[0].begin || icb->declaration_begin >= icb->declaration_end ||
+        icb->declaration_end > coverage->units[0].end) return false;
+    bool literal_seen[HLSL_HULL_ICB_ROW_LIMIT] = {false}, access_seen[HLSL_HULL_ICB_CONSUMER_LIMIT] = {false};
+    size_t previous = icb->declaration_begin;
+    for (size_t row = 0; row < plan->row_count; ++row) {
+        const size_t index = icb->literal_root_indices[row];
+        if (index >= coverage->root_count) return false;
+        const HLSLStageOwnedRoot *root = &coverage->roots[index];
+        if (root->owner.kind != HLSL_STAGE_ROOT_HULL_ICB_LITERAL || root->owner.icb_index != row ||
+            root->source_unit_id != 0 || !root->emitted || root->live_tree ||
+            root->begin < previous || root->begin >= root->end || root->end > icb->declaration_end) return false;
+        previous = root->end;
+    }
+    for (size_t consumer = 0; consumer < plan->consumer_count; ++consumer) {
+        const size_t index = icb->access_root_indices[consumer];
+        if (index >= coverage->root_count) return false;
+        const HLSLStageOwnedRoot *root = &coverage->roots[index];
+        if (root->owner.kind != HLSL_STAGE_ROOT_HULL_ICB_ACCESS || root->owner.icb_index != consumer ||
+            root->source_unit_id != 1 || !root->emitted || root->live_tree ||
+            root->begin >= root->end || root->end > coverage->units[1].end ||
+            root->begin < coverage->units[1].begin || !icb_access_tree_valid(coverage, root->tree, consumer)) return false;
+    }
+    for (size_t index = 0; index < coverage->root_count; ++index) {
+        const HLSLStageOwnedRoot *root = &coverage->roots[index];
+        if (root->owner.kind == HLSL_STAGE_ROOT_HULL_ICB_LITERAL) {
+            const size_t row = root->owner.icb_index;
+            if (row >= plan->row_count || literal_seen[row] || icb->literal_root_indices[row] != index) return false;
+            literal_seen[row] = true;
+        } else if (root->owner.kind == HLSL_STAGE_ROOT_HULL_ICB_ACCESS) {
+            const size_t consumer = root->owner.icb_index;
+            if (consumer >= plan->consumer_count || access_seen[consumer] || icb->access_root_indices[consumer] != index) return false;
+            access_seen[consumer] = true;
+        }
+    }
+    return true;
+}
+
+static bool icb_ledgers_equal(const HLSLStageHullICB *a, const HLSLStageHullICB *b) {
+    if (a->plan_captured != b->plan_captured || a->recorded_plan_captured != b->recorded_plan_captured ||
+        a->declaration_emitted != b->declaration_emitted || a->recorded_declaration_emitted != b->recorded_declaration_emitted ||
+        a->declaration_begin != b->declaration_begin || a->declaration_end != b->declaration_end ||
+        a->recorded_declaration_begin != b->recorded_declaration_begin || a->recorded_declaration_end != b->recorded_declaration_end ||
+        a->literal_root_count != b->literal_root_count || a->recorded_literal_root_count != b->recorded_literal_root_count ||
+        a->access_root_count != b->access_root_count || a->recorded_access_root_count != b->recorded_access_root_count ||
+        !hlsl_hull_icb_plans_equal(&a->plan, &b->plan) || !hlsl_hull_icb_plans_equal(&a->recorded_plan, &b->recorded_plan))
+        return false;
+    for (size_t row = 0; row < HLSL_HULL_ICB_ROW_LIMIT; ++row)
+        if (a->literal_root_indices[row] != b->literal_root_indices[row] ||
+            a->recorded_literal_root_indices[row] != b->recorded_literal_root_indices[row]) return false;
+    for (size_t index = 0; index < HLSL_HULL_ICB_CONSUMER_LIMIT; ++index)
+        if (a->access_root_indices[index] != b->access_root_indices[index] ||
+            a->recorded_access_root_indices[index] != b->recorded_access_root_indices[index]) return false;
     return true;
 }
 
@@ -426,7 +804,8 @@ void hlsl_stage_coverage_finish(HLSLEmitterContext *ctx) {
             !hlsl_hull_owned_contract_digest(ctx->program, digest) ||
             memcmp(digest, coverage->hull_owner_digest, sizeof(digest)) ||
             !hull_contract_view(&current, ctx->program) || !hull_contract_equal(&current, &coverage->hull_contract) ||
-            !hull_contract_equal(&coverage->hull_contract, &coverage->recorded_hull_contract)) return;
+            !hull_contract_equal(&coverage->hull_contract, &coverage->recorded_hull_contract) ||
+            !icb_emission_valid(coverage) || !hlsl_hull_icb_plan_matches(ctx->program, &coverage->hull_icb.plan)) return;
         for (size_t index = 0; index < coverage->instruction_count; ++index) {
             const USILInstruction *owner = &ctx->program->instructions[index];
             if (owner->source_instruction_index != coverage->source_instructions[index] ||
@@ -614,14 +993,17 @@ static bool hull_units_valid(const HLSLStageCoverage *coverage) {
         }
         source_end = unit->end; root_end = unit->root_end; syntax_end = unit->syntax_end;
     }
-    return source_end == coverage->source_size && root_end == coverage->root_count && syntax_end == coverage->syntax_count;
+    return source_end == coverage->source_size && root_end == coverage->root_count && syntax_end == coverage->syntax_count &&
+        icb_emission_valid(coverage);
 }
 
-static bool structural_tree_valid(const HLSLStageOwnedRoot *root) {
+static bool structural_tree_valid(const HLSLStageCoverage *coverage, const HLSLStageOwnedRoot *root) {
     if (root->owner.kind == HLSL_STAGE_ROOT_INSTRUCTION) return true;
-    if (root->owner.kind == HLSL_STAGE_ROOT_HULL_MAXIMUM)
+    if (root->owner.kind == HLSL_STAGE_ROOT_HULL_MAXIMUM || root->owner.kind == HLSL_STAGE_ROOT_HULL_ICB_LITERAL)
         return root->tree->kind == AST_EXPR_LITERAL && root->tree->u.literal.components == 1 &&
             root->tree->u.literal.scalar_type == AST_SCALAR_FLOAT32 && root->tree->u.literal.val[0] == root->owner.value_bits;
+    if (root->owner.kind == HLSL_STAGE_ROOT_HULL_ICB_ACCESS)
+        return icb_access_tree_valid(coverage, root->tree, root->owner.icb_index);
     if (root->tree->kind != AST_EXPR_EMITTER_OPERAND || !root->tree->operand_provenance.complete ||
         root->tree->operand_provenance.value_role != AST_OPERAND_VALUE_LOGICAL ||
         root->tree->operand_provenance.selection_role != AST_COMPONENT_SELECTION_NONE ||
@@ -662,7 +1044,8 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
         return false;
     if (coverage->schema == HLSL_STAGE_COVERAGE_HULL_FORK_THREE_UNIT) {
         if (!hull_units_valid(coverage)) return false;
-    } else if (coverage->schema != HLSL_STAGE_COVERAGE_ORDINARY_ENTRY) return false;
+    } else if (coverage->schema != HLSL_STAGE_COVERAGE_ORDINARY_ENTRY ||
+        !hlsl_stage_coverage_hull_icb_empty(&coverage->hull_icb)) return false;
     for (size_t index = 0; index < coverage->instruction_count; ++index) {
         if (!opcode_valid(coverage->opcodes[index]) ||
             coverage->opcodes[index] != coverage->recorded_opcodes[index] ||
@@ -695,7 +1078,7 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
         if (!root->emitted || root->live_tree || !root->tree ||
             !root_owners_equal(&root->owner, &root->recorded_owner) ||
             !root_owner_valid(coverage, &root->owner, root->instruction, root->source_unit_id) ||
-            !unit_kind_matches(coverage->schema, root->source_unit_id, root->unit_kind) || !structural_tree_valid(root) || root->begin >= root->end ||
+            !unit_kind_matches(coverage->schema, root->source_unit_id, root->unit_kind) || !structural_tree_valid(coverage, root) || root->begin >= root->end ||
             root->end > source->len || !hlsl_matrix_uses_trees_equal(root->tree, root->recorded_tree) ||
             !tree_owners_valid(coverage, root->tree, 0, &nodes)) return false;
         StringBuilder formatted;
@@ -730,6 +1113,7 @@ bool hlsl_stage_coverage_equal(const HLSLStageCoverage *a, const HLSLStageCovera
         a->stage != b->stage || a->schema != b->schema || a->instruction_count != b->instruction_count || a->source_size != b->source_size ||
         a->node_count != b->node_count || a->root_count != b->root_count || a->syntax_count != b->syntax_count ||
         a->recorded_root_count != b->recorded_root_count || a->recorded_syntax_count != b->recorded_syntax_count ||
+        !icb_ledgers_equal(&a->hull_icb, &b->hull_icb) ||
         !a->finished || !b->finished || !a->source || !b->source ||
         memcmp(a->source, b->source, a->source_size + 1)) return false;
     if (a->unit_count != b->unit_count || a->recorded_unit_count != b->recorded_unit_count || a->unit_count > 3) return false;
@@ -741,7 +1125,7 @@ bool hlsl_stage_coverage_equal(const HLSLStageCoverage *a, const HLSLStageCovera
         const StringBuilder left_source = {.buf = a->source, .len = a->source_size, .capacity = a->source_size + 1};
         const StringBuilder right_source = {.buf = b->source, .len = b->source_size, .capacity = b->source_size + 1};
         if (!hlsl_stage_coverage_validate(a, &left_source) || !hlsl_stage_coverage_validate(b, &right_source)) return false;
-    }
+    } else if (!hlsl_stage_coverage_hull_icb_empty(&a->hull_icb) || !hlsl_stage_coverage_hull_icb_empty(&b->hull_icb)) return false;
     for (size_t index = 0; index < a->unit_count; ++index)
         if (!units_equal(&a->units[index], &b->units[index]) || !units_equal(&a->recorded_units[index], &b->recorded_units[index])) return false;
     for (size_t index = 0; index < a->instruction_count; ++index) {

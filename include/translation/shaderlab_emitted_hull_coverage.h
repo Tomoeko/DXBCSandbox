@@ -37,7 +37,9 @@ typedef struct {
 /* Initially NULL output; nonempty output rejects unchanged. Scope is one
  * complete V/F + paired HULL/DOMAIN pass, with optional admitted geometry,
  * all selected bounded HULL variants and the existing parsed FORK producer.
- * JOIN and ICB remain unavailable.
+ * JOIN remains unavailable. Immediate constants are limited to one parsed
+ * finite scalar column of two through four rows in one FORK phase, with owned
+ * actual ForkID addressing and exact unused positive-zero DWORDs.
  * Inputs are borrowed and immutable during capture. The receipt owns complete
  * source/inventory, target/player/current/common inputs, local typed coverage
  * and its whole-source placements. Capture does not promote source quality,

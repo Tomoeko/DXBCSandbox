@@ -15,9 +15,10 @@ typedef struct {
 typedef struct {
     HLSLHullWholeRange *roots;
     HLSLHullWholeRange units[3];
+    HLSLHullWholeRange icb_declaration;
     size_t *syntax_ends;
     size_t root_count, unit_count, syntax_count, line_cursor;
-    bool rebased, offset;
+    bool has_icb_declaration, rebased, offset;
 } HLSLHullWholePlacement;
 
 typedef struct HLSLHullCoverageCapture {

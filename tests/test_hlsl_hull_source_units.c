@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "dxbc/dxbc_document.h"
 #include "test_tessellation_fixture.h"
-#include "dxbc/dxbc_hash.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter_internal.h"
 #include "translation/usil_validation.h"
@@ -18,15 +17,6 @@
         return false; \
     } \
 } while (0)
-#define INSTRUCTION(opcode, length) \
-    ((uint32_t)(opcode) | (uint32_t)(length) << 24)
-
-static void write_u32(uint8_t *bytes, uint32_t value) {
-    for (unsigned byte = 0; byte < 4; ++byte)
-        bytes[byte] = (uint8_t)(value >> (8 * byte));
-}
-
-
 typedef struct {
     DXBCDocument document;
     DXBCContainer semantic;
@@ -318,95 +308,11 @@ static bool scoped_cfg_ownership(void) {
     return true;
 }
 
-/* Independently authored quad/isoline token grammars exercise the generic
- * descriptor producer, including distinct raw per-edge names. */
-static size_t shape_signature(uint8_t *bytes, unsigned role, bool isoline) {
-    if (role != 2) return test_tessellation_hull_signature(bytes, role, false);
-    const unsigned count = isoline ? 2 : 6;
-    const size_t names = 8 + 24 * count;
-    const size_t size = names + sizeof("SV_TessFactor") + (isoline ? 0 : sizeof("SV_InsideTessFactor"));
-    memcpy(bytes, "PCSG", 4);
-    write_u32(bytes + 4, (uint32_t)size);
-    bytes += 8;
-    write_u32(bytes, count);
-    write_u32(bytes + 4, 8);
-    for (unsigned field = 0; field < count; ++field) {
-        const bool inner = !isoline && field >= 4;
-        uint8_t *element = bytes + 8 + 24 * field;
-        write_u32(element, (uint32_t)(names + (inner ? sizeof("SV_TessFactor") : 0)));
-        write_u32(element + 4, inner ? field - 4 : field);
-        write_u32(element + 8, isoline ? (field ? 15 : 16) : inner ? 12 : 11);
-        write_u32(element + 12, 3);
-        write_u32(element + 16, field);
-        write_u32(element + 20, 0x0e01);
-    }
-    memcpy(bytes + names, "SV_TessFactor", sizeof("SV_TessFactor"));
-    if (!isoline) memcpy(bytes + names + sizeof("SV_TessFactor"),
-        "SV_InsideTessFactor", sizeof("SV_InsideTessFactor"));
-    return size + 8;
-}
-
-static uint8_t *make_shape_dxbc(bool isoline, size_t *size) {
-    uint32_t words[128];
-    size_t count = 0;
-#define WORD(value) words[count++] = (uint32_t)(value)
-    const unsigned points = isoline ? 2 : 4;
-    WORD(INSTRUCTION(113, 1));
-    WORD(INSTRUCTION(147, 1) | points << 11);
-    WORD(INSTRUCTION(148, 1) | points << 11);
-    WORD(INSTRUCTION(149, 1) | (isoline ? 1u : 3u) << 11);
-    WORD(INSTRUCTION(150, 1) | 1u << 11);
-    WORD(INSTRUCTION(151, 1) | (isoline ? 2u : 3u) << 11);
-    WORD(INSTRUCTION(152, 2)); WORD(0x42000000);
-    WORD(INSTRUCTION(106, 1) | 1u << 11);
-    for (unsigned phase = 0; phase < (isoline ? 1u : 2u); ++phase) {
-        const unsigned factors = isoline ? 2 : phase ? 2 : 4;
-        const unsigned base = phase ? 4 : 0;
-        WORD(INSTRUCTION(115, 1));
-        WORD(INSTRUCTION(153, 2)); WORD(factors);
-        WORD(INSTRUCTION(95, 2)); WORD(0x00017000);
-        for (unsigned factor = 0; factor < factors; ++factor) {
-            const unsigned raw_name = isoline ? (factor ? 21 : 22) : phase ? 15 + factor : 11 + factor;
-            WORD(INSTRUCTION(103, 4)); WORD(0x00102012); WORD(base + factor); WORD(raw_name);
-        }
-        WORD(INSTRUCTION(104, 2)); WORD(1);
-        WORD(INSTRUCTION(91, 4)); WORD(0x00102012); WORD(base); WORD(factors);
-        WORD(INSTRUCTION(54, 4)); WORD(0x00100012); WORD(0); WORD(0x0001700a);
-        WORD(INSTRUCTION(54, base ? 7 : 6)); WORD(base ? 0x00d02012 : 0x00902012);
-        if (base) WORD(base);
-        WORD(0x0010000a); WORD(0); WORD(0x00004001); WORD(phase ? 0x40400000 : 0x40000000);
-        WORD(INSTRUCTION(62, 1));
-    }
-#undef WORD
-    uint8_t bytes[1024] = {0};
-    memcpy(bytes, "DXBC", 4);
-    write_u32(bytes + 20, 1);
-    write_u32(bytes + 28, 4);
-    size_t offset = 48;
-    for (unsigned role = 0; role < 3; ++role) {
-        write_u32(bytes + 32 + 4 * role, (uint32_t)offset);
-        offset += shape_signature(bytes + offset, role, isoline);
-        offset = (offset + 3) & ~(size_t)3;
-    }
-    write_u32(bytes + 44, (uint32_t)offset);
-    memcpy(bytes + offset, "SHEX", 4);
-    write_u32(bytes + offset + 4, (uint32_t)(4 * count + 8));
-    write_u32(bytes + offset + 8, 0x00030050);
-    write_u32(bytes + offset + 12, (uint32_t)(count + 2));
-    for (size_t word = 0; word < count; ++word) write_u32(bytes + offset + 16 + 4 * word, words[word]);
-    *size = offset + 16 + 4 * count;
-    write_u32(bytes + 24, (uint32_t)*size);
-    if (!dxbc_compute_hash(bytes, *size, bytes + 4)) return NULL;
-    uint8_t *result = malloc(*size);
-    if (result) memcpy(result, bytes, *size);
-    return result;
-}
-
 static bool other_domains_and_control_point_counts(void) {
     for (unsigned shape = 0; shape < 2; ++shape) {
         const bool isoline = shape != 0;
         size_t size = 0;
-        uint8_t *bytes = make_shape_dxbc(isoline, &size);
+        uint8_t *bytes = test_tessellation_hull_shape_dxbc(isoline, &size);
         HullFixture fixture;
         CHECK(hull_fixture_parse(&fixture, bytes, size));
         HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;

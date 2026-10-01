@@ -2335,6 +2335,7 @@ bool hlsl_emit_with_stage_coverage(const USILProgram *program, StringBuilder *ou
       coverage->hull_contract.patch_constant_count || coverage->recorded_hull_contract.patch_constant_count ||
       coverage->hull_contract.signature_declaration_count || coverage->recorded_hull_contract.signature_declaration_count ||
       coverage->hull_contract.cbuffer_count || coverage->recorded_hull_contract.cbuffer_count ||
+      !hlsl_stage_coverage_hull_icb_empty(&coverage->hull_icb) ||
       !output || !sb_ok(output) || output->len || !options || options->mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
       !hlsl_hull_owned_contract_digest(program, digest)) {
     hlsl_emit_diagnostic_init(diagnostic);

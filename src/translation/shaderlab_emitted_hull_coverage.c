@@ -61,6 +61,9 @@ bool shaderlab_hull_coverage_finish(HLSLHullCoverageCapture *entry,
     placement->root_count = entry->coverage.root_count;
     placement->unit_count = entry->coverage.unit_count;
     placement->syntax_count = entry->coverage.syntax_count;
+    placement->has_icb_declaration = entry->coverage.hull_icb.plan.present;
+    if (placement->has_icb_declaration)
+        placement->icb_declaration = (HLSLHullWholeRange){SIZE_MAX, SIZE_MAX};
     if (placement->root_count) {
         placement->roots = malloc(placement->root_count * sizeof(*placement->roots));
         if (!placement->roots) return false;
@@ -103,6 +106,7 @@ bool shaderlab_hull_coverage_rebase_line(HLSLHullCoverageCapture *entry,
         line_end > coverage->source_size || output_begin > SIZE_MAX - (line_end - line_begin) ||
         placement->root_count != coverage->root_count || placement->unit_count != coverage->unit_count ||
         placement->syntax_count != coverage->syntax_count || placement->unit_count != 3 ||
+        placement->has_icb_declaration != coverage->hull_icb.plan.present ||
         placement->root_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT ||
         placement->syntax_count > HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
         (placement->root_count && (!placement->roots || !coverage->roots)) ||
@@ -113,6 +117,9 @@ bool shaderlab_hull_coverage_rebase_line(HLSLHullCoverageCapture *entry,
     for (size_t index = 0; index < placement->unit_count; ++index)
         rebase_range(&placement->units[index], coverage->units[index].begin, coverage->units[index].end,
             line_begin, line_end, output_begin);
+    if (placement->has_icb_declaration)
+        rebase_range(&placement->icb_declaration, coverage->hull_icb.declaration_begin,
+            coverage->hull_icb.declaration_end, line_begin, line_end, output_begin);
     for (size_t index = 0; index < placement->syntax_count; ++index) {
         const HLSLStageOwnedSyntax *syntax = &coverage->syntax[index];
         const size_t end = syntax->source_end;
@@ -152,6 +159,8 @@ bool shaderlab_hull_coverage_offset(ShaderLabEmittedHullCoverage *owned,
             if (!range_can_offset(&placement->roots[root], offset)) return false;
         for (size_t unit = 0; unit < placement->unit_count; ++unit)
             if (!range_can_offset(&placement->units[unit], offset)) return false;
+        if (placement->has_icb_declaration && !range_can_offset(&placement->icb_declaration, offset))
+            return false;
         for (size_t syntax = 0; syntax < placement->syntax_count; ++syntax)
             if (placement->syntax_ends[syntax] == SIZE_MAX || placement->syntax_ends[syntax] > SIZE_MAX - offset)
                 return false;
@@ -167,6 +176,10 @@ bool shaderlab_hull_coverage_offset(ShaderLabEmittedHullCoverage *owned,
         for (size_t unit = 0; unit < placement->unit_count; ++unit) {
             placement->units[unit].begin += offset;
             placement->units[unit].end += offset;
+        }
+        if (placement->has_icb_declaration) {
+            placement->icb_declaration.begin += offset;
+            placement->icb_declaration.end += offset;
         }
         for (size_t syntax = 0; syntax < placement->syntax_count; ++syntax)
             placement->syntax_ends[syntax] += offset;
@@ -193,6 +206,7 @@ static bool placements_valid(const HLSLHullCoverageCapture *entry, const StringB
         placement->line_cursor != coverage->source_size || placement->root_count != coverage->root_count ||
         placement->unit_count != coverage->unit_count || placement->unit_count != 3 ||
         placement->syntax_count != coverage->syntax_count ||
+        placement->has_icb_declaration != coverage->hull_icb.plan.present ||
         (placement->root_count && !placement->roots) || (placement->syntax_count && !placement->syntax_ends)) return false;
     size_t previous = body->source_begin;
     for (size_t unit = 0; unit < placement->unit_count; ++unit) {
@@ -200,6 +214,11 @@ static bool placements_valid(const HLSLHullCoverageCapture *entry, const StringB
         if (range->begin < previous || range->begin >= range->end || range->end > body->source_end) return false;
         previous = range->end;
     }
+    if (placement->has_icb_declaration) {
+        const HLSLHullWholeRange *declaration = &placement->icb_declaration;
+        if (declaration->begin < placement->units[0].begin || declaration->begin >= declaration->end ||
+            declaration->end > placement->units[0].end) return false;
+    } else if (placement->icb_declaration.begin || placement->icb_declaration.end) return false;
     for (size_t index = 0; index < placement->root_count; ++index) {
         const HLSLStageOwnedRoot *root = &coverage->roots[index];
         const HLSLHullWholeRange *range = &placement->roots[index];
@@ -306,6 +325,8 @@ static bool maps_equal(const HLSLExpressionSourceMap *a, const HLSLExpressionSou
 static bool placements_equal(const HLSLHullWholePlacement *a, const HLSLHullWholePlacement *b) {
     if (a->root_count != b->root_count || a->unit_count != b->unit_count || a->syntax_count != b->syntax_count ||
         a->line_cursor != b->line_cursor || !a->rebased || !b->rebased || !a->offset || !b->offset ||
+        a->has_icb_declaration != b->has_icb_declaration ||
+        a->icb_declaration.begin != b->icb_declaration.begin || a->icb_declaration.end != b->icb_declaration.end ||
         a->root_count > HLSL_STAGE_COVERAGE_ROOT_LIMIT || a->unit_count != 3 ||
         a->syntax_count > HLSL_STAGE_COVERAGE_EVENT_LIMIT ||
         (a->root_count && (!a->roots || !b->roots)) || (a->syntax_count && (!a->syntax_ends || !b->syntax_ends))) return false;

@@ -3,6 +3,7 @@
 #define HLSL_STAGE_COVERAGE_INTERNAL_H
 
 #include "translation/hlsl_source_quality.h"
+#include "translation/hlsl_hull_icb_internal.h"
 
 enum {
     HLSL_STAGE_COVERAGE_BODY = 1u << 0,
@@ -30,7 +31,9 @@ typedef enum {
     HLSL_STAGE_ROOT_HULL_FACTOR_RETURN,
     HLSL_STAGE_ROOT_HULL_MAXIMUM,
     HLSL_STAGE_ROOT_HULL_IMPLICIT_COPY,
-    HLSL_STAGE_ROOT_HULL_POINT_RETURN
+    HLSL_STAGE_ROOT_HULL_POINT_RETURN,
+    HLSL_STAGE_ROOT_HULL_ICB_LITERAL,
+    HLSL_STAGE_ROOT_HULL_ICB_ACCESS
 } HLSLStageRootOwnerKind;
 
 typedef struct {
@@ -38,6 +41,8 @@ typedef struct {
     int phase_index;
     uint32_t source_instruction_index, value_bits, instance_count;
     uint32_t input_signature_index, output_signature_index;
+    /* Row for ICB_LITERAL, actual consumer ordinal for ICB_ACCESS. */
+    uint32_t icb_index;
 } HLSLStageRootOwner;
 
 typedef struct {
@@ -90,6 +95,19 @@ typedef struct {
     bool is_source, absolute, negative;
 } HLSLStageOwnedOperandUse;
 
+/* Declaration placement is separate from the existing traced expression
+ * roots. Both ledgers are frozen at acquisition, before caller callbacks. */
+typedef struct {
+    HLSLHullICBPlan plan, recorded_plan;
+    size_t declaration_begin, declaration_end, recorded_declaration_begin, recorded_declaration_end;
+    size_t literal_root_indices[HLSL_HULL_ICB_ROW_LIMIT];
+    size_t recorded_literal_root_indices[HLSL_HULL_ICB_ROW_LIMIT];
+    size_t access_root_indices[HLSL_HULL_ICB_CONSUMER_LIMIT];
+    size_t recorded_access_root_indices[HLSL_HULL_ICB_CONSUMER_LIMIT];
+    size_t literal_root_count, recorded_literal_root_count, access_root_count, recorded_access_root_count;
+    bool plan_captured, recorded_plan_captured, declaration_emitted, recorded_declaration_emitted;
+} HLSLStageHullICB;
+
 typedef struct HLSLStageCoverage {
     uint32_t obligations, required_binding_mask;
     DXBCProgramType stage;
@@ -120,6 +138,7 @@ typedef struct HLSLStageCoverage {
     HLSLStageOwnedUnit units[3], recorded_units[3];
     size_t unit_count, recorded_unit_count;
     HLSLStageHullContract hull_contract, recorded_hull_contract;
+    HLSLStageHullICB hull_icb;
     uint8_t hull_owner_digest[32];
     bool began, finished;
 } HLSLStageCoverage;
@@ -132,6 +151,11 @@ bool hlsl_stage_coverage_root(struct HLSLEmitterContext *ctx, const ASTExpr *roo
 bool hlsl_stage_coverage_owned_root(struct HLSLEmitterContext *ctx,
     const ASTExpr *root, int instruction, const HLSLStageRootOwner *owner);
 bool hlsl_hull_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+bool hlsl_stage_coverage_hull_icb_plan(struct HLSLEmitterContext *ctx, const HLSLHullICBPlan *plan);
+bool hlsl_stage_coverage_hull_icb_declaration(struct HLSLEmitterContext *ctx, size_t begin, size_t end);
+bool hlsl_stage_coverage_hull_icb_literal(struct HLSLEmitterContext *ctx, const ASTExpr *root, size_t row);
+bool hlsl_stage_coverage_hull_icb_access(struct HLSLEmitterContext *ctx, const ASTExpr *root, size_t consumer);
+bool hlsl_stage_coverage_hull_icb_empty(const HLSLStageHullICB *icb);
 bool hlsl_stage_coverage_observation(struct HLSLEmitterContext *ctx,
     const HLSLSourceQualityObservation *observation);
 bool hlsl_stage_coverage_span(HLSLStageCoverage *coverage,
@@ -141,7 +165,7 @@ bool hlsl_stage_coverage_validate(const HLSLStageCoverage *coverage, const Strin
 bool hlsl_stage_coverage_equal(const HLSLStageCoverage *a, const HLSLStageCoverage *b);
 void hlsl_stage_coverage_dispose(HLSLStageCoverage *coverage);
 /* Private stage-local capture only. Existing bounded parsed FORK HULL scope,
- * with no JOIN or ICB admission. Source quality and retained gaps are unchanged.
+ * with no JOIN admission. Source quality and retained gaps are unchanged.
  * The initially empty destination owns trees/contracts after success. A failed
  * new capture disposes partial ownership; argument rejection preserves previous
  * results and nonempty output. This is not an original-target receipt. */

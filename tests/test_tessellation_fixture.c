@@ -211,6 +211,90 @@ uint8_t *test_tessellation_hull_float3_dxbc(uint32_t points, uint32_t output_poi
     return make_hull_dxbc(points, output_points, scenario, semantic, true, size);
 }
 
+/* Independently authored quad/isoline token grammars exercise the generic
+ * descriptor producer, including distinct raw per-edge names. */
+static size_t shape_signature(uint8_t *bytes, unsigned role, bool isoline) {
+    if (role != 2) return test_tessellation_hull_signature(bytes, role, false);
+    const unsigned count = isoline ? 2 : 6;
+    const size_t names = 8 + 24 * count;
+    const size_t size = names + sizeof("SV_TessFactor") + (isoline ? 0 : sizeof("SV_InsideTessFactor"));
+    memcpy(bytes, "PCSG", 4);
+    write_u32(bytes + 4, (uint32_t)size);
+    bytes += 8;
+    write_u32(bytes, count);
+    write_u32(bytes + 4, 8);
+    for (unsigned field = 0; field < count; ++field) {
+        const bool inner = !isoline && field >= 4;
+        uint8_t *element = bytes + 8 + 24 * field;
+        write_u32(element, (uint32_t)(names + (inner ? sizeof("SV_TessFactor") : 0)));
+        write_u32(element + 4, inner ? field - 4 : field);
+        write_u32(element + 8, isoline ? (field ? 15 : 16) : inner ? 12 : 11);
+        write_u32(element + 12, 3);
+        write_u32(element + 16, field);
+        write_u32(element + 20, 0x0e01);
+    }
+    memcpy(bytes + names, "SV_TessFactor", sizeof("SV_TessFactor"));
+    if (!isoline) memcpy(bytes + names + sizeof("SV_TessFactor"),
+        "SV_InsideTessFactor", sizeof("SV_InsideTessFactor"));
+    return size + 8;
+}
+
+uint8_t *test_tessellation_hull_shape_dxbc(bool isoline, size_t *size) {
+    uint32_t words[128];
+    size_t count = 0;
+#define WORD(value) words[count++] = (uint32_t)(value)
+    const unsigned points = isoline ? 2 : 4;
+    WORD(INSTRUCTION(113, 1));
+    WORD(INSTRUCTION(147, 1) | points << 11);
+    WORD(INSTRUCTION(148, 1) | points << 11);
+    WORD(INSTRUCTION(149, 1) | (isoline ? 1u : 3u) << 11);
+    WORD(INSTRUCTION(150, 1) | 1u << 11);
+    WORD(INSTRUCTION(151, 1) | (isoline ? 2u : 3u) << 11);
+    WORD(INSTRUCTION(152, 2)); WORD(0x42000000);
+    WORD(INSTRUCTION(106, 1) | 1u << 11);
+    for (unsigned phase = 0; phase < (isoline ? 1u : 2u); ++phase) {
+        const unsigned factors = isoline ? 2 : phase ? 2 : 4;
+        const unsigned base = phase ? 4 : 0;
+        WORD(INSTRUCTION(115, 1));
+        WORD(INSTRUCTION(153, 2)); WORD(factors);
+        WORD(INSTRUCTION(95, 2)); WORD(0x00017000);
+        for (unsigned factor = 0; factor < factors; ++factor) {
+            const unsigned raw_name = isoline ? (factor ? 21 : 22) : phase ? 15 + factor : 11 + factor;
+            WORD(INSTRUCTION(103, 4)); WORD(0x00102012); WORD(base + factor); WORD(raw_name);
+        }
+        WORD(INSTRUCTION(104, 2)); WORD(1);
+        WORD(INSTRUCTION(91, 4)); WORD(0x00102012); WORD(base); WORD(factors);
+        WORD(INSTRUCTION(54, 4)); WORD(0x00100012); WORD(0); WORD(0x0001700a);
+        WORD(INSTRUCTION(54, base ? 7 : 6)); WORD(base ? 0x00d02012 : 0x00902012);
+        if (base) WORD(base);
+        WORD(0x0010000a); WORD(0); WORD(0x00004001); WORD(phase ? 0x40400000 : 0x40000000);
+        WORD(INSTRUCTION(62, 1));
+    }
+#undef WORD
+    uint8_t bytes[1024] = {0};
+    memcpy(bytes, "DXBC", 4);
+    write_u32(bytes + 20, 1);
+    write_u32(bytes + 28, 4);
+    size_t offset = 48;
+    for (unsigned role = 0; role < 3; ++role) {
+        write_u32(bytes + 32 + 4 * role, (uint32_t)offset);
+        offset += shape_signature(bytes + offset, role, isoline);
+        offset = (offset + 3) & ~(size_t)3;
+    }
+    write_u32(bytes + 44, (uint32_t)offset);
+    memcpy(bytes + offset, "SHEX", 4);
+    write_u32(bytes + offset + 4, (uint32_t)(4 * count + 8));
+    write_u32(bytes + offset + 8, 0x00030050);
+    write_u32(bytes + offset + 12, (uint32_t)(count + 2));
+    for (size_t word = 0; word < count; ++word) write_u32(bytes + offset + 16 + 4 * word, words[word]);
+    *size = offset + 16 + 4 * count;
+    write_u32(bytes + 24, (uint32_t)*size);
+    if (!dxbc_compute_hash(bytes, *size, bytes + 4)) return NULL;
+    uint8_t *result = malloc(*size);
+    if (result) memcpy(result, bytes, *size);
+    return result;
+}
+
 /* Reuse the authored signatures and instruction grammar above. The lossless
  * decoder supplies bounded instruction coordinates; this existing transform
  * adds one scalar buffer and two final clamps without another token parser. */
@@ -285,6 +369,103 @@ fail:
     return NULL;
 }
 
+
+/* Transform only this file's controlled grammar. DXBCDocument supplies every
+ * instruction boundary; the selected fixed operands are authored coordinates,
+ * not a second parser for arbitrary DXBC. */
+uint8_t *test_tessellation_hull_icb_dxbc(unsigned rows, unsigned column,
+    unsigned chain_length, unsigned transport_lane, bool zero_base,
+    bool scalar, bool float3, const uint32_t *values, size_t *size) {
+    if (!size) return NULL;
+    *size = 0;
+    if (rows < 2 || rows > 4 || column > 3 || chain_length > 3 ||
+        transport_lane > 3 || !values || ((scalar || float3) && rows != 3)) return NULL;
+    size_t original_size = 0;
+    uint8_t *bytes = rows != 3 ? test_tessellation_hull_shape_dxbc(rows == 2, &original_size)
+        : scalar ? test_tessellation_hull_scalar_cbuffer_dxbc(3, 3, float3, "POINTVALUE", &original_size)
+        : float3 ? test_tessellation_hull_float3_dxbc(3, 3, 0, "POINTVALUE", &original_size)
+        : test_tessellation_hull_dxbc(3, 3, 0, &original_size);
+    if (!bytes) return NULL;
+    DXBCDocument document;
+    dxbc_document_init(&document);
+    uint8_t *authored = NULL;
+    if (!dxbc_document_parse(&document, bytes, original_size, NULL) || !document.instruction_count) goto fail;
+    const DXBCDocumentChunk *chunk = &document.chunks[document.instructions[0].chunk_index];
+    if (chunk->kind != DXBC_DOCUMENT_CHUNK_EXECUTABLE || chunk->offset + chunk->raw_size != original_size) goto fail;
+    uint32_t words[256];
+    size_t count = 0;
+    unsigned phase_count = 0, consumers = 0;
+    bool declared = false;
+#define ICB_WORD(value) do { if (count == 256) goto fail; words[count++] = (uint32_t)(value); } while (0)
+    for (size_t index = 0; index < document.instruction_count; ++index) {
+        const DXBCDocumentInstruction *instruction = &document.instructions[index];
+        if (instruction->chunk_index != document.instructions[0].chunk_index || instruction->token_count > 32) goto fail;
+        if (instruction->opcode == 115) ++phase_count;
+        const uint32_t destination = instruction->token_count > 1 ? read_u32(instruction->raw_bytes + 4) : 0;
+        if (phase_count == 1 && (instruction->opcode == 54 || instruction->opcode == 51) &&
+            destination == UINT32_C(0x00902012)) {
+            const unsigned source_words = scalar ? 3 : 2;
+            if (instruction->token_count != (scalar ? 9u : 6u)) goto fail;
+            for (unsigned edge = 0; edge < chain_length; ++edge) {
+                const unsigned lane = (transport_lane + edge) % 4;
+                ICB_WORD(INSTRUCTION(54, edge ? 5 : 4));
+                ICB_WORD(UINT32_C(0x00100002) | (1u << lane) << 4);
+                ICB_WORD(edge + 1);
+                if (edge) {
+                    ICB_WORD(UINT32_C(0x0010000a) | ((transport_lane + edge - 1) % 4) << 4);
+                    ICB_WORD(edge);
+                } else ICB_WORD(UINT32_C(0x0001700a));
+            }
+            const unsigned operand_words = (zero_base ? 1 : 0) + (chain_length ? 3 : 2);
+            ICB_WORD(INSTRUCTION(instruction->opcode, instruction->token_count - source_words + operand_words));
+            for (unsigned word = 1; word < 4; ++word)
+                ICB_WORD(read_u32(instruction->raw_bytes + word * 4));
+            ICB_WORD((zero_base ? UINT32_C(0x00d0900a) : UINT32_C(0x0090900a)) | column << 4);
+            if (zero_base) ICB_WORD(0);
+            if (chain_length) {
+                ICB_WORD(UINT32_C(0x0010000a) | ((transport_lane + chain_length - 1) % 4) << 4);
+                ICB_WORD(chain_length);
+            } else ICB_WORD(UINT32_C(0x0001700a));
+            for (unsigned word = 4 + source_words; word < instruction->token_count; ++word)
+                ICB_WORD(read_u32(instruction->raw_bytes + word * 4));
+            ++consumers;
+        } else if (phase_count == 1 && instruction->opcode == 104) {
+            if (instruction->token_count != 2) goto fail;
+            ICB_WORD(INSTRUCTION(104, 2)); ICB_WORD(chain_length + 1);
+        } else {
+            for (uint32_t word = 0; word < instruction->token_count; ++word)
+                ICB_WORD(read_u32(instruction->raw_bytes + word * 4));
+        }
+        if (!declared && instruction->opcode == 113) {
+            ICB_WORD(53u | 3u << 11); ICB_WORD(rows * 4 + 2);
+            for (unsigned row = 0; row < rows; ++row)
+                for (unsigned component = 0; component < 4; ++component)
+                    ICB_WORD(component == column ? values[row] : 0);
+            declared = true;
+        }
+    }
+#undef ICB_WORD
+    if (!declared || consumers != 1) goto fail;
+    const size_t instruction_offset = (size_t)chunk->offset + 16;
+    const size_t authored_size = instruction_offset + count * 4;
+    authored = calloc(authored_size, 1);
+    if (!authored) goto fail;
+    memcpy(authored, bytes, instruction_offset);
+    write_u32(authored + 24, (uint32_t)authored_size);
+    write_u32(authored + chunk->offset + 4, (uint32_t)(count * 4 + 8));
+    write_u32(authored + chunk->offset + 12, (uint32_t)(count + 2));
+    for (size_t word = 0; word < count; ++word) write_u32(authored + instruction_offset + word * 4, words[word]);
+    if (!dxbc_compute_hash(authored, authored_size, authored + 4)) goto fail;
+    dxbc_document_free(&document);
+    free(bytes);
+    *size = authored_size;
+    return authored;
+fail:
+    dxbc_document_free(&document);
+    free(bytes);
+    free(authored);
+    return NULL;
+}
 
 /* Authored token grammar and signatures, with no captured byte array. */
 static size_t write_domain_signature(uint8_t *bytes, unsigned role, unsigned domain) {

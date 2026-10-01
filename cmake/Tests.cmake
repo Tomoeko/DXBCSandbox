@@ -387,6 +387,9 @@ if(BUILD_TESTING)
     dxbc_add_core_test(test_hlsl_hull_stage_coverage_units
         tests/test_hlsl_hull_stage_coverage_units.c hlsl_hull_stage_coverage_units)
     target_sources(test_hlsl_hull_stage_coverage_units PRIVATE tests/test_tessellation_fixture.c)
+    dxbc_add_core_test(test_hlsl_hull_icb_units
+        tests/test_hlsl_hull_icb_units.c hlsl_hull_icb_units)
+    target_sources(test_hlsl_hull_icb_units PRIVATE tests/test_tessellation_fixture.c)
     dxbc_add_core_test(test_tessellation_usil_units
         tests/test_tessellation_usil_units.c tessellation_usil_units)
     target_compile_definitions(test_tessellation_usil_units PRIVATE

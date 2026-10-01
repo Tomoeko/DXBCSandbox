@@ -130,6 +130,18 @@ static void fixture_dispose(Fixture *fixture) {
     memset(fixture, 0, sizeof(*fixture));
 }
 
+static bool fixture_init_icb(Fixture *fixture, bool scalar) {
+    CHECK(fixture_init(fixture, false, scalar));
+    const uint32_t values[] = {UINT32_C(0x3fa00000), UINT32_C(0x40200000), UINT32_C(0x40700000)};
+    size_t size = 0;
+    uint8_t *hull = test_tessellation_hull_icb_dxbc(3, 2, 3, 3, true,
+        scalar, false, values, &size);
+    CHECK(hull);
+    free(fixture->segments[HULL_STAGE]); fixture->segments[HULL_STAGE] = NULL;
+    CHECK(fixture_stage(fixture, HULL_STAGE, hull, size));
+    return true;
+}
+
 static bool fixture_second_state(Fixture *fixture, bool unsupported_hull) {
     const char *name = NULL;
     CHECK(serialized_string_pool_copy(&fixture->strings, "FEATURE", &name));
@@ -236,6 +248,16 @@ static bool check_placements(const ShaderLabEmittedHullCoverage *owned,
         CHECK(placement->syntax_ends[index] == whole_coordinate(coverage, body_begin,
             syntax->source_end, !at_unit_begin));
     }
+    CHECK(placement->has_icb_declaration == coverage->hull_icb.plan.present);
+    if (coverage->hull_icb.plan.present) {
+        CHECK(placement->icb_declaration.begin == whole_coordinate(coverage, body_begin,
+              coverage->hull_icb.declaration_begin, false));
+        CHECK(placement->icb_declaration.end == whole_coordinate(coverage, body_begin,
+              coverage->hull_icb.declaration_end, true));
+        CHECK(placement->icb_declaration.begin >= placement->units[0].begin &&
+              placement->icb_declaration.begin < placement->icb_declaration.end &&
+              placement->icb_declaration.end <= placement->units[0].end);
+    } else CHECK(!placement->icb_declaration.begin && !placement->icb_declaration.end);
     return true;
 }
 
@@ -313,6 +335,23 @@ static bool owned_mutations(const ShaderLabSourceQualityRequest *request,
     REJECT_RESTORE(++placement->line_cursor, --placement->line_cursor);
     REJECT_RESTORE(placement->rebased = false, placement->rebased = true);
     REJECT_RESTORE(placement->offset = false, placement->offset = true);
+    const bool has_declaration = placement->has_icb_declaration;
+    REJECT_RESTORE(placement->has_icb_declaration = !has_declaration,
+                   placement->has_icb_declaration = has_declaration);
+    if (has_declaration) {
+        REJECT_RESTORE(++placement->icb_declaration.begin, --placement->icb_declaration.begin);
+        REJECT_RESTORE(--placement->icb_declaration.end, ++placement->icb_declaration.end);
+        const HLSLHullWholeRange declaration = placement->icb_declaration;
+        REJECT_RESTORE(placement->icb_declaration = ((HLSLHullWholeRange){0, 1}),
+                       placement->icb_declaration = declaration);
+        REJECT_RESTORE(entry->coverage.hull_icb.plan.payload[2] ^= 1,
+                       entry->coverage.hull_icb.plan.payload[2] ^= 1);
+        REJECT_RESTORE(++entry->coverage.hull_icb.recorded_declaration_begin,
+                       --entry->coverage.hull_icb.recorded_declaration_begin);
+    } else {
+        REJECT_RESTORE(placement->icb_declaration.begin = 1, placement->icb_declaration.begin = 0);
+        REJECT_RESTORE(placement->icb_declaration.end = 1, placement->icb_declaration.end = 0);
+    }
 #undef REJECT_RESTORE
     return true;
 }
@@ -349,9 +388,9 @@ static bool current_mutations(Fixture *fixture, const ShaderLabSourceQualityRequ
     return true;
 }
 
-static bool positive_capture(bool control_point, bool scalar, bool two_states) {
+static bool positive_capture(bool control_point, bool scalar, bool two_states, bool icb) {
     Fixture fixture, replacement;
-    CHECK(fixture_init(&fixture, control_point, scalar));
+    CHECK(icb ? fixture_init_icb(&fixture, scalar) : fixture_init(&fixture, control_point, scalar));
     if (two_states) CHECK(fixture_second_state(&fixture, false));
     ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
     ShaderLabEmittedHullCoverage *owned = NULL, *independent = NULL;
@@ -400,11 +439,22 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states) {
               entry->inputs.common.cb_count == (scalar ? 1 : 0));
         if (scalar)
             CHECK(entry->inputs.current.constant_buffers != entry->inputs.common.constant_buffers);
+        CHECK(entry->coverage.hull_icb.plan.present == icb);
+        if (icb) {
+            CHECK(entry->coverage.hull_icb.plan.row_count == 3 &&
+                  entry->coverage.hull_icb.literal_root_count == 3 && entry->coverage.hull_icb.access_root_count == 1);
+            CHECK(entry->observation.base_quality.classification == HLSL_SOURCE_QUALITY_MIXED &&
+                  entry->observation.base_quality.counts.incomplete_units == 1);
+        }
         CHECK(check_placements(owned, entry));
         unsigned clamps = 0;
         for (size_t instruction = 0; instruction < entry->raw_map.count; ++instruction)
             if (entry->raw_map.origins[instruction].kind == HLSL_EXPRESSION_ORIGIN_HULL_FACTOR_CLAMP) ++clamps;
-        CHECK(clamps == (scalar ? 2u : 0u));
+        /* The ICB-fed outer MIN stays a readable expression. Existing clamp
+         * lowering still owns the scalar-buffer inner MIN through the stage
+         * attribute, without extending that lowering to ICB operands. */
+        CHECK(clamps == (scalar ? (icb ? 1u : 2u) : 0u));
+        if (scalar && icb) CHECK(strstr(entry->coverage.source, "min("));
     }
     /* The mutation helper deliberately targets the first ordinary selected
      * row; the multi-state fixture separately exercises complete denominators. */
@@ -414,7 +464,7 @@ static bool positive_capture(bool control_point, bool scalar, bool two_states) {
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &same) == SHADERLAB_HULL_COVERAGE_INVALID_ARGUMENT && same == owned);
     CHECK(!shaderlab_emitted_hull_coverage_entry(owned, owned->entry_count, &(ShaderLabEmittedHullEntry){0}));
 
-    CHECK(fixture_init(&replacement, control_point, scalar));
+    CHECK(icb ? fixture_init_icb(&replacement, scalar) : fixture_init(&replacement, control_point, scalar));
     if (two_states) CHECK(fixture_second_state(&replacement, false));
     fixture_dispose(&fixture);
     request.shader = &replacement.shader;
@@ -451,9 +501,9 @@ static bool observe_receipt(void *context, const ShaderLabSourceSyntaxReceipt *r
     return true;
 }
 
-static bool rejection_and_restore(void) {
+static bool rejection_and_restore(bool icb) {
     Fixture fixture;
-    CHECK(fixture_init(&fixture, false, false));
+    CHECK(icb ? fixture_init_icb(&fixture, false) : fixture_init(&fixture, false, false));
     ShaderLabSourceQualityRequest request = {.shader = &fixture.shader, .archive = &fixture.archive};
     ShaderLabEmittedHullCoverage *owned = NULL;
     CHECK(shaderlab_emitted_hull_coverage_capture(&request, &owned) == SHADERLAB_HULL_COVERAGE_OK);
@@ -507,9 +557,11 @@ static bool rejection_and_restore(void) {
 
 int main(void) {
     const size_t allocations = g_allocations_count, bytes = g_allocated_bytes;
-    if (!positive_capture(false, false, false) || !positive_capture(true, false, false) ||
-        !positive_capture(false, true, false) || !positive_capture(false, false, true) ||
-        !rejection_and_restore()) return 1;
+    if (!positive_capture(false, false, false, false) || !positive_capture(true, false, false, false) ||
+        !positive_capture(false, true, false, false) || !positive_capture(false, false, true, false) ||
+        !positive_capture(false, false, false, true) || !positive_capture(false, true, false, true) ||
+        !positive_capture(false, false, true, true) ||
+        !rejection_and_restore(false) || !rejection_and_restore(true)) return 1;
     if (g_allocations_count != allocations || g_allocated_bytes != bytes) {
         fprintf(stderr, "allocation leak: %zu/%zu -> %zu/%zu\n",
             allocations, bytes, g_allocations_count, g_allocated_bytes);

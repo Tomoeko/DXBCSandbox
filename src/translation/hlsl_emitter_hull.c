@@ -4,6 +4,7 @@
 #include "translation/hlsl_source_identifier.h"
 #include "translation/usil_validation.h"
 #include "translation/hlsl_global_declarations.h"
+#include "translation/hlsl_hull_icb_internal.h"
 #include "common/sha256.h"
 
 #include <math.h>
@@ -15,7 +16,7 @@
  * retaining global semantic/raw owners. The source boundary is independent
  * scalar-factor fork phases and either signature-backed implicit copy or
  * a separately owned pure float4 control-point phase. It is not an inverse of the authored function. */
-enum { HULL_SOURCE_INSTRUCTION_LIMIT = 64, HULL_SOURCE_NAME_COUNT = 11 };
+enum { HULL_SOURCE_INSTRUCTION_LIMIT = 64, HULL_SOURCE_NAME_COUNT = 12 };
 
 typedef struct {
     HLSLDomainShape shape;
@@ -26,6 +27,7 @@ typedef struct {
     HLSLInstructionOwners index_transports;
     HLSLInstructionOwners factor_clamps;
     HLSLHullFactorClampOrigin clamp_origins[HULL_SOURCE_INSTRUCTION_LIMIT];
+    HLSLHullICBPlan icb;
     size_t assignment_begin[HULL_SOURCE_INSTRUCTION_LIMIT];
     size_t assignment_end[HULL_SOURCE_INSTRUCTION_LIMIT];
     size_t maximum_attribute_begin, maximum_attribute_end;
@@ -37,7 +39,7 @@ typedef struct {
 } HullSourcePlan;
 
 enum { POINT_TYPE, FACTOR_TYPE, PATCH_FUNCTION, PATCH_VARIABLE, FACTOR_VARIABLE,
-       POINT_FIELD, OUTER_FIELD, INNER_FIELD, FACTOR_INDEX, POINT_INDEX, POINT_VARIABLE };
+       POINT_FIELD, OUTER_FIELD, INNER_FIELD, FACTOR_INDEX, POINT_INDEX, POINT_VARIABLE, FACTOR_OFFSETS };
 
 static const char *partitioning_name(DXBCTessellatorPartitioning partitioning) {
     switch (partitioning) {
@@ -254,7 +256,11 @@ static bool hull_contract(const USILProgram *program, HullSourcePlan *plan) {
         program->signature_declaration_alloc < program->signature_declaration_count ||
         !program->signature_declarations || !scalar_cbuffer_shape(program) || program->texture_count ||
         program->sampler_count || program->uav_count || program->indexable_temp_count ||
-        program->icb_value_count || program->geometry.valid || program->compute.valid ||
+        !usil_icb_declaration_is_valid(program) ||
+        (program->icb_value_count && (control_point || program->icb_value_count < 8 ||
+            program->icb_value_count > HLSL_HULL_ICB_WORD_LIMIT ||
+            program->icb_source_instruction_index >= program->tessellation.phases[0].marker_source_instruction_index)) ||
+        program->geometry.valid || program->compute.valid ||
         (program->has_global_flags && program->global_flags != 1) ||
         program->instruction_count < 2 || program->instruction_count > HULL_SOURCE_INSTRUCTION_LIMIT ||
         program->instruction_alloc < program->instruction_count || !program->instructions ||
@@ -400,6 +406,18 @@ static bool decoded_owner_digest(const USILProgram *program, uint8_t digest[COMM
         (uint64_t)program->index_range_count};
     for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); ++index)
         hash_owner_number(&hash, fields[index]);
+    /* Preserve old non-ICB observations while extending the actual parsed
+     * declaration guard with every admitted raw payload word. */
+    if (program->has_icb_declaration) {
+        static const char icb_domain[] = "dxbc-hull-icb-owner-v1";
+        common_sha256_update(&hash, icb_domain, sizeof(icb_domain));
+        hash_owner_number(&hash, program->icb_source_instruction_index);
+        hash_owner_number(&hash, program->icb_declaration_token);
+        hash_owner_number(&hash, program->icb_declaration_word_count);
+        hash_owner_number(&hash, (uint64_t)program->icb_value_count);
+        for (int word = 0; word < program->icb_value_count; ++word)
+            hash_owner_number(&hash, program->icb_values[word]);
+    }
     for (int index = 0; index < program->cbuffer_count; ++index) {
         hash_owner_number(&hash, (uint64_t)program->cbuffers[index].reg_idx);
         hash_owner_number(&hash, (uint64_t)program->cbuffers[index].size);
@@ -607,10 +625,197 @@ static bool factor_material_source_supported(HLSLEmitterContext *ctx, int index,
     return true;
 }
 
-static ASTExpr *factor_material_source_expression(HLSLEmitterContext *ctx, int index,
-                                                   int operand, uint8_t lanes, void *context) {
-    return factor_material_source_supported(ctx, index, operand, context)
-        ? hlsl_material_source_expression(ctx, index, operand, lanes) : NULL;
+static bool icb_operand_snapshot(const DXBCOperand *operand, bool relative,
+                                 HLSLHullICBOperandSnapshot *snapshot) {
+    if (!operand || !snapshot || operand->has_abs || operand->has_neg || operand->min_precision ||
+        operand->extended_token_count || operand->extended_tokens || operand->imm_value_count ||
+        operand->immediate_word_count || operand->register_index_dim < 0 || operand->register_index_dim > 1 ||
+        operand->rel_op1 || operand->rel_op2 || (relative ? !operand->rel_op0 : operand->rel_op0 != NULL)) return false;
+    for (unsigned index = 0; index < 4; ++index)
+        if (operand->imm_values[index] || operand->imm64_values[index]) return false;
+    for (unsigned index = 0; index < 8; ++index)
+        if (operand->immediate_words[index]) return false;
+    for (int dimension = operand->register_index_dim; dimension < 3; ++dimension)
+        if (operand->index_values[dimension] || operand->index_representations[dimension] ||
+            operand->index_has_immediate[dimension] || operand->index_value_exceeds_int[dimension]) return false;
+    *snapshot = (HLSLHullICBOperandSnapshot){.type = operand->type, .raw_token = operand->raw_token,
+        .register_index = operand->register_index, .register_index_dim = operand->register_index_dim,
+        .rel_offsets = {operand->rel_offset0, operand->rel_offset1, operand->rel_offset2},
+        .swizzle_mode = operand->swizzle_mode, .destination_mask = operand->destination_mask};
+    memcpy(snapshot->swizzle, operand->swizzle, sizeof(snapshot->swizzle));
+    memcpy(snapshot->index_values, operand->index_values, sizeof(snapshot->index_values));
+    memcpy(snapshot->index_representations, operand->index_representations, sizeof(snapshot->index_representations));
+    memcpy(snapshot->index_has_immediate, operand->index_has_immediate, sizeof(snapshot->index_has_immediate));
+    memcpy(snapshot->index_value_exceeds_int, operand->index_value_exceeds_int, sizeof(snapshot->index_value_exceeds_int));
+    return true;
+}
+
+/* Build predecessor edges root first. Shared MOV definitions retain one exact
+ * register/lane edge rather than acquiring authority from a membership bit. */
+static bool icb_index_transport(HLSLEmitterContext *ctx, HullSourcePlan *plan,
+    int definition, int before, const DXBCOperand *read, unsigned depth, int *tail) {
+    const USILHullPhase *phase = &ctx->program->tessellation.phases[plan->phase];
+    if (depth >= HLSL_HULL_ICB_TRANSPORT_LIMIT || !index_temp(ctx->program, read, false, false) ||
+        definition < phase->first_instruction_index || definition >= before) return false;
+    const unsigned lane = (unsigned)usil_operand_source_component(read, 0);
+    const USILInstruction *copy = &ctx->program->instructions[definition];
+    if (copy->opcode != USIL_OP_MOV || copy->operand_count != 2 ||
+        !index_temp(ctx->program, &copy->operands[0], true, false) ||
+        copy->operands[0].register_index != read->register_index ||
+        usil_operand_destination_lane_mask(&copy->operands[0]) != (1u << lane)) return false;
+    HLSLHullICBTransport edge = {.instruction_index = definition,
+        .source_instruction_index = copy->source_instruction_index,
+        .destination_lane = (uint8_t)lane, .predecessor_transport = -1};
+    if (!icb_operand_snapshot(&copy->operands[0], false, &edge.destination) ||
+        !icb_operand_snapshot(&copy->operands[1], false, &edge.source)) return false;
+    if (!instance_operand(&copy->operands[1], false)) {
+        if (!index_temp(ctx->program, &copy->operands[1], false, false) ||
+            !icb_index_transport(ctx, plan, hlsl_operand_definition(ctx, definition, 1, (int)lane),
+                definition, &copy->operands[1], depth + 1, &edge.predecessor_transport)) return false;
+        edge.source_lane = (uint8_t)usil_operand_source_component(&copy->operands[1], 0);
+    }
+    for (size_t index = 0; index < plan->icb.transport_count; ++index) {
+        const HLSLHullICBTransport *retained = &plan->icb.transports[index];
+        if (retained->instruction_index != definition) continue;
+        if (retained->source_instruction_index != edge.source_instruction_index ||
+            retained->destination_lane != edge.destination_lane || retained->source_lane != edge.source_lane ||
+            retained->predecessor_transport != edge.predecessor_transport ||
+            !hlsl_hull_icb_operands_equal(&retained->destination, &edge.destination) ||
+            !hlsl_hull_icb_operands_equal(&retained->source, &edge.source)) return false;
+        *tail = (int)index;
+        return true;
+    }
+    if (plan->owners_frozen || plan->icb.transport_count == HLSL_HULL_ICB_TRANSPORT_LIMIT) return false;
+    *tail = (int)plan->icb.transport_count;
+    plan->icb.transports[plan->icb.transport_count++] = edge;
+    return true;
+}
+
+static bool begin_icb_plan(HLSLEmitterContext *ctx, HullSourcePlan *plan, unsigned column) {
+    const USILProgram *program = ctx->program;
+    const USILHullPhase *phase = &program->tessellation.phases[plan->phase];
+    if (plan->icb.present) return plan->icb.phase_index == plan->phase &&
+        plan->icb.physical_column == column && plan->icb.row_count == phase->instance_count;
+    if (plan->owners_frozen) return false;
+    size_t fork = SIZE_MAX;
+    for (int index = 0; index < program->signature_declaration_count; ++index) {
+        const USILSignatureDeclaration *declaration = &program->signature_declarations[index];
+        if (declaration->operand_type != OPERAND_TYPE_FORK_INSTANCE_ID ||
+            declaration->source_instruction_index < phase->first_source_instruction_index ||
+            declaration->source_instruction_index >= phase->end_source_instruction_index) continue;
+        if (fork != SIZE_MAX) return false;
+        fork = (size_t)index;
+    }
+    if (fork == SIZE_MAX) return false;
+    HLSLHullICBPlan *icb = &plan->icb;
+    icb->present = true;
+    icb->declaration_source_instruction_index = program->icb_source_instruction_index;
+    icb->declaration_token = program->icb_declaration_token;
+    icb->declaration_word_count = program->icb_declaration_word_count;
+    icb->payload_count = (size_t)program->icb_value_count;
+    memcpy(icb->payload, program->icb_values, icb->payload_count * sizeof(*icb->payload));
+    icb->row_count = phase->instance_count;
+    icb->physical_column = (uint8_t)column;
+    icb->phase_index = plan->phase;
+    icb->phase = *phase;
+    icb->fork_declaration_index = fork;
+    icb->fork_declaration = program->signature_declarations[fork];
+    return hlsl_copy_checked(ctx, icb->array_name, sizeof(icb->array_name), plan->names[FACTOR_OFFSETS]) &&
+        hlsl_copy_checked(ctx, icb->index_name, sizeof(icb->index_name), plan->names[FACTOR_INDEX]);
+}
+
+static bool factor_constant_source_supported(HLSLEmitterContext *ctx, int index,
+                                             int operand, void *context) {
+    HullSourcePlan *plan = context;
+    if (!ctx || !ctx->program || !plan || plan->phase < 0 ||
+        (size_t)plan->phase >= ctx->program->tessellation.phase_count ||
+        plan->phase == plan->control_point_phase || index < 0 || index >= ctx->program->instruction_count ||
+        operand < 1 || operand >= ctx->program->instructions[index].operand_count ||
+        !ctx->program->icb_value_count || !usil_icb_declaration_is_valid(ctx->program)) return false;
+    const USILHullPhase *phase = &ctx->program->tessellation.phases[plan->phase];
+    const USILInstruction *instruction = &ctx->program->instructions[index];
+    const DXBCOperand *source = &instruction->operands[operand];
+    USILOperandUseInfo use;
+    HLSLHullICBConsumer consumer = {.instruction_index = index, .operand_index = operand,
+        .source_instruction_index = instruction->source_instruction_index, .transport_tail = -1};
+    if (index < phase->first_instruction_index || index >= phase->end_instruction_index ||
+        phase->kind != DXBC_HULL_PHASE_FORK || phase->instance_count < 2 || phase->instance_count > 4 ||
+        ctx->program->icb_value_count != (int)phase->instance_count * 4 ||
+        source->type != OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER || source->register_index_dim != 1 ||
+        source->register_index || source->rel_offset0 || source->rel_offset1 || source->rel_offset2 ||
+        source->swizzle_mode != 2 || source->index_values[0] || source->index_value_exceeds_int[0] ||
+        !((source->index_representations[0] == 2 && !source->index_has_immediate[0]) ||
+          (source->index_representations[0] == 3 && source->index_has_immediate[0])) ||
+        !icb_operand_snapshot(source, true, &consumer.operand) ||
+        !icb_operand_snapshot(source->rel_op0, false, &consumer.relative) ||
+        !usil_instruction_operand_use(ctx->program, instruction, operand, &use) ||
+        use.use != USIL_OPERAND_USE_SOURCE || !use.source_lane_mask ||
+        (use.source_lane_mask & (uint8_t)(use.source_lane_mask - 1u))) return false;
+    unsigned lane = 0;
+    while (!(use.source_lane_mask & (1u << lane))) ++lane;
+    const int column = usil_operand_source_component(source, (int)lane);
+    if (column < 0 || column >= 4) return false;
+    for (unsigned row = 0; row < phase->instance_count; ++row) {
+        const uint32_t bits = ctx->program->icb_values[row * 4 + (unsigned)column];
+        float value;
+        memcpy(&value, &bits, sizeof(value));
+        if (!isfinite(value)) return false;
+        for (unsigned physical = 0; physical < 4; ++physical)
+            if (physical != (unsigned)column && ctx->program->icb_values[row * 4 + physical]) return false;
+    }
+    if (!begin_icb_plan(ctx, plan, (unsigned)column)) return false;
+    consumer.demanded_lanes = use.source_lane_mask;
+    consumer.physical_column = (uint8_t)column;
+    consumer.direct_fork_id = instance_operand(source->rel_op0, false);
+    if (!consumer.direct_fork_id &&
+        (!claim_index_transport(ctx, plan, hlsl_relative_operand_definition(ctx, index, operand, 0), index, source->rel_op0) ||
+         !icb_index_transport(ctx, plan, hlsl_relative_operand_definition(ctx, index, operand, 0),
+             index, source->rel_op0, 0, &consumer.transport_tail))) return false;
+    for (size_t retained = 0; retained < plan->icb.consumer_count; ++retained) {
+        const HLSLHullICBConsumer *current = &plan->icb.consumers[retained];
+        if (current->instruction_index == index && current->operand_index == operand)
+            return hlsl_hull_icb_consumers_equal(current, &consumer);
+    }
+    if (plan->owners_frozen || plan->icb.consumer_count == HLSL_HULL_ICB_CONSUMER_LIMIT) return false;
+    plan->icb.consumers[plan->icb.consumer_count++] = consumer;
+    return true;
+}
+
+static bool factor_source_supported(HLSLEmitterContext *ctx, int index, int operand, void *context) {
+    return factor_material_source_supported(ctx, index, operand, context) ||
+        factor_constant_source_supported(ctx, index, operand, context);
+}
+
+static ASTExpr *factor_source_expression(HLSLEmitterContext *ctx, int index,
+                                        int operand, uint8_t lanes, void *context) {
+    if (factor_material_source_supported(ctx, index, operand, context))
+        return hlsl_material_source_expression(ctx, index, operand, lanes);
+    if (!factor_constant_source_supported(ctx, index, operand, context)) return NULL;
+    const HullSourcePlan *plan = context;
+    for (size_t consumer = 0; consumer < plan->icb.consumer_count; ++consumer) {
+        const HLSLHullICBConsumer *owner = &plan->icb.consumers[consumer];
+        if (owner->instruction_index != index || owner->operand_index != operand) continue;
+        if (owner->demanded_lanes != lanes) return NULL;
+        char text[2 * HLSL_HULL_ICB_NAME_LIMIT + 4];
+        if (!hlsl_format_checked(ctx, text, sizeof(text), "%s[%s]", plan->icb.array_name, plan->icb.index_name)) return NULL;
+        ASTOperandProvenance provenance;
+        ast_operand_provenance_init(&provenance);
+        provenance.complete = true;
+        provenance.value_role = AST_OPERAND_VALUE_LOGICAL;
+        provenance.logical_value_id = HLSL_HULL_ICB_ACCESS_LOGICAL_ID_BASE | (uint64_t)consumer;
+        provenance.natural_components = provenance.result_components = 1;
+        provenance.instruction_index = index;
+        provenance.source_instruction_index = owner->source_instruction_index;
+        provenance.operand_index = operand;
+        provenance.destination_lanes = lanes;
+        ASTExpr *access = ast_create_emitter_operand_with_provenance(text, &provenance);
+        if (access && !hlsl_stage_coverage_hull_icb_access(ctx, access, consumer)) {
+            ast_free_expr(access);
+            access = NULL;
+        }
+        return access;
+    }
+    return NULL;
 }
 
 static bool material_parameter_bounds(const SerializedProgramParameters *parameters) {
@@ -879,6 +1084,62 @@ static bool prepare_phase_graph(HLSLEmitterContext *ctx, HullSourcePlan *plan, i
     return true;
 }
 
+/* Every table consumer must reach a printed factor expression. The
+ * ordinary pure planner may otherwise discard a dead pending subtree before
+ * printing it. Follow demanded SSA lanes backward within this one straight
+ * phase, so capture and ordinary emission share the same admission boundary.
+ * This follows whole producer expressions conservatively; the existing pure
+ * planner retains their children when it projects a selected vector lane. */
+static bool icb_consumers_live(HLSLEmitterContext *ctx, const HullSourcePlan *plan) {
+    if (!plan->icb.present || plan->phase != plan->icb.phase_index) return true;
+    const USILProgram *program = ctx->program;
+    const USILHullPhase *phase = &program->tessellation.phases[plan->phase];
+    if (!plan->icb.consumer_count || plan->icb.consumer_count > HLSL_HULL_ICB_CONSUMER_LIMIT ||
+        phase->kind != DXBC_HULL_PHASE_FORK || phase->first_instruction_index < 0 ||
+        phase->end_instruction_index > HULL_SOURCE_INSTRUCTION_LIMIT) return false;
+    bool live[HULL_SOURCE_INSTRUCTION_LIMIT] = {false};
+    int output = -1;
+    for (int index = phase->first_instruction_index; index < phase->end_instruction_index; ++index) {
+        const USILInstruction *instruction = &program->instructions[index];
+        if (!instruction->operand_count || instruction->operands[0].type != OPERAND_TYPE_OUTPUT) continue;
+        if (output >= 0 || usil_operand_destination_lane_mask(&instruction->operands[0]) != 1) return false;
+        output = index;
+    }
+    if (output < 0) return false;
+    live[output] = true;
+    for (int index = output; index >= phase->first_instruction_index; --index) {
+        if (!live[index]) continue;
+        const USILInstruction *instruction = &program->instructions[index];
+        for (int operand = 1; operand < instruction->operand_count; ++operand) {
+            const DXBCOperand *source = &instruction->operands[operand];
+            if (source->type != OPERAND_TYPE_TEMP) continue;
+            USILOperandUseInfo use;
+            if (source->rel_op0 || source->rel_op1 || source->rel_op2 ||
+                !usil_instruction_operand_use(program, instruction, operand, &use) ||
+                use.use != USIL_OPERAND_USE_SOURCE || !use.source_lane_mask || (use.source_lane_mask & ~15u))
+                return false;
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                if (!(use.source_lane_mask & (1u << lane))) continue;
+                const int definition = hlsl_operand_definition(ctx, index, operand, (int)lane);
+                const int selected = usil_operand_source_component(source, (int)lane);
+                if (definition < phase->first_instruction_index || definition >= index || selected < 0 || selected >= 4 ||
+                    hlsl_instruction_owners_contains(&plan->index_transports, definition)) return false;
+                const USILInstruction *producer = &program->instructions[definition];
+                if (!producer->operand_count || producer->operands[0].type != OPERAND_TYPE_TEMP ||
+                    producer->operands[0].register_index != source->register_index ||
+                    !(usil_operand_destination_lane_mask(&producer->operands[0]) & (1u << (unsigned)selected))) return false;
+                live[definition] = true;
+            }
+        }
+    }
+    for (size_t index = 0; index < plan->icb.consumer_count; ++index) {
+        const int instruction = plan->icb.consumers[index].instruction_index;
+        if (instruction < phase->first_instruction_index || instruction >= phase->end_instruction_index || !live[instruction])
+            return false;
+    }
+    return true;
+}
+
 static bool prepare_phase(HLSLEmitterContext *ctx, HullSourcePlan *plan, int phase) {
     if (plan->owners_frozen) {
         uint8_t current[COMMON_SHA256_DIGEST_SIZE];
@@ -907,6 +1168,8 @@ static bool prepare_phase(HLSLEmitterContext *ctx, HullSourcePlan *plan, int pha
         for (int operand = 1; operand < instruction->operand_count; ++operand) {
             if (instruction->operands[operand].type == OPERAND_TYPE_CONSTANT_BUFFER &&
                 !factor_material_source_supported(ctx, index, operand, plan)) return false;
+            if (instruction->operands[operand].type == OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER &&
+                !factor_constant_source_supported(ctx, index, operand, plan)) return false;
             if (instruction->operands[operand].type == OPERAND_TYPE_TEMP) {
                 USILOperandUseInfo use;
                 if (!usil_instruction_operand_use(ctx->program, instruction, operand, &use) ||
@@ -918,6 +1181,7 @@ static bool prepare_phase(HLSLEmitterContext *ctx, HullSourcePlan *plan, int pha
             }
         }
     }
+    if (!icb_consumers_live(ctx, plan)) return false;
     if (phase != plan->control_point_phase) {
         for (int index = scope->first_instruction_index; index < scope->end_instruction_index; ++index) {
             HLSLHullFactorClampOrigin origin;
@@ -933,6 +1197,36 @@ static bool prepare_phase(HLSLEmitterContext *ctx, HullSourcePlan *plan, int pha
         }
     }
     return true;
+}
+
+bool hlsl_hull_icb_plan_matches(const USILProgram *program, const HLSLHullICBPlan *expected) {
+    HullSourcePlan plan = {0};
+    if (!expected || !hull_contract(program, &plan)) return false;
+    if (!program->icb_value_count) return hlsl_hull_icb_plans_equal(&plan.icb, expected);
+    if (!expected->present || !memchr(expected->array_name, 0, sizeof(expected->array_name)) ||
+        !memchr(expected->index_name, 0, sizeof(expected->index_name)) ||
+        !hlsl_source_identifier_valid(expected->array_name) || !hlsl_source_identifier_valid(expected->index_name) ||
+        !strcmp(expected->array_name, expected->index_name)) return false;
+    memcpy(plan.names[FACTOR_OFFSETS], expected->array_name, sizeof(plan.names[FACTOR_OFFSETS]));
+    memcpy(plan.names[FACTOR_INDEX], expected->index_name, sizeof(plan.names[FACTOR_INDEX]));
+    HLSLEmitterContext replay = {.program = program};
+    bool accepted = true;
+    for (size_t phase = 0; accepted && phase < program->tessellation.phase_count; ++phase) {
+        if (!prepare_phase_graph(&replay, &plan, (int)phase)) { accepted = false; break; }
+        const USILHullPhase *scope = &program->tessellation.phases[phase];
+        for (int index = scope->first_instruction_index; accepted && index < scope->end_instruction_index; ++index) {
+            const USILInstruction *instruction = &program->instructions[index];
+            for (int operand = 1; accepted && operand < instruction->operand_count; ++operand)
+                if (instruction->operands[operand].type == OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER &&
+                    !factor_constant_source_supported(&replay, index, operand, &plan)) accepted = false;
+        }
+        if (accepted && !icb_consumers_live(&replay, &plan)) accepted = false;
+    }
+    accepted = accepted && plan.icb.present && hlsl_hull_icb_plans_equal(&plan.icb, expected);
+    free_hlsl_use_def_graph(&replay);
+    free_hlsl_ssa_graph(&replay);
+    free_control_flow_graph(&replay);
+    return accepted;
 }
 
 bool hlsl_hull_factor_clamp_origin_matches(const HLSLExpressionOrigin *origin,
@@ -1001,7 +1295,7 @@ bool hlsl_hull_factor_clamp_map_kinds_match(const HLSLExpressionSourceMap *map, 
 static bool allocate_names(HLSLEmitterContext *ctx, HullSourcePlan *plan) {
     static const char *const bases[HULL_SOURCE_NAME_COUNT] = {
         "HullPoint", "HullFactors", "patchConstants", "patch", "factors",
-        "clipPosition", "outer", "inner", "factorIndex", "pointIndex", "controlPoint"};
+        "clipPosition", "outer", "inner", "factorIndex", "pointIndex", "controlPoint", "factorOffsets"};
     if (!hlsl_source_identifier_valid(ctx->entry_point_name) ||
         ctx->reserved_preprocessor_identifier_count > 1024) return false;
     static const char *const fixed_tokens[] = {"InputPatch", "struct", "for", "return", "const",
@@ -1011,7 +1305,8 @@ static bool allocate_names(HLSLEmitterContext *ctx, HullSourcePlan *plan) {
     for (size_t index = 0; index < ctx->reserved_preprocessor_identifier_count; ++index) {
         const char *reserved = ctx->reserved_preprocessor_identifiers[index];
         if (!strcmp(reserved, ctx->entry_point_name) ||
-            !strcmp(reserved, dxbc_signature_semantic_name(ctx->program->inputs))) return false;
+            !strcmp(reserved, dxbc_signature_semantic_name(ctx->program->inputs)) ||
+            (ctx->program->icb_value_count && !strcmp(reserved, "static"))) return false;
         for (size_t token = 0; token < sizeof(fixed_tokens) / sizeof(fixed_tokens[0]); ++token)
             if (!strcmp(reserved, fixed_tokens[token])) return false;
     }
@@ -1022,7 +1317,8 @@ static bool allocate_names(HLSLEmitterContext *ctx, HullSourcePlan *plan) {
     for (size_t index = 0; index < original_count; ++index) reserved[index] = original[index];
     ctx->reserved_preprocessor_identifiers = reserved;
     bool success = true;
-    for (int name = 0; name < HULL_SOURCE_NAME_COUNT; ++name) {
+    const int name_count = ctx->program->icb_value_count ? HULL_SOURCE_NAME_COUNT : FACTOR_OFFSETS;
+    for (int name = 0; name < name_count; ++name) {
         const char *base = name == POINT_FIELD && plan->point_width == 3 ? "pointValue" : bases[name];
         if (!hlsl_allocate_interface_name(ctx, base, plan->names[name])) { success = false; break; }
         reserved[ctx->reserved_preprocessor_identifier_count++] = plan->names[name];
@@ -1063,6 +1359,22 @@ static bool observe_owned_atom(HLSLEmitterContext *ctx, const char *text, int in
     return accepted;
 }
 
+/* The declaration hook already acquired this exact literal root. Observe its
+ * quality through the ordinary expression lifecycle without acquiring a
+ * second root or inventing an instruction for a declaration payload. */
+static bool observe_registered_icb_literal(HLSLEmitterContext *ctx, const ASTExpr *literal) {
+    if (!ctx->source_quality_analysis) return true;
+    hlsl_source_quality_interface_expression_begin(ctx, -1);
+    ctx->source_quality_root = literal;
+    ctx->source_quality_instruction = -1;
+    const bool accepted = hlsl_source_quality_analysis_expression(ctx->source_quality_analysis, literal);
+    ctx->source_quality_root = NULL;
+    if (!accepted)
+        hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
+            HLSL_EMIT_PHASE_INSTRUCTION_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    return accepted;
+}
+
 bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
     if (hlsl_high_level_hull_join_supported(ctx->program, ctx->emit_mode))
         return hlsl_emit_high_level_hull_join(ctx);
@@ -1076,8 +1388,10 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
     /* Analyze both independent phases before appending source. */
     for (size_t phase = 0; phase < ctx->program->tessellation.phase_count; ++phase)
         if (!prepare_phase(ctx, &plan, (int)phase)) goto finish;
+    if ((ctx->program->icb_value_count && !plan.icb.present) ||
+        !hlsl_hull_icb_plan_matches(ctx->program, &plan.icb)) goto finish;
     plan.owners_frozen = true;
-    if (!hlsl_stage_coverage_begin(ctx)) goto finish;
+    if (!hlsl_stage_coverage_begin(ctx) || !hlsl_stage_coverage_hull_icb_plan(ctx, &plan.icb)) goto finish;
     hlsl_expression_source_map_begin(ctx);
     StringBuilder *sb = ctx->sb;
     if (!begin_unit(ctx, 0, HLSL_SOURCE_UNIT_CONFIGURATION)) goto finish;
@@ -1085,6 +1399,33 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
         emit_cbuffers(ctx);
         if (!sb_ok(sb) || !hlsl_source_quality_cbuffer_inventory_complete(ctx) ||
             (ctx->diagnostic && ctx->diagnostic->status != HLSL_EMIT_STATUS_OK)) goto finish;
+    }
+    if (plan.icb.present) {
+        const size_t declaration_begin = sb->len;
+        sb_appendf(sb, "static const float %s[%zu] = {", plan.icb.array_name, plan.icb.row_count);
+        hlsl_source_quality_emission(ctx, 0, false, -1);
+        for (size_t row = 0; row < plan.icb.row_count; ++row) {
+            if (row) sb_append(sb, ", ");
+            const uint32_t bits = plan.icb.payload[row * 4 + plan.icb.physical_column];
+            ASTExpr *literal = ast_create_literal_bits(&bits, 1, AST_SCALAR_FLOAT32);
+            if (!literal || !hlsl_stage_coverage_hull_icb_literal(ctx, literal, row) ||
+                !observe_registered_icb_literal(ctx, literal)) {
+                ast_free_expr(literal);
+                goto finish;
+            }
+            const size_t literal_begin = sb->len;
+            ast_format_expr(literal, sb);
+            const bool captured = hlsl_stage_coverage_span(ctx->stage_coverage, literal, literal_begin, sb->len);
+            ast_free_expr(literal);
+            if (!captured || !sb_ok(sb)) goto finish;
+        }
+        sb_append(sb, "};\n\n");
+        if (!sb_ok(sb) || !hlsl_stage_coverage_hull_icb_declaration(ctx, declaration_begin, sb->len)) goto finish;
+        hlsl_source_quality_emission(ctx, 0, false, -1);
+        /* Exact declaration ownership supplies source integrity; logical local
+         * declaration completeness remains a separate future obligation. */
+        if (ctx->source_quality_analysis &&
+            !hlsl_source_quality_analysis_mark_incomplete_unit(ctx->source_quality_analysis)) goto finish;
     }
     sb_appendf(sb, "struct %s {\n    float%u %s : %s;\n};\n\n", plan.names[POINT_TYPE], plan.point_width, plan.names[POINT_FIELD],
         dxbc_signature_semantic_name(ctx->program->inputs));
@@ -1137,8 +1478,8 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx) {
         const HLSLPureExpressionScope scope = {.first_instruction = owned->first_instruction_index,
             .end_instruction = owned->end_instruction_index, .omitted_instructions = &plan.index_transports,
             .destination_supported = destination_supported, .append_destination = append_destination,
-            .source_supported = factor_material_source_supported,
-            .source_expression = factor_material_source_expression,
+            .source_supported = factor_source_supported,
+            .source_expression = factor_source_expression,
             .hull_factor_clamp_supported = factor_clamp_supported,
             .assignment_span = record_factor_assignment, .context = &plan};
         if (!hlsl_emit_pure_expression_scope(ctx, &scope)) goto finish;
@@ -1265,6 +1606,7 @@ finish:
         uint8_t current[COMMON_SHA256_DIGEST_SIZE];
         if (!material_parameters_match(ctx, &plan) || !decoded_owner_digest(ctx->program, current) ||
             memcmp(current, plan.decoded_owner_digest, sizeof(current)) ||
+            !hlsl_hull_icb_plan_matches(ctx->program, &plan.icb) ||
             (ctx->expression_source_map &&
              !hlsl_expression_source_map_matches(ctx->expression_source_map, ctx->program, ctx->sb->buf))) {
             hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED, HLSL_EMIT_PHASE_OUTPUT, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
