@@ -497,6 +497,26 @@ bool hlsl_high_level_output_projection(const USILProgram *program,
     const DXBCOperand *destination, HLSLNaturalOutputProjection *projection);
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);
+/* One direct unsigned system output in the packed vertex route. This is a
+ * numeric instruction/signature proof; serialized FLOAT1 authority is checked
+ * separately in the consuming context factory. Failure leaves a zero plan. */
+typedef struct {
+    bool present;
+    int output_signature_index;
+    int instruction_index;
+    uint32_t source_instruction_index;
+    uint8_t destination_lanes;
+    int cbuffer_binding;
+    uint32_t row;
+    uint8_t physical_component;
+    uint32_t byte_offset;
+} HLSLPackedUIntOutputPlan;
+bool hlsl_packed_uint_output_plan_prepare(const USILProgram *program,
+    HLSLPackedUIntOutputPlan *plan);
+/* Consumes the actual owned scalar material leaf on success and failure.
+ * FLOAT32 to UINT32 is a numeric CAST, with the decoded output writer owner. */
+ASTExpr *hlsl_packed_output_uint_expression(HLSLEmitterContext *ctx,
+    int instruction, ASTExpr *source);
 /* Consumes both actual owned pieces on success and failure. Interface assembly
  * has a canonical synthetic origin; neither decoded writer is widened. */
 ASTExpr *hlsl_output_assembly_expression(const HLSLDomainOutputPlan *plan,

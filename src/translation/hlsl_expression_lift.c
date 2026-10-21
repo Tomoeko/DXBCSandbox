@@ -124,14 +124,14 @@ static unsigned operation_width(uint8_t lanes, const ASTExpr *left,
     return width;
 }
 
-static ASTExpr *logical_expression(HLSLEmitterContext *ctx, ASTExpr *expression,
-                                    int instruction, uint8_t lanes, unsigned width) {
+static ASTExpr *typed_logical_expression(HLSLEmitterContext *ctx, ASTExpr *expression,
+    int instruction, uint8_t lanes, unsigned width, ASTScalarType scalar_type) {
     if (!expression || expression->kind == AST_EXPR_EMITTER_OPERAND)
         return expression;
     ASTLogicalValueOrigin origin;
     ast_logical_value_origin_init(&origin);
     origin.complete = true;
-    origin.scalar_type = AST_SCALAR_FLOAT32;
+    origin.scalar_type = scalar_type;
     origin.components = (uint8_t)width;
     origin.logical_value_id = (uint64_t)instruction;
     origin.instruction_index = instruction;
@@ -143,6 +143,11 @@ static ASTExpr *logical_expression(HLSLEmitterContext *ctx, ASTExpr *expression,
         return NULL;
     }
     return expression;
+}
+
+static ASTExpr *logical_expression(HLSLEmitterContext *ctx, ASTExpr *expression,
+                                    int instruction, uint8_t lanes, unsigned width) {
+    return typed_logical_expression(ctx, expression, instruction, lanes, width, AST_SCALAR_FLOAT32);
 }
 
 static bool output_piece_expression_owned(const HLSLDomainOutputPiece *piece, const ASTExpr *expression) {
@@ -247,7 +252,8 @@ static int vector_definition(const HLSLEmitterContext *ctx, int instruction, int
     return definition;
 }
 
-static HLSLEmitReason float_program_contract(const USILProgram *program, bool full_width) {
+static HLSLEmitReason float_program_contract_with_output(const USILProgram *program,
+    bool full_width, int unsigned_output) {
     if (program->instruction_count < 1 ||
         program->instruction_count > EXPRESSION_INSTRUCTION_LIMIT ||
         (program->shader_model_major != 4 && program->shader_model_major != 5) ||
@@ -261,13 +267,17 @@ static HLSLEmitReason float_program_contract(const USILProgram *program, bool fu
         const DXBCSignatureElement *signature = kind ? program->outputs : program->inputs;
         int count = kind ? program->output_count : program->input_count;
         for (int index = 0; index < count; ++index) {
-            if (signature[index].component_type != 3 || !signature[index].mask ||
+            if ((signature[index].component_type != 3 && (!kind || index != unsigned_output)) || !signature[index].mask ||
                 (full_width && signature[index].mask != 15) ||
                 signature[index].min_precision)
                 return HLSL_EMIT_REASON_UNREPRESENTABLE_LAYOUT;
         }
     }
     return HLSL_EMIT_REASON_NONE;
+}
+
+static HLSLEmitReason float_program_contract(const USILProgram *program, bool full_width) {
+    return float_program_contract_with_output(program, full_width, -1);
 }
 
 HLSLEmitReason hlsl_float4_program_contract(const USILProgram *program) {
@@ -708,10 +718,23 @@ bool hlsl_natural_float_program_supported(HLSLEmitterContext *ctx) {
     return ctx && ctx->program && vector_program_supported(ctx);
 }
 
+static bool packed_uint_material_supported(HLSLEmitterContext *ctx,
+    const HLSLPackedUIntOutputPlan *plan);
+
+static bool packed_program_supported(HLSLEmitterContext *ctx) {
+    HLSLPackedUIntOutputPlan plan;
+    const bool converted = hlsl_packed_uint_output_plan_prepare(ctx->program, &plan);
+    const HLSLEmitReason reason = ctx->use_uint_temps ? HLSL_EMIT_REASON_UNSUPPORTED_FEATURE :
+        float_program_contract_with_output(ctx->program, false,
+            converted ? plan.output_signature_index : -1);
+    return reason == HLSL_EMIT_REASON_NONE || reject(ctx, -1, reason);
+}
+
 static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, bool full_width,
                                        HLSLMatrixLiftPlan *matrix_plans,
                                        const HLSLPureExpressionScope *scope) {
-    if (!scope && !(full_width ? hlsl_float4_program_supported(ctx) : vector_program_supported(ctx)))
+    if (!scope && !(full_width ? hlsl_float4_program_supported(ctx) :
+        ctx->high_level_packed_outputs ? packed_program_supported(ctx) : vector_program_supported(ctx)))
         return false;
     if (ctx->compiler_model.replacement_count)
         return reject(ctx, -1, HLSL_EMIT_REASON_UNSUPPORTED_FEATURE);
@@ -765,8 +788,12 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
             index = final;
             continue;
         }
-        if (!float_instruction_supported(ctx, index, full_width, scope))
-            return false;
+        if (!scope && !full_width && ctx->high_level_packed_outputs && inst->opcode == USIL_OP_FTOU) {
+            HLSLPackedUIntOutputPlan plan;
+            if (!hlsl_packed_uint_output_plan_prepare(program, &plan) ||
+                plan.instruction_index != index || !packed_uint_material_supported(ctx, &plan))
+                return reject(ctx, index, HLSL_EMIT_REASON_MISSING_METADATA_AUTHORITY);
+        } else if (!float_instruction_supported(ctx, index, full_width, scope)) return false;
         if (hlsl_texture_sample_opcode(inst->opcode) || float_derivative(inst->opcode))
             uses[index] = 2; /* Keep quad/resource operations at their original site. */
         const DXBCOperand *destination = &inst->operands[0];
@@ -827,6 +854,132 @@ bool hlsl_float4_validate_expressions(HLSLEmitterContext *ctx,
     return validate_float_expressions(ctx, uses, true, NULL, NULL);
 }
 
+static bool material_field_name_unique(const HLSLEmitterContext *ctx, const TempVariable *field) {
+    for (int buffer_index = 0; buffer_index < ctx->cbuffer_layout_count; ++buffer_index) {
+        const HLSLCBufferLayout *other = &ctx->cbuffer_layouts[buffer_index];
+        if (other->variable_count < 0 || other->variable_alloc < other->variable_count ||
+            (other->variable_count && !other->variables)) return false;
+        for (int variable = 0; variable < other->variable_count; ++variable) {
+            const TempVariable *candidate = &other->variables[variable];
+            if (!candidate->name || (candidate != field && !strcmp(candidate->name, field->name)))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool bounded_material_name(const char *name) {
+    if (!name || !name[0]) return false;
+    for (size_t index = 1; index < 256u; ++index) if (!name[index]) return true;
+    return false;
+}
+
+/* Include dormant serialized buffers: the ordinary name resolver traverses
+ * both inventories, so another buffer's matching identifier cannot own this
+ * scalar even when its layout coincides. The two authorities may agree on one
+ * exact field; role and buffer identity remain part of that agreement. */
+static bool packed_uint_metadata_unique(const HLSLEmitterContext *ctx,
+    const HLSLCBufferLayout *buffer, const TempVariable *field) {
+    const SerializedProgramParameters *sources[] = {ctx->params, ctx->common_params};
+    bool found = false;
+    SerializedConstantBufferRole role = SERIALIZED_CBUFFER_NAMED;
+    for (size_t source = 0; source < 2u; ++source) {
+        const SerializedProgramParameters *parameters = sources[source];
+        if (!parameters) continue;
+        if (parameters->cb_count < 0 || parameters->cb_count > 8 ||
+            (parameters->cb_count && !parameters->constant_buffers) || parameters->res_count < 0 ||
+            parameters->res_count > 128 || (parameters->res_count && !parameters->resources)) return false;
+        unsigned matches = 0;
+        for (int cb = 0; cb < parameters->cb_count; ++cb) {
+            const SerializedConstantBuffer *owner = &parameters->constant_buffers[cb];
+            if (!bounded_material_name(owner->name) || owner->var_count < 0 || owner->var_count > 128 ||
+                (owner->var_count && !owner->variables) || owner->struct_count < 0 ||
+                owner->struct_count > 16 || (owner->struct_count && !owner->struct_params)) return false;
+            for (int variable = 0; variable < owner->var_count; ++variable) {
+                const SerializedVariable *candidate = &owner->variables[variable];
+                if (!bounded_material_name(candidate->name)) return false;
+                if (strcmp(candidate->name, field->name)) continue;
+                DecodedVariableLayout layout;
+                if (++matches > 1u || strcmp(owner->name, buffer->serialized_name) ||
+                    (owner->role != SERIALIZED_CBUFFER_NAMED &&
+                     owner->role != SERIALIZED_CBUFFER_LOOSE_PARAMETERS) ||
+                    (found && owner->role != role) ||
+                    !parameter_layout_decode(parameters, candidate, &layout) ||
+                    layout.scalar_type || layout.rows != 1 || layout.columns != 1 ||
+                    layout.array_size || layout.is_matrix || layout.byte_offset != field->byte_offset ||
+                    parameter_layout_byte_size(&layout) != 4) return false;
+                role = owner->role;
+                found = true;
+            }
+            for (int structure = 0; structure < owner->struct_count; ++structure) {
+                const SerializedStructParam *aggregate = &owner->struct_params[structure];
+                if (!bounded_material_name(aggregate->name) || aggregate->member_count < 0 ||
+                    aggregate->member_count > 128 || (aggregate->member_count && !aggregate->members) ||
+                    !strcmp(aggregate->name, field->name)) return false;
+                for (int member = 0; member < aggregate->member_count; ++member)
+                    if (!bounded_material_name(aggregate->members[member].name) ||
+                        !strcmp(aggregate->members[member].name, field->name)) return false;
+            }
+        }
+        for (int resource = 0; resource < parameters->res_count; ++resource) {
+            const SerializedResourceParam *binding = &parameters->resources[resource];
+            if (binding->bind_type != SERIALIZED_RESOURCE_CONSTANT_BUFFER) continue;
+            if (!bounded_material_name(binding->name) ||
+                (!strcmp(binding->name, buffer->serialized_name) && binding->bind_index != (uint32_t)buffer->reg))
+                return false;
+        }
+    }
+    return found;
+}
+
+static bool packed_uint_material_supported(HLSLEmitterContext *ctx,
+    const HLSLPackedUIntOutputPlan *plan) {
+    HLSLPackedUIntOutputPlan current;
+    if (!ctx || !ctx->high_level_packed_outputs || !plan || !plan->present ||
+        !hlsl_packed_output_candidate(ctx->program) ||
+        !hlsl_packed_uint_output_plan_prepare(ctx->program, &current) ||
+        current.instruction_index != plan->instruction_index ||
+        current.output_signature_index != plan->output_signature_index ||
+        current.source_instruction_index != plan->source_instruction_index ||
+        current.destination_lanes != plan->destination_lanes || current.cbuffer_binding != plan->cbuffer_binding ||
+        current.row != plan->row || current.physical_component != plan->physical_component ||
+        current.byte_offset != plan->byte_offset || !ctx->cbuffer_layouts_built ||
+        ctx->cbuffer_layout_count < 1 || ctx->cbuffer_layout_count > HLSL_MAX_CBUFFER_LAYOUTS) return false;
+    const HLSLCBufferLayout *buffer = get_cbuffer_emission_layout(ctx, current.cbuffer_binding);
+    const char *binding = get_cbuffer_name_from_map(ctx, current.cbuffer_binding);
+    if (!buffer || buffer->raw_storage || buffer->row_struct_storage || !buffer->has_serialized_authority ||
+        !bounded_material_name(buffer->serialized_name) || !bounded_material_name(binding) ||
+        strcmp(buffer->serialized_name, binding) || buffer->variable_count < 1 ||
+        buffer->variable_count > 128 || buffer->variable_alloc < buffer->variable_count ||
+        !buffer->variables || buffer->row_count <= (int)current.row) return false;
+    const TempVariable *field = NULL;
+    for (int variable = 0; variable < buffer->variable_count; ++variable) {
+        const TempVariable *candidate = &buffer->variables[variable];
+        if (candidate->byte_offset != current.byte_offset) continue;
+        if (field) return false;
+        field = candidate;
+    }
+    if (!field || !bounded_material_name(field->name) || field->type || field->rows != 1 || field->dim != 1 ||
+        field->is_matrix || field->matrix_array_size || field->byte_size != 4 ||
+        (field->authority != 1 && field->authority != 2)) return false;
+    for (int cb = 0; cb < ctx->cbuffer_layout_count; ++cb) {
+        const HLSLCBufferLayout *owner = &ctx->cbuffer_layouts[cb];
+        if (owner->variable_count < 0 || owner->variable_count > 128 ||
+            owner->variable_alloc < owner->variable_count || (owner->variable_count && !owner->variables)) return false;
+        for (int variable = 0; variable < owner->variable_count; ++variable)
+            if (!bounded_material_name(owner->variables[variable].name)) return false;
+    }
+    if (!material_field_name_unique(ctx, field) || !packed_uint_metadata_unique(ctx, buffer, field)) return false;
+    int field_offset = -1;
+    const char *name = resolve_cb_variable_ctx(ctx, current.cbuffer_binding, (int)current.row,
+        current.physical_component, &field_offset);
+    DecodedVariableLayout layout;
+    return name && !strcmp(name, field->name) && !field_offset &&
+        resolve_variable_layout_ctx(ctx, field->name, &layout) && !layout.scalar_type && layout.rows == 1 &&
+        layout.columns == 1 && !layout.is_matrix && !layout.array_size &&
+        layout.byte_offset == current.byte_offset && parameter_layout_byte_size(&layout) == 4;
+}
+
 /* The program-only position plan identifies the two physical slices. MAD
  * additionally needs one serialized float4 field; two adjacent float2 fields
  * cannot supply that source identity. Reuse the merged, scoped layout rather
@@ -866,16 +1019,7 @@ static bool position_output_material_supported(HLSLEmitterContext *ctx,
     /* The shared name-to-layout resolver is intentionally unscoped. A same
      * spelling in another buffer cannot prove this field's source identity,
      * even when both physical layouts happen to be identical. */
-    for (int buffer_index = 0; buffer_index < ctx->cbuffer_layout_count; ++buffer_index) {
-        const HLSLCBufferLayout *other = &ctx->cbuffer_layouts[buffer_index];
-        if (other->variable_count < 0 || other->variable_alloc < other->variable_count ||
-            (other->variable_count && !other->variables)) return false;
-        for (int variable = 0; variable < other->variable_count; ++variable) {
-            const TempVariable *candidate = &other->variables[variable];
-            if (!candidate->name || (candidate != field && !strcmp(candidate->name, field->name)))
-                return false;
-        }
-    }
+    if (!material_field_name_unique(ctx, field)) return false;
     for (int component = 0; component < 4; ++component) {
         int field_offset = -1;
         const char *name = resolve_cb_variable_ctx(ctx, scale->register_index,
@@ -1109,6 +1253,40 @@ ASTExpr *hlsl_material_source_expression(HLSLEmitterContext *ctx, int instructio
     const DXBCOperand *source = &ctx->program->instructions[instruction].operands[operand];
     if (!hlsl_material_source_supported(ctx, source, lanes)) return NULL;
     return formatted_source_atom(ctx, source, lanes, false, instruction, operand);
+}
+
+ASTExpr *hlsl_packed_output_uint_expression(HLSLEmitterContext *ctx,
+    int instruction, ASTExpr *source) {
+    HLSLPackedUIntOutputPlan plan;
+    if (!ctx || !ctx->high_level_packed_outputs || !source ||
+        source->kind != AST_EXPR_EMITTER_OPERAND ||
+        !hlsl_packed_uint_output_plan_prepare(ctx->program, &plan) ||
+        plan.instruction_index != instruction || !packed_uint_material_supported(ctx, &plan)) {
+        ast_free_expr(source);
+        return NULL;
+    }
+    const ASTOperandProvenance *origin = &source->operand_provenance;
+    const bool owned = origin->complete && origin->value_role == AST_OPERAND_VALUE_LOGICAL &&
+        origin->logical_value_id == (((uint64_t)(plan.cbuffer_binding + 1) << 32) | plan.byte_offset) &&
+        origin->natural_components == 1 && origin->result_components == 1 &&
+        origin->selection_role == AST_COMPONENT_SELECTION_NONE && !origin->selected_components[0] &&
+        origin->bitcast_role == AST_OPERAND_BITCAST_NONE && !origin->raw_buffer_reconstruction &&
+        !origin->synthetic_interface && origin->instruction_index == instruction &&
+        origin->source_instruction_index == plan.source_instruction_index && origin->operand_index == 1 &&
+        origin->destination_lanes == 1;
+    /* Bind the supplied owned leaf to the same existing formatter and complete
+     * typed provenance. A plausible scalar name, literal or forged owner is
+     * not a substitute for this instruction's actual serialized source. */
+    ASTExpr *expected = owned ? hlsl_material_source_expression(ctx, instruction, 1, 1) : NULL;
+    const bool matches = expected && hlsl_matrix_uses_trees_equal(source, expected);
+    ast_free_expr(expected);
+    if (!matches) {
+        ast_free_expr(source);
+        return NULL;
+    }
+    ASTExpr *cast = ast_create_cast("uint", source);
+    if (!cast) ast_free_expr(source);
+    return typed_logical_expression(ctx, cast, instruction, plan.destination_lanes, 1, AST_SCALAR_UINT32);
 }
 
 /* An actual domain coordinate is a pure logical parameter. Compose a vector
@@ -1497,6 +1675,15 @@ static ASTExpr *vector_operation(HLSLEmitterContext *ctx, int index, ASTExpr *le
                                  ASTExpr *right, ASTExpr *third,
                                  const HLSLPureExpressionScope *scope) {
     const USILOpcode opcode = ctx->program->instructions[index].opcode;
+    if (opcode == USIL_OP_FTOU) {
+        if (scope || !ctx->high_level_packed_outputs || right || third) {
+            if (third != left && third != right) ast_free_expr(third);
+            if (right != left) ast_free_expr(right);
+            ast_free_expr(left);
+            return NULL;
+        }
+        return hlsl_packed_output_uint_expression(ctx, index, left);
+    }
     if (opcode == USIL_OP_MIN && scope && scope->hull_factor_clamp_supported &&
         scope->hull_factor_clamp_supported(ctx, index, scope->context)) {
         const uint8_t lanes = usil_operand_destination_lane_mask(
@@ -1994,6 +2181,9 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
     if (program->program_type == DXBC_PROGRAM_TYPE_HULL &&
         !hlsl_hull_factor_clamp_map_kinds_match(map, program)) return false;
     const size_t source_length = strlen(source);
+    HLSLPackedUIntOutputPlan unsigned_output;
+    const bool converted = hlsl_packed_uint_output_plan_prepare(program, &unsigned_output) &&
+        hlsl_packed_output_candidate(program);
     for (size_t index = 0; index < map->count; ++index) {
         const HLSLExpressionOrigin *origin = &map->origins[index];
         const USILInstruction *inst = &program->instructions[index];
@@ -2009,6 +2199,8 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
         const bool scalar_comparison = scalar_comparison_opcode(inst->opcode) &&
             inst->operand_count == 3 && inst->operands[0].type == OPERAND_TYPE_TEMP &&
             lanes && !(lanes & (lanes - 1u));
+        const bool unsigned_conversion = converted && inst->opcode == USIL_OP_FTOU &&
+            (int)index == unsigned_output.instruction_index;
         if (origin->destination_lanes != lanes)
             return false;
         switch (origin->kind) {
@@ -2026,7 +2218,7 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
-            if ((!expression && !scalar_comparison) || !lanes)
+            if ((!expression && !scalar_comparison && !unsigned_conversion) || !lanes)
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_EFFECT:

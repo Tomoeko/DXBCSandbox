@@ -39,6 +39,7 @@ typedef struct {
     uint32_t raw_instruction, original_bits;
     USILOpcode opcode;
     uint8_t demanded_lanes, destination_lanes;
+    unsigned shader_model_major;
     bool valid;
 } ProbeDecodedLiteral;
 
@@ -334,8 +335,8 @@ static bool scalar_fixture_reflection(const UnityCompilerBinaryResponse *respons
 }
 
 /* A controlled native callback projection, not a player-blob capture or an
- * authored property/default-value lookup. Complete FLOAT4 and FLOAT4x4 tuples
- * use the existing text-layout input, which owns all copied strings. */
+ * authored property/default-value lookup. Complete FLOAT4/FLOAT4x4 tuples and
+ * the measured adjacent FLOAT1 pair use owned existing text-layout input. */
 static bool native_parameter_string_bounded(const char *text, size_t limit) {
     if (!text) return false;
     size_t size = 0;
@@ -411,6 +412,7 @@ static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
     SerializedResourceParam binding = {.bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER,
         .array_size = 1};
     bool have_buffer = false, have_binding = false, constant_scope = false;
+    bool scalar_pair = false;
     uint32_t next_offset = 0;
     int32_t variable_count = -1;
     for (size_t index = 0; index < response->reflection_record_count; ++index) {
@@ -436,7 +438,7 @@ static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
                 record->values[0] < 16 || record->values[0] > PROBE_NATIVE_CB_FIELD_LIMIT * 64 ||
                 (record->values[0] & 15) || record->values[1] < 1 ||
                 record->values[1] > PROBE_NATIVE_CB_FIELD_LIMIT ||
-                record->values[0] < record->values[1] * 16 ||
+                record->values[0] < record->values[1] * 4 ||
                 record->values[0] > record->values[1] * 64 ||
                 (!hlsl_source_identifier_valid(record->name) && strcmp(record->name, "$Globals")))
                 return false;
@@ -447,22 +449,26 @@ static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
             constant_scope = true;
         } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT) {
             const bool matrix = record->values[2] == 1 && record->values[3] == 4;
+            const bool scalar = !record->values[2] && record->values[3] == 1 &&
+                record->values[4] == 1;
+            const uint32_t extent = matrix ? 64u : scalar ? 4u : 16u;
             if (!have_buffer || !constant_scope || have_binding || record->value_count != 6u ||
                 buffer.var_count >= variable_count ||
                 record->values[0] < 0 || (uint32_t)record->values[0] != next_offset ||
                 record->values[1] || (!matrix && (record->values[2] || record->values[3] != 1)) ||
-                record->values[4] != 4 || record->values[5] ||
-                next_offset > buffer.size || (matrix ? 64u : 16u) > buffer.size - next_offset ||
+                (!scalar && record->values[4] != 4) || record->values[5] ||
+                next_offset > buffer.size || extent > buffer.size - next_offset ||
                 !hlsl_source_identifier_valid(record->name) || !strcmp(record->name, buffer.name))
                 return false;
             for (int field = 0; field < buffer.var_count; ++field)
                 if (!strcmp(fields[field].name, record->name)) return false;
             fields[buffer.var_count] = (SerializedVariable){.name = record->name,
-                .layout = {(uint32_t)record->values[0], 0, 0, 4, matrix ? 1u : 0u, 0}};
-            next_offset += matrix ? 64u : 16u;
+                .layout = {(uint32_t)record->values[0], 0, 0, scalar ? 1u : 4u, matrix ? 1u : 0u, 0}};
+            scalar_pair |= scalar;
+            next_offset += extent;
             ++buffer.var_count;
         } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) {
-            if (!have_buffer || have_binding || buffer.var_count != variable_count || next_offset != buffer.size ||
+            if (!have_buffer || have_binding || buffer.var_count != variable_count ||
                 record->value_count != 1u || record->values[0] < 0 ||
                 record->values[0] >= HLSL_SM5_CBUFFER_REGISTER_COUNT ||
                 strcmp(record->name, buffer.name)) return false;
@@ -472,16 +478,32 @@ static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
             constant_scope = false;
         } else return false;
     }
-    if (!have_buffer || !have_binding || buffer.var_count != variable_count || next_offset != buffer.size) return false;
+    if (!have_buffer || !have_binding || buffer.var_count != variable_count) return false;
+    if (scalar_pair) {
+        /* Only actual observed one-row scalar pairs, optionally preceded by
+         * one complete FLOAT4 row. The remaining eight bytes are CB rounding. */
+        const int first = buffer.var_count == 2 && buffer.size == 16u ? 0 :
+            buffer.var_count == 3 && buffer.size == 32u ? 1 : -1;
+        if (first < 0 || !hlsl_source_identifier_valid(buffer.name) ||
+            next_offset != buffer.size - 8u ||
+            (first && (fields[0].layout[0] || fields[0].layout[3] != 4u || fields[0].layout[4])))
+            return false;
+        for (int index = 0; index < 2; ++index) {
+            const SerializedVariable *field = &fields[first + index];
+            if (field->layout[0] != (uint32_t)first * 16u + (uint32_t)index * 4u ||
+                field->layout[3] != 1u || field->layout[4]) return false;
+        }
+    } else if (next_offset != buffer.size) return false;
     const SerializedProgramParameters projected = {.constant_buffers = &buffer,
         .cb_count = 1, .resources = &binding, .res_count = 1};
     for (int field = 0; field < buffer.var_count; ++field) {
         const bool matrix = fields[field].layout[4] != 0;
+        const uint32_t columns = fields[field].layout[3];
         DecodedVariableLayout layout;
         if (!parameter_layout_decode(&projected, &fields[field], &layout) ||
             layout.byte_offset != fields[field].layout[0] || layout.scalar_type || layout.array_size ||
-            layout.is_matrix != matrix || layout.rows != (matrix ? 4u : 1u) || layout.columns != 4u ||
-            parameter_layout_byte_size(&layout) != (matrix ? 64u : 16u)) return false;
+            layout.is_matrix != matrix || layout.rows != (matrix ? 4u : 1u) || layout.columns != columns ||
+            parameter_layout_byte_size(&layout) != (matrix ? 64u : columns * 4u)) return false;
     }
     if (!serialized_program_parameters_copy(parameters, &projected)) return false;
     if (role) {
@@ -787,6 +809,63 @@ static bool print_domain_operand(const DXBCOperand *operand, int instruction,
 /* This experiment recognizes the actual parsed fixture interface. Output RW
  * masks encode never-written components, unlike input RW masks. No shader text
  * or source-field spelling is used to infer a packed lane owner. */
+static bool packed_output_direct_ftou(const USILProgram *program,
+    const DXBCSignatureElement *field) {
+    if (!program || !field || program->instruction_count < 1 ||
+        program->instruction_count > PROBE_DOMAIN_INSTRUCTION_LIMIT ||
+        program->instruction_alloc < program->instruction_count || !program->instructions ||
+        program->cbuffer_count != 1 || program->cbuffer_alloc < 1 || !program->cbuffers)
+        return false;
+    unsigned declarations = 0, writes = 0;
+    for (int index = 0; index < program->signature_declaration_count; ++index) {
+        const USILSignatureDeclaration *declaration = &program->signature_declarations[index];
+        if (declaration->operand_type != OPERAND_TYPE_OUTPUT ||
+            !declaration->has_signature_register || declaration->register_id != field->register_id)
+            continue;
+        if (declaration->kind != USIL_SIGNATURE_DECL_OUTPUT_SIV || declaration->mask != 1u ||
+            declaration->stream_index || declaration->has_array_element_count ||
+            !declaration->has_system_value || declaration->system_value_name != 4u ||
+            declaration->has_interpolation) return false;
+        ++declarations;
+    }
+    for (int index = 0; index < program->instruction_count; ++index) {
+        const USILInstruction *instruction = &program->instructions[index];
+        if (instruction->operand_count < 0 || instruction->operand_count > 4) return false;
+        if (!instruction->operand_count) continue;
+        const DXBCOperand *destination = &instruction->operands[0];
+        if (destination->type != OPERAND_TYPE_OUTPUT || destination->register_index < 0 ||
+            (uint32_t)destination->register_index != field->register_id) continue;
+        if (instruction->opcode != USIL_OP_FTOU || instruction->operand_count != 2 ||
+            instruction->saturate || instruction->precise_mask ||
+            usil_operand_destination_lane_mask(destination) != 1u ||
+            destination->register_index_dim != 1 || destination->index_representations[0] ||
+            !destination->index_has_immediate[0] || destination->index_value_exceeds_int[0] ||
+            destination->index_values[0] != field->register_id ||
+            destination->rel_op0 || destination->rel_op1 || destination->rel_op2 ||
+            destination->has_neg || destination->has_abs || destination->min_precision ||
+            destination->extended_token_count) return false;
+        const DXBCOperand *source = &instruction->operands[1];
+        const USILConstantBuffer *buffer = &program->cbuffers[0];
+        USILOperandUseInfo use = {0};
+        if (source->type != OPERAND_TYPE_CONSTANT_BUFFER || source->register_index_dim != 2 ||
+            source->register_index < 0 || source->register_index != buffer->reg_idx ||
+            source->rel_offset0 < 0 || source->rel_offset0 >= buffer->size || buffer->dynamic_indexed ||
+            source->swizzle_mode != 2 || source->has_neg || source->has_abs || source->min_precision ||
+            source->extended_token_count || source->rel_op0 || source->rel_op1 || source->rel_op2 ||
+            source->index_representations[0] || source->index_representations[1] ||
+            !source->index_has_immediate[0] || !source->index_has_immediate[1] ||
+            source->index_value_exceeds_int[0] || source->index_value_exceeds_int[1] ||
+            source->index_values[0] != (uint32_t)source->register_index ||
+            source->index_values[1] != (uint32_t)source->rel_offset0 ||
+            !usil_instruction_operand_use(program, instruction, 1, &use) ||
+            use.use != USIL_OPERAND_USE_SOURCE || use.source_lane_mask != 1u) return false;
+        for (unsigned lane = 0; lane < 4u; ++lane)
+            if (source->swizzle[lane] != 1u) return false;
+        ++writes;
+    }
+    return declarations == 1u && writes == 1u;
+}
+
 static bool packed_output_vertex_shape(const USILProgram *program,
                                        int *packed_register, int *position_field) {
     if (!program || !packed_register || !position_field ||
@@ -795,7 +874,8 @@ static bool packed_output_vertex_shape(const USILProgram *program,
         program->input_count < 0 || program->input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
         program->input_alloc < program->input_count ||
         (program->input_alloc != 0) != (program->inputs != NULL) ||
-        program->output_count != 3 || program->output_alloc < 3 || !program->outputs ||
+        (program->output_count != 3 && program->output_count != 4) ||
+        program->output_alloc < program->output_count || !program->outputs ||
         program->patch_constant_count ||
         program->signature_declaration_count < 0 ||
         program->signature_declaration_count > PROBE_DOMAIN_DECLARATION_LIMIT ||
@@ -803,14 +883,21 @@ static bool packed_output_vertex_shape(const USILProgram *program,
         (program->signature_declaration_alloc != 0) !=
             (program->signature_declarations != NULL) ||
         !usil_signature_authority_is_valid(program)) return false;
-    const DXBCSignatureElement *position = NULL, *xy = NULL, *zw = NULL;
+    const DXBCSignatureElement *position = NULL, *xy = NULL, *zw = NULL, *converted = NULL;
     int position_index = -1;
     for (int index = 0; index < program->output_count; ++index) {
         const DXBCSignatureElement *field = &program->outputs[index];
-        if (!linked_inline_signature(field) || field->component_type != 3 ||
+        if (!linked_inline_signature(field) ||
             field->stream_index || field->min_precision ||
             field->register_id >= (unsigned)HLSL_SM5_IO_REGISTER_COUNT ||
             field->rw_mask != (uint8_t)(15u & ~(unsigned)field->mask)) return false;
+        if (program->output_count == 4 && index == 3 && field->component_type == 1u &&
+            field->system_value == 4u && !field->semantic_index && field->mask == 1u &&
+            field->rw_mask == 14u && !strcmp(field->semantic_name, "SV_RenderTargetArrayIndex")) {
+            converted = field;
+            continue;
+        }
+        if (field->component_type != 3u) return false;
         if (field->system_value == 1 && field->semantic_index == 0 &&
             field->mask == 15 && !position) {
             position = field;
@@ -823,7 +910,10 @@ static bool packed_output_vertex_shape(const USILProgram *program,
         else return false;
     }
     if (!position || !xy || !zw || position->register_id == xy->register_id ||
-        zw->register_id != xy->register_id) return false;
+        zw->register_id != xy->register_id ||
+        (program->output_count == 4 && (!converted ||
+         converted->register_id == position->register_id || converted->register_id == xy->register_id ||
+         !packed_output_direct_ftou(program, converted)))) return false;
     *packed_register = (int)xy->register_id;
     *position_field = position_index;
     return true;
@@ -1010,6 +1100,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                instruction->operand_count && (instruction->opcode == USIL_OP_MOV ||
                instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MUL || instruction->opcode == USIL_OP_MAD ||
                instruction->opcode == USIL_OP_MIN || instruction->opcode == USIL_OP_MAX || instruction->opcode == USIL_OP_DIV ||
+               (packed_output_fixture && instruction->opcode == USIL_OP_FTOU) ||
                instruction->opcode == USIL_OP_DP2 || instruction->opcode == USIL_OP_DP3 || instruction->opcode == USIL_OP_DP4 ||
                instruction->opcode == USIL_OP_LT || instruction->opcode == USIL_OP_GE ||
                instruction->opcode == USIL_OP_EQ || instruction->opcode == USIL_OP_NE)
@@ -1019,7 +1110,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
             instruction->opcode == USIL_OP_IF || instruction->opcode == USIL_OP_MAD ||
             instruction->opcode == USIL_OP_DP2 || instruction->opcode == USIL_OP_DP3 || instruction->opcode == USIL_OP_DP4 ||
             instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MOV ||
-            (packed_output_fixture && instruction->opcode == USIL_OP_MUL)) {
+            (packed_output_fixture && (instruction->opcode == USIL_OP_MUL || instruction->opcode == USIL_OP_FTOU))) {
             size_t remaining = PROBE_DOMAIN_OPERAND_LIMIT;
             for (int operand_index = 0; operand_index < instruction->operand_count; ++operand_index)
                 if (!print_domain_operand(&instruction->operands[operand_index], index,
@@ -1119,8 +1210,10 @@ static bool reconstruct_structured(const DXBCContainerView *target,
              "reason=unavailable-projected-metadata source_construction=not-run");
         goto done;
     }
+    captured.shader_model_major = program.shader_model_major;
     if (change_literal) {
-        if (!literal_owner->valid || captured.instruction != literal_owner->instruction ||
+        if (!literal_owner->valid || captured.shader_model_major != literal_owner->shader_model_major ||
+            captured.instruction != literal_owner->instruction ||
             captured.operand != literal_owner->operand || captured.component_mask != literal_owner->component_mask ||
             captured.raw_instruction != literal_owner->raw_instruction ||
             captured.opcode != literal_owner->opcode || captured.original_bits != literal_owner->original_bits ||
@@ -1171,6 +1264,11 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                quality.counts.residual_total, quality.counts.unknown_provenance,
                map.complete, map.count, map_valid,
                quality.counts.cbuffer_declarations, quality.counts.cbuffer_fields);
+        StringBuilder quality_details;
+        sb_init(&quality_details);
+        if (hlsl_source_quality_append_json(&quality, &quality_details))
+            printf("structured_quality_details=%s\n", quality_details.buf);
+        sb_free(&quality_details);
         accepted = map_valid && map.complete &&
             quality.classification != HLSL_SOURCE_QUALITY_FAILED;
         if (packed_output_fixture) {
@@ -1222,12 +1320,12 @@ done:
 }
 
 static bool structured_wrapper(const StringBuilder *fragment, StringBuilder *wrapper,
-                               const char *shader_name, bool vertex_fixture) {
-    if (!fragment || !sb_ok(fragment) || !fragment->buf || fragment->len > PROBE_SOURCE_LIMIT ||
+                               const char *shader_name, bool vertex_fixture, unsigned shader_model_major) {
+    if ((shader_model_major != 4u && shader_model_major != 5u) || !fragment || !sb_ok(fragment) || !fragment->buf || fragment->len > PROBE_SOURCE_LIMIT ||
         !wrapper || !sb_ok(wrapper) || wrapper->len) return false;
     sb_appendf(wrapper, "Shader \"%s\"\n{\n    SubShader\n    {\n        Pass\n        {\n"
-        "            HLSLPROGRAM\n#pragma target 5.0\n#pragma only_renderers d3d11\n"
-        "#pragma vertex vert\n#pragma fragment frag\n", shader_name);
+        "            HLSLPROGRAM\n#pragma target %u.0\n#pragma only_renderers d3d11\n"
+        "#pragma vertex vert\n#pragma fragment frag\n", shader_name, shader_model_major);
     sb_append_len(wrapper, fragment->buf, fragment->len);
     sb_append(wrapper, vertex_fixture
         ? "float4 frag() : SV_Target { return float4(0.25f, 0.5f, 0.75f, 1.0f); }\n"
@@ -2383,7 +2481,7 @@ int main(int argc, char **argv) {
         if (!reconstruct_structured(&target, &hull, &structured_literal, false,
                 structured_vertex_fixture, packed_output_vertex_fixture,
                 native_parameters.cb_count ? &native_parameters : NULL, false) ||
-            !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture)) {
+            !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture, structured_literal.shader_model_major)) {
             if (packed_output_vertex_fixture)
                 puts("packed_output_candidate=not-run packed_output_warm_mutation=not-run "
                      "packed_output_warm_restore=not-run");
@@ -2498,7 +2596,7 @@ int main(int argc, char **argv) {
         mutation_built = reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
                 structured_vertex_fixture, packed_output_vertex_fixture,
                 native_parameters.cb_count ? &native_parameters : NULL, false) &&
-            structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture);
+            structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture, structured_literal.shader_model_major);
         sb_free(&mutated_fragment);
     } else {
         mutation_built = changed_factor_wrapper(&hull, &changed_wrapper, shader_name, scalar_fixture,

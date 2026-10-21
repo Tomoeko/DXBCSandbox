@@ -93,9 +93,16 @@ static bool same_semantic_base(const char *left, const char *right) {
   return *left == *right;
 }
 
-/* This layout belongs to one parsed straight-line vertex route. Input
- * packing, integer/system varyings and partial field assembly remain separate
- * contracts. Output RW bits mean never-written lanes, unlike input RW bits. */
+static bool packed_uint_output_signature(const DXBCSignatureElement *field) {
+  return field->component_type == 1u && field->system_value == 4u &&
+      !field->semantic_index && field->mask == 1 && field->rw_mask == 14 &&
+      !field->min_precision && !field->stream_index && !field->interpolation_mode &&
+      same_semantic_base(dxbc_signature_semantic_name(field), "SV_RenderTargetArrayIndex");
+}
+
+/* This layout belongs to one parsed straight-line vertex route. The unsigned
+ * array-index field has a separate direct conversion proof. Output RW bits
+ * mean never-written lanes, unlike input RW bits. */
 static bool packed_output_layout_supported(const USILProgram *program) {
   if (!program || program->program_type != DXBC_PROGRAM_TYPE_VERTEX ||
       !program->has_stage_contract || !program->has_parsed_signature_authority || program->patch_constant_count ||
@@ -112,16 +119,32 @@ static bool packed_output_layout_supported(const USILProgram *program) {
   if (!natural_signature_registers(program->inputs, program->input_count, &inputs)) return false;
   unsigned counts[HLSL_SM5_IO_REGISTER_COUNT] = {0};
   uint8_t masks[HLSL_SM5_IO_REGISTER_COUNT] = {0};
-  unsigned position = 0, pairs = 0;
+  unsigned position = 0, pairs = 0, unsigned_outputs = 0;
   for (int index = 0; index < program->output_count; ++index) {
     const DXBCSignatureElement *field = &program->outputs[index];
-    if (!hlsl_signature_semantic_storage_valid(field) || field->component_type != 3 ||
+    if (!hlsl_signature_semantic_storage_valid(field) ||
+        (field->component_type != 3 && !packed_uint_output_signature(field)) ||
         field->min_precision || field->stream_index || !field->mask || field->mask > 15 ||
         field->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
         (masks[field->register_id] & field->mask) || ++counts[field->register_id] > 2u) return false;
     masks[field->register_id] |= field->mask;
     if (field->system_value == 1u) {
       if (field->mask != 15 || field->rw_mask || ++position > 1u) return false;
+    } else if (packed_uint_output_signature(field)) {
+      if (++unsigned_outputs > 1u) return false;
+      bool declared = false;
+      for (int declaration = 0; declaration < program->signature_declaration_count; ++declaration) {
+        const USILSignatureDeclaration *owner = &program->signature_declarations[declaration];
+        if (owner->operand_type != OPERAND_TYPE_OUTPUT || owner->register_id != field->register_id)
+          continue;
+        if (declared || owner->kind != USIL_SIGNATURE_DECL_OUTPUT_SIV ||
+            !owner->has_signature_register || owner->mask != 1 || owner->stream_index ||
+            owner->has_array_element_count || !owner->has_system_value ||
+            owner->system_value_name != 4u || owner->has_interpolation ||
+            owner->interpolation_mode) return false;
+        declared = true;
+      }
+      if (!declared) return false;
     } else if (field->system_value) return false;
     for (int previous = 0; previous < index; ++previous)
       if (field->semantic_index == program->outputs[previous].semantic_index &&
@@ -142,6 +165,71 @@ static bool packed_output_layout_supported(const USILProgram *program) {
           (masks[field->register_id] != 15 || ++pairs > 1u)) return false;
   }
   return position == 1u && pairs == 1u && usil_signature_authority_is_valid(program);
+}
+
+bool hlsl_packed_uint_output_plan_prepare(const USILProgram *program,
+    HLSLPackedUIntOutputPlan *plan) {
+  if (!plan) return false;
+  memset(plan, 0, sizeof(*plan));
+  if (!packed_output_layout_supported(program) || !program->instructions ||
+      program->instruction_count < 2 || program->instruction_count > 64 ||
+      program->instruction_alloc < program->instruction_count ||
+      program->cbuffer_count < 1 || program->cbuffer_count > 8 ||
+      program->cbuffer_alloc < program->cbuffer_count || !program->cbuffers) return false;
+  int field = -1, writer = -1;
+  for (int output = 0; output < program->output_count; ++output)
+    if (packed_uint_output_signature(&program->outputs[output])) field = output;
+  if (field < 0) return false;
+  for (int instruction = 0; instruction < program->instruction_count; ++instruction) {
+    const USILInstruction *owner = &program->instructions[instruction];
+    if (owner->operand_count < 0 || owner->operand_count > DXBC_MAX_OPERANDS) return false;
+    if (owner->opcode != USIL_OP_FTOU) continue;
+    if (writer >= 0 || owner->source_instruction_index == UINT32_MAX ||
+        owner->operand_count != 2 || owner->saturate || owner->precise_mask ||
+        owner->condition_test || owner->has_resource_dimension || owner->resource_stride ||
+        owner->has_texel_offset || owner->has_resource_return_types ||
+        owner->resource_info_return_type || owner->sample_info_return_type ||
+        owner->geometry_effect || owner->geometry_stream_id || owner->geometry_stream_explicit ||
+        owner->sync_flags || !usil_instruction_shape_valid(program, owner) ||
+        !hlsl_expression_effects_supported(program, owner)) return false;
+    const DXBCOperand *destination = &owner->operands[0], *source = &owner->operands[1];
+    HLSLNaturalOutputProjection output;
+    USILOperandUseInfo use;
+    if (!hlsl_high_level_output_projection(program, destination, &output) ||
+        output.field_index != field || destination->extended_tokens ||
+        destination->raw_token != UINT32_C(0x00102012) ||
+        source->type != OPERAND_TYPE_CONSTANT_BUFFER || !hlsl_lift_operand_is_plain(source) ||
+        source->extended_tokens || source->raw_token != UINT32_C(0x0020801a) ||
+        source->register_index < 0 || source->register_index >= HLSL_SM5_CBUFFER_REGISTER_COUNT ||
+        source->rel_offset0 < 0 || source->register_index_dim != 2 ||
+        !source->index_has_immediate[0] || !source->index_has_immediate[1] ||
+        source->index_representations[0] || source->index_representations[1] ||
+        source->index_value_exceeds_int[0] || source->index_value_exceeds_int[1] ||
+        source->index_values[0] != (uint32_t)source->register_index ||
+        source->index_values[1] != (uint32_t)source->rel_offset0 || source->swizzle_mode != 2 ||
+        !usil_instruction_operand_use(program, owner, 1, &use) ||
+        use.use != USIL_OPERAND_USE_SOURCE || use.source_lane_mask != 1) return false;
+    for (int lane = 0; lane < 4; ++lane)
+      if (source->swizzle[lane] != 1) return false;
+    bool declared = false;
+    for (int buffer = 0; buffer < program->cbuffer_count; ++buffer) {
+      const USILConstantBuffer *declaration = &program->cbuffers[buffer];
+      if (declaration->reg_idx != source->register_index) continue;
+      if (declared || declaration->dynamic_indexed || declaration->size <= source->rel_offset0)
+        return false;
+      declared = true;
+    }
+    if (!declared || (uint64_t)(uint32_t)source->rel_offset0 * 16u + 4u > UINT32_MAX) return false;
+    writer = instruction;
+  }
+  if (writer < 0) return false;
+  const USILInstruction *owner = &program->instructions[writer];
+  *plan = (HLSLPackedUIntOutputPlan){.present = true, .output_signature_index = field,
+      .instruction_index = writer, .source_instruction_index = owner->source_instruction_index,
+      .destination_lanes = 1, .cbuffer_binding = owner->operands[1].register_index,
+      .row = (uint32_t)owner->operands[1].rel_offset0, .physical_component = 1,
+      .byte_offset = (uint32_t)owner->operands[1].rel_offset0 * 16u + 4u};
+  return true;
 }
 
 bool hlsl_high_level_output_projection(const USILProgram *program,
@@ -284,10 +372,15 @@ bool hlsl_packed_output_candidate(const USILProgram *program) {
       (program->has_global_flags && program->global_flags != 1u)) return false;
   HLSLPositionOutputPlan position;
   const bool split_position = hlsl_position_output_plan_prepare(program, &position);
+  HLSLPackedUIntOutputPlan unsigned_output;
+  const bool converted = hlsl_packed_uint_output_plan_prepare(program, &unsigned_output);
+  for (int output = 0; output < program->output_count; ++output)
+    if (packed_uint_output_signature(&program->outputs[output]) && !converted) return false;
   bool written[HLSL_SM5_IO_REGISTER_COUNT] = {false};
   for (int index = 0; index < program->instruction_count; ++index) {
     const USILInstruction *instruction = &program->instructions[index];
-    const int arity = instruction->opcode == USIL_OP_MOV ? 2 :
+    const int arity = instruction->opcode == USIL_OP_MOV ||
+        (converted && index == unsigned_output.instruction_index) ? 2 :
         instruction->opcode == USIL_OP_ADD || instruction->opcode == USIL_OP_MUL ? 3 :
         instruction->opcode == USIL_OP_MAD ? 4 : instruction->opcode == USIL_OP_RET ? 0 : -1;
     if (arity < 0 || instruction->operand_count != arity || instruction->saturate ||
@@ -307,6 +400,8 @@ bool hlsl_packed_output_candidate(const USILProgram *program) {
           HLSLNaturalOutputProjection projection;
           if (!hlsl_high_level_output_projection(program, value, &projection) ||
               written[projection.field_index]) return false;
+          if (program->outputs[projection.field_index].component_type != 3 &&
+              (!converted || index != unsigned_output.instruction_index)) return false;
           written[projection.field_index] = true;
         } else if (value->type != OPERAND_TYPE_TEMP) return false;
       } else if (value->type != OPERAND_TYPE_TEMP && value->type != OPERAND_TYPE_INPUT &&
@@ -1284,6 +1379,8 @@ static bool prepare_high_level_interface(HLSLEmitterContext *ctx, bool packed_pr
       const char *role = semantic_input_role(semantic);
       if (element->system_value == 1) role = "clipPosition";
       else if (element->system_value == 64) role = "color";
+      else if (ctx->high_level_packed_outputs && packed_uint_output_signature(element))
+        role = "renderTargetArrayIndex";
       char base[80];
       if (!role) {
         if (!hlsl_format_checked(ctx, base, sizeof(base), "attribute%d", output)) return false;
