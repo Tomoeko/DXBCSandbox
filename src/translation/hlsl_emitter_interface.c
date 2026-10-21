@@ -474,12 +474,11 @@ bool hlsl_natural_input_layout_supported(const USILProgram *program, bool *has_p
   return true;
 }
 
-bool hlsl_natural_input_projection(const USILProgram *program, const DXBCOperand *operand,
-    uint8_t demanded_lanes, HLSLNaturalInputProjection *projection) {
+static bool input_projection_in_layout(const USILProgram *program, const DXBCOperand *operand,
+    uint8_t demanded_lanes, bool packed_layout, HLSLNaturalInputProjection *projection) {
   if (!projection) return false;
   memset(projection, 0, sizeof(*projection));
-  bool packed_layout;
-  if (!hlsl_natural_input_layout_supported(program, &packed_layout) || !operand ||
+  if (!operand ||
       operand->type != OPERAND_TYPE_INPUT || !hlsl_lift_operand_is_plain(operand) ||
       operand->register_index < 0 || operand->register_index >= HLSL_SM5_IO_REGISTER_COUNT ||
       operand->register_index_dim != 1 || !operand->index_has_immediate[0] ||
@@ -521,6 +520,36 @@ bool hlsl_natural_input_projection(const USILProgram *program, const DXBCOperand
   }
   *projection = result;
   return true;
+}
+
+bool hlsl_natural_input_projection(const USILProgram *program, const DXBCOperand *operand,
+    uint8_t demanded_lanes, HLSLNaturalInputProjection *projection) {
+  if (!projection) return false;
+  memset(projection, 0, sizeof(*projection));
+  bool packed = false;
+  return hlsl_natural_input_layout_supported(program, &packed) &&
+      input_projection_in_layout(program, operand, demanded_lanes, packed, projection);
+}
+
+bool hlsl_high_level_input_projection(const HLSLEmitterContext *ctx, const DXBCOperand *operand,
+    uint8_t demanded_lanes, HLSLNaturalInputProjection *projection) {
+  if (!projection) return false;
+  memset(projection, 0, sizeof(*projection));
+  if (!ctx) return false;
+  if (!ctx->high_level_packed_sample_inputs)
+    return hlsl_natural_input_projection(ctx->program, operand, demanded_lanes, projection);
+  HLSLSampledFragmentPlan plan = {0};
+  if (!ctx->high_level_sampled_fragment || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) ||
+      !plan.packed_inputs || demanded_lanes != 3) return false;
+  /* This wrapper grants only the decoded sample's complete logical UV value.
+   * The established IF layout keeps its independent, stricter use contract. */
+  if (input_projection_in_layout(ctx->program, operand, demanded_lanes, true, projection) &&
+      operand->raw_token == ctx->program->instructions[0].operands[1].raw_token &&
+      projection->packed && projection->field_index == plan.coordinate_field &&
+      projection->natural_components == 2 && projection->result_components == 2 &&
+      !projection->selected_components[0] && projection->selected_components[1] == 1) return true;
+  memset(projection, 0, sizeof(*projection));
+  return false;
 }
 
 /* Static vertex indices retain distinct value identity and are checked against
@@ -979,15 +1008,17 @@ bool hlsl_emit_high_level_geometry_effect(HLSLEmitterContext *ctx, int instructi
   return true;
 }
 
-static bool inactive_input_fields(const HLSLEmitterContext *ctx) {
-  return ctx->high_level_inactive_inputs || ctx->high_level_inactive_sample_inputs;
+static bool separate_input_fields(const HLSLEmitterContext *ctx) {
+  return ctx->high_level_inactive_inputs || ctx->high_level_inactive_sample_inputs ||
+      ctx->high_level_packed_sample_inputs;
 }
 
 static bool natural_interface_input_registers(const HLSLEmitterContext *ctx, uint32_t *registers) {
-  if (ctx->high_level_inactive_sample_inputs) {
+  if (ctx->high_level_inactive_sample_inputs || ctx->high_level_packed_sample_inputs) {
     HLSLSampledFragmentPlan plan = {0};
     if (!ctx->straightline_guard || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) ||
-        !plan.inactive_typed_inputs) return false;
+        ctx->high_level_inactive_sample_inputs != plan.inactive_typed_inputs ||
+        ctx->high_level_packed_sample_inputs != plan.packed_inputs) return false;
     *registers = plan.input_registers;
     return true;
   }
@@ -1031,7 +1062,7 @@ bool hlsl_source_quality_interface_inventory_supported(const HLSLEmitterContext 
       !natural_interface_output_registers(ctx, &outputs) ||
       !outputs) return false;
   for (int input = 0; input < program->input_count; ++input)
-    if (!((ctx->high_level_packed_inputs || inactive_input_fields(ctx)) ? hlsl_high_level_input_field_name(ctx, input)
+    if (!((ctx->high_level_packed_inputs || separate_input_fields(ctx)) ? hlsl_high_level_input_field_name(ctx, input)
         : hlsl_high_level_input_name(ctx, (int)program->inputs[input].register_id))) return false;
   if (ctx->high_level_domain && (!hlsl_high_level_domain_interface_supported(program, ctx->emit_mode) ||
       !ctx->high_level_domain_point_type[0] || !ctx->high_level_domain_patch_variable[0] ||
@@ -1064,7 +1095,7 @@ bool hlsl_source_quality_interface_inventory_complete(const HLSLEmitterContext *
       ctx->high_level_output_statements_emitted != outputs ||
       !ctx->high_level_entry_signature_emitted || !ctx->high_level_return_block_emitted)
     return false;
-  if (ctx->high_level_packed_inputs || inactive_input_fields(ctx)) {
+  if (ctx->high_level_packed_inputs || separate_input_fields(ctx)) {
     const uint32_t fields = ctx->program->input_count == HLSL_SM5_IO_REGISTER_COUNT
         ? UINT32_MAX : (UINT32_C(1) << (unsigned)ctx->program->input_count) - 1u;
     if (ctx->high_level_input_fields_emitted != fields) return false;
@@ -1344,11 +1375,12 @@ static bool prepare_high_level_interface(HLSLEmitterContext *ctx, bool packed_pr
   HLSLInactiveInputPlan inactive;
   if (ctx->high_level_inactive_inputs && !hlsl_inactive_input_plan_prepare(ctx->program, &inactive)) goto unsupported;
   HLSLSampledFragmentPlan sampled = {0};
-  if (ctx->high_level_inactive_sample_inputs &&
+  if ((ctx->high_level_inactive_sample_inputs || ctx->high_level_packed_sample_inputs) &&
       (!ctx->high_level_sampled_fragment || !hlsl_sampled_fragment_plan_prepare(ctx->program, &sampled) ||
-       !sampled.inactive_typed_inputs)) goto unsupported;
+       ctx->high_level_inactive_sample_inputs != sampled.inactive_typed_inputs ||
+       ctx->high_level_packed_sample_inputs != sampled.packed_inputs)) goto unsupported;
   bool packed = false;
-  if (!inactive_input_fields(ctx) && (ctx->program->program_type == DXBC_PROGRAM_TYPE_VERTEX ||
+  if (!separate_input_fields(ctx) && (ctx->program->program_type == DXBC_PROGRAM_TYPE_VERTEX ||
        ctx->program->program_type == DXBC_PROGRAM_TYPE_PIXEL) &&
       hlsl_natural_input_layout_supported(ctx->program, &packed) && packed) {
     /* A candidate hint cannot authorize packed parameter syntax. Repeat the
@@ -1358,21 +1390,21 @@ static bool prepare_high_level_interface(HLSLEmitterContext *ctx, bool packed_pr
   }
   for (int input = 0; input < ctx->program->input_count; ++input) {
     const DXBCSignatureElement *element = &ctx->program->inputs[input];
-    if ((!inactive_input_fields(ctx) && element->component_type != 3) || !element->mask || element->mask > 15 ||
-        (!inactive_input_fields(ctx) && !ctx->high_level_packed_inputs && (element->mask & (element->mask + 1u))) || element->min_precision ||
+    if ((!separate_input_fields(ctx) && element->component_type != 3) || !element->mask || element->mask > 15 ||
+        (!separate_input_fields(ctx) && !ctx->high_level_packed_inputs && (element->mask & (element->mask + 1u))) || element->min_precision ||
         element->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
         ctx->high_level_input_names[input][0]) goto unsupported;
-    if (!ctx->high_level_packed_inputs && !inactive_input_fields(ctx))
+    if (!ctx->high_level_packed_inputs && !separate_input_fields(ctx))
       for (int previous = 0; previous < input; ++previous)
         if (ctx->program->inputs[previous].register_id == element->register_id) goto unsupported;
     char base[80];
     const char *semantic = dxbc_signature_semantic_name(element);
     const char *role = semantic_input_role(semantic);
-    if ((ctx->high_level_geometry || ctx->high_level_domain || inactive_input_fields(ctx)) &&
+    if ((ctx->high_level_geometry || ctx->high_level_domain || separate_input_fields(ctx)) &&
         element->system_value == 1) role = "clipPosition";
-    if (inactive_input_fields(ctx) && element->system_value == 4) role = "renderTargetArrayIndex";
-    if (inactive_input_fields(ctx) && element->system_value == 9) role = "frontFace";
-    if (inactive_input_fields(ctx) && !element->system_value &&
+    if (separate_input_fields(ctx) && element->system_value == 4) role = "renderTargetArrayIndex";
+    if (separate_input_fields(ctx) && element->system_value == 9) role = "frontFace";
+    if (separate_input_fields(ctx) && !element->system_value &&
         !dxbc_ascii_strcasecmp(semantic, "SV_InstanceID")) role = "instanceId";
     if (!role) {
       if (!hlsl_format_checked(ctx, base, sizeof(base), "attribute%d", input)) return false;
@@ -1450,8 +1482,9 @@ bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
       !(ctx->high_level_domain && operand->type == OPERAND_TYPE_INPUT_CONTROL_POINT) &&
       !location) return false;
   HLSLNaturalInputProjection projection = {0};
-  const bool packed_input = ctx->high_level_packed_inputs && operand->type == OPERAND_TYPE_INPUT;
-  if (packed_input && !hlsl_natural_input_projection(ctx->program, operand, demanded_lanes, &projection))
+  const bool packed_input = (ctx->high_level_packed_inputs || ctx->high_level_packed_sample_inputs) &&
+      operand->type == OPERAND_TYPE_INPUT;
+  if (packed_input && !hlsl_high_level_input_projection(ctx, operand, demanded_lanes, &projection))
     return false;
   const DXBCSignatureElement *element = packed_input ? &ctx->program->inputs[projection.field_index]
       : hlsl_high_level_input_operand_signature(ctx, operand);
@@ -1944,12 +1977,12 @@ void emit_entry_point_declarations(HLSLEmitterContext* ctx,
     for (int input = 0; input < program->input_count; ++input) {
       const DXBCSignatureElement *element = &program->inputs[input];
       const char *input_semantic = dxbc_signature_semantic_name(element);
-      const char *name = (ctx->high_level_packed_inputs || inactive_input_fields(ctx)) ? hlsl_high_level_input_field_name(ctx, input)
+      const char *name = (ctx->high_level_packed_inputs || separate_input_fields(ctx)) ? hlsl_high_level_input_field_name(ctx, input)
           : hlsl_high_level_input_name(ctx, (int)element->register_id);
       if (!name) { sb->failed = true; return; }
       if (input) sb_append(sb, ", ");
       sb_appendf(sb, "%s%s %s : %s", interpolation_modifier(element->interpolation_mode),
-                 inactive_input_fields(ctx) && element->system_value == 9 ? "bool" :
+                 separate_input_fields(ctx) && element->system_value == 9 ? "bool" :
                      get_type_str(element->component_type, (int)signature_width(element)),
                  name, input_semantic);
       if (element->semantic_index || strcmp(input_semantic, "TEXCOORD") == 0)
@@ -1957,7 +1990,7 @@ void emit_entry_point_declarations(HLSLEmitterContext* ctx,
       hlsl_source_quality_emission(ctx, 0, false, -1);
       if (!sb_ok(sb)) return;
       ctx->high_level_input_parameters_emitted |= UINT32_C(1) << element->register_id;
-      if (ctx->high_level_packed_inputs || inactive_input_fields(ctx))
+      if (ctx->high_level_packed_inputs || separate_input_fields(ctx))
         ctx->high_level_input_fields_emitted |= UINT32_C(1) << (unsigned)input;
     }
     if (ctx->high_level_direct_return) {

@@ -470,7 +470,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
         break;
     case DECODED_OWNER_SAMPLED_FRAGMENT:
         if (!hlsl_sampled_fragment_plan_prepare(program, &sampled) ||
-            (sampled.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !sampled.inactive_typed_inputs)) return false;
+            (sampled.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !sampled.inactive_typed_inputs && !sampled.packed_inputs)) return false;
         break;
     default:
         return false;
@@ -485,8 +485,11 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     static const char cube_sample[] = "dxbc-cube-sample-owner-v1";
     static const char array_sample[] = "dxbc-array-sample-owner-v1";
     static const char inactive_sample[] = "dxbc-inactive-sample-owner-v1";
+    static const char packed_sample[] = "dxbc-packed-sample-owner-v1";
     if (stage == DECODED_OWNER_SAMPLED_FRAGMENT) {
-        if (sampled.inactive_typed_inputs)
+        if (sampled.packed_inputs)
+            common_sha256_update(&hash, packed_sample, sizeof(packed_sample));
+        else if (sampled.inactive_typed_inputs)
             common_sha256_update(&hash, inactive_sample, sizeof(inactive_sample));
         else if (sampled.texture_kind == HLSL_SAMPLED_TEXTURE_CUBE)
             common_sha256_update(&hash, cube_sample, sizeof(cube_sample));

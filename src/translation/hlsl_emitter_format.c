@@ -983,9 +983,10 @@ bool format_operand_hlsl_sb(HLSLEmitterContext* ctx, const DXBCOperand* op,
     sb_init(&idx);
     bool formatting_ok = true;
     HLSLNaturalInputProjection input_projection = {0};
-    const bool packed_input = ctx->high_level_packed_inputs && op->type == OPERAND_TYPE_INPUT;
+    const bool packed_input = (ctx->high_level_packed_inputs || ctx->high_level_packed_sample_inputs) &&
+        op->type == OPERAND_TYPE_INPUT;
     if (packed_input && (((unsigned)write_mask & ~240u) ||
-            !hlsl_natural_input_projection(ctx->program, op,
+            !hlsl_high_level_input_projection(ctx, op,
                 (uint8_t)((unsigned)write_mask >> 4u), &input_projection))) {
         hlsl_builder_failed(ctx, output);
         sb_free(&idx); sb_free(&reg);

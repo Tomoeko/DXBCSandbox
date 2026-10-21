@@ -701,7 +701,7 @@ static bool validate_float_expressions(HLSLEmitterContext *ctx, unsigned *uses, 
                                        HLSLMatrixLiftPlan *matrix_plans,
                                        const HLSLPureExpressionScope *scope) {
     if (!scope && !(full_width ? hlsl_float4_program_supported(ctx) :
-        ctx->high_level_inactive_sample_inputs ? (!ctx->use_uint_temps &&
+        (ctx->high_level_inactive_sample_inputs || ctx->high_level_packed_sample_inputs) ? (!ctx->use_uint_temps &&
             hlsl_sampled_fragment_plan_prepare(ctx->program, &(HLSLSampledFragmentPlan){0})) :
         ctx->high_level_inactive_inputs ? hlsl_inactive_input_plan_prepare(ctx->program, &(HLSLInactiveInputPlan){0}) :
         ctx->high_level_packed_outputs ? packed_program_supported(ctx) : vector_program_supported(ctx)))

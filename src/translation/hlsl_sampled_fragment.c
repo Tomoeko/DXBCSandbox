@@ -87,32 +87,39 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
             (index ? instruction->resource_dimension[0] != 0 :
                 strcmp(instruction->resource_dimension, texture->dimension) != 0)) return false;
     }
-    static const uint8_t identity[4] = {0, 1, 2, 3}, xy[4] = {0, 1, 0, 0}, xyz[4] = {0, 1, 2, 0};
+    static const uint8_t identity[4] = {0, 1, 2, 3}, xy[4] = {0, 1, 0, 0},
+        xyz[4] = {0, 1, 2, 0}, zw[4] = {2, 3, 2, 2};
+    const bool tail_coordinates = kind == HLSL_SAMPLED_TEXTURE_2D &&
+        sample->operands[1].raw_token == UINT32_C(0x00101ae6);
     if (!sample_register(&sample->operands[0], OPERAND_TYPE_OUTPUT, UINT32_C(0x001020f2), identity) ||
         sample->operands[0].register_index ||
         !sample_register(&sample->operands[1], OPERAND_TYPE_INPUT,
-            three_coordinates ? UINT32_C(0x00101246) : UINT32_C(0x00101046), three_coordinates ? xyz : xy) ||
+            three_coordinates ? UINT32_C(0x00101246) : tail_coordinates ? UINT32_C(0x00101ae6) : UINT32_C(0x00101046),
+            three_coordinates ? xyz : tail_coordinates ? zw : xy) ||
+        sample->operands[1].register_index >= HLSL_SM5_IO_REGISTER_COUNT ||
         !sample_register(&sample->operands[2], OPERAND_TYPE_RESOURCE, UINT32_C(0x00107e46), identity) ||
         sample->operands[2].register_index != texture->reg_idx ||
         !sample_register(&sample->operands[3], OPERAND_TYPE_SAMPLER, UINT32_C(0x00106000), identity) ||
         sample->operands[3].register_index != sampler->reg_idx || (level && !sample_level(&sample->operands[4])))
         return false;
-    const uint8_t coordinate_mask = three_coordinates ? 7 : 3;
+    const uint8_t coordinate_mask = three_coordinates ? 7 : tail_coordinates ? 12 : 3;
     int coordinate = -1;
     bool inactive_typed_inputs = false;
+    uint8_t occupied[HLSL_SM5_IO_REGISTER_COUNT] = {0};
+    unsigned register_fields[HLSL_SM5_IO_REGISTER_COUNT] = {0};
     uint32_t registers = 0;
     for (int index = 0; index < program->input_count; ++index) {
         const DXBCSignatureElement *field = &program->inputs[index];
         const char *semantic = dxbc_signature_semantic_name(field);
         if (field->component_type < 1 || field->component_type > 3 ||
-            !field->mask || field->mask > 15 || (field->mask & (field->mask + 1u)) ||
+            !field->mask || field->mask > 15 ||
             field->min_precision || field->stream_index || field->register_id >= HLSL_SM5_IO_REGISTER_COUNT ||
-            (registers & (UINT32_C(1) << field->register_id))) return false;
+            (occupied[field->register_id] & field->mask) || ++register_fields[field->register_id] > 2u) return false;
         if (!hlsl_inactive_input_semantic_supported(field)) return false;
         for (int previous = 0; previous < index; ++previous)
             if (program->inputs[previous].semantic_index == field->semantic_index &&
                 !dxbc_ascii_strcasecmp(dxbc_signature_semantic_name(&program->inputs[previous]), semantic)) return false;
-        if (field->register_id == (uint32_t)sample->operands[1].register_index) {
+        if (field->register_id == (uint32_t)sample->operands[1].register_index && field->mask == coordinate_mask) {
             if (field->system_value || field->component_type != 3 ||
                 field->mask != coordinate_mask || field->rw_mask != coordinate_mask ||
                 field->interpolation_mode < 2 || field->interpolation_mode > 7) return false;
@@ -121,8 +128,22 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
             if (field->rw_mask || field->interpolation_mode) return false;
             inactive_typed_inputs |= field->component_type != 3;
         }
+        occupied[field->register_id] |= field->mask;
         registers |= UINT32_C(1) << field->register_id;
     }
+    uint32_t packed_registers = 0;
+    for (int index = 0; index < program->input_count; ++index) {
+        const DXBCSignatureElement *field = &program->inputs[index];
+        if (register_fields[field->register_id] == 1u) {
+            if (field->mask & (field->mask + 1u)) return false;
+        } else {
+            if (kind != HLSL_SAMPLED_TEXTURE_2D || field->component_type != 3 || field->system_value ||
+                (field->mask != 3 && field->mask != 12) || occupied[field->register_id] != 15) return false;
+            packed_registers |= UINT32_C(1) << field->register_id;
+        }
+    }
+    if (packed_registers && (inactive_typed_inputs || (packed_registers & (packed_registers - 1u)) ||
+        packed_registers != (UINT32_C(1) << (unsigned)sample->operands[1].register_index))) return false;
     if (coordinate < 0 || program->signature_declaration_count != 2) return false;
     bool input_seen = false, output_seen = false;
     for (int index = 0; index < 2; ++index) {
@@ -142,7 +163,8 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
     }
     if (!input_seen || !output_seen) return false;
     *plan = (HLSLSampledFragmentPlan){.present = true, .texture_kind = kind, .explicit_level = level,
-        .inactive_typed_inputs = inactive_typed_inputs, .coordinate_field = coordinate, .input_registers = registers,
+        .inactive_typed_inputs = inactive_typed_inputs, .packed_inputs = packed_registers != 0,
+        .coordinate_field = coordinate, .input_registers = registers,
         .texture_register = (uint32_t)texture->reg_idx,
         .sampler_register = (uint32_t)sampler->reg_idx};
     return true;
@@ -152,7 +174,7 @@ bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx) {
     HLSLSampledFragmentPlan plan;
     const char *name = NULL;
     if (!ctx || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) ||
-        (plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !plan.inactive_typed_inputs)) return false;
+        (plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !plan.inactive_typed_inputs && !plan.packed_inputs)) return false;
     const uint32_t metadata_dimension = plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D ? 2 :
         plan.texture_kind == HLSL_SAMPLED_TEXTURE_CUBE ? 4 : 5;
     const SerializedProgramParameters *parameters[2] = {ctx->params, ctx->common_params};

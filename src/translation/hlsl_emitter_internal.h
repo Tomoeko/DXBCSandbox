@@ -314,6 +314,7 @@ typedef struct HLSLEmitterContext {
     bool high_level_inactive_inputs;
     bool high_level_sampled_fragment;
     bool high_level_inactive_sample_inputs;
+    bool high_level_packed_sample_inputs;
     uint32_t high_level_input_fields_emitted;
     /* A separate straight-line proof binds packed output signature ordinals,
      * while the established register bitmaps retain their original meaning. */
@@ -524,6 +525,7 @@ typedef struct {
     HLSLSampledTextureKind texture_kind;
     bool explicit_level;
     bool inactive_typed_inputs;
+    bool packed_inputs;
     int coordinate_field;
     uint32_t input_registers;
     uint32_t texture_register, sampler_register;
@@ -582,6 +584,8 @@ typedef struct {
  * prefix fields retain their names and identities. Outputs are zero on failure. */
 bool hlsl_natural_input_layout_supported(const USILProgram *program, bool *has_packed);
 bool hlsl_natural_input_projection(const USILProgram *program, const DXBCOperand *operand,
+    uint8_t demanded_lanes, HLSLNaturalInputProjection *projection);
+bool hlsl_high_level_input_projection(const HLSLEmitterContext *ctx, const DXBCOperand *operand,
     uint8_t demanded_lanes, HLSLNaturalInputProjection *projection);
 bool hlsl_natural_structured_header_matches(const HLSLEmitterContext *ctx);
 bool hlsl_high_level_input_provenance(HLSLEmitterContext *ctx,
