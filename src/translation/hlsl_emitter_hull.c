@@ -448,7 +448,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     uint8_t digest[COMMON_SHA256_DIGEST_SIZE], DecodedOwnerStage stage) {
     HullSourcePlan checked = {0};
     HLSLInactiveInputPlan inactive;
-    HLSLSampledFragmentPlan sampled;
+    HLSLSampledFragmentPlan sampled = {0};
     const bool graphics = stage == DECODED_OWNER_NATURAL_STRUCTURED ||
         stage == DECODED_OWNER_PACKED_OUTPUT || stage == DECODED_OWNER_INACTIVE_INPUT ||
         stage == DECODED_OWNER_SAMPLED_FRAGMENT;
