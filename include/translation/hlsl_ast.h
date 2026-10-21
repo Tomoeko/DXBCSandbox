@@ -18,7 +18,9 @@ typedef enum {
     AST_EXPR_CAST,
     AST_EXPR_BITCAST,
     AST_EXPR_EMITTER_OPERAND,
-    AST_EXPR_COMPARISON
+    AST_EXPR_COMPARISON,
+    AST_EXPR_VECTOR_COMPARISON,
+    AST_EXPR_LOGICAL_BINARY
 } ASTExprKind;
 
 typedef enum { AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32, AST_SCALAR_BOOL } ASTScalarType;
@@ -211,6 +213,7 @@ ASTExpr *ast_create_var(int ssa_var, int reg, int type, const char *name);
 ASTExpr *ast_create_literal_bits(const uint32_t *bits, int components, ASTScalarType scalar_type);
 ASTExpr *ast_create_literal_float(float f);
 ASTExpr *ast_create_literal_int(int i);
+ASTExpr *ast_create_literal_bool(bool value);
 /* Operators are an explicitly admitted subset of USILOpcode: unary INEG/NOT;
  * binary ADD/SUB/MUL/DIV/IADD/AND/OR/XOR/ISHL/ISHR/USHR. Comparisons that produce
  * DXBC masks and multi-result integer operations require separate lowering.
@@ -220,6 +223,9 @@ ASTExpr *ast_create_unary(int op, ASTExpr *sub);
 ASTExpr *ast_create_binary(int op, ASTExpr *left, ASTExpr *right);
 /* Scalar logical predicate only. DXBC mask values need separate lowering. */
 ASTExpr *ast_create_comparison(int op, ASTExpr *left, ASTExpr *right);
+/* Explicit Boolean operations; complete origins retain the result width. */
+ASTExpr *ast_create_vector_comparison(int op, ASTExpr *left, ASTExpr *right);
+ASTExpr *ast_create_logical_binary(int op, ASTExpr *left, ASTExpr *right);
 ASTExpr *ast_create_ternary(ASTExpr *cond, ASTExpr *true_expr, ASTExpr *false_expr);
 ASTExpr *ast_create_swizzle(ASTExpr *sub, const int *swizzle, int count);
 ASTExpr *ast_create_call(const char *name, ASTExpr **args, int count);

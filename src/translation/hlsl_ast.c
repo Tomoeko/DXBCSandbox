@@ -83,6 +83,16 @@ ASTExpr *ast_create_literal_int(int i) {
     return ast_create_literal_bits(&bits, 1, AST_SCALAR_SINT32);
 }
 
+ASTExpr *ast_create_literal_bool(bool value) {
+    ASTExpr *expression = ast_allocate_expr();
+    if (!expression) return NULL;
+    expression->kind = AST_EXPR_LITERAL;
+    expression->u.literal.scalar_type = AST_SCALAR_BOOL;
+    expression->u.literal.components = 1;
+    expression->u.literal.val[0] = value ? 1u : 0u;
+    return expression;
+}
+
 static const char *unary_operator(int opcode) {
     switch (opcode) {
     case USIL_OP_INEG:
@@ -133,17 +143,21 @@ ASTExpr *ast_create_unary(int op, ASTExpr *sub) {
     return expr;
 }
 
-ASTExpr *ast_create_binary(int op, ASTExpr *left, ASTExpr *right) {
-    if (!left || !right || left == right || !binary_operator(op))
+static ASTExpr *create_binary_expression(ASTExprKind kind, int op, ASTExpr *left, ASTExpr *right) {
+    if (!left || !right || left == right)
         return NULL;
     ASTExpr *expr = ast_allocate_expr();
     if (!expr)
         return NULL;
-    expr->kind = AST_EXPR_BINARY;
+    expr->kind = kind;
     expr->u.binary.op = op;
     expr->u.binary.left = left;
     expr->u.binary.right = right;
     return expr;
+}
+
+ASTExpr *ast_create_binary(int op, ASTExpr *left, ASTExpr *right) {
+    return binary_operator(op) ? create_binary_expression(AST_EXPR_BINARY, op, left, right) : NULL;
 }
 
 static const char *comparison_operator(int op) {
@@ -157,14 +171,21 @@ static const char *comparison_operator(int op) {
 }
 
 ASTExpr *ast_create_comparison(int op, ASTExpr *left, ASTExpr *right) {
-    if (!comparison_operator(op) || !left || !right || left == right) return NULL;
-    ASTExpr *expression = ast_allocate_expr();
-    if (!expression) return NULL;
-    expression->kind = AST_EXPR_COMPARISON;
-    expression->u.binary.op = op;
-    expression->u.binary.left = left;
-    expression->u.binary.right = right;
-    return expression;
+    return comparison_operator(op) ? create_binary_expression(AST_EXPR_COMPARISON, op, left, right) : NULL;
+}
+
+ASTExpr *ast_create_vector_comparison(int op, ASTExpr *left, ASTExpr *right) {
+    return comparison_operator(op) ? create_binary_expression(AST_EXPR_VECTOR_COMPARISON, op, left, right) : NULL;
+}
+
+static const char *logical_operator(int op) {
+    if (op == USIL_OP_AND) return " && ";
+    if (op == USIL_OP_OR) return " || ";
+    return NULL;
+}
+
+ASTExpr *ast_create_logical_binary(int op, ASTExpr *left, ASTExpr *right) {
+    return logical_operator(op) ? create_binary_expression(AST_EXPR_LOGICAL_BINARY, op, left, right) : NULL;
 }
 
 ASTExpr *ast_create_ternary(ASTExpr *cond, ASTExpr *true_expr, ASTExpr *false_expr) {
@@ -322,7 +343,7 @@ ASTExpr *ast_create_emitter_operand_with_provenance(
 bool ast_set_logical_value_origin(ASTExpr *expression,
                                   const ASTLogicalValueOrigin *origin) {
     if (!expression || !origin || expression->kind < AST_EXPR_VAR ||
-        (expression->kind == AST_EXPR_EMITTER_OPERAND || expression->kind > AST_EXPR_COMPARISON) ||
+        (expression->kind == AST_EXPR_EMITTER_OPERAND || expression->kind > AST_EXPR_LOGICAL_BINARY) ||
         (!scalar_type_valid(origin->scalar_type) && origin->scalar_type != AST_SCALAR_BOOL) || origin->components > 4 ||
         origin->instruction_index < -1 || (origin->destination_lanes & ~15u) ||
         (origin->instruction_index < 0 &&
@@ -336,6 +357,11 @@ bool ast_set_logical_value_origin(ASTExpr *expression,
     if (origin->complete) {
         if (expression->kind == AST_EXPR_COMPARISON &&
             (origin->scalar_type != AST_SCALAR_BOOL || origin->components != 1))
+            return false;
+        if (expression->kind == AST_EXPR_VECTOR_COMPARISON &&
+            (origin->scalar_type != AST_SCALAR_BOOL || origin->components < 2))
+            return false;
+        if (expression->kind == AST_EXPR_LOGICAL_BINARY && origin->scalar_type != AST_SCALAR_BOOL)
             return false;
         if (expression->kind == AST_EXPR_LITERAL &&
             (origin->components != expression->u.literal.components ||
@@ -366,6 +392,8 @@ void ast_free_expr(ASTExpr *expr) {
         ast_free_expr(expr->u.unary.sub);
         break;
     case AST_EXPR_COMPARISON:
+    case AST_EXPR_VECTOR_COMPARISON:
+    case AST_EXPR_LOGICAL_BINARY:
     case AST_EXPR_BINARY:
         ast_free_expr(expr->u.binary.left);
         ast_free_expr(expr->u.binary.right);
@@ -504,6 +532,11 @@ void ast_free_stmt(ASTStmt *stmt) {
 }
 
 static void format_literal(const ASTLiteral *literal, StringBuilder *sb) {
+    if (literal->scalar_type == AST_SCALAR_BOOL) {
+        if (literal->components != 1 || literal->val[0] > 1u) sb->failed = true;
+        else sb_append(sb, literal->val[0] ? "true" : "false");
+        return;
+    }
     if (literal->components < 1 || literal->components > 4 ||
         !scalar_type_valid(literal->scalar_type)) {
         sb->failed = true;
@@ -586,24 +619,20 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth,
         sb_append(sb, ")");
         break;
     case AST_EXPR_BINARY:
-        if (!binary_operator(expr->u.binary.op)) {
-            sb->failed = true;
-            break;
-        }
-        sb_append(sb, "(");
-        format_expr(expr->u.binary.left, sb, depth + 1u, observer, context);
-        sb_append(sb, binary_operator(expr->u.binary.op));
-        format_expr(expr->u.binary.right, sb, depth + 1u, observer, context);
-        sb_append(sb, ")");
-        break;
     case AST_EXPR_COMPARISON:
-        if (!comparison_operator(expr->u.binary.op)) { sb->failed = true; break; }
+    case AST_EXPR_VECTOR_COMPARISON:
+    case AST_EXPR_LOGICAL_BINARY: {
+        const char *op = expr->kind == AST_EXPR_BINARY ? binary_operator(expr->u.binary.op) :
+            expr->kind == AST_EXPR_LOGICAL_BINARY ? logical_operator(expr->u.binary.op) :
+            comparison_operator(expr->u.binary.op);
+        if (!op) { sb->failed = true; break; }
         sb_append_char(sb, '(');
         format_expr(expr->u.binary.left, sb, depth + 1u, observer, context);
-        sb_append(sb, comparison_operator(expr->u.binary.op));
+        sb_append(sb, op);
         format_expr(expr->u.binary.right, sb, depth + 1u, observer, context);
         sb_append_char(sb, ')');
         break;
+    }
     case AST_EXPR_TERNARY:
         sb_append(sb, "(");
         format_expr(expr->u.ternary.cond, sb, depth + 1u, observer, context);

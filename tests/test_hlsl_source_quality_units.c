@@ -582,6 +582,123 @@ static bool owned_logical_facts(void *context, uint32_t unit_id,
     return true;
 }
 
+static bool boolean_ast_origin(ASTExpr *expression, ASTScalarType type, unsigned width, uint64_t id) {
+    ASTLogicalValueOrigin origin;
+    ast_logical_value_origin_init(&origin);
+    origin.complete = true; origin.scalar_type = type; origin.components = (uint8_t)width;
+    origin.logical_value_id = id;
+    return ast_set_logical_value_origin(expression, &origin);
+}
+
+static bool analyze_boolean_ast(const ASTExpr *root, HLSLSourceQualityResult *quality) {
+    const ASTExpr *expressions[] = {root};
+    HLSLSourceQualityUnit unit = {.source_unit_id = 1, .kind = HLSL_SOURCE_UNIT_ENTRY_POINT,
+        .coverage_complete = true, .expressions = expressions, .expression_count = 1};
+    HLSLSourceQualityRequest request = {.stage = DXBC_PROGRAM_TYPE_PIXEL, .emission_status = HLSL_EMIT_STATUS_OK,
+        .units = &unit, .unit_count = 1, .expected_unit_count = 1, .expression_facts = owned_logical_facts};
+    return hlsl_source_quality_analyze(&request, quality);
+}
+
+static bool check_typed_boolean_ast(void) {
+    const ASTScalarType types[] = {AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32, AST_SCALAR_BOOL};
+    const int operations[] = {USIL_OP_LT, USIL_OP_ILT, USIL_OP_ULT, USIL_OP_IEQ};
+    for (unsigned type = 0; type < 4; ++type) for (unsigned width = 2; width <= 4; ++width) {
+        ASTExpr *value = ast_create_var(-1, 0, OPERAND_TYPE_TEMP, "value");
+        const uint32_t zero = 0;
+        ASTExpr *constant = type == 3 ? ast_create_literal_bool(false)
+            : ast_create_literal_bits(&zero, 1, types[type]);
+        ASTExpr *root = ast_create_vector_comparison(operations[type], value, constant);
+        CHECK(root && boolean_ast_origin(value, types[type], width, 1) &&
+            boolean_ast_origin(root, AST_SCALAR_BOOL, width, 2));
+        HLSLSourceQualityResult quality;
+        CHECK(analyze_boolean_ast(root, &quality) && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+            !quality.reasons && !quality.counts.residual_total && !quality.counts.unknown_provenance);
+        const ASTLogicalValueOrigin original = value->logical_origin;
+        value->logical_origin.complete = false;
+        CHECK(analyze_boolean_ast(root, &quality) && quality.classification != HLSL_SOURCE_QUALITY_CLEAN &&
+            quality.counts.unknown_provenance);
+        value->logical_origin = original;
+        value->logical_origin.components = width == 4 ? 3 : 4;
+        CHECK(!analyze_boolean_ast(root, &quality) && quality.classification == HLSL_SOURCE_QUALITY_FAILED);
+        value->logical_origin = original;
+        value->logical_origin.scalar_type = types[(type + 1) % 4];
+        CHECK(!analyze_boolean_ast(root, &quality));
+        value->logical_origin = original;
+        root->logical_origin.complete = false;
+        CHECK(analyze_boolean_ast(root, &quality) && quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        ast_free_expr(root);
+    }
+    for (unsigned width = 1; width <= 4; ++width) {
+        ASTExpr *value = ast_create_var(-1, 0, OPERAND_TYPE_TEMP, "flags");
+        ASTExpr *constant = ast_create_literal_bool(false);
+        ASTExpr *root = ast_create_logical_binary(width & 1 ? USIL_OP_OR : USIL_OP_AND, value, constant);
+        CHECK(root && boolean_ast_origin(value, AST_SCALAR_BOOL, width, 1) &&
+            boolean_ast_origin(root, AST_SCALAR_BOOL, width, 2));
+        HLSLSourceQualityResult quality;
+        CHECK(analyze_boolean_ast(root, &quality) && quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+        const ASTLogicalValueOrigin original = value->logical_origin;
+        value->logical_origin.scalar_type = AST_SCALAR_FLOAT32;
+        CHECK(!analyze_boolean_ast(root, &quality));
+        value->logical_origin = original;
+        constant->u.literal.val[0] = 2;
+        CHECK(!analyze_boolean_ast(root, &quality));
+        constant->u.literal.val[0] = 0;
+        root->u.binary.op = USIL_OP_OR;
+        root->logical_origin.components = width == 4 ? 3 : 4;
+        CHECK(!analyze_boolean_ast(root, &quality));
+        root->logical_origin.components = (uint8_t)width;
+        root->u.binary.op = USIL_OP_XOR;
+        CHECK(!analyze_boolean_ast(root, &quality));
+        ast_free_expr(root);
+    }
+    ASTExpr *negative_value = ast_create_var(-1, 0, OPERAND_TYPE_TEMP, "color");
+    ASTExpr *positive_value = ast_create_var(-1, 0, OPERAND_TYPE_TEMP, "color");
+    ASTExpr *zero_value = ast_create_var(-1, 0, OPERAND_TYPE_TEMP, "color");
+    CHECK(negative_value && positive_value && zero_value &&
+        boolean_ast_origin(negative_value, AST_SCALAR_FLOAT32, 4, 1) &&
+        boolean_ast_origin(positive_value, AST_SCALAR_FLOAT32, 4, 1) &&
+        boolean_ast_origin(zero_value, AST_SCALAR_FLOAT32, 4, 1));
+    ASTExpr *negative = ast_create_vector_comparison(USIL_OP_LT, negative_value, ast_create_literal_float(0.0f));
+    ASTExpr *positive = ast_create_vector_comparison(USIL_OP_LT, ast_create_literal_float(0.0f), positive_value);
+    ASTExpr *nonzero = ast_create_logical_binary(USIL_OP_OR, negative, positive);
+    ASTExpr *zero = ast_create_vector_comparison(USIL_OP_EQ, zero_value, ast_create_literal_float(0.0f));
+    ASTExpr *ordered = ast_create_logical_binary(USIL_OP_OR, nonzero, zero);
+    ASTExpr *predicate = ast_create_vector_comparison(USIL_OP_IEQ, ordered, ast_create_literal_bool(false));
+    CHECK(predicate && boolean_ast_origin(negative, AST_SCALAR_BOOL, 4, 2) &&
+        boolean_ast_origin(positive, AST_SCALAR_BOOL, 4, 3) &&
+        boolean_ast_origin(nonzero, AST_SCALAR_BOOL, 4, 4) &&
+        boolean_ast_origin(zero, AST_SCALAR_BOOL, 4, 5) &&
+        boolean_ast_origin(ordered, AST_SCALAR_BOOL, 4, 6) &&
+        boolean_ast_origin(predicate, AST_SCALAR_BOOL, 4, 7));
+    HLSLSourceQualityResult nested_quality;
+    CHECK(analyze_boolean_ast(predicate, &nested_quality) &&
+        nested_quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        !nested_quality.counts.residual_total && !nested_quality.counts.unknown_provenance);
+    negative_value->logical_origin.complete = false;
+    const ASTExpr *helper_expressions[] = {predicate};
+    ASTExpr *entry = ast_create_literal_bool(true);
+    const ASTExpr *entry_expressions[] = {entry};
+    HLSLSourceQualityUnit units[2] = {
+        {.source_unit_id = 0, .kind = HLSL_SOURCE_UNIT_HELPER, .coverage_complete = true,
+         .expressions = helper_expressions, .expression_count = 1},
+        {.source_unit_id = 1, .kind = HLSL_SOURCE_UNIT_ENTRY_POINT, .coverage_complete = true,
+         .expressions = entry_expressions, .expression_count = 1}};
+    HLSLSourceQualityRequest request = {.stage = DXBC_PROGRAM_TYPE_PIXEL, .emission_status = HLSL_EMIT_STATUS_OK,
+        .units = units, .unit_count = 2, .expected_unit_count = 2, .expression_facts = owned_logical_facts};
+    CHECK(entry && hlsl_source_quality_analyze(&request, &nested_quality) &&
+        nested_quality.classification != HLSL_SOURCE_QUALITY_CLEAN && nested_quality.counts.inspected_units == 2 &&
+        nested_quality.counts.unknown_provenance);
+    ast_free_expr(predicate); ast_free_expr(entry);
+    ASTExpr *constant = ast_create_literal_bool(true);
+    HLSLSourceQualityResult quality;
+    CHECK(constant && analyze_boolean_ast(constant, &quality) &&
+        quality.classification == HLSL_SOURCE_QUALITY_CLEAN);
+    constant->u.literal.components = 2;
+    CHECK(!analyze_boolean_ast(constant, &quality));
+    ast_free_expr(constant);
+    return true;
+}
+
 static bool check_owned_ast_logical_origins(void) {
     ASTExpr *base = ast_create_var(-1, 7, OPERAND_TYPE_TEMP, "r7");
     ASTExpr *nested = ast_create_binary(USIL_OP_MUL, base, ast_create_literal_float(2.0f));
@@ -946,6 +1063,7 @@ int main(void) {
         !check_hidden_helpers_and_categories() || !check_statements_and_emission_outcomes() ||
         !check_invalid_and_bounded_analysis() || !check_streaming_matches_batch() ||
         !check_real_emitter_quality_is_independent() || !check_owned_ast_logical_origins() ||
+        !check_typed_boolean_ast() ||
         !check_natural_interfaces_and_residual_projections() || !check_multiple_entry_inventory() ||
         !check_cbuffer_shape_facts())
         return 1;

@@ -26,12 +26,17 @@ static ASTExpr *copy_tree(const ASTExpr *source, unsigned depth, size_t *nodes) 
         break;
     }
     case AST_EXPR_BINARY:
+    case AST_EXPR_VECTOR_COMPARISON:
+    case AST_EXPR_LOGICAL_BINARY:
     case AST_EXPR_COMPARISON: {
         ASTExpr *left = copy_tree(source->u.binary.left, depth + 1, nodes);
         ASTExpr *right = left ? copy_tree(source->u.binary.right, depth + 1, nodes) : NULL;
-        if (left && right) copy = source->kind == AST_EXPR_BINARY
-            ? ast_create_binary(source->u.binary.op, left, right)
-            : ast_create_comparison(source->u.binary.op, left, right);
+        if (left && right) {
+            if (source->kind == AST_EXPR_BINARY) copy = ast_create_binary(source->u.binary.op, left, right);
+            else if (source->kind == AST_EXPR_LOGICAL_BINARY) copy = ast_create_logical_binary(source->u.binary.op, left, right);
+            else if (source->kind == AST_EXPR_VECTOR_COMPARISON) copy = ast_create_vector_comparison(source->u.binary.op, left, right);
+            else copy = ast_create_comparison(source->u.binary.op, left, right);
+        }
         if (!copy) { ast_free_expr(left); ast_free_expr(right); }
         break;
     }
@@ -54,8 +59,11 @@ static ASTExpr *copy_tree(const ASTExpr *source, unsigned depth, size_t *nodes) 
         break;
     }
     case AST_EXPR_LITERAL:
-        copy = ast_create_literal_bits(source->u.literal.val, source->u.literal.components,
-                                       source->u.literal.scalar_type);
+        if (source->u.literal.scalar_type == AST_SCALAR_BOOL) {
+            if (source->u.literal.components == 1 && source->u.literal.val[0] <= 1u)
+                copy = ast_create_literal_bool(source->u.literal.val[0] != 0);
+        } else copy = ast_create_literal_bits(source->u.literal.val, source->u.literal.components,
+                                              source->u.literal.scalar_type);
         break;
     case AST_EXPR_EMITTER_OPERAND:
         copy = ast_create_emitter_operand_with_provenance(source->u.emitter_operand,
@@ -186,7 +194,8 @@ static bool trees_equal(const ASTExpr *a, const ASTExpr *b, unsigned depth, size
             a->u.var.operand_type == b->u.var.operand_type && a->u.var.name && b->u.var.name && !strcmp(a->u.var.name, b->u.var.name);
     if (a->kind == AST_EXPR_UNARY)
         return a->u.unary.op == b->u.unary.op && trees_equal(a->u.unary.sub, b->u.unary.sub, depth + 1, nodes);
-    if (a->kind == AST_EXPR_BINARY || a->kind == AST_EXPR_COMPARISON)
+    if (a->kind == AST_EXPR_BINARY || a->kind == AST_EXPR_COMPARISON ||
+        a->kind == AST_EXPR_VECTOR_COMPARISON || a->kind == AST_EXPR_LOGICAL_BINARY)
         return a->u.binary.op == b->u.binary.op &&
             trees_equal(a->u.binary.left, b->u.binary.left, depth + 1, nodes) &&
             trees_equal(a->u.binary.right, b->u.binary.right, depth + 1, nodes);

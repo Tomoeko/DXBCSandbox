@@ -1224,6 +1224,8 @@ static bool tree_owners_valid(const HLSLStageCoverage *coverage, const ASTExpr *
     case AST_EXPR_VAR: return true;
     case AST_EXPR_UNARY: return tree_owners_valid(coverage, tree->u.unary.sub, depth + 1, nodes);
     case AST_EXPR_BINARY:
+    case AST_EXPR_VECTOR_COMPARISON:
+    case AST_EXPR_LOGICAL_BINARY:
     case AST_EXPR_COMPARISON:
         return tree_owners_valid(coverage, tree->u.binary.left, depth + 1, nodes) &&
             tree_owners_valid(coverage, tree->u.binary.right, depth + 1, nodes);

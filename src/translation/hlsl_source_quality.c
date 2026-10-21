@@ -31,6 +31,8 @@ struct HLSLSourceQualityAnalysis {
 typedef struct {
     bool logical;
     unsigned components;
+    bool type_known;
+    ASTScalarType scalar_type;
 } ExpressionValue;
 
 void hlsl_source_quality_facts_init(HLSLSourceQualityFacts *facts) {
@@ -266,6 +268,46 @@ static bool scalar_valid(ASTScalarType type) {
            type == AST_SCALAR_UINT32;
 }
 
+static bool comparison_valid(int op) {
+    return op == USIL_OP_GE || op == USIL_OP_IGE || op == USIL_OP_UGE ||
+        op == USIL_OP_LT || op == USIL_OP_ILT || op == USIL_OP_ULT ||
+        op == USIL_OP_EQ || op == USIL_OP_IEQ || op == USIL_OP_NE || op == USIL_OP_INE;
+}
+
+static bool comparison_type_valid(int op, ASTScalarType type) {
+    switch (op) {
+    case USIL_OP_GE: case USIL_OP_LT: case USIL_OP_EQ: case USIL_OP_NE:
+        return type == AST_SCALAR_FLOAT32;
+    case USIL_OP_IGE: case USIL_OP_ILT:
+        return type == AST_SCALAR_SINT32;
+    case USIL_OP_UGE: case USIL_OP_ULT:
+        return type == AST_SCALAR_UINT32;
+    case USIL_OP_IEQ: case USIL_OP_INE:
+        return type == AST_SCALAR_SINT32 || type == AST_SCALAR_UINT32 || type == AST_SCALAR_BOOL;
+    default:
+        return false;
+    }
+}
+
+static bool typed_boolean_value_valid(const ASTExpr *expression,
+    const HLSLSourceQualityFacts *facts, const ExpressionValue children[3]) {
+    const ASTLogicalValueOrigin *origin = &expression->logical_origin;
+    const unsigned width = facts->components;
+    if (!origin->complete || origin->scalar_type != AST_SCALAR_BOOL ||
+        origin->components != width || !width || width > 4 ||
+        facts->value_kind != HLSL_SOURCE_VALUE_LOGICAL ||
+        (expression->kind == AST_EXPR_VECTOR_COMPARISON && width < 2)) return false;
+    if (!children[0].logical || !children[1].logical) return true;
+    if (!children[0].type_known || !children[1].type_known ||
+        children[0].scalar_type != children[1].scalar_type ||
+        (children[0].components != width && children[0].components != 1) ||
+        (children[1].components != width && children[1].components != 1) ||
+        (children[0].components != width && children[1].components != width)) return false;
+    return expression->kind == AST_EXPR_LOGICAL_BINARY
+        ? children[0].scalar_type == AST_SCALAR_BOOL
+        : comparison_type_valid(expression->u.binary.op, children[0].scalar_type);
+}
+
 static bool visit_expression(QualityAnalysis *analysis, const ASTExpr *expression,
                              unsigned depth, ExpressionValue *value) {
     if (!enter_node(analysis, expression, depth))
@@ -282,7 +324,9 @@ static bool visit_expression(QualityAnalysis *analysis, const ASTExpr *expressio
     switch (expression->kind) {
     case AST_EXPR_LITERAL:
         if (expression->u.literal.components < 1 || expression->u.literal.components > 4 ||
-            !scalar_valid(expression->u.literal.scalar_type))
+            (!scalar_valid(expression->u.literal.scalar_type) &&
+             (expression->u.literal.scalar_type != AST_SCALAR_BOOL ||
+              expression->u.literal.components != 1 || expression->u.literal.val[0] > 1u)))
             return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
         /* Literal encoding is self-describing and cannot hide register syntax.
          * Preserve any resolver-provided ownership while fixing these facts. */
@@ -316,11 +360,7 @@ static bool visit_expression(QualityAnalysis *analysis, const ASTExpr *expressio
         children_logical = children[0].logical && children[1].logical;
         break;
     case AST_EXPR_COMPARISON:
-        if ((expression->u.binary.op != USIL_OP_GE && expression->u.binary.op != USIL_OP_IGE &&
-             expression->u.binary.op != USIL_OP_UGE && expression->u.binary.op != USIL_OP_LT &&
-             expression->u.binary.op != USIL_OP_ILT && expression->u.binary.op != USIL_OP_ULT &&
-             expression->u.binary.op != USIL_OP_EQ && expression->u.binary.op != USIL_OP_IEQ &&
-             expression->u.binary.op != USIL_OP_NE && expression->u.binary.op != USIL_OP_INE) ||
+        if (!comparison_valid(expression->u.binary.op) ||
             expression->u.binary.left == expression->u.binary.right)
             return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
         if (!visit_expression(analysis, expression->u.binary.left, depth + 1, &children[0]) ||
@@ -329,6 +369,19 @@ static bool visit_expression(QualityAnalysis *analysis, const ASTExpr *expressio
         children_logical = children[0].logical && children[1].logical;
         if (facts.known && (facts.components != 1 || children[0].components != 1 ||
                             children[1].components != 1))
+            return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
+        break;
+    case AST_EXPR_VECTOR_COMPARISON:
+    case AST_EXPR_LOGICAL_BINARY:
+        if ((expression->kind == AST_EXPR_VECTOR_COMPARISON
+                ? !comparison_valid(expression->u.binary.op)
+                : expression->u.binary.op != USIL_OP_AND && expression->u.binary.op != USIL_OP_OR) ||
+            expression->u.binary.left == expression->u.binary.right)
+            return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
+        if (!visit_expression(analysis, expression->u.binary.left, depth + 1, &children[0]) ||
+            !visit_expression(analysis, expression->u.binary.right, depth + 1, &children[1])) return false;
+        children_logical = children[0].logical && children[1].logical;
+        if (facts.known && !typed_boolean_value_valid(expression, &facts, children))
             return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
         break;
     case AST_EXPR_TERNARY:
@@ -405,6 +458,10 @@ static bool visit_expression(QualityAnalysis *analysis, const ASTExpr *expressio
     value->logical = facts.known && facts.value_kind == HLSL_SOURCE_VALUE_LOGICAL &&
                      !facts.artifacts && children_logical;
     value->components = facts.components;
+    value->type_known = value->logical && (expression->kind == AST_EXPR_LITERAL ||
+        (expression->logical_origin.complete && expression->logical_origin.components == facts.components));
+    value->scalar_type = expression->kind == AST_EXPR_LITERAL ? expression->u.literal.scalar_type
+        : expression->logical_origin.scalar_type;
     return observe(analysis, HLSL_SOURCE_OBSERVATION_EXPRESSION, expression->kind, facts,
                    facts.logical_operation && facts.value_kind == HLSL_SOURCE_VALUE_LOGICAL);
 }

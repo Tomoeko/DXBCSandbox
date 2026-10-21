@@ -109,6 +109,60 @@ static bool check_operators_and_casts(void) {
     return true;
 }
 
+static bool check_boolean_expressions(void) {
+    CHECK(expect_expression(ast_create_literal_bool(true), "true"));
+    CHECK(expect_expression(ast_create_literal_bool(false), "false"));
+    CHECK(expect_expression(ast_create_logical_binary(USIL_OP_OR, ast_create_literal_bool(true),
+        ast_create_literal_bool(false)), "(true || false)"));
+    CHECK(expect_expression(ast_create_logical_binary(USIL_OP_AND, ast_create_literal_bool(true),
+        ast_create_literal_bool(false)), "(true && false)"));
+    CHECK(expect_expression(ast_create_binary(USIL_OP_OR, ast_create_literal_int(1),
+        ast_create_literal_int(2)), "(1 | 2)"));
+    const uint32_t zero = 0;
+    CHECK(!ast_create_literal_bits(&zero, 1, AST_SCALAR_BOOL));
+    ASTExpr *left = ast_create_literal_bool(true), *right = ast_create_literal_bool(false);
+    CHECK(left && right && !ast_create_logical_binary(USIL_OP_XOR, left, right) &&
+        !ast_create_logical_binary(USIL_OP_OR, left, left) &&
+        !ast_create_vector_comparison(USIL_OP_ADD, left, right) &&
+        !ast_create_vector_comparison(USIL_OP_EQ, left, left) &&
+        !ast_create_bitcast(AST_SCALAR_BOOL, left));
+    CHECK(expect_expression(left, "true") && expect_expression(right, "false"));
+    ASTExpr *vector = ast_create_vector_comparison(USIL_OP_LT,
+        ast_create_var(-1, 0, OPERAND_TYPE_INPUT, "color"), ast_create_literal_float(0.0f));
+    ASTExpr *scalar = ast_create_comparison(USIL_OP_LT, ast_create_literal_float(0.0f),
+        ast_create_literal_float(1.0f));
+    CHECK(vector && scalar);
+    ASTLogicalValueOrigin origin;
+    ast_logical_value_origin_init(&origin);
+    origin.complete = true; origin.scalar_type = AST_SCALAR_BOOL;
+    origin.logical_value_id = 1; origin.components = 4;
+    CHECK(ast_set_logical_value_origin(vector, &origin) && !ast_set_logical_value_origin(scalar, &origin));
+    const ASTLogicalValueOrigin previous = vector->logical_origin;
+    origin.components = 1;
+    CHECK(!ast_set_logical_value_origin(vector, &origin) && ast_set_logical_value_origin(scalar, &origin));
+    CHECK(!memcmp(&previous, &vector->logical_origin, sizeof(previous)));
+    origin.components = 4; origin.scalar_type = AST_SCALAR_FLOAT32;
+    CHECK(!ast_set_logical_value_origin(vector, &origin));
+    CHECK(expect_expression(vector, "(color < 0.0f)") && expect_expression(scalar, "(0.0f < 1.0f)"));
+    ASTExpr *logical = ast_create_logical_binary(USIL_OP_AND, ast_create_literal_bool(true),
+        ast_create_literal_bool(false));
+    CHECK(logical && !ast_set_logical_value_origin(logical, &origin));
+    origin.scalar_type = AST_SCALAR_BOOL;
+    CHECK(ast_set_logical_value_origin(logical, &origin));
+    ast_free_expr(logical);
+    for (unsigned invalid = 0; invalid < 2; ++invalid) {
+        ASTExpr *literal = ast_create_literal_bool(false);
+        CHECK(literal);
+        if (invalid) literal->u.literal.components = 2;
+        else literal->u.literal.val[0] = 2;
+        StringBuilder text; sb_init(&text);
+        ast_format_expr(literal, &text);
+        CHECK(!sb_ok(&text));
+        sb_free(&text); ast_free_expr(literal);
+    }
+    return true;
+}
+
 typedef struct {
     const ASTExpr *nodes[3];
     size_t begins[3], ends[3], count;
@@ -188,7 +242,7 @@ static bool check_invalid_trees_and_ownership(void) {
 }
 
 int main(void) {
-    if (!check_literal_bits() || !check_operators_and_casts() ||
+    if (!check_literal_bits() || !check_operators_and_casts() || !check_boolean_expressions() ||
         !check_invalid_trees_and_ownership() || !check_expression_spans())
         return 1;
     puts("HLSL AST bits, operators and ownership passed");

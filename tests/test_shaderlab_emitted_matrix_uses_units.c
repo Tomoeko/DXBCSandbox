@@ -27,6 +27,48 @@ static void fixture_dispose(Fixture *fixture) {
     test_shaderlab_matrix_fixture_dispose(fixture);
 }
 
+static bool owned_boolean_expression(void) {
+    ASTExpr *comparison = ast_create_vector_comparison(USIL_OP_IEQ,
+        ast_create_var(1, 0, 0, "flags"), ast_create_literal_bool(false));
+    ASTExpr *original = ast_create_logical_binary(USIL_OP_OR,
+        comparison, ast_create_literal_bool(true));
+    CHECK(original && comparison);
+    ASTLogicalValueOrigin origin = {.complete = true, .scalar_type = AST_SCALAR_BOOL,
+        .components = 4, .logical_value_id = 3, .instruction_index = -1,
+        .source_instruction_index = UINT32_MAX};
+    CHECK(ast_set_logical_value_origin(comparison, &origin));
+    ++origin.logical_value_id;
+    CHECK(ast_set_logical_value_origin(original, &origin));
+    size_t nodes = 0;
+    ASTExpr *copy = hlsl_owned_expression_copy(original, &nodes);
+    CHECK(copy && nodes == 5 && copy != original);
+    CHECK(copy->u.binary.left != comparison);
+    CHECK(hlsl_matrix_uses_trees_equal(original, copy));
+    copy->u.binary.left->kind = AST_EXPR_COMPARISON;
+    CHECK(!hlsl_matrix_uses_trees_equal(original, copy));
+    copy->u.binary.left->kind = AST_EXPR_VECTOR_COMPARISON;
+    copy->u.binary.right->u.literal.val[0] = 0;
+    CHECK(!hlsl_matrix_uses_trees_equal(original, copy));
+    copy->u.binary.right->u.literal.val[0] = 1;
+    CHECK(hlsl_matrix_uses_trees_equal(original, copy));
+    ast_free_expr(original);
+    StringBuilder source;
+    sb_init(&source);
+    ast_format_expr(copy, &source);
+    CHECK(sb_ok(&source) && source.buf && !strcmp(source.buf, "((flags == false) || true)"));
+    sb_free(&source);
+    ast_free_expr(copy);
+    ASTExpr *invalid = ast_create_literal_bool(false);
+    CHECK(invalid);
+    invalid->u.literal.val[0] = 2;
+    CHECK(!hlsl_owned_expression_copy(invalid, &nodes));
+    invalid->u.literal.val[0] = 0;
+    invalid->u.literal.components = 2;
+    CHECK(!hlsl_owned_expression_copy(invalid, &nodes));
+    ast_free_expr(invalid);
+    return true;
+}
+
 static bool owned_input_guarantees(const HLSLOwnedStageInputs *original) {
     HLSLOwnedStageInputs retained = {0};
     size_t aggregate = 0;
@@ -355,5 +397,5 @@ static bool positive_and_mutations(void) {
 }
 
 int main(void) {
-    return positive_and_mutations() ? 0 : 1;
+    return owned_boolean_expression() && positive_and_mutations() ? 0 : 1;
 }
