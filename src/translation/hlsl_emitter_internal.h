@@ -311,13 +311,14 @@ typedef struct HLSLEmitterContext {
     /* The packed natural IF route owns each actual signature field, even
      * when two parameter declarations share one physical input register. */
     bool high_level_packed_inputs;
+    bool high_level_inactive_inputs;
     uint32_t high_level_input_fields_emitted;
     /* A separate straight-line proof binds packed output signature ordinals,
      * while the established register bitmaps retain their original meaning. */
     bool high_level_packed_outputs;
     uint32_t high_level_output_field_declarations;
     uint32_t high_level_output_field_statements;
-    struct HLSLPackedOutputGuard *packed_output_guard;
+    struct HLSLStraightLineGuard *straightline_guard;
     /* Every frozen natural structured route retains this callback-free
      * interface replay. Disposal shares the natural body inventory lifecycle. */
     StringBuilder natural_structured_header_source;
@@ -495,6 +496,15 @@ typedef struct {
 /* Exact complete-field selection, never a physical-register fallback. */
 bool hlsl_high_level_output_projection(const USILProgram *program,
     const DXBCOperand *destination, HLSLNaturalOutputProjection *projection);
+/* Storage/shape safety shared by the bounded graphics owner digests. */
+bool hlsl_decoded_graphics_owner_storage_valid(const USILProgram *program, bool constant_buffers);
+typedef struct {
+    bool present;
+    int active_input_field; /* -1 for a literal return. */
+    uint32_t input_registers;
+} HLSLInactiveInputPlan;
+bool hlsl_inactive_input_plan_prepare(const USILProgram *program, HLSLInactiveInputPlan *plan);
+bool hlsl_inactive_input_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);
 /* One direct unsigned system output in the packed vertex route. This is a

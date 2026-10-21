@@ -1319,6 +1319,88 @@ done:
     return accepted;
 }
 
+/* A constant or identity-color fragment may retain unread typed/packed
+ * inputs. Reconstruct from the decoded target alone. Warm counterexamples
+ * change one actual literal or the active input declaration's interpolation. */
+static bool reconstruct_inactive_inputs(const DXBCContainerView *target,
+    StringBuilder *source, ProbeDecodedLiteral *owner, bool changed) {
+    DXBCDocument document;
+    dxbc_document_init(&document);
+    DXBCContainer semantic = {0};
+    DXBCStageContract contract;
+    dxbc_stage_contract_init(&contract);
+    USILProgram program = {0};
+    HLSLInactiveInputPlan plan;
+    bool accepted = false;
+    if (!target || !source || !owner || source->len || !sb_ok(source) ||
+        !dxbc_document_parse(&document, target->data, target->size, NULL) ||
+        !dxbc_document_decode_semantic(&document, &semantic) ||
+        !dxbc_stage_contract_decode(&document, &semantic, &contract, NULL) ||
+        !usil_translate_with_stage_contract(&program, &semantic, &contract) ||
+        !hlsl_inactive_input_plan_prepare(&program, &plan) ||
+        !print_domain_signature("inactive-fragment-input", program.inputs, program.input_count) ||
+        !print_domain_signature("inactive-fragment-output", program.outputs, program.output_count)) goto done;
+    const bool literal = plan.active_input_field < 0;
+    ProbeDecodedLiteral captured = {.instruction = literal ? 0 : -1,
+        .operand = literal ? 1 : plan.active_input_field,
+        .raw_instruction = program.instructions[0].source_instruction_index,
+        .original_bits = literal ? program.instructions[0].operands[1].imm_values[0] :
+            program.inputs[plan.active_input_field].interpolation_mode,
+        .opcode = USIL_OP_MOV, .shader_model_major = program.shader_model_major, .valid = true};
+    int declaration_index = -1;
+    if (!literal) {
+        for (int index = 0; index < program.signature_declaration_count; ++index)
+            if (program.signature_declarations[index].kind == USIL_SIGNATURE_DECL_INPUT_PS) declaration_index = index;
+        if (declaration_index < 0) goto done;
+        captured.raw_instruction = program.signature_declarations[declaration_index].source_instruction_index;
+    }
+    if (changed) {
+        if (!owner->valid || owner->instruction != captured.instruction || owner->operand != captured.operand ||
+            owner->raw_instruction != captured.raw_instruction || owner->original_bits != captured.original_bits ||
+            owner->shader_model_major != captured.shader_model_major) goto done;
+        if (literal) {
+            const uint32_t replacement = captured.original_bits == UINT32_C(0x3f400000)
+                ? UINT32_C(0x3f000000) : UINT32_C(0x3f400000);
+            program.instructions[0].operands[1].imm_values[0] = replacement;
+            program.instructions[0].operands[1].immediate_words[0] = replacement;
+        } else {
+            const uint8_t replacement = captured.original_bits == 3u ? 2u : 3u;
+            program.inputs[plan.active_input_field].interpolation_mode = replacement;
+            program.signature_declarations[declaration_index].interpolation_mode = replacement;
+        }
+        if (!hlsl_inactive_input_plan_prepare(&program, &plan)) goto done;
+    } else *owner = captured;
+    printf("inactive_counterexample_owner=%s instruction=%d raw_instruction=%u field_or_operand=%d "
+        "original=0x%08" PRIx32 " changed=%d model=%u.0\n",
+        literal ? "decoded-mov-literal" : "decoded-input-declaration-interpolation", captured.instruction,
+        captured.raw_instruction, captured.operand, captured.original_bits, changed, program.shader_model_major);
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    HLSLEmitDiagnostic diagnostic;
+    options.expression_source_map = &map;
+    options.source_quality = &quality;
+    const HLSLEmitNames names = {.entry_point = "frag"};
+    const bool emitted = hlsl_emit_with_options_diagnostic(&program, source, NULL, NULL, &names, &options, &diagnostic);
+    const bool mapped = emitted && map.complete && hlsl_expression_source_map_matches(&map, &program, source->buf);
+    printf("inactive_source_result=%s status=%s phase=%s reason=%s bytes=%zu quality=%s reasons=0x%x "
+        "incomplete=%zu residual=%zu unknown=%zu map_complete=%d map_count=%zu map_valid=%d\n",
+        emitted ? "generated" : "unavailable", hlsl_emit_status_name(diagnostic.status),
+        hlsl_emit_phase_name(diagnostic.phase), hlsl_emit_reason_name(diagnostic.reason), source->len,
+        hlsl_source_quality_class_name(quality.classification), quality.reasons, quality.counts.incomplete_units,
+        quality.counts.residual_total, quality.counts.unknown_provenance, map.complete, map.count, mapped);
+    if (emitted) print_hash(changed ? "mutated_fragment_sha256" : "reconstructed_fragment_sha256", source->buf, source->len);
+    accepted = mapped && map.count == 2 && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+        !quality.reasons && !quality.counts.incomplete_units && !quality.counts.residual_total &&
+        !quality.counts.unknown_provenance;
+done:
+    usil_free(&program);
+    dxbc_stage_contract_free(&contract);
+    dxbc_free(&semantic);
+    dxbc_document_free(&document);
+    return accepted;
+}
+
 static bool structured_wrapper(const StringBuilder *fragment, StringBuilder *wrapper,
                                const char *shader_name, bool vertex_fixture, unsigned shader_model_major) {
     if ((shader_model_major != 4u && shader_model_major != 5u) || !fragment || !sb_ok(fragment) || !fragment->buf || fragment->len > PROBE_SOURCE_LIMIT ||
@@ -2314,7 +2396,7 @@ static void usage(const char *name) {
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture]\n"
+        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture | --inactive-input-fixture]\n"
         "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -2344,6 +2426,9 @@ static void usage(const char *name) {
         "broadcast 0.375 literal with whole-field demand for the warm change to 3.0. "
         "A whole-pair MUL is separately labeled as a boundary observation. "
         "Unavailable shapes never receive substitute source or target bytes.\n"
+        "--inactive-input-fixture reconstructs a constant or identity-color fragment "
+        "with unread typed/packed signature fields. Cold exact comparison enables "
+        "an actual MOV literal or active input interpolation change and exact warm restoration.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -2357,10 +2442,11 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
+    const bool inactive_input_fixture = argc == 5 && !strcmp(argv[4], "--inactive-input-fixture");
     const bool packed_output_vertex_fixture = argc == 5 && !strcmp(argv[4], "--packed-output-vertex-fixture");
     const bool structured_vertex_fixture = packed_output_vertex_fixture ||
         (argc == 5 && !strcmp(argv[4], "--structured-vertex-fixture"));
-    const bool structured_fixture = structured_vertex_fixture ||
+    const bool structured_fixture = inactive_input_fixture || structured_vertex_fixture ||
         (argc == 5 && !strcmp(argv[4], "--structured-fixture"));
     const bool scalar_fixture = argc >= 5 && !strcmp(argv[4], "--scalar-fixture");
     const bool icb_fixture = argc >= 5 && !strcmp(argv[4], "--icb-fixture");
@@ -2386,7 +2472,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     CommonFileBytes authored = {0};
-    const char *shader_name = packed_output_vertex_fixture ? "Fixture/HighLevel/PackedFloat2VertexOutput" :
+    const char *shader_name = inactive_input_fixture ? "Fixture/HighLevel/InactiveFragmentInputs" :
+        packed_output_vertex_fixture ? "Fixture/HighLevel/PackedFloat2VertexOutput" :
         structured_vertex_fixture ? "Fixture/HighLevel/StructuredFloat3VertexBranch" :
         structured_fixture ? "Fixture/HighLevel/StructuredFloat3Branch" : scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
         : icb_fixture ? "Fixture/HighLevel/HullFloat3ICB" : default_shader_name;
@@ -2478,9 +2565,10 @@ int main(int argc, char **argv) {
         }
         if (native_parameters.cb_count)
             puts("metadata_authority=actual-native-callback-projection player_metadata=not-supplied");
-        if (!reconstruct_structured(&target, &hull, &structured_literal, false,
-                structured_vertex_fixture, packed_output_vertex_fixture,
-                native_parameters.cb_count ? &native_parameters : NULL, false) ||
+        if (!(inactive_input_fixture ? reconstruct_inactive_inputs(&target, &hull, &structured_literal, false) :
+                reconstruct_structured(&target, &hull, &structured_literal, false,
+                    structured_vertex_fixture, packed_output_vertex_fixture,
+                    native_parameters.cb_count ? &native_parameters : NULL, false)) ||
             !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture, structured_literal.shader_model_major)) {
             if (packed_output_vertex_fixture)
                 puts("packed_output_candidate=not-run packed_output_warm_mutation=not-run "
@@ -2593,9 +2681,10 @@ int main(int argc, char **argv) {
     if (structured_fixture) {
         StringBuilder mutated_fragment;
         sb_init(&mutated_fragment);
-        mutation_built = reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
-                structured_vertex_fixture, packed_output_vertex_fixture,
-                native_parameters.cb_count ? &native_parameters : NULL, false) &&
+        mutation_built = (inactive_input_fixture ? reconstruct_inactive_inputs(&target, &mutated_fragment, &structured_literal, true) :
+                reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
+                    structured_vertex_fixture, packed_output_vertex_fixture,
+                    native_parameters.cb_count ? &native_parameters : NULL, false)) &&
             structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture, structured_literal.shader_model_major);
         sb_free(&mutated_fragment);
     } else {
@@ -2671,7 +2760,11 @@ int main(int argc, char **argv) {
                      repeated_authority
                  ? 0
                  : 1;
-    if (structured_fixture)
+    if (inactive_input_fixture)
+        printf("inactive_input_isolated_stage_qualified=%d original_target_reference=1 "
+               "actual_owned_mutation=%s warm_restore=%s import=not-run runtime=not-run semantic_certificate=not-run\n",
+               !result, mutation_diff && mutation_authority ? "different" : "failed", !result ? "exact" : "failed");
+    if (structured_fixture && !inactive_input_fixture)
         printf("structured_isolated_stage_qualified=%d original_target_reference=1 "
                "decoded_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
                !result, mutation_diff && mutation_authority ? "different" : "failed",

@@ -1631,9 +1631,9 @@ static void natural_if_write_u32(uint8_t *bytes, uint32_t value) {
  * The normal document, stage-contract and USIL decoders supply its authority. */
 static size_t natural_if_signature(uint8_t *bytes, bool output,
     const DXBCSignatureElement *fields, unsigned count) {
-    if (!count || count > 4) return 0;
+    if (!count || count > HLSL_SM5_IO_REGISTER_COUNT) return 0;
     const size_t name_offset = 8u + count * 24u;
-    size_t offsets[4], payload_size = name_offset;
+    size_t offsets[HLSL_SM5_IO_REGISTER_COUNT], payload_size = name_offset;
     for (unsigned index = 0; index < count; ++index) {
         unsigned previous = 0;
         while (previous < index && strcmp(fields[index].semantic_name,
@@ -1677,7 +1677,7 @@ static void natural_if_fixture_dispose(NaturalIfFixture *fixture) {
 static bool natural_if_fixture_decode_words(NaturalIfFixture *fixture, uint32_t program_token,
     const uint32_t *words, size_t word_count, const DXBCSignatureElement *inputs,
     unsigned input_count, const DXBCSignatureElement *outputs, unsigned output_count) {
-    uint8_t bytes[1024] = {0};
+    uint8_t bytes[4096] = {0};
     memcpy(bytes, "DXBC", 4);
     natural_if_write_u32(bytes + 20, 1);
     natural_if_write_u32(bytes + 28, 3);
@@ -8411,6 +8411,323 @@ static bool check_packed_output_emission(void) {
     return true;
 }
 
+/* Actual signature grammar keeps inactive fields, including fields packed in
+ * the same physical register. The body has no access to those fields. */
+static bool inactive_input_fixture(NaturalIfFixture *fixture, unsigned model,
+    unsigned layout, bool color, bool reordered) {
+    memset(fixture, 0, sizeof(*fixture));
+    DXBCSignatureElement inputs[HLSL_SM5_IO_REGISTER_COUNT] = {
+        {.semantic_name = "SV_POSITION", .system_value = 1, .component_type = 3, .mask = 15},
+        {.semantic_name = "SV_RenderTargetArrayIndex", .system_value = 4, .component_type = 1,
+         .register_id = 1, .mask = 1}};
+    unsigned count = 2;
+    if (layout == 1) {
+        inputs[1] = (DXBCSignatureElement){.semantic_name = "COORDVALUE", .component_type = 3,
+            .register_id = 1, .mask = 7};
+        inputs[2] = (DXBCSignatureElement){.semantic_name = "WEIGHT", .component_type = 3,
+            .register_id = 1, .mask = 8};
+        inputs[3] = (DXBCSignatureElement){.semantic_name = "IDENTIFIER", .component_type = 1,
+            .register_id = 2, .mask = 1};
+        count = 4;
+    } else if (layout == 2) {
+        inputs[1] = (DXBCSignatureElement){.semantic_name = "SV_IsFrontFace", .system_value = 9,
+            .component_type = 1, .register_id = 1, .mask = 1};
+    } else if (layout == 3) {
+        inputs[1] = (DXBCSignatureElement){.semantic_name = "IDENTIFIER", .component_type = 2,
+            .register_id = 1, .mask = 1};
+    } else if (layout == 6) {
+        inputs[1] = (DXBCSignatureElement){.semantic_name = "SV_InstanceID", .component_type = 1,
+            .register_id = 1, .mask = 1};
+    } else if (layout == 4 || layout == 5) {
+        count = layout == 5 ? HLSL_SM5_IO_REGISTER_COUNT : 10;
+        for (unsigned index = 1; index < count; ++index)
+            inputs[index] = (DXBCSignatureElement){.semantic_name = "TEXCOORD", .semantic_index = index - 1u,
+                .component_type = 3, .register_id = index, .mask = index == 9 ? 12 : 3};
+        if (layout == 5) inputs[count - 1u].component_type = 1;
+    }
+    unsigned source_register = count;
+    if (color) {
+        CHECK(count < 10);
+        inputs[count] = (DXBCSignatureElement){.semantic_name = "COLOR", .component_type = 3,
+            .register_id = source_register, .mask = 15, .rw_mask = 15};
+        ++count;
+    }
+    if (reordered) {
+        const DXBCSignatureElement first = inputs[0];
+        inputs[0] = inputs[count - 1u]; inputs[count - 1u] = first;
+    }
+    const DXBCSignatureElement output = {.semantic_name = "SV_Target", .component_type = 3, .mask = 15};
+    uint32_t words[32];
+    size_t length = 0;
+#define INACTIVE_WORD(word) do { words[length++] = (word); } while (0)
+    if (model == 5) INACTIVE_WORD(UINT32_C(0x0100086a));
+    if (color) {
+        INACTIVE_WORD(UINT32_C(0x03001062)); INACTIVE_WORD(UINT32_C(0x001010f2)); INACTIVE_WORD(source_register);
+    }
+    INACTIVE_WORD(UINT32_C(0x03000065)); INACTIVE_WORD(UINT32_C(0x001020f2)); INACTIVE_WORD(0);
+    INACTIVE_WORD(color ? UINT32_C(0x05000036) : UINT32_C(0x08000036));
+    INACTIVE_WORD(UINT32_C(0x001020f2)); INACTIVE_WORD(0);
+    if (color) {
+        INACTIVE_WORD(UINT32_C(0x00101e46)); INACTIVE_WORD(source_register);
+    } else {
+        INACTIVE_WORD(UINT32_C(0x00004002));
+        INACTIVE_WORD(UINT32_C(0x3f800000)); INACTIVE_WORD(0); INACTIVE_WORD(UINT32_C(0x3f800000)); INACTIVE_WORD(0);
+    }
+    INACTIVE_WORD(UINT32_C(0x0100003e));
+#undef INACTIVE_WORD
+    return natural_if_fixture_decode_words(fixture, model == 5 ? UINT32_C(0x50) : UINT32_C(0x40),
+        words, length, inputs, count, &output, 1);
+}
+
+typedef struct {
+    USILProgram *program;
+    StringBuilder *source;
+    HLSLExpressionSourceMap *map;
+    HLSLEmitNames *names;
+    HLSLEmitOptions *options;
+    unsigned observations, mutate_at, mutation;
+    bool mutated;
+} InactiveInputObserver;
+
+static bool observe_inactive_input(void *context, const HLSLSourceQualityObservation *observation) {
+    InactiveInputObserver *state = context;
+    if (!state) return true;
+    (void)observation;
+    if (++state->observations != state->mutate_at || !state->mutation) return true;
+    USILProgram *program = state->program;
+    switch (state->mutation) {
+    case 1: program->inputs[1].component_type = 2; break;
+    case 2: program->inputs[1].semantic_name[0] ^= 1; break;
+    case 3: program->inputs[1].mask = 2; break;
+    case 4: program->inputs[1].rw_mask = 1; break;
+    case 5: program->inputs[1].register_id = 3; break;
+    case 6: program->instructions[0].operands[1].imm_values[0] ^= 1; break;
+    case 7: program->instructions[0].source_instruction_index += 1; break;
+    case 8: program->signature_declarations[0].source_instruction_index += 1; break;
+    case 9: program->has_parsed_signature_authority = false; break;
+    case 10: program->inputs = NULL; break;
+    case 11: program->input_count = 1; break;
+    case 12: state->source->buf[0] ^= 1; break;
+    case 13: sb_append(state->source, "float unexpectedValue;\n"); break;
+    case 14: state->map->complete = !state->map->complete; break;
+    case 15: state->names->entry_point = "changedEntry"; break;
+    case 16: state->options->source_quality_pass_index += 1; break;
+    case 17: state->mutated = true; return false;
+    default: return false;
+    }
+    state->mutated = true;
+    return true;
+}
+
+static bool inactive_input_emit(USILProgram *program, StringBuilder *source,
+    HLSLExpressionSourceMap *map, HLSLSourceQualityResult *quality, InactiveInputObserver *observer,
+    HLSLEmitDiagnostic *diagnostic) {
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLEmitNames names = {.entry_point = "frag"};
+    options.expression_source_map = map;
+    options.source_quality = quality;
+    if (observer) {
+        options.source_quality_observer = observe_inactive_input;
+        options.source_quality_observer_context = observer;
+        observer->program = program; observer->source = source; observer->map = map;
+        observer->names = &names; observer->options = &options;
+    }
+    return hlsl_emit_with_options_diagnostic(program, source, NULL, NULL, &names, &options, diagnostic);
+}
+
+static bool check_inactive_input_positive(unsigned model, unsigned layout, bool color, bool reordered) {
+    NaturalIfFixture fixture;
+    CHECK(inactive_input_fixture(&fixture, model, layout, color, reordered));
+    USILProgram *program = &fixture.program;
+    HLSLInactiveInputPlan plan;
+    CHECK(hlsl_inactive_input_plan_prepare(program, &plan) && plan.present &&
+        (plan.active_input_field >= 0) == color);
+    /* Existing public FLOAT contracts retain their stricter input domain. */
+    CHECK(hlsl_float4_program_contract(program) != HLSL_EMIT_REASON_NONE);
+    StringBuilder source; sb_init(&source);
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    HLSLEmitDiagnostic diagnostic;
+    InactiveInputObserver observer = {0};
+    const bool emitted = inactive_input_emit(program, &source, &map, &quality, &observer, &diagnostic);
+    if (!emitted) fprintf(stderr, "Inactive input model=%u layout=%u color=%d: %s/%s/%s\n", model, layout,
+        color, hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase),
+        hlsl_emit_reason_name(diagnostic.reason));
+    CHECK(emitted && packed_output_clean(&quality) && map.complete && map.count == 2 &&
+        hlsl_expression_source_map_matches(&map, program, source.buf) && observer.observations);
+    CHECK(strstr(source.buf, "float4 frag(") && strstr(source.buf, " : SV_Target") &&
+        !strstr(source.buf, "asfloat") && !strstr(source.buf, "uint4") && !strstr(source.buf, ".xyzw"));
+    if (layout == 2) CHECK(strstr(source.buf, "bool frontFace : SV_IsFrontFace"));
+    if (layout == 3) CHECK(strstr(source.buf, "int attribute"));
+    if (layout == 6) CHECK(strstr(source.buf, "uint instanceId : SV_InstanceID"));
+    if (layout == 1) CHECK(strstr(source.buf, "float attribute") && strstr(source.buf, " : WEIGHT"));
+    for (unsigned requested = 0; requested < 4; ++requested) {
+        StringBuilder repeated; sb_init(&repeated);
+        HLSLExpressionSourceMap repeated_map;
+        HLSLSourceQualityResult repeated_quality;
+        const bool repeated_ok = inactive_input_emit(program, &repeated, requested & 1u ? &repeated_map : NULL,
+            requested & 2u ? &repeated_quality : NULL, NULL, &diagnostic);
+        if (!repeated_ok || repeated.len != source.len || memcmp(repeated.buf, source.buf, source.len))
+            fprintf(stderr, "Inactive optional model=%u layout=%u requested=%u emitted=%d bytes=%zu/%zu %s/%s/%s\n",
+                model, layout, requested, repeated_ok, repeated.len, source.len,
+                hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase),
+                hlsl_emit_reason_name(diagnostic.reason));
+        CHECK(repeated_ok && repeated.len == source.len && !memcmp(repeated.buf, source.buf, source.len));
+        if (requested & 1u) CHECK(repeated_map.complete && hlsl_expression_source_map_matches(&repeated_map, program, repeated.buf));
+        if (requested & 2u) CHECK(packed_output_clean(&repeated_quality));
+        sb_free(&repeated);
+    }
+    sb_free(&source);
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_inactive_input_boundaries(void) {
+    NaturalIfFixture fixture;
+    CHECK(inactive_input_fixture(&fixture, 5, 0, false, false));
+    USILProgram *program = &fixture.program;
+    const USILProgram parent = *program;
+    const DXBCSignatureElement signature = program->inputs[1];
+    const USILInstruction move = program->instructions[0];
+    const USILSignatureDeclaration declaration = program->signature_declarations[0];
+    for (unsigned mutation = 0; mutation < 29; ++mutation) {
+        switch (mutation) {
+        case 0: program->inputs[1].rw_mask = 1; break;
+        case 1: program->inputs[1].component_type = 3; break;
+        case 2: program->inputs[1].mask = 3; break;
+        case 3: program->inputs[1].system_value = 9; break;
+        case 4: program->inputs[1].min_precision = 1; break;
+        case 5: program->inputs[1].stream_index = 1; break;
+        case 6: program->inputs[1].interpolation_mode = 1; break;
+        case 7: program->has_parsed_signature_authority = false; break;
+        case 8: program->temp_count = 1; break;
+        case 9: program->shader_model_minor = 1; break;
+        case 10: program->instructions[0].saturate = true; break;
+        case 11: program->instructions[0].precise_mask = 15; break;
+        case 12: program->instructions[0].operands[1].has_neg = true; break;
+        case 13: program->instructions[0].operands[1].imm_values[0] ^= 1; break;
+        case 14: program->instructions[0].operands[1].raw_token ^= 1; break;
+        case 15: program->signature_declarations[0].register_id = 1; break;
+        case 16: program->signature_declarations[0].has_interpolation = true; break;
+        case 17: program->instructions[0].source_instruction_index = UINT32_MAX; break;
+        case 18: program->inputs[1].register_id = 0; break;
+        case 19: program->signature_declaration_count = 0; break;
+        case 20: program->global_flags = 2; break;
+        case 21: program->has_stage_contract = false; break;
+        case 22: program->instructions[0].opcode = USIL_OP_ADD; break;
+        case 23: program->instructions[0].operands[1].swizzle_mode = 1; break;
+        case 24: program->instructions[0].operands[1].swizzle[0] = 1; break;
+        case 25: program->instructions[0].operands[1].destination_mask = 1; break;
+        case 26: program->instructions[0].operands[0].swizzle[0] = 1; break;
+        case 27: program->instructions[0].operands[0].rel_offset1 = 1; break;
+        case 28: program->instructions[0].operands[1].rel_offset1 = 1; break;
+        }
+        HLSLInactiveInputPlan plan = {.present = true, .active_input_field = 9, .input_registers = UINT32_MAX};
+        CHECK(!hlsl_inactive_input_plan_prepare(program, &plan) && !plan.present && !plan.input_registers);
+        /* A FLOAT-only signature still belongs to the established route. */
+        if (mutation != 1) {
+            StringBuilder rejected; sb_init(&rejected); sb_append(&rejected, "// caller prefix\n");
+            HLSLExpressionSourceMap rejected_map;
+            HLSLSourceQualityResult rejected_quality;
+            HLSLEmitDiagnostic diagnostic;
+            const bool boundary_emitted = inactive_input_emit(program, &rejected, &rejected_map, &rejected_quality, NULL, &diagnostic);
+            if (boundary_emitted || rejected_map.complete || rejected_map.count || !rejected.failed ||
+                strcmp(rejected.buf, "// caller prefix\n"))
+                fprintf(stderr, "Inactive boundary=%u emitted=%d bytes=%zu failed=%d map=%d/%zu %s/%s/%s\n",
+                    mutation, boundary_emitted, rejected.len, rejected.failed, rejected_map.complete, rejected_map.count,
+                    hlsl_emit_status_name(diagnostic.status), hlsl_emit_phase_name(diagnostic.phase), hlsl_emit_reason_name(diagnostic.reason));
+            CHECK(!boundary_emitted && !rejected_map.complete && !rejected_map.count && rejected.failed &&
+                !strcmp(rejected.buf, "// caller prefix\n"));
+            sb_free(&rejected);
+        }
+        program->inputs = parent.inputs; program->inputs[1] = signature; program->instructions[0] = move;
+        program->signature_declarations[0] = declaration; *program = parent;
+        CHECK(hlsl_inactive_input_plan_prepare(program, &plan));
+    }
+    natural_if_fixture_dispose(&fixture);
+    CHECK(inactive_input_fixture(&fixture, 5, 1, true, false));
+    program = &fixture.program;
+    const DXBCOperand original = program->instructions[0].operands[1];
+    program->instructions[0].operands[1].swizzle[0] = 1;
+    HLSLInactiveInputPlan plan;
+    CHECK(!hlsl_inactive_input_plan_prepare(program, &plan));
+    program->instructions[0].operands[1] = original;
+    CHECK(hlsl_inactive_input_plan_prepare(program, &plan));
+    program->inputs[3].rw_mask = 1;
+    CHECK(!hlsl_inactive_input_plan_prepare(program, &plan));
+    program->inputs[3].rw_mask = 0;
+    CHECK(hlsl_inactive_input_plan_prepare(program, &plan));
+    natural_if_fixture_dispose(&fixture);
+    CHECK(inactive_input_fixture(&fixture, 5, 6, false, false));
+    program = &fixture.program;
+    const DXBCSignatureElement instance = program->inputs[1];
+    for (unsigned mutation = 0; mutation < 6; ++mutation) {
+        if (mutation == 0) program->inputs[1].rw_mask = 1;
+        if (mutation == 1) program->inputs[1].component_type = 2;
+        if (mutation == 2) program->inputs[1].mask = 3;
+        if (mutation == 3) program->inputs[1].semantic_index = 1;
+        if (mutation == 4) program->inputs[1].system_value = 8;
+        if (mutation == 5) memcpy(program->inputs[1].semantic_name, "SV_Unexpected", sizeof("SV_Unexpected"));
+        CHECK(!hlsl_inactive_input_plan_prepare(program, &plan));
+        program->inputs[1] = instance;
+        CHECK(hlsl_inactive_input_plan_prepare(program, &plan));
+    }
+    natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_inactive_input_callbacks(void) {
+    NaturalIfFixture fixture;
+    CHECK(inactive_input_fixture(&fixture, 5, 0, false, false));
+    USILProgram *program = &fixture.program;
+    const USILProgram parent = *program;
+    const DXBCSignatureElement signature = program->inputs[1];
+    const USILInstruction move = program->instructions[0];
+    const USILSignatureDeclaration declaration = program->signature_declarations[0];
+    StringBuilder baseline; sb_init(&baseline); sb_append(&baseline, "// caller prefix\n");
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    HLSLEmitDiagnostic diagnostic;
+    InactiveInputObserver observer = {0};
+    CHECK(inactive_input_emit(program, &baseline, &map, &quality, &observer, &diagnostic) && packed_output_clean(&quality));
+    const unsigned events = observer.observations;
+    CHECK(events > 1);
+    for (unsigned mutation = 1; mutation <= 17; ++mutation) for (unsigned event = 1; event <= events; ++event) {
+        StringBuilder changed; sb_init(&changed); sb_append(&changed, "// caller prefix\n");
+        InactiveInputObserver drift = {.mutation = mutation, .mutate_at = event};
+        const bool emitted = inactive_input_emit(program, &changed, &map, &quality, &drift, &diagnostic);
+        *program = parent; program->inputs[1] = signature; program->instructions[0] = move;
+        program->signature_declarations[0] = declaration;
+        CHECK(!emitted && drift.mutated && changed.failed && !map.complete && !map.count &&
+            quality.classification == HLSL_SOURCE_QUALITY_FAILED && changed.len == strlen("// caller prefix\n") && !strcmp(changed.buf, "// caller prefix\n"));
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, "// caller prefix\n");
+        CHECK(inactive_input_emit(program, &changed, &map, &quality, NULL, &diagnostic) && packed_output_clean(&quality) &&
+            changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) &&
+            hlsl_expression_source_map_matches(&map, program, changed.buf));
+        sb_free(&changed);
+    }
+    program->instructions[0].operands[1].imm_values[0] = UINT32_C(0x3f400000);
+    program->instructions[0].operands[1].immediate_words[0] = UINT32_C(0x3f400000);
+    StringBuilder fresh; sb_init(&fresh); sb_append(&fresh, "// caller prefix\n");
+    CHECK(inactive_input_emit(program, &fresh, &map, &quality, NULL, &diagnostic) && packed_output_clean(&quality) &&
+        strcmp(fresh.buf, baseline.buf) && hlsl_expression_source_map_matches(&map, program, fresh.buf));
+    program->instructions[0] = move;
+    sb_free(&fresh); sb_init(&fresh); sb_append(&fresh, "// caller prefix\n");
+    CHECK(inactive_input_emit(program, &fresh, &map, &quality, NULL, &diagnostic) && packed_output_clean(&quality) &&
+        fresh.len == baseline.len && !memcmp(fresh.buf, baseline.buf, baseline.len));
+    sb_free(&fresh); sb_free(&baseline); natural_if_fixture_dispose(&fixture);
+    return true;
+}
+
+static bool check_inactive_input_emission(void) {
+    for (unsigned model = 4; model <= 5; ++model) for (unsigned layout = 0; layout < 7; ++layout) {
+        CHECK(check_inactive_input_positive(model, layout, false, layout == 3));
+        if (layout < 2) CHECK(check_inactive_input_positive(model, layout, true, true));
+    }
+    CHECK(check_inactive_input_boundaries() && check_inactive_input_callbacks());
+    return true;
+}
+
 int main(void) {
     if (!check_multiple_results() || !check_modified_moves() ||
         !check_merge_and_undefined_lanes() || !check_loop_phi() || !check_structured_flow_edges() ||
@@ -8420,7 +8737,7 @@ int main(void) {
         !check_result_candidates() ||
         !check_effects() || !check_transactions() || !check_result_transactions() ||
         !check_expression_emission() || !check_conditional_emission() ||
-        !check_natural_conditional_emission() || !check_packed_output_emission() ||
+        !check_natural_conditional_emission() || !check_packed_output_emission() || !check_inactive_input_emission() ||
         !check_counted_loop_emission() || !check_function_emission() || !check_unity_uv_emission())
         return 1;
     puts("HLSL dataflow contracts passed");

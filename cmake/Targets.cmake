@@ -88,6 +88,7 @@ set(DXBC_SOURCES
     src/translation/hlsl_texture_lift.c
     src/translation/hlsl_function_lift.c
     src/translation/hlsl_unity_uv_lift.c
+    src/translation/hlsl_inactive_input.c
     src/translation/hlsl_material_source.c
     src/translation/hlsl_expression_lift.c
     src/translation/hlsl_geometry_flow.c
