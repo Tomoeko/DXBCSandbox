@@ -66,7 +66,9 @@ bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index)
         !layout->has_serialized_authority || !layout->has_reflection_size_authority ||
         layout->raw_storage || layout->row_struct_storage || layout->omit_declaration ||
         layout->row_count < 1 || layout->row_count >= CBUFFER_INVENTORY_ROW_LIMIT ||
-        layout->reflection_size_bytes != ((uint32_t)layout->row_count + 1u) * 16u ||
+        (layout->reflection_size_bytes & 15u) ||
+        layout->reflection_size_bytes <= (uint32_t)layout->row_count * 16u ||
+        layout->reflection_size_bytes > CBUFFER_INVENTORY_ROW_LIMIT * 16u ||
         layout->variable_count != 1 || layout->variable_alloc < 1 || !layout->variables ||
         layout->use_alloc < 1 || !layout->uses || !layout->uses[0].referenced ||
         layout->projection_status != DXBC_CBUFFER_PROJECTION_EXACT ||

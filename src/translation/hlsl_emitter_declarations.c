@@ -1877,7 +1877,7 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
           return;
         }
         sb_appendf(sb, "    // Preserve the constant buffer size.\n"
-            "    float4 %s : register(c%u);\n", HLSL_GLOBAL_TAIL_IDENTIFIER, (uint32_t)layout->row_count);
+            "    float4 %s : register(c%u);\n", HLSL_GLOBAL_TAIL_IDENTIFIER, layout->reflection_size_bytes / 16u - 1u);
         hlsl_source_quality_emission(ctx, 0, false, -1);
       }
       uint32_t total_size_bytes = layout->reflection_size_bytes;

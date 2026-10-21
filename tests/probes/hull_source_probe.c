@@ -541,7 +541,7 @@ static bool native_scalar_global_parameters(const UnityCompilerBinaryResponse *r
         (shell->values[0] & 15) || shell->values[1] < 1 || shell->values[1] > 4096 ||
         (!hlsl_source_identifier_valid(shell->name) && strcmp(shell->name, "$Globals")) ||
         constant->value_count != 6 || constant->values[0] < 0 || (constant->values[0] & 15) ||
-        (constant->values[0] != shell->values[0] - 16 && constant->values[0] != shell->values[0] - 32) ||
+        constant->values[0] > shell->values[0] - 16 ||
         constant->values[1] || constant->values[2] || constant->values[3] != 1 ||
         constant->values[4] != 1 || constant->values[5] || !hlsl_source_identifier_valid(constant->name) ||
         binding_record->value_count != 1 || binding_record->values[0] != 0 ||
@@ -622,12 +622,11 @@ static bool native_named_program_matches(const USILProgram *program,
         program->cbuffer_count == 1 && program->cbuffer_alloc >= 1 && program->cbuffers &&
         !program->cbuffers[0].dynamic_indexed && program->cbuffers[0].reg_idx >= 0 &&
         (uint32_t)program->cbuffers[0].reg_idx == parameters->resources[0].bind_index &&
-        program->cbuffers[0].size > 0 &&
+        program->cbuffers[0].size > 0 && program->cbuffers[0].size <= 4096 &&
         (scalar_globals ? parameters->constant_buffers[0].var_count == 1 &&
             parameters->constant_buffers[0].variables &&
             parameters->constant_buffers[0].variables[0].layout[0] == ((uint32_t)program->cbuffers[0].size - 1u) * 16u &&
-            (parameters->constant_buffers[0].size == (uint32_t)program->cbuffers[0].size * 16u ||
-             parameters->constant_buffers[0].size == ((uint32_t)program->cbuffers[0].size + 1u) * 16u) :
+            parameters->constant_buffers[0].size >= (uint32_t)program->cbuffers[0].size * 16u :
             (uint32_t)program->cbuffers[0].size == parameters->constant_buffers[0].size / 16u) &&
         !program->texture_count && !program->sampler_count && !program->uav_count;
 }

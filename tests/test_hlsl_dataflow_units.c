@@ -6396,6 +6396,15 @@ static bool observe_packed_output(void *context, const HLSLSourceQualityObservat
         program->instructions[4].operands[0].register_index = 3;
         program->instructions[4].operands[0].index_values[0] = 3;
         break;
+    case 22: {
+        SerializedProgramParameters *parameters = ledger->mutable_parameters;
+        if (!parameters || (parameters->cb_count != 1 && parameters->cb_count != 2) ||
+            !parameters->constant_buffers) return false;
+        SerializedConstantBuffer *shell = &parameters->constant_buffers[parameters->cb_count - 1];
+        if (shell->role != SERIALIZED_CBUFFER_NAMED) return false;
+        shell->size += 16;
+        break;
+    }
     }
     ledger->mutated = true;
     return true;
@@ -6798,7 +6807,8 @@ static bool check_packed_output_cbuffer(void) {
 
 /* An unread reflection tail is source layout, not another executable CB row.
  * Exercise the same parsed instruction and ownership path as the vector cases. */
-static bool check_packed_scalar_global_tail(unsigned row, bool split) {
+static bool check_packed_scalar_global_tail(unsigned row, unsigned tail_rows, bool split) {
+    CHECK(tail_rows && row + tail_rows < 4096);
     const PackedScalarGlobalConfig config = {.row = row};
     PackedOutputFixture fixture;
     CHECK(packed_output_fixture_layout_position_config(&fixture, 0, false, false, 0, 1, 0, NULL, NULL, &config));
@@ -6807,11 +6817,11 @@ static bool check_packed_scalar_global_tail(unsigned row, bool split) {
         strcpy(metadata.buffer_names[authority], "$Globals");
         metadata.fields[authority].layout[0] = row * 16u;
         metadata.fields[authority].layout[3] = 1;
-        metadata.buffers[authority].size = (row + 2u) * 16u;
+        metadata.buffers[authority].size = (row + tail_rows + 1u) * 16u;
     }
     SerializedConstantBuffer selected_buffers[2] = {
         {.name = "$Globals", .role = SERIALIZED_CBUFFER_LOOSE_PARAMETERS},
-        {.name = "$Globals", .role = SERIALIZED_CBUFFER_NAMED, .size = (row + 2u) * 16u}};
+        {.name = "$Globals", .role = SERIALIZED_CBUFFER_NAMED, .size = (row + tail_rows + 1u) * 16u}};
     SerializedProgramParameters selected = {.is_binary = true, .constant_buffers = selected_buffers, .cb_count = 2};
     if (split) {
         metadata.buffers[1].has_is_partial = true; metadata.buffers[1].is_partial = true;
@@ -6830,7 +6840,7 @@ static bool check_packed_scalar_global_tail(unsigned row, bool split) {
         hlsl_expression_source_map_matches(&map, &fixture.decoded.program, baseline.buf));
     char declaration[96]; snprintf(declaration, sizeof(declaration), "float _Scale : register(c%u);", row);
     CHECK(strstr(baseline.buf, declaration));
-    snprintf(declaration, sizeof(declaration), "float4 _GlobalsLayoutEnd : register(c%u);", row + 1u);
+    snprintf(declaration, sizeof(declaration), "float4 _GlobalsLayoutEnd : register(c%u);", row + tail_rows);
     CHECK(strstr(baseline.buf, declaration) && !strstr(baseline.buf, "cb0_"));
     for (unsigned outputs = 0; outputs < 4; ++outputs) {
         sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
@@ -6842,18 +6852,20 @@ static bool check_packed_scalar_global_tail(unsigned row, bool split) {
     }
     /* Every public observation is synchronous. Vetoes and metadata drift must
      * roll back the source and map, including during the declaration itself. */
-    if (row == 26) for (unsigned mutation = 0; mutation < 2; ++mutation)
+    if (row == 26) for (unsigned mutation = 0; mutation < 3; ++mutation)
         for (size_t at = 1; at <= observer.observations; ++at) {
-            PackedOutputObservations drift = {.reject_at = mutation ? 0 : at, .mutate_at = at, .mutation = mutation ? 10u : 0u,
-                .mutable_field_name = metadata.field_names[authority]};
+            PackedOutputObservations drift = {.reject_at = mutation ? 0 : at, .mutate_at = at, .mutation = mutation == 2 ? 22u : mutation ? 10u : 0u,
+                .mutable_field_name = metadata.field_names[authority],
+                .mutable_parameters = split ? &selected : &metadata.parameters[0]};
             sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
             CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
                 (!mutation || drift.mutated) && !changed_map.complete && !changed_map.count &&
                 changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && changed.len == sizeof(prefix) - 1u &&
                 changed.buf && !strcmp(changed.buf, prefix));
             strcpy(metadata.field_names[authority], "_Scale");
+            metadata.buffers[0].size = selected_buffers[1].size = (row + tail_rows + 1u) * 16u;
         }
-    /* Known fields, shell identity and the exact single-row extent are never
+    /* Known fields, shell identity and row-aligned bounded extent are never
      * discarded to qualify a compact declaration. Some are valid fallbacks. */
     for (unsigned failure = 0; failure < 11; ++failure) {
         const SerializedConstantBuffer saved = metadata.buffers[authority];
@@ -6866,7 +6878,7 @@ static bool check_packed_scalar_global_tail(unsigned row, bool split) {
         const HLSLEmitNames collision = {.entry_point = "_GlobalsLayoutEnd"};
         PackedOutputObservations names = {.names = &collision};
         switch (failure) {
-        case 0: metadata.buffers[authority].size += 16; if (split) selected_buffers[1].size += 16; break;
+        case 0: metadata.buffers[authority].size += 8; if (split) selected_buffers[1].size += 8; break;
         case 1: metadata.buffers[authority].variables = extra; metadata.buffers[authority].var_count = 2; break;
         case 2: strcpy(metadata.field_names[authority], "_GlobalsLayoutEnd"); break;
         case 3: strcpy(metadata.buffer_names[authority], "MaterialInputs"); break;
@@ -6890,7 +6902,7 @@ static bool check_packed_scalar_global_tail(unsigned row, bool split) {
         metadata.buffers[authority] = saved; metadata.fields[authority] = saved_field;
         metadata.parameters[authority] = saved_parameters; *read = saved_read;
         strcpy(metadata.buffer_names[authority], "$Globals"); strcpy(metadata.field_names[authority], "_Scale");
-        selected_buffers[1].size = (row + 2u) * 16u;
+        selected_buffers[1].size = (row + tail_rows + 1u) * 16u;
         selected_buffers[1].has_is_partial = selected_buffers[1].is_partial = false;
         fixture.decoded.program.cbuffers[0].dynamic_indexed = false;
     }
@@ -8519,8 +8531,13 @@ static bool check_packed_output_emission(void) {
         check_packed_position_mad_duplicate_field() && check_packed_position_mad_callbacks());
     const unsigned scalar_rows[] = {0, 3, 26, 31, 4094};
     for (unsigned row = 0; row < sizeof(scalar_rows) / sizeof(scalar_rows[0]); ++row)
-        CHECK(check_packed_scalar_global_tail(scalar_rows[row], false) &&
-            check_packed_scalar_global_tail(scalar_rows[row], true));
+        CHECK(check_packed_scalar_global_tail(scalar_rows[row], 1, false) &&
+            check_packed_scalar_global_tail(scalar_rows[row], 1, true));
+    const unsigned tails[][2] = {{0, 2}, {0, 3}, {0, 4095}, {3, 3}, {3, 61}, {3, 4092},
+        {26, 2}, {26, 5}, {26, 37}, {26, 4069}, {31, 2}, {31, 4064}};
+    for (unsigned tail = 0; tail < sizeof(tails) / sizeof(tails[0]); ++tail)
+        CHECK(check_packed_scalar_global_tail(tails[tail][0], tails[tail][1], false) &&
+            check_packed_scalar_global_tail(tails[tail][0], tails[tail][1], true));
     CHECK(check_packed_uint_output());
     return true;
 }
