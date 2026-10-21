@@ -470,7 +470,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
         break;
     case DECODED_OWNER_SAMPLED_FRAGMENT:
         if (!hlsl_sampled_fragment_plan_prepare(program, &sampled) ||
-            (sampled.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !sampled.inactive_typed_inputs && !sampled.packed_inputs)) return false;
+            (sampled.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !sampled.inactive_typed_inputs && !sampled.packed_inputs && !sampled.nan_guard)) return false;
         break;
     default:
         return false;
@@ -486,8 +486,11 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     static const char array_sample[] = "dxbc-array-sample-owner-v1";
     static const char inactive_sample[] = "dxbc-inactive-sample-owner-v1";
     static const char packed_sample[] = "dxbc-packed-sample-owner-v1";
+    static const char sampled_nan_guard[] = "dxbc-sampled-nan-guard-owner-v1";
     if (stage == DECODED_OWNER_SAMPLED_FRAGMENT) {
-        if (sampled.packed_inputs)
+        if (sampled.nan_guard)
+            common_sha256_update(&hash, sampled_nan_guard, sizeof(sampled_nan_guard));
+        else if (sampled.packed_inputs)
             common_sha256_update(&hash, packed_sample, sizeof(packed_sample));
         else if (sampled.inactive_typed_inputs)
             common_sha256_update(&hash, inactive_sample, sizeof(inactive_sample));

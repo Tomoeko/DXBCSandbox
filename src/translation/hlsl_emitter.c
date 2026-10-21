@@ -1589,7 +1589,7 @@ bool hlsl_source_quality_body_inventory_supported(HLSLEmitterContext *ctx) {
       /* This body consumes only the proved flow plan, never legacy compiler
        * replacement plans discovered by the common analysis passes. */
       (ctx->compiler_model.replacement_count && !bounded_flow) ||
-      ctx->use_uint_temps ||
+      (ctx->use_uint_temps && !ctx->high_level_sampled_nan_guard) ||
       ctx->indexed_face_basis.valid || ctx->surface_tangent_frame.valid ||
       !hlsl_source_quality_resource_inventory_complete(ctx) || program->uav_count ||
       program->icb_value_count || program->indexable_temp_count ||
@@ -2333,6 +2333,11 @@ static bool hlsl_emit_with_options_impl(
       hlsl_sampled_fragment_plan_prepare(program, &sampled_inputs);
   ctx.high_level_inactive_sample_inputs = sampled_inputs_ready && sampled_inputs.inactive_typed_inputs;
   ctx.high_level_packed_sample_inputs = sampled_inputs_ready && sampled_inputs.packed_inputs;
+  ctx.high_level_sampled_nan_guard = sampled_inputs_ready && sampled_inputs.nan_guard;
+  if (ctx.high_level_sampled_nan_guard) {
+    ctx.high_level_direct_return = true;
+    ctx.high_level_interface = true;
+  }
   ctx.preferred_output_struct_name = output_struct;
   ctx.preferred_input_struct_name = input_struct;
   ctx.entry_point_name = entry_point;
@@ -2466,6 +2471,13 @@ static bool hlsl_emit_with_options_impl(
   const bool natural_structured = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
       !ctx.unity_uv_helper && hlsl_natural_structured_preflight(&ctx);
   const bool packed_output = ctx.high_level_packed_outputs && hlsl_packed_output_preflight(&ctx);
+  if (ctx.high_level_sampled_nan_guard && !hlsl_sampled_nan_guard_preflight(&ctx)) {
+    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS,
+                   HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+    free_emitter_context(&ctx);
+    free(ctx_ptr);
+    return false;
+  }
   if ((ctx.high_level_packed_outputs && !packed_output) ||
       (defer_multi_output_interface && !natural_structured && !packed_output)) {
     hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_INTERFACE_EMISSION,

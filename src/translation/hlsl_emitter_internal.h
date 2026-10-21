@@ -313,6 +313,7 @@ typedef struct HLSLEmitterContext {
     bool high_level_packed_inputs;
     bool high_level_inactive_inputs;
     bool high_level_sampled_fragment;
+    bool high_level_sampled_nan_guard;
     bool high_level_inactive_sample_inputs;
     bool high_level_packed_sample_inputs;
     uint32_t high_level_input_fields_emitted;
@@ -526,6 +527,7 @@ typedef struct {
     bool explicit_level;
     bool inactive_typed_inputs;
     bool packed_inputs;
+    bool nan_guard;
     int coordinate_field;
     uint32_t input_registers;
     uint32_t texture_register, sampler_register;
@@ -533,6 +535,10 @@ typedef struct {
 bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan);
 bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_fragment_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+bool hlsl_sampled_nan_guard_preflight(const HLSLEmitterContext *ctx);
+bool hlsl_emit_sampled_nan_guard(HLSLEmitterContext *ctx);
+bool hlsl_format_owned_expression(HLSLEmitterContext *ctx, const ASTExpr *expression,
+    ASTExpr **roots, const HLSLInstructionOwners *owners, bool function);
 
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);

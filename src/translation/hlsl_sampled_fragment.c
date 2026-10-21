@@ -13,8 +13,8 @@ static bool sample_register(const DXBCOperand *operand, DXBCOperandType type,
     uint32_t token, const uint8_t selectors[4]) {
     if (!hlsl_lift_operand_is_plain(operand) || operand->extended_tokens || operand->type != type ||
         operand->raw_token != token || operand->register_index_dim != 1 || operand->register_index < 0 ||
-        operand->swizzle_mode != (type == OPERAND_TYPE_INPUT || type == OPERAND_TYPE_RESOURCE ? 1 : 0) ||
-        operand->destination_mask != (type == OPERAND_TYPE_OUTPUT ? 0xf0 : 0) ||
+        operand->swizzle_mode != ((token >> 2u) & 3u) ||
+        operand->destination_mask != ((token & 12u) ? 0 : (token & 0xf0u)) ||
         operand->rel_offset0 || operand->rel_offset2 || operand->rel_offset1 != operand->register_index ||
         operand->imm_value_count || operand->immediate_word_count ||
         !operand->index_has_immediate[0] || operand->index_representations[0] ||
@@ -49,12 +49,14 @@ static bool sample_level(const DXBCOperand *operand) {
     return true;
 }
 
-bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan) {
+/* The layout belongs to the actual sample and released signatures. Result
+ * consumers have separate complete instruction-graph proofs below. */
+static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan) {
     if (!plan) return false;
     memset(plan, 0, sizeof(*plan));
     if (!hlsl_decoded_graphics_owner_storage_valid(program, HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT) ||
         program->program_type != DXBC_PROGRAM_TYPE_PIXEL || program->shader_model_minor ||
-        program->instruction_count != 2 || program->temp_count || !program->input_count || program->output_count != 1 ||
+        !program->input_count || program->output_count != 1 ||
         (program->has_global_flags && program->global_flags != 1u)) return false;
     const USILTexture *texture = &program->textures[0];
     const USILSampler *sampler = &program->samplers[0];
@@ -74,12 +76,10 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
         output->system_value || output->semantic_index || output->stream_index || output->min_precision ||
         output->interpolation_mode || dxbc_ascii_strcasecmp(dxbc_signature_semantic_name(output), "SV_Target"))
         return false;
-    const USILInstruction *sample = &program->instructions[0], *ret = &program->instructions[1];
+    const USILInstruction *sample = &program->instructions[0];
     const bool level = sample->opcode == USIL_OP_SAMPLE_L;
-    if ((!level && sample->opcode != USIL_OP_SAMPLE) || sample->operand_count != (level ? 5 : 4) ||
-        ret->opcode != USIL_OP_RET || ret->operand_count ||
-        ret->source_instruction_index != sample->source_instruction_index + 1u) return false;
-    for (unsigned index = 0; index < 2; ++index) {
+    if ((!level && sample->opcode != USIL_OP_SAMPLE) || sample->operand_count != (level ? 5 : 4)) return false;
+    for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *instruction = &program->instructions[index];
         if (instruction->saturate || instruction->precise_mask || instruction->condition_test ||
             instruction->has_texel_offset || instruction->resource_stride || instruction->geometry_effect || instruction->geometry_stream_id ||
@@ -91,9 +91,7 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
         xyz[4] = {0, 1, 2, 0}, zw[4] = {2, 3, 2, 2};
     const bool tail_coordinates = kind == HLSL_SAMPLED_TEXTURE_2D &&
         sample->operands[1].raw_token == UINT32_C(0x00101ae6);
-    if (!sample_register(&sample->operands[0], OPERAND_TYPE_OUTPUT, UINT32_C(0x001020f2), identity) ||
-        sample->operands[0].register_index ||
-        !sample_register(&sample->operands[1], OPERAND_TYPE_INPUT,
+    if (!sample_register(&sample->operands[1], OPERAND_TYPE_INPUT,
             three_coordinates ? UINT32_C(0x00101246) : tail_coordinates ? UINT32_C(0x00101ae6) : UINT32_C(0x00101046),
             three_coordinates ? xyz : tail_coordinates ? zw : xy) ||
         sample->operands[1].register_index >= HLSL_SM5_IO_REGISTER_COUNT ||
@@ -170,11 +168,99 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
     return true;
 }
 
+static bool vector_literal(const DXBCOperand *operand, bool zero) {
+    if (!hlsl_lift_operand_is_plain(operand) || operand->extended_tokens ||
+        operand->type != OPERAND_TYPE_IMMEDIATE32 || operand->raw_token != UINT32_C(0x00004002) ||
+        operand->register_index_dim || operand->register_index || operand->swizzle_mode || operand->destination_mask ||
+        operand->rel_offset0 || operand->rel_offset1 || operand->rel_offset2 ||
+        operand->imm_value_count != 4 || operand->immediate_word_count != 4) return false;
+    for (unsigned index = 0; index < 3; ++index)
+        if (operand->index_has_immediate[index] || operand->index_representations[index] ||
+            operand->index_value_exceeds_int[index] || operand->index_values[index]) return false;
+    for (unsigned lane = 0; lane < 4; ++lane)
+        if (operand->swizzle[lane] != lane || operand->imm64_values[lane] ||
+            operand->imm_values[lane] != operand->immediate_words[lane] ||
+            (zero && operand->imm_values[lane])) return false;
+    for (unsigned word = 4; word < 8; ++word)
+        if (operand->immediate_words[word]) return false;
+    return true;
+}
+
+static bool guard_temp(const DXBCOperand *operand, unsigned reg, uint32_t token) {
+    uint8_t selectors[4] = {0, 1, 2, 3};
+    if (((token >> 2u) & 3u) == 2u)
+        for (unsigned lane = 0; lane < 4; ++lane) selectors[lane] = (uint8_t)((token >> 4u) & 3u);
+    else if (((token >> 2u) & 3u) == 1u)
+        for (unsigned lane = 0; lane < 4; ++lane) selectors[lane] = (uint8_t)((token >> (4u + lane * 2u)) & 3u);
+    return sample_register(operand, OPERAND_TYPE_TEMP, token, selectors) &&
+        operand->register_index == (int)reg;
+}
+
+/* Canonical masks come from these actual comparisons, then OR and IEQ.
+ * Arbitrary nonzero MOVC conditions and Boolean usage facts supply no proof. */
+static bool sampled_nan_guard_shape(const USILProgram *program) {
+    static const USILOpcode operations[12] = {USIL_OP_SAMPLE, USIL_OP_LT, USIL_OP_LT,
+        USIL_OP_OR, USIL_OP_EQ, USIL_OP_OR, USIL_OP_IEQ, USIL_OP_OR, USIL_OP_OR,
+        USIL_OP_OR, USIL_OP_MOVC, USIL_OP_RET};
+    static const uint8_t identity[4] = {0, 1, 2, 3};
+    if (program->instruction_count != 12 || program->temp_count != 3) return false;
+    const USILInstruction *instructions = program->instructions;
+    for (unsigned index = 0; index < 12; ++index)
+        if (instructions[index].opcode != operations[index] ||
+            instructions[index].operand_count != (index == 11 ? 0 : index == 0 || index == 10 ? 4 : 3) ||
+            instructions[index].source_instruction_index != instructions[0].source_instruction_index + index)
+            return false;
+    if (!guard_temp(&instructions[0].operands[0], 0, UINT32_C(0x001000f2))) return false;
+    for (unsigned index = 1; index <= 6; ++index) {
+        const DXBCOperand *operands = instructions[index].operands;
+        if (!guard_temp(&operands[0], index == 2 || index == 4 ? 2 : 1, UINT32_C(0x001000f2))) return false;
+        if (index == 3 || index == 5) {
+            if (!guard_temp(&operands[1], 1, UINT32_C(0x00100e46)) ||
+                !guard_temp(&operands[2], 2, UINT32_C(0x00100e46))) return false;
+        } else {
+            const unsigned literal = index == 2 ? 1 : 2;
+            if (!vector_literal(&operands[literal], true) ||
+                !guard_temp(&operands[3 - literal], index == 6 ? 1 : 0, UINT32_C(0x00100e46))) return false;
+        }
+    }
+    for (unsigned index = 7; index <= 9; ++index) {
+        const DXBCOperand *operands = instructions[index].operands;
+        if (!guard_temp(&operands[0], 1, UINT32_C(0x00100012)) ||
+            !guard_temp(&operands[1], 1, UINT32_C(0x0010000a) | ((index - 6u) << 4u)) ||
+            !guard_temp(&operands[2], 1, UINT32_C(0x0010000a))) return false;
+    }
+    const DXBCOperand *result = instructions[10].operands;
+    return sample_register(&result[0], OPERAND_TYPE_OUTPUT, UINT32_C(0x001020f2), identity) &&
+        !result[0].register_index && guard_temp(&result[1], 1, UINT32_C(0x00100006)) &&
+        vector_literal(&result[2], false) && guard_temp(&result[3], 0, UINT32_C(0x00100e46));
+}
+
+bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan) {
+    if (!plan) return false;
+    memset(plan, 0, sizeof(*plan));
+    HLSLSampledFragmentPlan layout = {0};
+    if (!sample_layout_prepare(program, &layout)) return false;
+    static const uint8_t identity[4] = {0, 1, 2, 3};
+    if (program->instruction_count == 2 && !program->temp_count &&
+        program->instructions[1].opcode == USIL_OP_RET && !program->instructions[1].operand_count &&
+        program->instructions[1].source_instruction_index == program->instructions[0].source_instruction_index + 1u &&
+        sample_register(&program->instructions[0].operands[0], OPERAND_TYPE_OUTPUT,
+            UINT32_C(0x001020f2), identity) && !program->instructions[0].operands[0].register_index) {
+        *plan = layout;
+        return true;
+    }
+    if (layout.texture_kind != HLSL_SAMPLED_TEXTURE_2D || layout.explicit_level ||
+        layout.inactive_typed_inputs || !sampled_nan_guard_shape(program)) return false;
+    layout.nan_guard = true;
+    *plan = layout;
+    return true;
+}
+
 bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx) {
     HLSLSampledFragmentPlan plan;
     const char *name = NULL;
     if (!ctx || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) ||
-        (plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !plan.inactive_typed_inputs && !plan.packed_inputs)) return false;
+        (plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !plan.inactive_typed_inputs && !plan.packed_inputs && !plan.nan_guard)) return false;
     const uint32_t metadata_dimension = plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D ? 2 :
         plan.texture_kind == HLSL_SAMPLED_TEXTURE_CUBE ? 4 : 5;
     const SerializedProgramParameters *parameters[2] = {ctx->params, ctx->common_params};

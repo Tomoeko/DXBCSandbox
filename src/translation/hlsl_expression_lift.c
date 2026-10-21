@@ -1429,6 +1429,16 @@ static bool finish_expression_origins(ExpressionSpanContext *trace, bool dead) {
     return true;
 }
 
+bool hlsl_format_owned_expression(HLSLEmitterContext *ctx, const ASTExpr *expression,
+    ASTExpr **roots, const HLSLInstructionOwners *owners, bool function) {
+    ExpressionSpanContext trace = {.map = ctx->expression_source_map, .roots = roots,
+        .owners = *owners, .function = function, .matrix_capture = ctx->matrix_use_capture,
+        .stage_coverage = ctx->stage_coverage};
+    ast_format_expr_traced(expression, ctx->sb,
+        trace.map || trace.matrix_capture || trace.stage_coverage ? record_expression_span : NULL, &trace);
+    return finish_expression_origins(&trace, false) && sb_ok(ctx->sb);
+}
+
 /* The selected compiler's identity-multiply spelling retains an ADD's
  * decoded child order. This constructs a candidate inverse, not an independent
  * floating-point equivalence proof. Complete compiler equality is required. */
@@ -1912,8 +1922,7 @@ static bool emit_straightline_expressions(HLSLEmitterContext *ctx,
                 ? hlsl_stage_coverage_domain_output_construction(ctx, expression)
                 : hlsl_source_quality_observe_expression(ctx, expression, index)))
             ctx->sb->failed = true;
-        ast_format_expr_traced(expression, ctx->sb, map || ctx->matrix_use_capture || ctx->stage_coverage ? record_expression_span : NULL, &trace);
-        if (!finish_expression_origins(&trace, false))
+        if (!hlsl_format_owned_expression(ctx, expression, roots, &owners, group >= 0))
             ctx->sb->failed = true;
         sb_append(ctx->sb, ";\n");
         if (scope && scope->assignment_span)
@@ -1953,6 +1962,7 @@ bool hlsl_emit_pure_expression_scope(HLSLEmitterContext *ctx,
 
 bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
     if (ctx->unity_uv_helper) return emit_unity_uv_lift(ctx);
+    if (ctx->high_level_sampled_nan_guard) return hlsl_emit_sampled_nan_guard(ctx);
     for (int index = 0; index < ctx->program->instruction_count; ++index)
         if (ctx->program->instructions[index].opcode == USIL_OP_IF ||
             ctx->program->instructions[index].opcode == USIL_OP_LOOP)
@@ -1975,6 +1985,8 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
     HLSLPackedUIntOutputPlan unsigned_output;
     const bool converted = hlsl_packed_uint_output_plan_prepare(program, &unsigned_output) &&
         hlsl_packed_output_candidate(program);
+    HLSLSampledFragmentPlan sampled = {0};
+    const bool nan_guard = hlsl_sampled_fragment_plan_prepare(program, &sampled) && sampled.nan_guard;
     for (size_t index = 0; index < map->count; ++index) {
         const HLSLExpressionOrigin *origin = &map->origins[index];
         const USILInstruction *inst = &program->instructions[index];
@@ -2009,7 +2021,8 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_EXPRESSION:
-            if ((!expression && !scalar_comparison && !unsigned_conversion) || !lanes)
+            if ((!expression && !scalar_comparison && !unsigned_conversion &&
+                    !(nan_guard && index >= 1 && index <= 10)) || !lanes)
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_EFFECT:

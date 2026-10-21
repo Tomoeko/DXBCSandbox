@@ -1369,8 +1369,8 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     DXBCStageContract contract;
     dxbc_stage_contract_init(&contract);
     USILProgram program = {0};
-    HLSLInactiveInputPlan plan;
-    HLSLSampledFragmentPlan sampled;
+    HLSLInactiveInputPlan plan = {0};
+    HLSLSampledFragmentPlan sampled = {0};
     const bool texture_sample = family == PROBE_FRAGMENT_SAMPLED;
     const char *prefix = texture_sample ? "sampled" : "inactive";
     bool accepted = false;
@@ -1384,14 +1384,15 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
         !print_domain_signature(texture_sample ? "sampled-fragment-input" : "inactive-fragment-input", program.inputs, program.input_count) ||
         !print_domain_signature(texture_sample ? "sampled-fragment-output" : "inactive-fragment-output", program.outputs, program.output_count)) goto done;
     const int active_field = texture_sample ? sampled.coordinate_field : plan.active_input_field;
-    const bool literal = texture_sample ? sampled.explicit_level : active_field < 0;
-    const int literal_operand = texture_sample ? 4 : 1;
-    ProbeDecodedLiteral captured = {.instruction = literal ? 0 : -1,
+    const bool literal = texture_sample ? sampled.explicit_level || sampled.nan_guard : active_field < 0;
+    const int literal_instruction = texture_sample && sampled.nan_guard ? 10 : 0;
+    const int literal_operand = texture_sample ? sampled.nan_guard ? 2 : 4 : 1;
+    ProbeDecodedLiteral captured = {.instruction = literal ? literal_instruction : -1,
         .operand = literal ? literal_operand : active_field,
-        .raw_instruction = program.instructions[0].source_instruction_index,
-        .original_bits = literal ? program.instructions[0].operands[literal_operand].imm_values[0] :
+        .raw_instruction = program.instructions[literal_instruction].source_instruction_index,
+        .original_bits = literal ? program.instructions[literal_instruction].operands[literal_operand].imm_values[0] :
             program.inputs[active_field].interpolation_mode,
-        .opcode = program.instructions[0].opcode, .shader_model_major = program.shader_model_major, .valid = true};
+        .opcode = program.instructions[literal_instruction].opcode, .shader_model_major = program.shader_model_major, .valid = true};
     int declaration_index = -1;
     if (!literal) {
         for (int index = 0; index < program.signature_declaration_count; ++index)
@@ -1406,10 +1407,10 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
         if (literal) {
             const uint32_t replacement = captured.original_bits == UINT32_C(0x3f400000)
                 ? UINT32_C(0x3f000000) : UINT32_C(0x3f400000);
-            DXBCOperand *operand = &program.instructions[0].operands[literal_operand];
+            DXBCOperand *operand = &program.instructions[literal_instruction].operands[literal_operand];
             operand->imm_values[0] = replacement;
             operand->immediate_words[0] = replacement;
-            if (texture_sample)
+            if (texture_sample && !sampled.nan_guard)
                 for (unsigned lane = 1; lane < 4; ++lane) operand->imm_values[lane] = replacement;
         } else {
             const uint8_t replacement = captured.original_bits == 3u ? 2u : 3u;
@@ -1421,7 +1422,7 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     } else *owner = captured;
     printf("%s_counterexample_owner=%s instruction=%d raw_instruction=%u field_or_operand=%d "
         "original=0x%08" PRIx32 " changed=%d model=%u.0\n",
-        prefix, literal ? texture_sample ? "decoded-level-literal" : "decoded-mov-literal" :
+        prefix, literal ? texture_sample ? sampled.nan_guard ? "decoded-selection-literal" : "decoded-level-literal" : "decoded-mov-literal" :
             "decoded-input-declaration-interpolation", captured.instruction,
         captured.raw_instruction, captured.operand, captured.original_bits, changed, program.shader_model_major);
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
@@ -1442,7 +1443,7 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     if (texture_sample)
         printf("sampled_resource_declarations=%zu actual_metadata_supplied=%d\n", quality.counts.resource_declarations, parameters != NULL);
     if (emitted) print_hash(changed ? "mutated_fragment_sha256" : "reconstructed_fragment_sha256", source->buf, source->len);
-    accepted = mapped && map.count == 2 && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+    accepted = mapped && map.count == (size_t)program.instruction_count && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
         !quality.reasons && !quality.counts.incomplete_units && !quality.counts.residual_total &&
         !quality.counts.unknown_provenance;
 done:
