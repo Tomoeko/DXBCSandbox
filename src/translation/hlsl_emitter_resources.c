@@ -462,7 +462,9 @@ bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *c
   for (int texture = 0; texture < program->texture_count; ++texture) {
     const USILTexture *resource = &program->textures[texture];
     const char *name = NULL;
-    if (strcmp(resource->dimension, "2d") != 0 || resource->stride || resource->sample_count ||
+    if ((strcmp(resource->dimension, "2d") && !(ctx->high_level_cube_sample &&
+            !strcmp(resource->dimension, "cube") && hlsl_cube_sample_admission(ctx))) ||
+        resource->stride || resource->sample_count ||
         !resolve_srv_name_ctx(ctx, resource->reg_idx, SERIALIZED_RESOURCE_TEXTURE, &name) ||
         !resource_identifier_valid(name) ||
         (ctx->omit_unity_builtin_declarations && unity_builtin_texture_contract(name, resource)))
@@ -514,9 +516,9 @@ bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *c
   return true;
 }
 
-static void observe_resource_declaration(HLSLEmitterContext *ctx, const char *name,
+static bool observe_resource_declaration(HLSLEmitterContext *ctx, const char *name,
     HLSLSourceQualityResourceKind kind, uint32_t reg, uint32_t artifacts) {
-  if (!ctx->source_quality_analysis) return;
+  if (!ctx->source_quality_analysis) return sb_ok(ctx->sb);
   HLSLSourceQualityFacts facts;
   hlsl_source_quality_facts_init(&facts);
   facts.known = resource_identifier_valid(name);
@@ -527,6 +529,7 @@ static void observe_resource_declaration(HLSLEmitterContext *ctx, const char *na
   if (!hlsl_source_quality_analysis_emission(ctx->source_quality_analysis, &facts))
     hlsl_emit_fail(ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
         HLSL_EMIT_PHASE_RESOURCE_EMISSION, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+  return sb_ok(ctx->sb);
 }
 
 void emit_resources(HLSLEmitterContext* ctx) {
@@ -639,10 +642,10 @@ void emit_resources(HLSLEmitterContext* ctx) {
     } else {
       sb_appendf(sb, "%s t%d : register(t%d);\n", tex_type, reg, reg);
     }
-    observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_TEXTURE, (uint32_t)reg,
+    if (!observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_TEXTURE, (uint32_t)reg,
         strcmp(program->textures[i].dimension, "raw") == 0 ||
         strcmp(program->textures[i].dimension, "structured") == 0
-            ? HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION : 0);
+            ? HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION : 0)) return;
   }
   const char *emitted_sampler_names[HLSL_SM5_SAMPLER_REGISTER_COUNT] = {0};
   int emitted_sampler_count = 0;
@@ -722,7 +725,7 @@ void emit_resources(HLSLEmitterContext* ctx) {
                                    : "SamplerState";
     sb_appendf(sb, "%s %s : register(s%d);\n", sampler_type, name,
                reg);
-    observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_SAMPLER, (uint32_t)reg, 0);
+    if (!observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_SAMPLER, (uint32_t)reg, 0)) return;
   }
   for (int i = 0; i < program->uav_count; i++) {
     int reg = program->uavs[i].reg_idx;
@@ -784,10 +787,10 @@ void emit_resources(HLSLEmitterContext* ctx) {
                  program->uavs[i].globally_coherent ? "globallycoherent " : "",
                  uav_type, reg, reg);
     }
-    observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_UAV, (uint32_t)reg,
+    if (!observe_resource_declaration(ctx, name, HLSL_SOURCE_RESOURCE_UAV, (uint32_t)reg,
         strcmp(program->uavs[i].dimension, "raw") == 0 ||
         strcmp(program->uavs[i].dimension, "structured") == 0
-            ? HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION : 0);
+            ? HLSL_SOURCE_ARTIFACT_RAW_BUFFER_RECONSTRUCTION : 0)) return;
   }
   if (program->texture_count > 0 || program->sampler_count > 0 ||
       program->uav_count > 0) {

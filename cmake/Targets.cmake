@@ -85,6 +85,7 @@ set(DXBC_SOURCES
     src/translation/hlsl_current_matrix_reads.c
     src/translation/hlsl_matrix_lift.c
     src/translation/hlsl_global_declarations.c
+    src/translation/hlsl_sampled_fragment.c
     src/translation/hlsl_texture_lift.c
     src/translation/hlsl_function_lift.c
     src/translation/hlsl_unity_uv_lift.c

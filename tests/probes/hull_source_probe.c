@@ -514,6 +514,43 @@ static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
     return true;
 }
 
+static bool native_sampled_parameters(const UnityCompilerBinaryResponse *response,
+    SerializedProgramParameters *parameters, const char *role) {
+    if (!response || !parameters || response->reflection_record_count > 32 ||
+        (response->reflection_record_count && !response->reflection_records)) return false;
+    SerializedResourceParam texture = {0};
+    bool found = false;
+    for (size_t index = 0; index < response->reflection_record_count; ++index) {
+        const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
+        if (!native_reflection_record_canonical(record)) return false;
+        if (record->kind == UNITY_COMPILER_REFLECTION_INPUT || record->kind == UNITY_COMPILER_REFLECTION_STATS) continue;
+        if (record->kind != UNITY_COMPILER_REFLECTION_TEXTURE_BINDING || found || record->value_count != 4 ||
+            !hlsl_source_identifier_valid(record->name) || record->values[0] < 0 ||
+            record->values[0] >= HLSL_SM5_RESOURCE_REGISTER_COUNT || record->values[1] < 0 ||
+            record->values[1] >= HLSL_SM5_SAMPLER_REGISTER_COUNT || record->values[2] ||
+            (record->values[3] != 2 && record->values[3] != 4)) return false;
+        texture = (SerializedResourceParam){.name = record->name, .bind_type = SERIALIZED_RESOURCE_TEXTURE,
+            .bind_index = (uint32_t)record->values[0], .sampler_index = (uint32_t)record->values[1],
+            .dimension = (uint32_t)record->values[3], .extra = {(uint32_t)record->values[1], 0}};
+        printf("native_texture_record role=%s name=%s texture=%u sampler=%u dimension=%u multisampled=0\n",
+            role, texture.name, texture.bind_index, texture.sampler_index, texture.dimension);
+        found = true;
+    }
+    const SerializedProgramParameters projected = {.resources = &texture, .res_count = 1};
+    return found && serialized_program_parameters_copy(parameters, &projected);
+}
+
+static bool native_sampled_parameters_equal(const UnityCompilerBinaryResponse *response,
+    const SerializedProgramParameters *original, const char *role) {
+    SerializedProgramParameters current;
+    serialized_program_parameters_init(&current);
+    const bool equal = native_sampled_parameters(response, &current, role) &&
+        serialized_program_parameters_equal(original, &current);
+    serialized_program_parameters_free(&current);
+    printf("native_texture_projection_equal role=%s original_tuples_equal=%d\n", role, equal);
+    return equal;
+}
+
 static bool native_named_parameters_equal(const UnityCompilerBinaryResponse *response,
     const SerializedProgramParameters *original, const char *role) {
     SerializedProgramParameters current;
@@ -1319,11 +1356,13 @@ done:
     return accepted;
 }
 
-/* A constant or identity-color fragment may retain unread typed/packed
- * inputs. Reconstruct from the decoded target alone. Warm counterexamples
- * change one actual literal or the active input declaration's interpolation. */
-static bool reconstruct_inactive_inputs(const DXBCContainerView *target,
-    StringBuilder *source, ProbeDecodedLiteral *owner, bool changed) {
+typedef enum { PROBE_FRAGMENT_INACTIVE, PROBE_FRAGMENT_SAMPLED } ProbeSimpleFragment;
+
+/* Both closed fragment proofs use the ordinary emitter. Counterexamples
+ * change an actual literal or the actual active input declaration. */
+static bool reconstruct_simple_fragment(const DXBCContainerView *target,
+    StringBuilder *source, ProbeDecodedLiteral *owner, bool changed,
+    const SerializedProgramParameters *parameters, ProbeSimpleFragment family) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -1331,22 +1370,28 @@ static bool reconstruct_inactive_inputs(const DXBCContainerView *target,
     dxbc_stage_contract_init(&contract);
     USILProgram program = {0};
     HLSLInactiveInputPlan plan;
+    HLSLSampledFragmentPlan sampled;
+    const bool texture_sample = family == PROBE_FRAGMENT_SAMPLED;
+    const char *prefix = texture_sample ? "sampled" : "inactive";
     bool accepted = false;
     if (!target || !source || !owner || source->len || !sb_ok(source) ||
         !dxbc_document_parse(&document, target->data, target->size, NULL) ||
         !dxbc_document_decode_semantic(&document, &semantic) ||
         !dxbc_stage_contract_decode(&document, &semantic, &contract, NULL) ||
         !usil_translate_with_stage_contract(&program, &semantic, &contract) ||
-        !hlsl_inactive_input_plan_prepare(&program, &plan) ||
-        !print_domain_signature("inactive-fragment-input", program.inputs, program.input_count) ||
-        !print_domain_signature("inactive-fragment-output", program.outputs, program.output_count)) goto done;
-    const bool literal = plan.active_input_field < 0;
+        !(texture_sample ? hlsl_sampled_fragment_plan_prepare(&program, &sampled) :
+            hlsl_inactive_input_plan_prepare(&program, &plan)) ||
+        !print_domain_signature(texture_sample ? "sampled-fragment-input" : "inactive-fragment-input", program.inputs, program.input_count) ||
+        !print_domain_signature(texture_sample ? "sampled-fragment-output" : "inactive-fragment-output", program.outputs, program.output_count)) goto done;
+    const int active_field = texture_sample ? sampled.coordinate_field : plan.active_input_field;
+    const bool literal = texture_sample ? sampled.explicit_level : active_field < 0;
+    const int literal_operand = texture_sample ? 4 : 1;
     ProbeDecodedLiteral captured = {.instruction = literal ? 0 : -1,
-        .operand = literal ? 1 : plan.active_input_field,
+        .operand = literal ? literal_operand : active_field,
         .raw_instruction = program.instructions[0].source_instruction_index,
-        .original_bits = literal ? program.instructions[0].operands[1].imm_values[0] :
-            program.inputs[plan.active_input_field].interpolation_mode,
-        .opcode = USIL_OP_MOV, .shader_model_major = program.shader_model_major, .valid = true};
+        .original_bits = literal ? program.instructions[0].operands[literal_operand].imm_values[0] :
+            program.inputs[active_field].interpolation_mode,
+        .opcode = program.instructions[0].opcode, .shader_model_major = program.shader_model_major, .valid = true};
     int declaration_index = -1;
     if (!literal) {
         for (int index = 0; index < program.signature_declaration_count; ++index)
@@ -1357,22 +1402,27 @@ static bool reconstruct_inactive_inputs(const DXBCContainerView *target,
     if (changed) {
         if (!owner->valid || owner->instruction != captured.instruction || owner->operand != captured.operand ||
             owner->raw_instruction != captured.raw_instruction || owner->original_bits != captured.original_bits ||
-            owner->shader_model_major != captured.shader_model_major) goto done;
+            owner->shader_model_major != captured.shader_model_major || owner->opcode != captured.opcode) goto done;
         if (literal) {
             const uint32_t replacement = captured.original_bits == UINT32_C(0x3f400000)
                 ? UINT32_C(0x3f000000) : UINT32_C(0x3f400000);
-            program.instructions[0].operands[1].imm_values[0] = replacement;
-            program.instructions[0].operands[1].immediate_words[0] = replacement;
+            DXBCOperand *operand = &program.instructions[0].operands[literal_operand];
+            operand->imm_values[0] = replacement;
+            operand->immediate_words[0] = replacement;
+            if (texture_sample)
+                for (unsigned lane = 1; lane < 4; ++lane) operand->imm_values[lane] = replacement;
         } else {
             const uint8_t replacement = captured.original_bits == 3u ? 2u : 3u;
-            program.inputs[plan.active_input_field].interpolation_mode = replacement;
+            program.inputs[active_field].interpolation_mode = replacement;
             program.signature_declarations[declaration_index].interpolation_mode = replacement;
         }
-        if (!hlsl_inactive_input_plan_prepare(&program, &plan)) goto done;
+        if (!(texture_sample ? hlsl_sampled_fragment_plan_prepare(&program, &sampled) :
+            hlsl_inactive_input_plan_prepare(&program, &plan))) goto done;
     } else *owner = captured;
-    printf("inactive_counterexample_owner=%s instruction=%d raw_instruction=%u field_or_operand=%d "
+    printf("%s_counterexample_owner=%s instruction=%d raw_instruction=%u field_or_operand=%d "
         "original=0x%08" PRIx32 " changed=%d model=%u.0\n",
-        literal ? "decoded-mov-literal" : "decoded-input-declaration-interpolation", captured.instruction,
+        prefix, literal ? texture_sample ? "decoded-level-literal" : "decoded-mov-literal" :
+            "decoded-input-declaration-interpolation", captured.instruction,
         captured.raw_instruction, captured.operand, captured.original_bits, changed, program.shader_model_major);
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
     HLSLExpressionSourceMap map;
@@ -1381,14 +1431,16 @@ static bool reconstruct_inactive_inputs(const DXBCContainerView *target,
     options.expression_source_map = &map;
     options.source_quality = &quality;
     const HLSLEmitNames names = {.entry_point = "frag"};
-    const bool emitted = hlsl_emit_with_options_diagnostic(&program, source, NULL, NULL, &names, &options, &diagnostic);
+    const bool emitted = hlsl_emit_with_options_diagnostic(&program, source, parameters, NULL, &names, &options, &diagnostic);
     const bool mapped = emitted && map.complete && hlsl_expression_source_map_matches(&map, &program, source->buf);
-    printf("inactive_source_result=%s status=%s phase=%s reason=%s bytes=%zu quality=%s reasons=0x%x "
+    printf("%s_source_result=%s status=%s phase=%s reason=%s bytes=%zu quality=%s reasons=0x%x "
         "incomplete=%zu residual=%zu unknown=%zu map_complete=%d map_count=%zu map_valid=%d\n",
-        emitted ? "generated" : "unavailable", hlsl_emit_status_name(diagnostic.status),
+        prefix, emitted ? "generated" : "unavailable", hlsl_emit_status_name(diagnostic.status),
         hlsl_emit_phase_name(diagnostic.phase), hlsl_emit_reason_name(diagnostic.reason), source->len,
         hlsl_source_quality_class_name(quality.classification), quality.reasons, quality.counts.incomplete_units,
         quality.counts.residual_total, quality.counts.unknown_provenance, map.complete, map.count, mapped);
+    if (texture_sample)
+        printf("sampled_resource_declarations=%zu actual_metadata_supplied=%d\n", quality.counts.resource_declarations, parameters != NULL);
     if (emitted) print_hash(changed ? "mutated_fragment_sha256" : "reconstructed_fragment_sha256", source->buf, source->len);
     accepted = mapped && map.count == 2 && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
         !quality.reasons && !quality.counts.incomplete_units && !quality.counts.residual_total &&
@@ -2396,7 +2448,7 @@ static void usage(const char *name) {
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture | --inactive-input-fixture]\n"
+        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture | --inactive-input-fixture | --sampled-fragment-fixture]\n"
         "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -2429,6 +2481,8 @@ static void usage(const char *name) {
         "--inactive-input-fixture reconstructs a constant or identity-color fragment "
         "with unread typed/packed signature fields. Cold exact comparison enables "
         "an actual MOV literal or active input interpolation change and exact warm restoration.\n"
+        "--sampled-fragment-fixture uses actual native texture-binding callbacks and "
+        "the decoded one-sample fragment. Its warm change owns a scalar level or active input interpolation.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -2442,11 +2496,12 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
+    const bool sampled_fragment_fixture = argc == 5 && !strcmp(argv[4], "--sampled-fragment-fixture");
     const bool inactive_input_fixture = argc == 5 && !strcmp(argv[4], "--inactive-input-fixture");
     const bool packed_output_vertex_fixture = argc == 5 && !strcmp(argv[4], "--packed-output-vertex-fixture");
     const bool structured_vertex_fixture = packed_output_vertex_fixture ||
         (argc == 5 && !strcmp(argv[4], "--structured-vertex-fixture"));
-    const bool structured_fixture = inactive_input_fixture || structured_vertex_fixture ||
+    const bool structured_fixture = sampled_fragment_fixture || inactive_input_fixture || structured_vertex_fixture ||
         (argc == 5 && !strcmp(argv[4], "--structured-fixture"));
     const bool scalar_fixture = argc >= 5 && !strcmp(argv[4], "--scalar-fixture");
     const bool icb_fixture = argc >= 5 && !strcmp(argv[4], "--icb-fixture");
@@ -2472,7 +2527,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     CommonFileBytes authored = {0};
-    const char *shader_name = inactive_input_fixture ? "Fixture/HighLevel/InactiveFragmentInputs" :
+    const char *shader_name = sampled_fragment_fixture ? "Fixture/HighLevel/SampledFloatTexture" :
+        inactive_input_fixture ? "Fixture/HighLevel/InactiveFragmentInputs" :
         packed_output_vertex_fixture ? "Fixture/HighLevel/PackedFloat2VertexOutput" :
         structured_vertex_fixture ? "Fixture/HighLevel/StructuredFloat3VertexBranch" :
         structured_fixture ? "Fixture/HighLevel/StructuredFloat3Branch" : scalar_fixture ? "Fixture/HighLevel/HullFloat3ScalarCBuffer"
@@ -2563,9 +2619,15 @@ int main(int argc, char **argv) {
                  "packed_output_warm_restore=not-run");
             goto done;
         }
-        if (native_parameters.cb_count)
+        if (sampled_fragment_fixture && !native_sampled_parameters(&compiled[0], &native_parameters, "original")) {
+            puts("native_texture_projection=unavailable sampled_source=not-attempted");
+            goto done;
+        }
+        if (native_parameters.cb_count || native_parameters.res_count)
             puts("metadata_authority=actual-native-callback-projection player_metadata=not-supplied");
-        if (!(inactive_input_fixture ? reconstruct_inactive_inputs(&target, &hull, &structured_literal, false) :
+        if (!(inactive_input_fixture || sampled_fragment_fixture ? reconstruct_simple_fragment(&target, &hull, &structured_literal, false,
+                sampled_fragment_fixture ? &native_parameters : NULL,
+                sampled_fragment_fixture ? PROBE_FRAGMENT_SAMPLED : PROBE_FRAGMENT_INACTIVE) :
                 reconstruct_structured(&target, &hull, &structured_literal, false,
                     structured_vertex_fixture, packed_output_vertex_fixture,
                     native_parameters.cb_count ? &native_parameters : NULL, false)) ||
@@ -2632,6 +2694,8 @@ int main(int argc, char **argv) {
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
     if (native_parameters.cb_count &&
         !native_named_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
+    if (sampled_fragment_fixture &&
+        !native_sampled_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
     const bool controls_equal =
         selected_controls_equal(&requests[0], &requests[1]);
     const bool toolchain_equal =
@@ -2681,7 +2745,9 @@ int main(int argc, char **argv) {
     if (structured_fixture) {
         StringBuilder mutated_fragment;
         sb_init(&mutated_fragment);
-        mutation_built = (inactive_input_fixture ? reconstruct_inactive_inputs(&target, &mutated_fragment, &structured_literal, true) :
+        mutation_built = (inactive_input_fixture || sampled_fragment_fixture ? reconstruct_simple_fragment(&target, &mutated_fragment, &structured_literal, true,
+                sampled_fragment_fixture ? &native_parameters : NULL,
+                sampled_fragment_fixture ? PROBE_FRAGMENT_SAMPLED : PROBE_FRAGMENT_INACTIVE) :
                 reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
                     structured_vertex_fixture, packed_output_vertex_fixture,
                     native_parameters.cb_count ? &native_parameters : NULL, false)) &&
@@ -2703,6 +2769,8 @@ int main(int argc, char **argv) {
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
     if (native_parameters.cb_count &&
         !native_named_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
+    if (sampled_fragment_fixture &&
+        !native_sampled_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
     const DXBCCompareStatus mutation_status = dxbc_compare_exact(
         candidate.data, candidate.size, changed.data, changed.size, &comparison);
     const bool mutation_diff =
@@ -2735,6 +2803,8 @@ int main(int argc, char **argv) {
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
     if (native_parameters.cb_count &&
         !native_named_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;
+    if (sampled_fragment_fixture &&
+        !native_sampled_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;
     const DXBCCompareStatus repeated_status = dxbc_compare_exact(
         summary_only ? target.data : candidate.data,
         summary_only ? target.size : candidate.size,
@@ -2764,7 +2834,11 @@ int main(int argc, char **argv) {
         printf("inactive_input_isolated_stage_qualified=%d original_target_reference=1 "
                "actual_owned_mutation=%s warm_restore=%s import=not-run runtime=not-run semantic_certificate=not-run\n",
                !result, mutation_diff && mutation_authority ? "different" : "failed", !result ? "exact" : "failed");
-    if (structured_fixture && !inactive_input_fixture)
+    if (sampled_fragment_fixture)
+        printf("sampled_fragment_isolated_stage_qualified=%d original_target_reference=1 "
+               "actual_owned_mutation=%s warm_restore=%s import=not-run runtime=not-run semantic_certificate=not-run\n",
+               !result, mutation_diff && mutation_authority ? "different" : "failed", !result ? "exact" : "failed");
+    if (structured_fixture && !inactive_input_fixture && !sampled_fragment_fixture)
         printf("structured_isolated_stage_qualified=%d original_target_reference=1 "
                "decoded_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
                !result, mutation_diff && mutation_authority ? "different" : "failed",

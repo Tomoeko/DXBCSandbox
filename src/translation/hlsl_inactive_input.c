@@ -66,7 +66,7 @@ static bool plain_instruction(const USILInstruction *instruction) {
 bool hlsl_inactive_input_plan_prepare(const USILProgram *program, HLSLInactiveInputPlan *plan) {
     if (!plan) return false;
     memset(plan, 0, sizeof(*plan));
-    if (!hlsl_decoded_graphics_owner_storage_valid(program, false) ||
+    if (!hlsl_decoded_graphics_owner_storage_valid(program, HLSL_GRAPHICS_OWNER_PURE) ||
         program->program_type != DXBC_PROGRAM_TYPE_PIXEL || program->shader_model_minor ||
         program->instruction_count != 2 || program->temp_count ||
         program->input_count < 1 || program->output_count != 1 ||

@@ -39,8 +39,9 @@ static bool sample_binding(const HLSLEmitterContext *ctx, int index,
         usil_operand_destination_lane_mask(&instruction->operands[0]) != 15)
         return false;
     const USILTexture *texture = hlsl_instruction_texture(ctx->program, instruction, 2);
-    if (!texture || strcmp(texture->dimension, "2d") || texture->stride || texture->sample_count)
-        return false;
+    if (!texture || texture->stride || texture->sample_count ||
+        (strcmp(texture->dimension, "2d") && !(ctx->high_level_cube_sample &&
+            !strcmp(texture->dimension, "cube") && hlsl_cube_sample_admission(ctx)))) return false;
     for (unsigned component = 0; component < 4; ++component)
         if (texture->return_types[component] != 5u) return false;
     for (int operand_index = 2; operand_index <= 3; ++operand_index) {

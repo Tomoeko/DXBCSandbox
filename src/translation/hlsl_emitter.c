@@ -807,7 +807,7 @@ static bool hlsl_opcode_supported(USILOpcode opcode) {
   }
 }
 
-static bool validate_instruction_resource_authority(
+bool hlsl_instruction_resource_authority_valid(
     const USILProgram *program, const USILInstruction *instruction) {
   if (!has_terminated_text(instruction->resource_dimension,
                            sizeof(instruction->resource_dimension))) {
@@ -1389,7 +1389,7 @@ static bool validate_program_for_hlsl(const USILProgram *program,
           HLSL_EMIT_REASON_INVALID_INSTRUCTION_SHAPE, instruction, -1);
       return false;
     }
-    if (!validate_instruction_resource_authority(program, value)) {
+    if (!hlsl_instruction_resource_authority_valid(program, value)) {
       hlsl_emit_set_instruction_failure(
           diagnostic, program, HLSL_EMIT_STATUS_INVALID_PROGRAM,
           HLSL_EMIT_PHASE_PROGRAM_VALIDATION,
@@ -1546,6 +1546,7 @@ static bool high_level_direct_return_supported(const USILProgram *program,
 
 bool hlsl_source_quality_observe_owned_expression(HLSLEmitterContext *ctx,
     const ASTExpr *expression, int instruction, const HLSLStageRootOwner *owner) {
+  if (!sb_ok(ctx->sb)) return false;
   if (!ctx->source_quality_analysis) return true;
   if (!(owner ? hlsl_stage_coverage_owned_root(ctx, expression, instruction, owner) :
         hlsl_stage_coverage_root(ctx, expression, instruction))) return false;
@@ -1732,6 +1733,7 @@ static bool straightline_maps_equal(const HLSLExpressionSourceMap *left,
 }
 
 static bool straightline_model_digest(const HLSLEmitterContext *ctx, uint8_t digest[32]) {
+  if (ctx->high_level_cube_sample) return hlsl_cube_sample_owned_contract_digest(ctx->program, digest);
   return ctx->high_level_inactive_inputs
       ? hlsl_inactive_input_owned_contract_digest(ctx->program, digest)
       : hlsl_packed_output_owned_contract_digest(ctx->program, digest);
@@ -1810,6 +1812,8 @@ static bool straightline_guard_prepare(HLSLEmitterContext *ctx, size_t prefix_le
       !straightline_lease(guard, program->signature_declarations,
           (size_t)program->signature_declaration_count * sizeof(*program->signature_declarations)) ||
       !straightline_lease(guard, program->cbuffers, (size_t)program->cbuffer_count * sizeof(*program->cbuffers)) ||
+      !straightline_lease(guard, program->textures, (size_t)program->texture_count * sizeof(*program->textures)) ||
+      !straightline_lease(guard, program->samplers, (size_t)program->sampler_count * sizeof(*program->samplers)) ||
       !straightline_parameters_lease(guard, ctx->params, &guard->current) ||
       !straightline_parameters_lease(guard, ctx->common_params, &guard->common) ||
       !straightline_lease(guard, names, names ? sizeof(*names) : 0) ||
@@ -1878,7 +1882,7 @@ static bool straightline_quality_observer(HLSLEmitterContext *ctx,
 
 void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
                                   bool logical_operation, int instruction) {
-  if (!ctx->source_quality_analysis) return;
+  if (!ctx->source_quality_analysis || !sb_ok(ctx->sb)) return;
   HLSLSourceQualityFacts facts;
   hlsl_source_quality_facts_init(&facts);
   facts.known = true;
@@ -1928,7 +1932,7 @@ void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
 
 static bool owned_stage_quality_observer(void *context, const HLSLSourceQualityObservation *observation) {
   HLSLEmitterContext *ctx = context;
-  if (ctx->high_level_packed_outputs || ctx->high_level_inactive_inputs) return straightline_quality_observer(ctx, observation);
+  if (ctx->high_level_packed_outputs || ctx->high_level_inactive_inputs || ctx->high_level_cube_sample) return straightline_quality_observer(ctx, observation);
   return hlsl_stage_coverage_observation(ctx, observation) &&
       (!ctx->source_quality_forward_observer ||
        ctx->source_quality_forward_observer(ctx->source_quality_forward_observer_context, observation));
@@ -1939,7 +1943,7 @@ bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptio
   ctx->source_quality_forward_observer = options->source_quality_observer;
   ctx->source_quality_forward_observer_context = options->source_quality_observer_context;
   const bool owned_observer = ctx->stage_coverage || ctx->matrix_use_capture ||
-      ctx->high_level_packed_outputs || ctx->high_level_inactive_inputs;
+      ctx->high_level_packed_outputs || ctx->high_level_inactive_inputs || ctx->high_level_cube_sample;
   const HLSLSourceQualityRequest quality_request = {
       .stage = ctx->program->program_type,
       .pass_index = options->source_quality_pass_index,
@@ -2322,6 +2326,8 @@ static bool hlsl_emit_with_options_impl(
   HLSLInactiveInputPlan inactive_inputs;
   ctx.high_level_inactive_inputs = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
       !ctx.unity_uv_helper && hlsl_inactive_input_plan_prepare(program, &inactive_inputs);
+  ctx.high_level_cube_sample = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
+      !ctx.unity_uv_helper && hlsl_cube_sample_admission(&ctx);
   ctx.preferred_output_struct_name = output_struct;
   ctx.preferred_input_struct_name = input_struct;
   ctx.entry_point_name = entry_point;
@@ -2498,7 +2504,7 @@ static bool hlsl_emit_with_options_impl(
     common_sha256(sb->buf, source_start, ctx.natural_structured_append_prefix_digest);
     ctx.natural_structured_owners_guarded = true;
   }
-  if ((packed_output || ctx.high_level_inactive_inputs) && !straightline_replay &&
+  if ((packed_output || ctx.high_level_inactive_inputs || ctx.high_level_cube_sample) && !straightline_replay &&
       !straightline_guard_prepare(&ctx, source_start, names, options)) {
     hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_ANALYSIS_FAILED,
                    HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS, HLSL_EMIT_REASON_ANALYSIS_CONFLICT);

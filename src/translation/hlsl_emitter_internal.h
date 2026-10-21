@@ -312,6 +312,7 @@ typedef struct HLSLEmitterContext {
      * when two parameter declarations share one physical input register. */
     bool high_level_packed_inputs;
     bool high_level_inactive_inputs;
+    bool high_level_cube_sample;
     uint32_t high_level_input_fields_emitted;
     /* A separate straight-line proof binds packed output signature ordinals,
      * while the established register bitmaps retain their original meaning. */
@@ -497,7 +498,12 @@ typedef struct {
 bool hlsl_high_level_output_projection(const USILProgram *program,
     const DXBCOperand *destination, HLSLNaturalOutputProjection *projection);
 /* Storage/shape safety shared by the bounded graphics owner digests. */
-bool hlsl_decoded_graphics_owner_storage_valid(const USILProgram *program, bool constant_buffers);
+typedef enum {
+    HLSL_GRAPHICS_OWNER_PURE,
+    HLSL_GRAPHICS_OWNER_CONSTANT_BUFFERS,
+    HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT
+} HLSLGraphicsOwnerStorage;
+bool hlsl_decoded_graphics_owner_storage_valid(const USILProgram *program, HLSLGraphicsOwnerStorage storage);
 typedef struct {
     bool present;
     int active_input_field; /* -1 for a literal return. */
@@ -505,6 +511,17 @@ typedef struct {
 } HLSLInactiveInputPlan;
 bool hlsl_inactive_input_plan_prepare(const USILProgram *program, HLSLInactiveInputPlan *plan);
 bool hlsl_inactive_input_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+typedef struct {
+    bool present;
+    bool cube;
+    bool explicit_level;
+    int coordinate_field;
+    uint32_t texture_register, sampler_register;
+} HLSLSampledFragmentPlan;
+bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan);
+bool hlsl_cube_sample_admission(const HLSLEmitterContext *ctx);
+bool hlsl_cube_sample_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);
 /* One direct unsigned system output in the packed vertex route. This is a
@@ -726,6 +743,7 @@ bool hlsl_signature_semantic_storage_valid(const DXBCSignatureElement *element);
 void hlsl_expression_source_map_begin(HLSLEmitterContext *ctx);
 /* Shared closed float4 contracts and compiler inverse AST construction. */
 bool hlsl_lift_operand_is_plain(const DXBCOperand *value);
+bool hlsl_instruction_resource_authority_valid(const USILProgram *program, const USILInstruction *instruction);
 HLSLEmitReason hlsl_float4_program_contract(const USILProgram *program);
 bool hlsl_float4_program_supported(HLSLEmitterContext *ctx);
 bool emit_unity_uv_lift(HLSLEmitterContext *ctx);
