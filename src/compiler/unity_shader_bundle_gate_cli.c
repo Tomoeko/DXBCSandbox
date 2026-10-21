@@ -4,12 +4,26 @@
 #include "common/executable_resource.h"
 #include "common/windows_utf8.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define UNITY_BUNDLE_GATE_BRIDGE_RESOURCE \
     "dxbc-sandbox/unity/Editor/DXBCShaderBundleGate.cs"
+
+typedef enum {
+    BUNDLE_ARGUMENTS_OK = 0,
+    BUNDLE_ARGUMENTS_HELP,
+    BUNDLE_ARGUMENTS_INVALID
+} BundleArgumentStatus;
+
+typedef struct {
+    UnityShaderBundleGateOptions options;
+    const char **inputs;
+    bool target_seen;
+    bool backend_seen;
+} BundleCommandLine;
 
 static void print_usage(FILE* stream, const char* executable) {
     fprintf(stream,
@@ -72,85 +86,72 @@ static bool parse_target(const char* value, UnityShaderBundleTarget* target) {
     return false;
 }
 
-static int unity_shader_bundle_gate_main(int argc, char** argv) {
-    UnityShaderBundleGateOptions options;
-    unity_shader_bundle_gate_options_init(&options);
-    const char** inputs = (const char**)calloc(
-        argc > 0 ? (size_t)argc : 1U, sizeof(*inputs));
-    if (!inputs) {
-        fprintf(stderr, "allocation failed\n");
-        return 1;
-    }
+static BundleArgumentStatus parse_arguments(int argc, char **argv, BundleCommandLine *command) {
+    UnityShaderBundleGateOptions *options = &command->options;
     bool parse_ok = true;
-    bool target_seen = false;
-    bool backend_seen = false;
     for (int index = 1; index < argc; ++index) {
-        const char* argument = argv[index];
-        if (strcmp(argument, "-h") == 0 ||
-            strcmp(argument, "--help") == 0) {
-            print_usage(stdout, argv[0]);
-            free(inputs);
-            return 0;
+        const char *argument = argv[index];
+        if (strcmp(argument, "-h") == 0 || strcmp(argument, "--help") == 0) {
+            return BUNDLE_ARGUMENTS_HELP;
         }
         if (strcmp(argument, "--unity") == 0) {
-            options.unity_executable = option_value(argc, argv, &index,
-                                                    argument);
-            parse_ok = options.unity_executable != NULL;
+            options->unity_executable = option_value(argc, argv, &index, argument);
+            parse_ok = options->unity_executable != NULL;
         } else if (strcmp(argument, "--unity-version") == 0) {
-            options.expected_unity_version = option_value(argc, argv, &index,
-                                                          argument);
-            parse_ok = options.expected_unity_version != NULL;
+            options->expected_unity_version = option_value(argc, argv, &index, argument);
+            parse_ok = options->expected_unity_version != NULL;
         } else if (strcmp(argument, "--bridge") == 0) {
-            options.bridge_path = option_value(argc, argv, &index, argument);
-            parse_ok = options.bridge_path != NULL;
+            options->bridge_path = option_value(argc, argv, &index, argument);
+            parse_ok = options->bridge_path != NULL;
         } else if (strcmp(argument, "--report") == 0) {
-            options.report_path = option_value(argc, argv, &index, argument);
-            parse_ok = options.report_path != NULL;
+            options->report_path = option_value(argc, argv, &index, argument);
+            parse_ok = options->report_path != NULL;
         } else if (strcmp(argument, "--log") == 0) {
-            options.log_path = option_value(argc, argv, &index, argument);
-            parse_ok = options.log_path != NULL;
+            options->log_path = option_value(argc, argv, &index, argument);
+            parse_ok = options->log_path != NULL;
         } else if (strcmp(argument, "--bundle") == 0) {
-            options.output_bundle_path = option_value(argc, argv, &index,
-                                                      argument);
-            parse_ok = options.output_bundle_path != NULL;
+            options->output_bundle_path = option_value(argc, argv, &index, argument);
+            parse_ok = options->output_bundle_path != NULL;
         } else if (strcmp(argument, "--temp-root") == 0) {
-            options.temporary_root = option_value(argc, argv, &index, argument);
-            parse_ok = options.temporary_root != NULL;
+            options->temporary_root = option_value(argc, argv, &index, argument);
+            parse_ok = options->temporary_root != NULL;
         } else if (strcmp(argument, "--target") == 0) {
-            const char* value = option_value(argc, argv, &index, argument);
-            target_seen = value != NULL && parse_target(value, &options.target);
-            parse_ok = target_seen;
-            if (value && !target_seen)
+            const char *value = option_value(argc, argv, &index, argument);
+            command->target_seen = value != NULL && parse_target(value, &options->target);
+            parse_ok = command->target_seen;
+            if (value && !command->target_seen) {
                 fprintf(stderr, "invalid --target value: %s\n", value);
+            }
         } else if (strcmp(argument, "--backend") == 0) {
-            const char* value = option_value(argc, argv, &index, argument);
-            backend_seen = value != NULL &&
-                unity_shader_bundle_backend_parse(value, &options.backend);
-            parse_ok = backend_seen;
-            if (value && !backend_seen)
+            const char *value = option_value(argc, argv, &index, argument);
+            command->backend_seen =
+                value != NULL && unity_shader_bundle_backend_parse(value, &options->backend);
+            parse_ok = command->backend_seen;
+            if (value && !command->backend_seen) {
                 fprintf(stderr, "invalid --backend value: %s\n", value);
+            }
         } else if (strcmp(argument, "--warnings") == 0) {
-            const char* value = option_value(argc, argv, &index, argument);
+            const char *value = option_value(argc, argv, &index, argument);
             if (!value) {
                 parse_ok = false;
             } else if (strcmp(value, "allow") == 0) {
-                options.warning_policy = UNITY_SHADER_IMPORT_WARNINGS_ALLOW;
+                options->warning_policy = UNITY_SHADER_IMPORT_WARNINGS_ALLOW;
             } else if (strcmp(value, "fail") == 0) {
-                options.warning_policy = UNITY_SHADER_IMPORT_WARNINGS_FAIL;
+                options->warning_policy = UNITY_SHADER_IMPORT_WARNINGS_FAIL;
             } else {
                 fprintf(stderr, "invalid --warnings value: %s\n", value);
                 parse_ok = false;
             }
         } else if (strcmp(argument, "--keep") == 0) {
-            const char* value = option_value(argc, argv, &index, argument);
+            const char *value = option_value(argc, argv, &index, argument);
             if (!value) {
                 parse_ok = false;
             } else if (strcmp(value, "on-failure") == 0) {
-                options.keep_policy = UNITY_SHADER_IMPORT_KEEP_ON_FAILURE;
+                options->keep_policy = UNITY_SHADER_IMPORT_KEEP_ON_FAILURE;
             } else if (strcmp(value, "always") == 0) {
-                options.keep_policy = UNITY_SHADER_IMPORT_KEEP_ALWAYS;
+                options->keep_policy = UNITY_SHADER_IMPORT_KEEP_ALWAYS;
             } else if (strcmp(value, "never") == 0) {
-                options.keep_policy = UNITY_SHADER_IMPORT_KEEP_NEVER;
+                options->keep_policy = UNITY_SHADER_IMPORT_KEEP_NEVER;
             } else {
                 fprintf(stderr, "invalid --keep value: %s\n", value);
                 parse_ok = false;
@@ -159,35 +160,36 @@ static int unity_shader_bundle_gate_main(int argc, char** argv) {
             fprintf(stderr, "unknown option: %s\n", argument);
             parse_ok = false;
         } else {
-            inputs[options.input_count++] = argument;
+            command->inputs[options->input_count++] = argument;
         }
-        if (!parse_ok) break;
-    }
-    options.inputs = inputs;
-    char* packaged_bridge = NULL;
-    if (parse_ok && !options.bridge_path) {
-        packaged_bridge = common_executable_resource_find(
-            argv[0], UNITY_BUNDLE_GATE_BRIDGE_RESOURCE);
-        options.bridge_path = packaged_bridge;
-        if (!packaged_bridge) {
-            fprintf(stderr,
-                    "packaged ShaderImporter bundle bridge was not found; "
-                    "use --bridge PATH\n");
-            parse_ok = false;
+        if (!parse_ok) {
+            break;
         }
     }
-    if (!target_seen || !backend_seen || !parse_ok ||
-        !unity_shader_bundle_gate_options_validate(&options)) {
-        print_usage(stderr, argv[0]);
-        free(packaged_bridge);
-        free(inputs);
-        return 1;
-    }
+    return parse_ok ? BUNDLE_ARGUMENTS_OK : BUNDLE_ARGUMENTS_INVALID;
+}
 
+static int bundle_gate_exit_code(UnityShaderBundleGateStatus status) {
+    switch (status) {
+        case UNITY_SHADER_BUNDLE_GATE_OK:
+            return 0;
+        case UNITY_SHADER_BUNDLE_GATE_DIAGNOSTICS_FOUND:
+            return 2;
+        case UNITY_SHADER_BUNDLE_GATE_TARGET_UNAVAILABLE:
+            return 4;
+        case UNITY_SHADER_BUNDLE_GATE_BACKEND_UNAVAILABLE:
+            return 5;
+        case UNITY_SHADER_BUNDLE_GATE_BUILD_FAILED:
+            return 6;
+        default:
+            return 1;
+    }
+}
+
+static int run_bundle_gate(const UnityShaderBundleGateOptions *options) {
     UnityShaderBundleGateRunResult result;
-    UnityShaderBundleGateStatus status = unity_shader_bundle_gate_run(
-        &options, &result);
-    FILE* stream = status == UNITY_SHADER_BUNDLE_GATE_OK ? stdout : stderr;
+    const UnityShaderBundleGateStatus status = unity_shader_bundle_gate_run(options, &result);
+    FILE *stream = status == UNITY_SHADER_BUNDLE_GATE_OK ? stdout : stderr;
     fprintf(stream,
         "status=%s candidates=%llu messages=%llu errors=%llu warnings=%llu "
         "bundle_published=%s unity_exit=%d\n",
@@ -199,17 +201,58 @@ static int unity_shader_bundle_gate_main(int argc, char** argv) {
         result.bundle_published ? "true" : "false",
         result.unity_exit_code);
     if (result.workspace_preserved) {
-        fprintf(stderr, "isolated project preserved: %s\n",
-                result.workspace_path);
+        fprintf(stderr, "isolated project preserved: %s\n", result.workspace_path);
     }
+    return bundle_gate_exit_code(status);
+}
+
+static int unity_shader_bundle_gate_main(int argc, char **argv) {
+    BundleCommandLine command = {0};
+    UnityShaderBundleGateOptions *options = &command.options;
+    unity_shader_bundle_gate_options_init(options);
+    const size_t input_capacity = argc > 0 ? (size_t)argc : 1U;
+    if (input_capacity <= SIZE_MAX / sizeof(*command.inputs)) {
+        command.inputs = calloc(input_capacity, sizeof(*command.inputs));
+    }
+    if (!command.inputs) {
+        fprintf(stderr, "allocation failed\n");
+        return 1;
+    }
+
+    char *packaged_bridge = NULL;
+    int exit_code = 1;
+    const BundleArgumentStatus arguments = parse_arguments(argc, argv, &command);
+    bool parse_ok = arguments == BUNDLE_ARGUMENTS_OK;
+    if (arguments == BUNDLE_ARGUMENTS_HELP) {
+        print_usage(stdout, argv[0]);
+        exit_code = 0;
+        goto cleanup;
+    }
+
+    options->inputs = command.inputs;
+    if (parse_ok && !options->bridge_path) {
+        packaged_bridge =
+            common_executable_resource_find(argv[0], UNITY_BUNDLE_GATE_BRIDGE_RESOURCE);
+        options->bridge_path = packaged_bridge;
+        if (!packaged_bridge) {
+            fprintf(stderr,
+                "packaged ShaderImporter bundle bridge was not found; "
+                "use --bridge PATH\n");
+            parse_ok = false;
+        }
+    }
+    if (!command.target_seen || !command.backend_seen || !parse_ok ||
+        !unity_shader_bundle_gate_options_validate(options)) {
+        print_usage(stderr, argv[0]);
+        goto cleanup;
+    }
+
+    exit_code = run_bundle_gate(options);
+
+cleanup:
     free(packaged_bridge);
-    free(inputs);
-    if (status == UNITY_SHADER_BUNDLE_GATE_OK) return 0;
-    if (status == UNITY_SHADER_BUNDLE_GATE_DIAGNOSTICS_FOUND) return 2;
-    if (status == UNITY_SHADER_BUNDLE_GATE_TARGET_UNAVAILABLE) return 4;
-    if (status == UNITY_SHADER_BUNDLE_GATE_BACKEND_UNAVAILABLE) return 5;
-    if (status == UNITY_SHADER_BUNDLE_GATE_BUILD_FAILED) return 6;
-    return 1;
+    free(command.inputs);
+    return exit_code;
 }
 
 COMMON_DEFINE_UTF8_MAIN(unity_shader_bundle_gate_main)
