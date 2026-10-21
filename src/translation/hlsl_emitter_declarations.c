@@ -1391,7 +1391,7 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
         (size_t)layout->variable_count, layout->uses,
         &layout->projection);
     free(ranges);
-    if (!layout->compact_global_layout && hlsl_global_scalar_tail_supported(ctx, index)) {
+    if (!layout->compact_global_layout && hlsl_global_tail_supported(ctx, index)) {
       layout->compact_global_layout = true;
       layout->compact_global_tail = true;
     }
@@ -1871,7 +1871,7 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
        * continues to use row_count from stripped DXBC. D3DCompiler retains
        * this unused tail in reflection while trimming it from dcl_constantbuffer. */
       if (layout->compact_global_tail) {
-        if (!hlsl_global_scalar_tail_supported(ctx, i)) {
+        if (!hlsl_global_tail_supported(ctx, i)) {
           fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
               HLSL_EMIT_PHASE_CBUFFER_EMISSION, HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY, i, -1);
           return;

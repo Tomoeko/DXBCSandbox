@@ -6003,7 +6003,17 @@ typedef struct {
  * document/signature/declaration/USIL decoder chain above. */
 typedef struct { unsigned row; bool different_rows, second_buffer; } PackedPositionMADConfig;
 typedef struct { unsigned placement; } PackedMatrixReceiptConfig;
-typedef struct { unsigned row; } PackedScalarGlobalConfig;
+typedef struct {
+    unsigned row, vector_row, position_row;
+    bool vector, position;
+} PackedScalarGlobalConfig;
+
+static unsigned packed_global_rows(const PackedScalarGlobalConfig *config) {
+    unsigned last = config->row;
+    if (config->vector && config->vector_row > last) last = config->vector_row;
+    if (config->position && config->position_row > last) last = config->position_row;
+    return last + 1u;
+}
 
 static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fixture, unsigned arithmetic,
     bool reversed, bool union_declaration, unsigned boundary, unsigned cbuffer, unsigned position_width,
@@ -6013,10 +6023,12 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
     dxbc_document_init(&fixture->decoded.document);
     dxbc_stage_contract_init(&fixture->decoded.contract);
     CHECK(arithmetic < 4 && boundary < 3 && cbuffer < 3 && (!boundary || cbuffer != 2));
-    CHECK(!position_width || (position_width >= 2 && position_width <= 4 && !boundary && !cbuffer));
+    CHECK(!position_width || (position_width >= 2 && position_width <= 4 && !boundary &&
+        (!cbuffer || (scalar && scalar->position))));
     CHECK(!mad || (position_width && mad->row < 2 && arithmetic == 1 && !reversed));
     CHECK(!matrix || (matrix->placement < 3 && cbuffer == 2 && arithmetic == 1 && !mad));
-    CHECK(!scalar || (scalar->row < 4095 && cbuffer == 1 && !mad && !matrix));
+    CHECK(!scalar || (packed_global_rows(scalar) <= 4095 && cbuffer == 1 && !mad && !matrix &&
+        (!scalar->position || (scalar->vector && position_width == 3))));
     uint32_t words[96]; size_t count = 0;
 #define PACKED_WORD(value) do { CHECK(count < sizeof(words) / sizeof(words[0])); words[count++] = (value); } while (0)
 #define PACKED_INST(opcode, length) ((uint32_t)(opcode) | (uint32_t)(length) << 24u)
@@ -6035,7 +6047,7 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
     if (cbuffer || mad) {
         PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(0);
         PACKED_WORD(mad ? mad->different_rows ? 2u : mad->row + 1u :
-            cbuffer == 2 ? matrix && matrix->placement ? 5u : 4u : scalar ? scalar->row + 1u : 1u);
+            cbuffer == 2 ? matrix && matrix->placement ? 5u : 4u : scalar ? packed_global_rows(scalar) : 1u);
     }
     if (mad && mad->second_buffer) {
         PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(1); PACKED_WORD(1);
@@ -6067,6 +6079,15 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
         PACKED_WORD(0); PACKED_WORD(mad->row);
         PACKED_WORD((natural_if_source_token(OPERAND_TYPE_CONSTANT_BUFFER, mad->different_rows ? xy_selection : zw_selection) &
             ~(UINT32_C(3) << 20u)) | UINT32_C(2) << 20u); PACKED_WORD(0); PACKED_WORD(mad->different_rows ? 1u : mad->row);
+    } else if (scalar && scalar->position) {
+        const uint8_t xy[4] = {0, 1, 0, 0}, zw[4] = {2, 3, 2, 2};
+        PACKED_WORD(PACKED_INST(50, 11)); PACKED_WORD(UINT32_C(0x00102032)); PACKED_WORD(0);
+        PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, xy)); PACKED_WORD(0);
+        for (unsigned operand = 0; operand < 2; ++operand) {
+            PACKED_WORD((natural_if_source_token(OPERAND_TYPE_CONSTANT_BUFFER, operand ? zw : xy) &
+                ~(UINT32_C(3) << 20u)) | UINT32_C(2) << 20u);
+            PACKED_WORD(0); PACKED_WORD(scalar->position_row);
+        }
     } else {
         PACKED_WORD(PACKED_INST(54, 5)); PACKED_WORD(position_width ? UINT32_C(0x00102032) :
             boundary == 1 ? UINT32_C(0x00102072) : UINT32_C(0x001020f2)); PACKED_WORD(0);
@@ -6094,7 +6115,7 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
         const uint8_t selection[4] = {0, is_xy ? 1 : 0, 0, is_xy ? 0 : 1};
         const USILOpcode opcode = is_xy ? xy[arithmetic] : zw[arithmetic];
         const uint32_t raw_opcode = opcode == USIL_OP_MOV ? 54 : natural_arithmetic_raw_opcode(opcode);
-        const bool cbuffer_source = cbuffer == 1 && is_xy;
+        const bool cbuffer_source = cbuffer == 1 && (is_xy || (scalar && scalar->vector));
         const bool uv_cbuffer = mad && (mad->row || mad->second_buffer) && is_xy;
         const bool matrix_vector_source = matrix && matrix->placement && is_xy;
         const unsigned length = mad ? uv_cbuffer ? 8u : 10u :
@@ -6103,8 +6124,8 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
         PACKED_WORD(PACKED_INST(raw_opcode, length));
         PACKED_WORD(UINT32_C(0x00102002) | (uint32_t)mask << 4u); PACKED_WORD(1);
         if (cbuffer_source) {
-            PACKED_WORD(scalar ? UINT32_C(0x00208006) : UINT32_C(0x00208046));
-            PACKED_WORD(0); PACKED_WORD(scalar ? scalar->row : 0);
+            PACKED_WORD(scalar ? is_xy ? UINT32_C(0x00208006) : UINT32_C(0x00208406) : UINT32_C(0x00208046));
+            PACKED_WORD(0); PACKED_WORD(scalar ? is_xy ? scalar->row : scalar->vector_row : 0);
         } else {
             PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, selection)); PACKED_WORD(is_xy ? 1 : 2);
         }
@@ -6156,7 +6177,7 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
     CHECK(program->cbuffer_count == (mad && mad->second_buffer ? 2 : cbuffer || mad ? 1 : 0));
     if (cbuffer || mad) CHECK(program->cbuffers[0].reg_idx == 0 && program->cbuffers[0].size ==
         (mad ? (int)(mad->different_rows ? 2u : mad->row + 1u) :
-            cbuffer == 2 ? matrix && matrix->placement ? 5 : 4 : scalar ? (int)scalar->row + 1 : 1) && !program->cbuffers[0].dynamic_indexed);
+            cbuffer == 2 ? matrix && matrix->placement ? 5 : 4 : scalar ? (int)packed_global_rows(scalar) : 1) && !program->cbuffers[0].dynamic_indexed);
     if (mad && mad->second_buffer) CHECK(program->cbuffers[1].reg_idx == 1 && program->cbuffers[1].size == 1 &&
         !program->cbuffers[1].dynamic_indexed);
     return true;
@@ -6905,6 +6926,107 @@ static bool check_packed_scalar_global_tail(unsigned row, unsigned tail_rows, bo
         selected_buffers[1].size = (row + tail_rows + 1u) * 16u;
         selected_buffers[1].has_is_partial = selected_buffers[1].is_partial = false;
         fixture.decoded.program.cbuffers[0].dynamic_indexed = false;
+    }
+    sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+    CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+        changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) &&
+        natural_if_maps_equal(&map, &changed_map) && hlsl_source_quality_results_equal(&quality, &changed_quality));
+    sb_free(&baseline); sb_free(&changed); natural_if_fixture_dispose(&fixture.decoded);
+    return true;
+}
+
+/* Every field is read through a parsed CB operand. The split model contributes
+ * current fields, not sibling read authority. The position case also exercises
+ * the existing material-backed position assembly with a third float4 field. */
+static bool check_packed_global_fields(unsigned first_row, bool position, bool split, bool boundary) {
+    const PackedScalarGlobalConfig config = {.row = first_row, .vector_row = first_row + 1u,
+        .position_row = first_row + 2u, .vector = true, .position = position};
+    const unsigned fields = position ? 3u : 2u;
+    const unsigned rows = packed_global_rows(&config), full_rows = boundary ? 4096u : rows + 15u;
+    CHECK(rows < full_rows);
+    PackedOutputFixture fixture;
+    CHECK(packed_output_fixture_layout_position_config(&fixture, 0, false, false, 0, 1,
+        position ? 3u : 0u, NULL, NULL, &config));
+    char names[2][3][32] = {{"_Scale", "_Transform", "_PositionTransform"},
+                            {"_Scale", "_Transform", "_PositionTransform"}};
+    SerializedVariable variables[2][3] = {0};
+    SerializedConstantBuffer buffers[2] = {0};
+    SerializedResourceParam bindings[2] = {0};
+    SerializedProgramParameters parameters[2] = {0};
+    for (unsigned source = 0; source < 2; ++source) {
+        for (unsigned field = 0; field < fields; ++field)
+            variables[source][field] = (SerializedVariable){names[source][field],
+                {(first_row + field) * 16u, 0, 0, field ? 4u : 1u, 0, 0}};
+        buffers[source] = (SerializedConstantBuffer){.name = "$Globals", .size = full_rows * 16u,
+            .role = SERIALIZED_CBUFFER_NAMED, .variables = variables[source], .var_count = (int)fields};
+        bindings[source] = (SerializedResourceParam){.name = "$Globals", .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER};
+        parameters[source] = (SerializedProgramParameters){.constant_buffers = &buffers[source], .cb_count = 1,
+            .resources = &bindings[source], .res_count = 1};
+    }
+    SerializedConstantBuffer selected_buffers[2] = {
+        {.name = "$Globals", .role = SERIALIZED_CBUFFER_LOOSE_PARAMETERS},
+        {.name = "$Globals", .role = SERIALIZED_CBUFFER_NAMED, .size = full_rows * 16u}};
+    SerializedProgramParameters selected = {.is_binary = true, .constant_buffers = selected_buffers, .cb_count = 2};
+    if (split) {
+        buffers[1].has_is_partial = buffers[1].is_partial = true;
+        fixture.parameters = &selected; fixture.common_parameters = &parameters[1];
+    } else fixture.parameters = &parameters[0];
+    const unsigned authority = split ? 1u : 0u;
+    const char prefix[] = "// caller prefix\n";
+    StringBuilder baseline, changed; sb_init(&baseline); sb_init(&changed); sb_append(&baseline, prefix);
+    HLSLExpressionSourceMap map, changed_map;
+    HLSLSourceQualityResult quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic;
+    PackedOutputObservations observer = {0};
+    CHECK(packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic) &&
+        packed_output_clean(&quality) && !observer.wrong_owner && !observer.cbuffer_events &&
+        hlsl_expression_source_map_matches(&map, &fixture.decoded.program, baseline.buf) &&
+        strstr(baseline.buf, "float _Scale : register(") && strstr(baseline.buf, "float4 _Transform : register(") &&
+        strstr(baseline.buf, "float4 _GlobalsLayoutEnd : register(") && !strstr(baseline.buf, "cb0_"));
+    if (position) CHECK(strstr(baseline.buf, "float4 _PositionTransform : register("));
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(packed_output_emit(&fixture, &changed, outputs & 1u ? &changed_map : NULL,
+            outputs & 2u ? &changed_quality : NULL, NULL, &diagnostic) && changed.len == baseline.len &&
+            !memcmp(changed.buf, baseline.buf, baseline.len));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &changed_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &changed_quality));
+    }
+    if (first_row == 26) for (unsigned change = 0; change < fields + 2u; ++change)
+        for (size_t at = 1; at <= observer.observations; ++at) {
+            PackedOutputObservations drift = {.reject_at = change ? 0 : at, .mutate_at = at,
+                .mutation = change == fields + 1u ? 22u : change ? 10u : 0u,
+                .mutable_field_name = change && change <= fields ? names[authority][change - 1u] : NULL,
+                .mutable_parameters = split ? &selected : &parameters[0]};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+                (!change || drift.mutated) && !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && changed.len == sizeof(prefix) - 1u &&
+                changed.buf && !strcmp(changed.buf, prefix));
+            strcpy(names[authority][0], "_Scale"); strcpy(names[authority][1], "_Transform");
+            strcpy(names[authority][2], "_PositionTransform");
+            buffers[0].size = selected_buffers[1].size = full_rows * 16u;
+        }
+    for (unsigned failure = 0; failure < 6; ++failure) {
+        const SerializedVariable saved = variables[authority][1];
+        const SerializedConstantBuffer saved_buffer = buffers[authority];
+        SerializedVariable extra[4] = {variables[authority][0], variables[authority][1], variables[authority][2],
+            {"_Unused", {rows * 16u, 0, 0, 4, 0, 0}}};
+        switch (failure) {
+        case 0: variables[authority][1].layout[3] = 2; break;
+        case 1: variables[authority][1].layout[0] += 4; break;
+        case 2: strcpy(names[authority][1], "_GlobalsLayoutEnd"); break;
+        case 3: buffers[authority].size += 8; if (split) selected_buffers[1].size += 8; break;
+        case 4: variables[authority][1].layout[2] = 2; break;
+        case 5:
+            if (!position) extra[2] = extra[3];
+            buffers[authority].variables = extra; buffers[authority].var_count = (int)fields + 1; break;
+        }
+        sb_free(&changed); sb_init(&changed);
+        const bool emitted = packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic);
+        CHECK(!emitted || !strstr(changed.buf, "float4 _GlobalsLayoutEnd : register("));
+        variables[authority][1] = saved; buffers[authority] = saved_buffer;
+        strcpy(names[authority][1], "_Transform"); selected_buffers[1].size = full_rows * 16u;
     }
     sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
     CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
@@ -8538,6 +8660,11 @@ static bool check_packed_output_emission(void) {
     for (unsigned tail = 0; tail < sizeof(tails) / sizeof(tails[0]); ++tail)
         CHECK(check_packed_scalar_global_tail(tails[tail][0], tails[tail][1], false) &&
             check_packed_scalar_global_tail(tails[tail][0], tails[tail][1], true));
+    for (unsigned split = 0; split < 2; ++split) for (unsigned position = 0; position < 2; ++position) {
+        CHECK(check_packed_global_fields(0, position != 0, split != 0, false) &&
+            check_packed_global_fields(26, position != 0, split != 0, false) &&
+            check_packed_global_fields(position ? 4092u : 4093u, position != 0, split != 0, true));
+    }
     CHECK(check_packed_uint_output());
     return true;
 }

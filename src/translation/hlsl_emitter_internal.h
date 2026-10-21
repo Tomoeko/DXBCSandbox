@@ -668,8 +668,10 @@ bool hlsl_source_quality_packed_output_guard_active(const HLSLEmitterContext *ct
 /* One declaration at the final reflected register preserves an unread tail
  * within the 64 KiB $Globals shell. Complete source replay supplies coverage. */
 #define HLSL_GLOBAL_TAIL_IDENTIFIER "_GlobalsLayoutEnd"
-bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index);
-bool hlsl_scalar_material_metadata_unique(const HLSLEmitterContext *ctx,
+bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index);
+bool hlsl_cbuffer_field_matches(const TempVariable *field, const SerializedVariable *variable,
+    const DecodedVariableLayout *decoded);
+bool hlsl_material_metadata_unique(const HLSLEmitterContext *ctx,
     const HLSLCBufferLayout *buffer, const TempVariable *field);
 bool hlsl_source_quality_cbuffer_syntax(HLSLEmitterContext *ctx, int layout_index,
     HLSLSourceQualityCBufferDeclarationKind kind, int field_index, uint8_t authority);

@@ -41,7 +41,7 @@ static bool name_available(const HLSLEmitterContext *ctx, const HLSLCBufferLayou
     return true;
 }
 
-static bool field_matches(const TempVariable *field, const SerializedVariable *variable,
+bool hlsl_cbuffer_field_matches(const TempVariable *field, const SerializedVariable *variable,
                           const DecodedVariableLayout *decoded) {
     return variable->name && strcmp(variable->name, field->name) == 0 &&
         decoded->scalar_type == field->type && decoded->byte_offset == field->byte_offset &&
@@ -51,7 +51,7 @@ static bool field_matches(const TempVariable *field, const SerializedVariable *v
         parameter_layout_byte_size(decoded) == field->byte_size;
 }
 
-bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index) {
+bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index) {
     if (!ctx || !ctx->program || index != 0 || ctx->program->cbuffer_count != 1 ||
         ctx->cbuffer_layout_count != 1 || !ctx->high_level_packed_outputs ||
         ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
@@ -69,19 +69,26 @@ bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index)
         (layout->reflection_size_bytes & 15u) ||
         layout->reflection_size_bytes <= (uint32_t)layout->row_count * 16u ||
         layout->reflection_size_bytes > CBUFFER_INVENTORY_ROW_LIMIT * 16u ||
-        layout->variable_count != 1 || layout->variable_alloc < 1 || !layout->variables ||
-        layout->use_alloc < 1 || !layout->uses || !layout->uses[0].referenced ||
+        layout->variable_count < 1 || layout->variable_count > 128 ||
+        layout->variable_alloc < layout->variable_count || !layout->variables ||
+        layout->use_alloc < layout->variable_count || !layout->uses ||
         layout->projection_status != DXBC_CBUFFER_PROJECTION_EXACT ||
         !layout->projection.saw_access || layout->projection.saw_dynamic_access ||
-        layout->projection.saw_padding_access) return false;
-    const TempVariable *field = &layout->variables[0];
-    if ((field->authority != 1 && field->authority != 2) || field->type || field->is_matrix ||
-        field->matrix_array_size || field->row_major || field->rows != 1 || field->dim != 1 ||
-        field->byte_size != 4 || field->byte_offset != ((uint32_t)layout->row_count - 1u) * 16u ||
-        field->reg_offset != (uint32_t)layout->row_count - 1u ||
-        !name_available(ctx, layout, field, field->name) ||
-        !name_available(ctx, layout, NULL, HLSL_GLOBAL_TAIL_IDENTIFIER) ||
-        !hlsl_scalar_material_metadata_unique(ctx, layout, field)) return false;
+        layout->projection.saw_padding_access ||
+        !name_available(ctx, layout, NULL, HLSL_GLOBAL_TAIL_IDENTIFIER)) return false;
+    uint32_t last_named_row = 0;
+    for (int variable = 0; variable < layout->variable_count; ++variable) {
+        const TempVariable *field = &layout->variables[variable];
+        if ((field->authority != 1 && field->authority != 2) || !layout->uses[variable].referenced ||
+            field->type || field->is_matrix || field->matrix_array_size || field->row_major ||
+            field->rows != 1 || (field->dim != 1 && field->dim != 4) || field->byte_size != field->dim * 4u ||
+            (field->byte_offset & 15u) || field->byte_offset >= (uint32_t)layout->row_count * 16u ||
+            field->reg_offset != field->byte_offset / 16u ||
+            !name_available(ctx, layout, field, field->name) ||
+            !hlsl_material_metadata_unique(ctx, layout, field)) return false;
+        if (field->reg_offset > last_named_row) last_named_row = field->reg_offset;
+    }
+    if (last_named_row != (uint32_t)layout->row_count - 1u) return false;
     bool shell = false;
     const SerializedProgramParameters *sources[2] = {ctx->params, ctx->common_params};
     for (unsigned source = 0; source < 2; ++source) {
@@ -98,8 +105,14 @@ bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index)
             }
             for (int variable = 0; variable < metadata->var_count; ++variable) {
                 DecodedVariableLayout decoded;
-                if (!parameter_layout_decode(parameters, &metadata->variables[variable], &decoded) ||
-                    !field_matches(field, &metadata->variables[variable], &decoded)) return false;
+                if (!parameter_layout_decode(parameters, &metadata->variables[variable], &decoded)) return false;
+                bool found = false;
+                for (int field = 0; field < layout->variable_count; ++field)
+                    if (hlsl_cbuffer_field_matches(&layout->variables[field], &metadata->variables[variable], &decoded)) {
+                        if (found) return false;
+                        found = true;
+                    }
+                if (!found) return false;
             }
         }
     }
@@ -108,8 +121,17 @@ bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index)
         size_t count = 0;
         const HLSLGlobalDeclarationField *fields =
             hlsl_global_declarations_fields(ctx->global_declarations, &count);
-        if (count != 1 || !fields || !fields[0].current_authority ||
-            strcmp(fields[0].name, field->name)) return false;
+        if (count != (size_t)layout->variable_count || !fields) return false;
+        for (size_t declaration = 0; declaration < count; ++declaration) {
+            if (!fields[declaration].current_authority) return false;
+            bool found = false;
+            for (int field = 0; field < layout->variable_count; ++field)
+                if (!strcmp(fields[declaration].name, layout->variables[field].name)) {
+                    if (found) return false;
+                    found = true;
+                }
+            if (!found) return false;
+        }
     }
     return true;
 }
@@ -197,13 +219,13 @@ bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
                 if (matrix_inventory) {
                     field = UINT32_MAX;
                     for (int candidate = 0; candidate < layout->variable_count; ++candidate) {
-                        if (!field_matches(&layout->variables[candidate], variable, &decoded)) continue;
+                        if (!hlsl_cbuffer_field_matches(&layout->variables[candidate], variable, &decoded)) continue;
                         if (field != UINT32_MAX) return false;
                         field = (uint32_t)candidate;
                     }
                 }
                 if (field >= (uint32_t)layout->variable_count ||
-                    !field_matches(&layout->variables[field], variable, &decoded)) return false;
+                    !hlsl_cbuffer_field_matches(&layout->variables[field], variable, &decoded)) return false;
                 if (field_authorities[field] & (1u << source)) return false;
                 field_authorities[field] |= (uint8_t)(1u << source);
             }
@@ -225,7 +247,7 @@ bool hlsl_source_quality_local_cbuffer_supported(const HLSLEmitterContext *ctx, 
     return (layout->compact_global_layout && !layout->omit_declaration && !layout->raw_storage &&
             !layout->row_struct_storage && !layout->is_unity_builtin &&
             (!layout->compact_global_tail || (hlsl_source_quality_packed_output_guard_active(ctx) &&
-                hlsl_global_scalar_tail_supported(ctx, index)))) ||
+                hlsl_global_tail_supported(ctx, index)))) ||
         hlsl_source_quality_named_cbuffer_supported(ctx, index, NULL);
 }
 

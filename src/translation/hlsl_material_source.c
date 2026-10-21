@@ -59,9 +59,9 @@ static bool bounded_material_name(const char *name) {
 
 /* Include dormant serialized buffers: the ordinary name resolver traverses
  * both inventories, so another buffer's matching identifier cannot own this
- * scalar even when its layout coincides. The two authorities may agree on one
+ * field even when its layout coincides. The two authorities may agree on one
  * exact field; role and buffer identity remain part of that agreement. */
-bool hlsl_scalar_material_metadata_unique(const HLSLEmitterContext *ctx,
+bool hlsl_material_metadata_unique(const HLSLEmitterContext *ctx,
     const HLSLCBufferLayout *buffer, const TempVariable *field) {
     const SerializedProgramParameters *sources[] = {ctx->params, ctx->common_params};
     bool found = false;
@@ -88,9 +88,7 @@ bool hlsl_scalar_material_metadata_unique(const HLSLEmitterContext *ctx,
                      owner->role != SERIALIZED_CBUFFER_LOOSE_PARAMETERS) ||
                     (found && owner->role != role) ||
                     !parameter_layout_decode(parameters, candidate, &layout) ||
-                    layout.scalar_type || layout.rows != 1 || layout.columns != 1 ||
-                    layout.array_size || layout.is_matrix || layout.byte_offset != field->byte_offset ||
-                    parameter_layout_byte_size(&layout) != 4) return false;
+                    !hlsl_cbuffer_field_matches(field, candidate, &layout)) return false;
                 role = owner->role;
                 found = true;
             }
@@ -152,7 +150,7 @@ bool hlsl_packed_uint_material_supported(HLSLEmitterContext *ctx,
         for (int variable = 0; variable < owner->variable_count; ++variable)
             if (!bounded_material_name(owner->variables[variable].name)) return false;
     }
-    if (!material_field_name_unique(ctx, field) || !hlsl_scalar_material_metadata_unique(ctx, buffer, field)) return false;
+    if (!material_field_name_unique(ctx, field) || !hlsl_material_metadata_unique(ctx, buffer, field)) return false;
     int field_offset = -1;
     const char *name = resolve_cb_variable_ctx(ctx, current.cbuffer_binding, (int)current.row,
         current.physical_component, &field_offset);

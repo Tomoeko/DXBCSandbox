@@ -65,7 +65,9 @@ static bool position_mad_leaf_facts(const USILProgram *program,
     if (!program || !program->instructions || piece->instruction_index < 0 ||
         piece->instruction_index >= program->instruction_count ||
         !parameters || parameters->is_binary || parameters->cb_count != 1 ||
-        !parameters->constant_buffers || parameters->res_count != 1 || !parameters->resources)
+        !parameters->constant_buffers || parameters->res_count != 1 || !parameters->resources ||
+        program->cbuffer_count != 1 || !program->cbuffers ||
+        program->cbuffers[0].size < 1 || program->cbuffers[0].size > 4096)
         return false;
     const USILInstruction *instruction = &program->instructions[piece->instruction_index];
     if (instruction->opcode != USIL_OP_MAD || instruction->operand_count != 4 ||
@@ -86,7 +88,7 @@ static bool position_mad_leaf_facts(const USILProgram *program,
         USILOperandUseInfo use;
         if (source->type != OPERAND_TYPE_CONSTANT_BUFFER || source->register_index < 0 ||
             (uint32_t)source->register_index != binding->bind_index || source->rel_offset0 < 0 ||
-            source->rel_offset0 >= PROBE_NATIVE_CB_FIELD_LIMIT ||
+            source->rel_offset0 >= program->cbuffers[0].size ||
             !usil_instruction_operand_use(program, instruction, operand, &use) ||
             use.use != USIL_OPERAND_USE_SOURCE || use.source_lane_mask != piece->mask) return false;
         const uint32_t offset = (uint32_t)source->rel_offset0 * 16u;
@@ -519,48 +521,53 @@ static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
  * used fields only. Keep their counts distinct; certify the projected CB scope
  * with the shared verifier, whose COMPATIBLE result explicitly discards count.
  * Input callbacks are outside this projection and remain independently decoded. */
-static bool native_scalar_global_parameters(const UnityCompilerBinaryResponse *response,
-    SerializedProgramParameters *parameters, const char *role) {
+static bool native_global_parameters(const UnityCompilerBinaryResponse *response,
+    SerializedProgramParameters *parameters, const SerializedProgramParameters *expected, const char *role) {
     if (!response || !parameters || response->reflection_record_count > PROBE_NATIVE_CB_RECORD_LIMIT ||
         (response->reflection_record_count && !response->reflection_records)) return false;
-    UnityCompilerReflectionRecord records[3];
-    size_t count = 0;
+    UnityCompilerReflectionRecord records[5]; size_t count = 0;
+    SerializedVariable fields[3] = {0};
+    SerializedConstantBuffer buffer = {.role = SERIALIZED_CBUFFER_NAMED, .variables = fields};
+    SerializedResourceParam binding = {.bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER, .array_size = 1, .extra = {1}};
+    bool have_shell = false, have_binding = false;
+    int declared_variables = -1;
     for (size_t index = 0; index < response->reflection_record_count; ++index) {
         const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
         if (!native_reflection_record_canonical(record)) return false;
         if (record->kind == UNITY_COMPILER_REFLECTION_INPUT || record->kind == UNITY_COMPILER_REFLECTION_STATS) continue;
-        if (count == 3) return false;
+        if (count == 5 || !record->name) return false;
         records[count++] = *record;
+        if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER) {
+            if (have_shell || have_binding || record->value_count != 2 || record->values[0] < 16 ||
+                record->values[0] > 65536 || (record->values[0] & 15) || record->values[1] < 1 ||
+                record->values[1] > 4096 ||
+                (!hlsl_source_identifier_valid(record->name) && strcmp(record->name, "$Globals"))) return false;
+            buffer.name = record->name; buffer.size = (uint32_t)record->values[0];
+            declared_variables = record->values[1]; have_shell = true;
+        } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT) {
+            if (!have_shell || have_binding || buffer.var_count == 3 || record->value_count != 6 ||
+                record->values[0] < 0 || (record->values[0] & 15) || record->values[1] || record->values[2] ||
+                record->values[3] != 1 || (record->values[4] != 1 && record->values[4] != 4) || record->values[5] ||
+                !hlsl_source_identifier_valid(record->name) || (uint32_t)record->values[0] > buffer.size ||
+                (uint32_t)record->values[4] * 4u > buffer.size - (uint32_t)record->values[0]) return false;
+            fields[buffer.var_count++] = (SerializedVariable){.name = record->name,
+                .layout = {(uint32_t)record->values[0], 0, 0, (uint32_t)record->values[4], 0, 0}};
+        } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) {
+            if (!have_shell || have_binding || !buffer.var_count || record->value_count != 1 ||
+                record->values[0] != 0 || strcmp(record->name, buffer.name)) return false;
+            binding.name = record->name; have_binding = true;
+        } else return false;
     }
-    if (count != 3 || records[0].kind != UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER ||
-        records[1].kind != UNITY_COMPILER_REFLECTION_CONSTANT ||
-        records[2].kind != UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) return false;
-    const UnityCompilerReflectionRecord *shell = &records[0], *constant = &records[1], *binding_record = &records[2];
-    if (!shell->name || !constant->name || !binding_record->name ||
-        shell->value_count != 2 || shell->values[0] < 16 || shell->values[0] > 65536 ||
-        (shell->values[0] & 15) || shell->values[1] < 1 || shell->values[1] > 4096 ||
-        (!hlsl_source_identifier_valid(shell->name) && strcmp(shell->name, "$Globals")) ||
-        constant->value_count != 6 || constant->values[0] < 0 || (constant->values[0] & 15) ||
-        constant->values[0] > shell->values[0] - 16 ||
-        constant->values[1] || constant->values[2] || constant->values[3] != 1 ||
-        constant->values[4] != 1 || constant->values[5] || !hlsl_source_identifier_valid(constant->name) ||
-        binding_record->value_count != 1 || binding_record->values[0] != 0 ||
-        strcmp(binding_record->name, shell->name)) return false;
-    SerializedVariable field = {.name = constant->name,
-        .layout = {(uint32_t)constant->values[0], 0, 0, 1, 0, 0}};
-    SerializedConstantBuffer buffer = {.name = shell->name, .size = (uint32_t)shell->values[0],
-        .role = SERIALIZED_CBUFFER_NAMED, .variables = &field, .var_count = 1};
-    SerializedResourceParam binding = {.name = shell->name, .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER,
-        .array_size = 1, .extra = {1}};
+    if (!have_shell || !have_binding || count != (size_t)buffer.var_count + 2u) return false;
     const SerializedProgramParameters projected = {.constant_buffers = &buffer, .cb_count = 1,
         .resources = &binding, .res_count = 1};
     const PlayerSubProgramMetadata empty_player = {0};
     UnityReflectionCertificateReport report;
     const UnityReflectionCertificateStatus status = unity_reflection_certify_d3d11_bindings(
-        &empty_player, &projected, NULL, records, count, &report);
-    printf("native_scalar_projection role=%s scope=CB-only status=%s declared_variables=%d used_fields=1 "
+        &empty_player, expected ? expected : &projected, NULL, records, count, &report);
+    printf("native_scalar_projection role=%s scope=CB-only status=%s declared_variables=%d used_fields=%d "
            "variable_count_authority=unavailable input_binding_certificate=not-run\n", role,
-        unity_reflection_certificate_status_name(status), shell->values[1]);
+        unity_reflection_certificate_status_name(status), declared_variables, buffer.var_count);
     return status == UNITY_REFLECTION_CERTIFICATE_COMPATIBLE &&
         serialized_program_parameters_copy(parameters, &projected);
 }
@@ -606,29 +613,38 @@ static bool native_cb_parameters_equal(const UnityCompilerBinaryResponse *respon
     const SerializedProgramParameters *original, bool scalar_globals, const char *role) {
     SerializedProgramParameters current;
     serialized_program_parameters_init(&current);
-    const bool equal = (scalar_globals ? native_scalar_global_parameters(response, &current, role) :
-        native_named_parameters(response, &current, role)) &&
-        serialized_program_parameters_equal(original, &current);
+    /* Raw callback field order is not runtime binding authority. The shared
+     * certificate compares the candidate records directly against the original
+     * named/typed fields; only its documented CB variable count is discarded. */
+    const bool equal = scalar_globals
+        ? native_global_parameters(response, &current, original, role)
+        : native_named_parameters(response, &current, role) && serialized_program_parameters_equal(original, &current);
     serialized_program_parameters_free(&current);
     printf("native_cb_projection_equal role=%s original_tuples_equal=%d\n", role, equal);
     return equal;
 }
 
 static bool native_named_program_matches(const USILProgram *program,
-    const SerializedProgramParameters *parameters, bool scalar_globals) {
+    const SerializedProgramParameters *parameters, bool sparse_globals) {
     if (!parameters) return true;
-    return program && parameters->cb_count == 1 && parameters->constant_buffers &&
-        parameters->res_count == 1 && parameters->resources &&
-        program->cbuffer_count == 1 && program->cbuffer_alloc >= 1 && program->cbuffers &&
-        !program->cbuffers[0].dynamic_indexed && program->cbuffers[0].reg_idx >= 0 &&
-        (uint32_t)program->cbuffers[0].reg_idx == parameters->resources[0].bind_index &&
-        program->cbuffers[0].size > 0 && program->cbuffers[0].size <= 4096 &&
-        (scalar_globals ? parameters->constant_buffers[0].var_count == 1 &&
-            parameters->constant_buffers[0].variables &&
-            parameters->constant_buffers[0].variables[0].layout[0] == ((uint32_t)program->cbuffers[0].size - 1u) * 16u &&
-            parameters->constant_buffers[0].size >= (uint32_t)program->cbuffers[0].size * 16u :
-            (uint32_t)program->cbuffers[0].size == parameters->constant_buffers[0].size / 16u) &&
-        !program->texture_count && !program->sampler_count && !program->uav_count;
+    if (!program || parameters->cb_count != 1 || !parameters->constant_buffers ||
+        parameters->res_count != 1 || !parameters->resources || program->cbuffer_count != 1 ||
+        program->cbuffer_alloc < 1 || !program->cbuffers || program->cbuffers[0].dynamic_indexed ||
+        program->cbuffers[0].reg_idx < 0 ||
+        (uint32_t)program->cbuffers[0].reg_idx != parameters->resources[0].bind_index ||
+        program->cbuffers[0].size < 1 || program->cbuffers[0].size > 4096 ||
+        program->texture_count || program->sampler_count || program->uav_count) return false;
+    const SerializedConstantBuffer *buffer = &parameters->constant_buffers[0];
+    if (!sparse_globals) return (uint32_t)program->cbuffers[0].size == buffer->size / 16u;
+    if (buffer->var_count < 1 || buffer->var_count > 3 || !buffer->variables ||
+        buffer->size < (uint32_t)program->cbuffers[0].size * 16u) return false;
+    uint32_t last = 0;
+    for (int field = 0; field < buffer->var_count; ++field) {
+        const uint32_t row = buffer->variables[field].layout[0] / 16u;
+        if (row >= (uint32_t)program->cbuffers[0].size) return false;
+        if (row > last) last = row;
+    }
+    return last == (uint32_t)program->cbuffers[0].size - 1u;
 }
 
 static void print_digest(const char *role, const uint8_t digest[32]) {
@@ -1016,22 +1032,24 @@ static bool packed_output_vertex_shape(const USILProgram *program,
  * immediate representations must agree; no float conversion or token rewrite
  * participates in selecting the actual warm counterexample. */
 static bool packed_output_literal(const USILProgram *program,
-    const USILInstruction *instruction, int operand_index, int packed_register, bool scalar_globals,
+    const USILInstruction *instruction, int operand_index, int packed_register, bool scalar_globals, bool global_fields,
     uint8_t *component_mask, uint8_t *demanded_lanes) {
     if (!program || !instruction || !component_mask || !demanded_lanes ||
-        (scalar_globals ? instruction->opcode != USIL_OP_MAD || instruction->operand_count != 4 || operand_index != 3 :
+        (global_fields ? instruction->opcode != USIL_OP_ADD || instruction->operand_count != 3 || operand_index != 2 :
+            scalar_globals ? instruction->opcode != USIL_OP_MAD || instruction->operand_count != 4 || operand_index != 3 :
             instruction->opcode != USIL_OP_MUL || instruction->operand_count != 3 || operand_index > 2) ||
         instruction->saturate || instruction->precise_mask ||
         operand_index < 1 || operand_index > 3) return false;
     const DXBCOperand *destination = &instruction->operands[0];
     const uint8_t lanes = usil_operand_destination_lane_mask(destination);
     if ((lanes != 3 && lanes != 12 && lanes != 15) ||
-        destination->type != OPERAND_TYPE_OUTPUT ||
+        destination->type != (global_fields ? OPERAND_TYPE_TEMP : OPERAND_TYPE_OUTPUT) ||
         destination->register_index < 0 || destination->register_index_dim != 1 ||
         destination->rel_op0 || destination->rel_op1 || destination->rel_op2 ||
         destination->has_neg || destination->has_abs || destination->min_precision ||
         destination->extended_token_count ||
-        destination->register_index != packed_register) return false;
+        destination->register_index != (global_fields ? 0 : packed_register) ||
+        (global_fields && lanes != 3)) return false;
     const DXBCOperand *operand = &instruction->operands[operand_index];
     USILOperandUseInfo use = {0};
     if (operand->type != OPERAND_TYPE_IMMEDIATE32 || operand->has_neg || operand->has_abs ||
@@ -1048,7 +1066,7 @@ static bool packed_output_literal(const USILProgram *program,
             usil_operand_source_component(operand, lane);
         if (selected < 0 || selected >= operand->imm_value_count ||
             selected >= operand->immediate_word_count ||
-            operand->imm_values[selected] != (scalar_globals ? UINT32_C(0x3f000000) : UINT32_C(0x3ec00000)) ||
+            operand->imm_values[selected] != (global_fields ? UINT32_C(0x3f800000) : scalar_globals ? UINT32_C(0x3f000000) : UINT32_C(0x3ec00000)) ||
             operand->immediate_words[selected] != operand->imm_values[selected]) return false;
         captured |= (uint8_t)(1u << selected);
     }
@@ -1183,6 +1201,8 @@ static bool reconstruct_structured(const DXBCContainerView *target,
             printf("structured_cbuffer index=%d register=%d rows=%d dynamic_indexed=%d\n", index,
                 program.cbuffers[index].reg_idx, program.cbuffers[index].size, program.cbuffers[index].dynamic_indexed);
     }
+    const bool global_fields = scalar_globals && parameters && parameters->cb_count == 1 &&
+        parameters->constant_buffers[0].var_count > 1;
     ProbeDecodedLiteral captured = {0};
     unsigned packed_literal_count = 0;
     for (int index = 0; index < program.instruction_count; ++index) {
@@ -1215,12 +1235,12 @@ static bool reconstruct_structured(const DXBCContainerView *target,
             for (int operand_index = 1; operand_index < instruction->operand_count; ++operand_index) {
                 uint8_t component_mask = 0, demanded_lanes = 0;
                 if (!packed_output_literal(&program, instruction, operand_index,
-                        packed_register, scalar_globals, &component_mask, &demanded_lanes)) continue;
+                        packed_register, scalar_globals, global_fields, &component_mask, &demanded_lanes)) continue;
                 ++packed_literal_count;
                 captured = (ProbeDecodedLiteral){.instruction = index, .operand = operand_index,
                     .component_mask = component_mask,
                     .raw_instruction = instruction->source_instruction_index,
-                    .original_bits = scalar_globals ? UINT32_C(0x3f000000) : UINT32_C(0x3ec00000), .opcode = instruction->opcode,
+                    .original_bits = global_fields ? UINT32_C(0x3f800000) : scalar_globals ? UINT32_C(0x3f000000) : UINT32_C(0x3ec00000), .opcode = instruction->opcode,
                     .demanded_lanes = demanded_lanes,
                     .destination_lanes = usil_operand_destination_lane_mask(&instruction->operands[0]),
                     .valid = true};
@@ -1280,7 +1300,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
             goto done;
         }
         printf("packed_output_literal_scope=%s demanded_lanes=%u destination_lanes=%u\n",
-               captured.destination_lanes == 15 ? "whole-pair-boundary" : "whole-field",
+               global_fields ? "temporary-value" : captured.destination_lanes == 15 ? "whole-pair-boundary" : "whole-field",
                (unsigned)captured.demanded_lanes, (unsigned)captured.destination_lanes);
         if (captured.destination_lanes == 15) {
             printf("packed_output_whole_pair_boundary=excluded instruction=%d "
@@ -2506,7 +2526,7 @@ static void usage(const char *name) {
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture | --inactive-input-fixture | --sampled-fragment-fixture | --scalar-global-fixture]\n"
+        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture | --inactive-input-fixture | --sampled-fragment-fixture | --scalar-global-fixture | --global-fields-fixture]\n"
         "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -2544,6 +2564,8 @@ static void usage(const char *name) {
         "--scalar-global-fixture projects one actual native F32 scalar and a full CB shell. "
         "It reuses the packed vertex flow, a decoded MAD 0.5 literal, and a CB-only COMPATIBLE "
         "reflection certificate; declared-variable count and input bindings remain uncertified.\n"
+        "--global-fields-fixture uses the same CB certificate and cold/warm flow for two or three "
+        "actual scalar/float4 fields. Its counterexample changes the decoded temporary ADD literal.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -2559,7 +2581,9 @@ int main(int argc, char **argv) {
     }
     const bool sampled_fragment_fixture = argc == 5 && !strcmp(argv[4], "--sampled-fragment-fixture");
     const bool inactive_input_fixture = argc == 5 && !strcmp(argv[4], "--inactive-input-fixture");
-    const bool scalar_globals_fixture = argc == 5 && !strcmp(argv[4], "--scalar-global-fixture");
+    const bool global_fields_fixture = argc == 5 && !strcmp(argv[4], "--global-fields-fixture");
+    const bool scalar_globals_fixture = global_fields_fixture ||
+        (argc == 5 && !strcmp(argv[4], "--scalar-global-fixture"));
     const bool packed_output_vertex_fixture = scalar_globals_fixture ||
         (argc == 5 && !strcmp(argv[4], "--packed-output-vertex-fixture"));
     const bool structured_vertex_fixture = packed_output_vertex_fixture ||
@@ -2673,7 +2697,7 @@ int main(int argc, char **argv) {
             goto done;
         }
         if (packed_output_vertex_fixture &&
-            !(scalar_globals_fixture ? native_scalar_global_parameters(&compiled[0], &native_parameters, "original") :
+            !(scalar_globals_fixture ? native_global_parameters(&compiled[0], &native_parameters, NULL, "original") :
                 native_named_parameters(&compiled[0], &native_parameters, "original"))) {
             puts("native_cb_projection=unavailable actual_metadata_not_substituted=1");
             (void)reconstruct_structured(&target, &hull, &structured_literal, false,
@@ -2907,7 +2931,12 @@ int main(int argc, char **argv) {
                "decoded_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
                !result, mutation_diff && mutation_authority ? "different" : "failed",
                !result ? "exact" : "failed");
-    if (scalar_globals_fixture)
+    if (global_fields_fixture)
+        printf("global_fields_isolated_stage_qualified=%d original_target_reference=1 "
+               "actual_add_literal_mutation=%s warm_restore=%s scope=CB-only "
+               "import=not-run runtime=not-run semantic_certificate=not-run\n",
+               !result, mutation_diff && mutation_authority ? "different" : "failed", !result ? "exact" : "failed");
+    if (scalar_globals_fixture && !global_fields_fixture)
         printf("scalar_global_isolated_stage_qualified=%d original_target_reference=1 "
                "actual_mad_literal_mutation=%s warm_restore=%s scope=CB-only "
                "import=not-run runtime=not-run semantic_certificate=not-run\n",
