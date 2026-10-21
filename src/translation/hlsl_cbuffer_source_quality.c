@@ -104,9 +104,9 @@ static bool global_fields_supported(const HLSLEmitterContext *ctx, int index, bo
     if (packed && (first_offset & 15u)) return false;
     bool saw_packed = false;
     for (int variable = 0; variable < layout->variable_count; ++variable) {
-        const int index = packed ? order[variable] : variable;
-        const TempVariable *field = &layout->variables[index];
-        if ((field->authority != 1 && field->authority != 2) || !layout->uses[index].referenced ||
+        const int field_index = packed ? order[variable] : variable;
+        const TempVariable *field = &layout->variables[field_index];
+        if ((field->authority != 1 && field->authority != 2) || !layout->uses[field_index].referenced ||
             field->type || field->is_matrix || field->matrix_array_size || field->row_major ||
             field->rows != 1 || (field->dim != 1 && field->dim != 4) || field->byte_size != field->dim * 4u ||
             (field->byte_offset & (packed ? 3u : 15u)) ||
