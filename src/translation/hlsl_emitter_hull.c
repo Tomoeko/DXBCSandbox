@@ -390,7 +390,7 @@ typedef enum {
     DECODED_OWNER_NATURAL_STRUCTURED,
     DECODED_OWNER_PACKED_OUTPUT,
     DECODED_OWNER_INACTIVE_INPUT,
-    DECODED_OWNER_CUBE_SAMPLE
+    DECODED_OWNER_SAMPLED_FRAGMENT
 } DecodedOwnerStage;
 
 /* Storage and decoded-shape safety only. The structured producer separately
@@ -451,7 +451,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     HLSLSampledFragmentPlan sampled;
     const bool graphics = stage == DECODED_OWNER_NATURAL_STRUCTURED ||
         stage == DECODED_OWNER_PACKED_OUTPUT || stage == DECODED_OWNER_INACTIVE_INPUT ||
-        stage == DECODED_OWNER_CUBE_SAMPLE;
+        stage == DECODED_OWNER_SAMPLED_FRAGMENT;
     switch (stage) {
     case DECODED_OWNER_HULL:
         if (!hull_contract(program, &checked)) return false;
@@ -468,8 +468,9 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     case DECODED_OWNER_INACTIVE_INPUT:
         if (!hlsl_inactive_input_plan_prepare(program, &inactive)) return false;
         break;
-    case DECODED_OWNER_CUBE_SAMPLE:
-        if (!hlsl_sampled_fragment_plan_prepare(program, &sampled) || !sampled.cube) return false;
+    case DECODED_OWNER_SAMPLED_FRAGMENT:
+        if (!hlsl_sampled_fragment_plan_prepare(program, &sampled) ||
+            sampled.texture_kind == HLSL_SAMPLED_TEXTURE_2D) return false;
         break;
     default:
         return false;
@@ -482,8 +483,12 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     static const char packed_output[] = "dxbc-packed-output-owner-v1";
     static const char inactive_input[] = "dxbc-inactive-input-owner-v1";
     static const char cube_sample[] = "dxbc-cube-sample-owner-v1";
-    if (stage == DECODED_OWNER_CUBE_SAMPLE)
-        common_sha256_update(&hash, cube_sample, sizeof(cube_sample));
+    static const char array_sample[] = "dxbc-array-sample-owner-v1";
+    if (stage == DECODED_OWNER_SAMPLED_FRAGMENT) {
+        if (sampled.texture_kind == HLSL_SAMPLED_TEXTURE_CUBE)
+            common_sha256_update(&hash, cube_sample, sizeof(cube_sample));
+        else common_sha256_update(&hash, array_sample, sizeof(array_sample));
+    }
     else if (stage == DECODED_OWNER_INACTIVE_INPUT)
         common_sha256_update(&hash, inactive_input, sizeof(inactive_input));
     else if (stage == DECODED_OWNER_PACKED_OUTPUT)
@@ -525,7 +530,7 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
         for (unsigned index = 0; index < 3; ++index)
             hash_owner_number(&hash, program->compute.thread_group_size[index]);
     }
-    if (stage == DECODED_OWNER_CUBE_SAMPLE) {
+    if (stage == DECODED_OWNER_SAMPLED_FRAGMENT) {
         const USILTexture *texture = &program->textures[0];
         hash_owner_number(&hash, (uint64_t)texture->reg_idx);
         common_sha256_update(&hash, texture->dimension, sizeof(texture->dimension));
@@ -658,8 +663,8 @@ bool hlsl_inactive_input_owned_contract_digest(const USILProgram *program, uint8
     return digest && decoded_stage_owner_digest(program, digest, DECODED_OWNER_INACTIVE_INPUT);
 }
 
-bool hlsl_cube_sample_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
-    return digest && decoded_stage_owner_digest(program, digest, DECODED_OWNER_CUBE_SAMPLE);
+bool hlsl_sampled_fragment_owned_contract_digest(const USILProgram *program, uint8_t digest[32]) {
+    return digest && decoded_stage_owner_digest(program, digest, DECODED_OWNER_SAMPLED_FRAGMENT);
 }
 
 static bool instance_operand(const DXBCOperand *operand, bool control_point) {

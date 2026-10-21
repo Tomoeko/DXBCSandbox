@@ -462,8 +462,8 @@ bool hlsl_source_quality_resource_inventory_complete(const HLSLEmitterContext *c
   for (int texture = 0; texture < program->texture_count; ++texture) {
     const USILTexture *resource = &program->textures[texture];
     const char *name = NULL;
-    if ((strcmp(resource->dimension, "2d") && !(ctx->high_level_cube_sample &&
-            !strcmp(resource->dimension, "cube") && hlsl_cube_sample_admission(ctx))) ||
+    if ((strcmp(resource->dimension, "2d") && !(ctx->high_level_sampled_fragment &&
+            hlsl_sampled_fragment_admission(ctx))) ||
         resource->stride || resource->sample_count ||
         !resolve_srv_name_ctx(ctx, resource->reg_idx, SERIALIZED_RESOURCE_TEXTURE, &name) ||
         !resource_identifier_valid(name) ||

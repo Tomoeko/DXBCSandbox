@@ -58,8 +58,13 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
         (program->has_global_flags && program->global_flags != 1u)) return false;
     const USILTexture *texture = &program->textures[0];
     const USILSampler *sampler = &program->samplers[0];
-    const bool cube = !strcmp(texture->dimension, "cube");
-    if ((!cube && strcmp(texture->dimension, "2d")) || texture->stride || texture->sample_count ||
+    HLSLSampledTextureKind kind;
+    if (!strcmp(texture->dimension, "2d")) kind = HLSL_SAMPLED_TEXTURE_2D;
+    else if (!strcmp(texture->dimension, "cube")) kind = HLSL_SAMPLED_TEXTURE_CUBE;
+    else if (!strcmp(texture->dimension, "2darray")) kind = HLSL_SAMPLED_TEXTURE_2D_ARRAY;
+    else return false;
+    const bool three_coordinates = kind != HLSL_SAMPLED_TEXTURE_2D;
+    if (texture->stride || texture->sample_count ||
         texture->reg_idx < 0 || texture->reg_idx >= HLSL_SM5_RESOURCE_REGISTER_COUNT ||
         sampler->reg_idx < 0 || sampler->reg_idx >= HLSL_SM5_SAMPLER_REGISTER_COUNT) return false;
     for (unsigned lane = 0; lane < 4; ++lane)
@@ -86,13 +91,13 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
     if (!sample_register(&sample->operands[0], OPERAND_TYPE_OUTPUT, UINT32_C(0x001020f2), identity) ||
         sample->operands[0].register_index ||
         !sample_register(&sample->operands[1], OPERAND_TYPE_INPUT,
-            cube ? UINT32_C(0x00101246) : UINT32_C(0x00101046), cube ? xyz : xy) ||
+            three_coordinates ? UINT32_C(0x00101246) : UINT32_C(0x00101046), three_coordinates ? xyz : xy) ||
         !sample_register(&sample->operands[2], OPERAND_TYPE_RESOURCE, UINT32_C(0x00107e46), identity) ||
         sample->operands[2].register_index != texture->reg_idx ||
         !sample_register(&sample->operands[3], OPERAND_TYPE_SAMPLER, UINT32_C(0x00106000), identity) ||
         sample->operands[3].register_index != sampler->reg_idx || (level && !sample_level(&sample->operands[4])))
         return false;
-    const uint8_t coordinate_mask = cube ? 7 : 3;
+    const uint8_t coordinate_mask = three_coordinates ? 7 : 3;
     int coordinate = -1;
     uint32_t registers = 0;
     for (int index = 0; index < program->input_count; ++index) {
@@ -132,16 +137,18 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
         else return false;
     }
     if (!input_seen || !output_seen) return false;
-    *plan = (HLSLSampledFragmentPlan){.present = true, .cube = cube, .explicit_level = level,
+    *plan = (HLSLSampledFragmentPlan){.present = true, .texture_kind = kind, .explicit_level = level,
         .coordinate_field = coordinate, .texture_register = (uint32_t)texture->reg_idx,
         .sampler_register = (uint32_t)sampler->reg_idx};
     return true;
 }
 
-bool hlsl_cube_sample_admission(const HLSLEmitterContext *ctx) {
+bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx) {
     HLSLSampledFragmentPlan plan;
     const char *name = NULL;
-    if (!ctx || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) || !plan.cube) return false;
+    if (!ctx || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) ||
+        plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D) return false;
+    const uint32_t metadata_dimension = plan.texture_kind == HLSL_SAMPLED_TEXTURE_CUBE ? 4 : 5;
     const SerializedProgramParameters *parameters[2] = {ctx->params, ctx->common_params};
     for (unsigned authority = 0; authority < 2; ++authority) {
         const SerializedProgramParameters *source = parameters[authority];
@@ -159,7 +166,7 @@ bool hlsl_cube_sample_admission(const HLSLEmitterContext *ctx) {
             if (resource->bind_type == SERIALIZED_RESOURCE_SAMPLER && resource->bind_index == plan.sampler_register)
                 return false;
             if (resource->bind_type != SERIALIZED_RESOURCE_TEXTURE || resource->bind_index != plan.texture_register) continue;
-            if (!resource->name || strcmp(resource->name, name) || resource->dimension != 4 || resource->multisampled ||
+            if (!resource->name || strcmp(resource->name, name) || resource->dimension != metadata_dimension || resource->multisampled ||
                 resource->sampler_index != plan.sampler_register) return false;
             found = true;
         }

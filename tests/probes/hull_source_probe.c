@@ -528,7 +528,7 @@ static bool native_sampled_parameters(const UnityCompilerBinaryResponse *respons
             !hlsl_source_identifier_valid(record->name) || record->values[0] < 0 ||
             record->values[0] >= HLSL_SM5_RESOURCE_REGISTER_COUNT || record->values[1] < 0 ||
             record->values[1] >= HLSL_SM5_SAMPLER_REGISTER_COUNT || record->values[2] ||
-            (record->values[3] != 2 && record->values[3] != 4)) return false;
+            (record->values[3] != 2 && record->values[3] != 4 && record->values[3] != 5)) return false;
         texture = (SerializedResourceParam){.name = record->name, .bind_type = SERIALIZED_RESOURCE_TEXTURE,
             .bind_index = (uint32_t)record->values[0], .sampler_index = (uint32_t)record->values[1],
             .dimension = (uint32_t)record->values[3], .extra = {(uint32_t)record->values[1], 0}};

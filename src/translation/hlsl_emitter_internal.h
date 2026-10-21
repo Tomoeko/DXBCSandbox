@@ -312,7 +312,7 @@ typedef struct HLSLEmitterContext {
      * when two parameter declarations share one physical input register. */
     bool high_level_packed_inputs;
     bool high_level_inactive_inputs;
-    bool high_level_cube_sample;
+    bool high_level_sampled_fragment;
     uint32_t high_level_input_fields_emitted;
     /* A separate straight-line proof binds packed output signature ordinals,
      * while the established register bitmaps retain their original meaning. */
@@ -511,16 +511,21 @@ typedef struct {
 } HLSLInactiveInputPlan;
 bool hlsl_inactive_input_plan_prepare(const USILProgram *program, HLSLInactiveInputPlan *plan);
 bool hlsl_inactive_input_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+typedef enum {
+    HLSL_SAMPLED_TEXTURE_2D,
+    HLSL_SAMPLED_TEXTURE_CUBE,
+    HLSL_SAMPLED_TEXTURE_2D_ARRAY
+} HLSLSampledTextureKind;
 typedef struct {
     bool present;
-    bool cube;
+    HLSLSampledTextureKind texture_kind;
     bool explicit_level;
     int coordinate_field;
     uint32_t texture_register, sampler_register;
 } HLSLSampledFragmentPlan;
 bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan);
-bool hlsl_cube_sample_admission(const HLSLEmitterContext *ctx);
-bool hlsl_cube_sample_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx);
+bool hlsl_sampled_fragment_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
 
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);
