@@ -215,4 +215,3 @@ bool hlsl_position_output_material_supported(HLSLEmitterContext *ctx,
         !layout.is_matrix && !layout.array_size && layout.byte_offset == field->byte_offset &&
         parameter_layout_byte_size(&layout) == field->byte_size;
 }
-
