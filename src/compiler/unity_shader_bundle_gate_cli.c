@@ -72,27 +72,6 @@ static bool parse_target(const char* value, UnityShaderBundleTarget* target) {
     return false;
 }
 
-static bool parse_backend(const char* value,
-                          UnityShaderBundleBackend* backend) {
-    if (strcmp(value, "metal") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_METAL;
-        return true;
-    }
-    if (strcmp(value, "d3d11") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_D3D11;
-        return true;
-    }
-    if (strcmp(value, "openglcore") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_OPENGLCORE;
-        return true;
-    }
-    if (strcmp(value, "vulkan") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_VULKAN;
-        return true;
-    }
-    return false;
-}
-
 static int unity_shader_bundle_gate_main(int argc, char** argv) {
     UnityShaderBundleGateOptions options;
     unity_shader_bundle_gate_options_init(&options);
@@ -145,8 +124,8 @@ static int unity_shader_bundle_gate_main(int argc, char** argv) {
                 fprintf(stderr, "invalid --target value: %s\n", value);
         } else if (strcmp(argument, "--backend") == 0) {
             const char* value = option_value(argc, argv, &index, argument);
-            backend_seen = value != NULL && parse_backend(value,
-                                                          &options.backend);
+            backend_seen = value != NULL &&
+                unity_shader_bundle_backend_parse(value, &options.backend);
             parse_ok = backend_seen;
             if (value && !backend_seen)
                 fprintf(stderr, "invalid --backend value: %s\n", value);

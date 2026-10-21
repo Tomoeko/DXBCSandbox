@@ -134,6 +134,10 @@ typedef struct {
     ShaderLabStructuralDiagnostic structure;
 } ShaderLabSourceQualityDiagnostic;
 
+/* Compare typed summary fields. NULL inputs are unequal. */
+bool shaderlab_source_quality_results_equal(
+    const ShaderLabSourceQualityResult *a, const ShaderLabSourceQualityResult *b);
+
 /* Initialize with {0}. Disposal resets owned receipts and linked stage map. */
 void shaderlab_source_quality_inventory_dispose(ShaderLabSourceQualityInventory *inventory);
 

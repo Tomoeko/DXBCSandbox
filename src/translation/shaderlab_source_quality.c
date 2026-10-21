@@ -503,7 +503,9 @@ static bool entries_equal(const ShaderLabExpressionSourceRecord *a, const Shader
         instruction_maps_equal(&a->instructions, &b->instructions);
 }
 
-static bool summaries_equal(const ShaderLabSourceQualityResult *a, const ShaderLabSourceQualityResult *b) {
+bool shaderlab_source_quality_results_equal(
+    const ShaderLabSourceQualityResult *a, const ShaderLabSourceQualityResult *b) {
+    if (!a || !b) return false;
     if (a->classification != b->classification || a->reasons != b->reasons || a->gaps != b->gaps ||
         a->wrapper_complete != b->wrapper_complete || a->wrapper_receipt_count != b->wrapper_receipt_count ||
         a->linked_entry_count != b->linked_entry_count ||
@@ -553,7 +555,7 @@ ShaderLabSourceQualityStatus shaderlab_source_quality_inventory_analyze(
         memcmp(inventory->source_digest, canonical.source_digest, 32) ||
         memcmp(inventory->modeled_input_digest, canonical.modeled_input_digest, 32) ||
         inventory->has_structural_authority != canonical.has_structural_authority ||
-        !summaries_equal(&inventory->quality, &canonical.quality) ||
+        !shaderlab_source_quality_results_equal(&inventory->quality, &canonical.quality) ||
         !structures_equal(&inventory->structure, &canonical.structure))
         goto cleanup;
     for (size_t index = 0; index < canonical.receipt_count; ++index)

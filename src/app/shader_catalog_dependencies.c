@@ -153,19 +153,6 @@ static bool release_reports_equal(const ShaderCatalogObjectReport *a, const Shad
         memcmp(a->release_digest, b->release_digest, COMMON_SHA256_DIGEST_SIZE) == 0;
 }
 
-static bool quality_equal(const ShaderLabSourceQualityResult *a, const ShaderLabSourceQualityResult *b) {
-    if (a->classification != b->classification || a->reasons != b->reasons || a->gaps != b->gaps ||
-        a->wrapper_complete != b->wrapper_complete || a->wrapper_receipt_count != b->wrapper_receipt_count ||
-        a->linked_entry_count != b->linked_entry_count ||
-        a->observed_stage_residual_total != b->observed_stage_residual_total ||
-        a->observed_stage_unknown_provenance != b->observed_stage_unknown_provenance ||
-        a->observed_stage_incomplete_units != b->observed_stage_incomplete_units ||
-        a->required_external_include_root_count != b->required_external_include_root_count) return false;
-    for (unsigned index = 0; index < 5; ++index)
-        if (a->stage_class_counts[index] != b->stage_class_counts[index]) return false;
-    return true;
-}
-
 static bool observations_equal(const ShaderCatalogDependencies *owned, const ShaderCatalogDependencies *current,
     const ShaderCatalogDependenciesInput *input) {
     const ShaderCatalogDependenciesSummary *a = &owned->summary, *b = &current->summary;
@@ -181,7 +168,7 @@ static bool observations_equal(const ShaderCatalogDependencies *owned, const Sha
         a->nonmodifiable_texture_count != b->nonmodifiable_texture_count ||
         a->parsed_dependency_count != b->parsed_dependency_count ||
         a->has_emitted_source != b->has_emitted_source || a->source_status != b->source_status ||
-        !quality_equal(&a->base_quality, &b->base_quality) ||
+        !shaderlab_source_quality_results_equal(&a->base_quality, &b->base_quality) ||
         owned->has_d3d11_archive != current->has_d3d11_archive ||
         memcmp(owned->root_digest, current->root_digest, COMMON_SHA256_DIGEST_SIZE) != 0)
         return false;
@@ -211,10 +198,10 @@ static bool observations_equal(const ShaderCatalogDependencies *owned, const Sha
         ShaderLabSourceQualityRequest current_request = source_request(current);
         if (shaderlab_source_quality_inventory_analyze(&original_request, &owned->source,
                 &owned->inventory, &quality, &diagnostic) != SHADERLAB_SOURCE_QUALITY_OK ||
-            !quality_equal(&quality, &a->base_quality) ||
+            !shaderlab_source_quality_results_equal(&quality, &a->base_quality) ||
             shaderlab_source_quality_inventory_analyze(&current_request, &owned->source,
                 &owned->inventory, &quality, &diagnostic) != SHADERLAB_SOURCE_QUALITY_OK ||
-            !quality_equal(&quality, &b->base_quality)) return false;
+            !shaderlab_source_quality_results_equal(&quality, &b->base_quality)) return false;
     } else if (owned->source.len || owned->source.buf || owned->inventory.complete ||
         owned->inventory.receipts || owned->inventory.receipt_count || owned->inventory.receipt_capacity ||
         owned->inventory.entries.records || owned->inventory.entries.count || owned->inventory.entries.capacity ||

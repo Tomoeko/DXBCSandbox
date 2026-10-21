@@ -616,26 +616,6 @@ static bool parse_target(const char* value, UnityShaderBundleTarget* target) {
     return false;
 }
 
-static bool parse_backend(const char* value, UnityShaderBundleBackend* backend) {
-    if (strcmp(value, "metal") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_METAL;
-        return true;
-    }
-    if (strcmp(value, "d3d11") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_D3D11;
-        return true;
-    }
-    if (strcmp(value, "openglcore") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_OPENGLCORE;
-        return true;
-    }
-    if (strcmp(value, "vulkan") == 0) {
-        *backend = UNITY_SHADER_BUNDLE_BACKEND_VULKAN;
-        return true;
-    }
-    return false;
-}
-
 static bool parse_status(const char* value,
                          UnityShaderBundleGateStatus* status) {
     if (strcmp(value, "passed") == 0) {
@@ -761,7 +741,7 @@ UnityShaderBundleGateStatus unity_shader_bundle_gate_parse_result_json(
         } else if (bit == TOP_BACKEND) {
             char value[24];
             if (!json_parse_string(&cursor, value, sizeof(value)) ||
-                !parse_backend(value, &declared.backend)) {
+                !unity_shader_bundle_backend_parse(value, &declared.backend)) {
                 return UNITY_SHADER_BUNDLE_GATE_RESULT_INVALID;
             }
         } else if (bit == TOP_POLICY) {
@@ -972,6 +952,28 @@ const char* unity_shader_bundle_backend_name(UnityShaderBundleBackend backend) {
         case UNITY_SHADER_BUNDLE_BACKEND_VULKAN: return "vulkan";
         default: return "invalid";
     }
+}
+
+bool unity_shader_bundle_backend_parse(
+    const char* value, UnityShaderBundleBackend* backend) {
+    if (!value || !backend) return false;
+    if (strcmp(value, "metal") == 0) {
+        *backend = UNITY_SHADER_BUNDLE_BACKEND_METAL;
+        return true;
+    }
+    if (strcmp(value, "d3d11") == 0) {
+        *backend = UNITY_SHADER_BUNDLE_BACKEND_D3D11;
+        return true;
+    }
+    if (strcmp(value, "openglcore") == 0) {
+        *backend = UNITY_SHADER_BUNDLE_BACKEND_OPENGLCORE;
+        return true;
+    }
+    if (strcmp(value, "vulkan") == 0) {
+        *backend = UNITY_SHADER_BUNDLE_BACKEND_VULKAN;
+        return true;
+    }
+    return false;
 }
 
 const char* unity_shader_bundle_gate_status_name(
