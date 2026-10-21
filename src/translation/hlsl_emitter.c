@@ -2328,6 +2328,9 @@ static bool hlsl_emit_with_options_impl(
       !ctx.unity_uv_helper && hlsl_inactive_input_plan_prepare(program, &inactive_inputs);
   ctx.high_level_sampled_fragment = emit_mode == HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE &&
       !ctx.unity_uv_helper && hlsl_sampled_fragment_admission(&ctx);
+  HLSLSampledFragmentPlan sampled_inputs = {0};
+  ctx.high_level_inactive_sample_inputs = ctx.high_level_sampled_fragment &&
+      hlsl_sampled_fragment_plan_prepare(program, &sampled_inputs) && sampled_inputs.inactive_typed_inputs;
   ctx.preferred_output_struct_name = output_struct;
   ctx.preferred_input_struct_name = input_struct;
   ctx.entry_point_name = entry_point;

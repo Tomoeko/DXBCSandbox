@@ -8728,6 +8728,14 @@ static bool check_inactive_input_emission(void) {
     return true;
 }
 
+typedef enum {
+    SAMPLED_INACTIVE_NONE,
+    SAMPLED_INACTIVE_ARRAY_INDEX,
+    SAMPLED_INACTIVE_FRONT_FACE,
+    SAMPLED_INACTIVE_UINT,
+    SAMPLED_INACTIVE_SINT
+} SampledInactiveKind;
+
 typedef struct {
     NaturalIfFixture decoded;
     char texture_name[32];
@@ -8736,7 +8744,8 @@ typedef struct {
     const SerializedProgramParameters *common_parameters;
 } SampledFragmentFixture;
 
-static bool sampled_fragment_fixture(SampledFragmentFixture *fixture, unsigned model, HLSLSampledTextureKind kind, bool level) {
+static bool sampled_fragment_fixture_with_inactive(SampledFragmentFixture *fixture, unsigned model,
+    HLSLSampledTextureKind kind, bool level, SampledInactiveKind inactive) {
     memset(fixture, 0, sizeof(*fixture));
     memcpy(fixture->texture_name, "_Texture", sizeof("_Texture"));
     fixture->texture = (SerializedResourceParam){.name = fixture->texture_name,
@@ -8745,9 +8754,23 @@ static bool sampled_fragment_fixture(SampledFragmentFixture *fixture, unsigned m
     const bool three_coordinates = kind != HLSL_SAMPLED_TEXTURE_2D;
     const uint32_t dimension = kind == HLSL_SAMPLED_TEXTURE_2D ? 3u : kind == HLSL_SAMPLED_TEXTURE_CUBE ? 6u : 8u;
     const uint8_t mask = three_coordinates ? 7 : 3;
-    const DXBCSignatureElement inputs[2] = {
+    DXBCSignatureElement inputs[3] = {
         {.semantic_name = "SV_POSITION", .component_type = 3, .system_value = 1, .mask = 15},
         {.semantic_name = "TEXCOORD", .component_type = 3, .register_id = 1, .mask = mask, .rw_mask = mask}};
+    if (inactive != SAMPLED_INACTIVE_NONE) {
+        inputs[2] = (DXBCSignatureElement){.register_id = 2, .mask = 1,
+            .component_type = inactive == SAMPLED_INACTIVE_SINT ? 2 : 1};
+        if (inactive == SAMPLED_INACTIVE_ARRAY_INDEX) {
+            memcpy(inputs[2].semantic_name, "SV_RenderTargetArrayIndex", sizeof("SV_RenderTargetArrayIndex"));
+            inputs[2].system_value = 4;
+        } else if (inactive == SAMPLED_INACTIVE_FRONT_FACE) {
+            memcpy(inputs[2].semantic_name, "SV_IsFrontFace", sizeof("SV_IsFrontFace"));
+            inputs[2].system_value = 9;
+        } else {
+            memcpy(inputs[2].semantic_name, "TEXCOORD", sizeof("TEXCOORD"));
+            inputs[2].semantic_index = 1;
+        }
+    }
     const DXBCSignatureElement output = {.semantic_name = "SV_Target", .component_type = 3, .mask = 15};
     uint32_t words[40];
     size_t count = 0;
@@ -8772,8 +8795,13 @@ static bool sampled_fragment_fixture(SampledFragmentFixture *fixture, unsigned m
     SAMPLE_WORD(UINT32_C(0x0100003e));
 #undef SAMPLE_WORD
     CHECK(natural_if_fixture_decode_words(&fixture->decoded, model == 5 ? UINT32_C(0x50) : UINT32_C(0x40),
-        words, count, inputs, 2, &output, 1));
+        words, count, inputs, inactive == SAMPLED_INACTIVE_NONE ? 2 : 3, &output, 1));
     return true;
+}
+
+static bool sampled_fragment_fixture(SampledFragmentFixture *fixture, unsigned model,
+    HLSLSampledTextureKind kind, bool level) {
+    return sampled_fragment_fixture_with_inactive(fixture, model, kind, level, SAMPLED_INACTIVE_NONE);
 }
 
 typedef struct {
@@ -8788,7 +8816,7 @@ static bool observe_sampled_fragment(void *context, const HLSLSourceQualityObser
     SampledFragmentFixture *fixture = state->fixture;
     USILProgram *program = &fixture->decoded.program;
     switch (state->base.mutation) {
-    case 18: fixture->texture.dimension = 2; break;
+    case 18: fixture->texture.dimension = fixture->texture.dimension == 2 ? 4 : 2; break;
     case 19: fixture->texture_name[1] ^= 1; break;
     case 20: program->textures[0].dimension[0] ^= 1; break;
     case 21: program->textures = NULL; break;
@@ -8797,6 +8825,16 @@ static bool observe_sampled_fragment(void *context, const HLSLSourceQualityObser
     case 24: program->samplers[0].mode = 1; break;
     case 25: program->texture_count = 0; break;
     case 26: program->instructions = NULL; break;
+    case 27: program->inputs[2].component_type = 2; break;
+    case 28: program->inputs[2].semantic_name[0] ^= 1; break;
+    case 29: program->inputs[2].rw_mask = 1; break;
+    case 30: program->inputs[2].min_precision = 1; break;
+    case 31: program->inputs[2].interpolation_mode = 1; break;
+    case 32: program->inputs[2].mask = 2; break;
+    case 33: program->inputs[2].register_id = 1; break;
+    case 34: program->inputs[2].system_value = 0; break;
+    case 35: program->input_count = 2; break;
+    case 36: program->instructions[0].operands[1].register_index = 2; break;
     default: return false;
     }
     state->base.mutated = true;
@@ -8820,12 +8858,15 @@ static bool sampled_fragment_emit(SampledFragmentFixture *fixture, StringBuilder
         fixture->common_parameters, &names, &options, diagnostic);
 }
 
-static bool check_sampled_fragment_positive(unsigned model, HLSLSampledTextureKind kind, bool level) {
+static bool check_sampled_fragment_positive(unsigned model, HLSLSampledTextureKind kind, bool level,
+    SampledInactiveKind inactive) {
     SampledFragmentFixture fixture;
-    CHECK(sampled_fragment_fixture(&fixture, model, kind, level));
+    CHECK(sampled_fragment_fixture_with_inactive(&fixture, model, kind, level, inactive));
     HLSLSampledFragmentPlan plan;
     CHECK(hlsl_sampled_fragment_plan_prepare(&fixture.decoded.program, &plan) && plan.present &&
-        plan.texture_kind == kind && plan.explicit_level == level && plan.coordinate_field == 1);
+        plan.texture_kind == kind && plan.explicit_level == level && plan.coordinate_field == 1 &&
+        plan.inactive_typed_inputs == (inactive != SAMPLED_INACTIVE_NONE) &&
+        plan.input_registers == (inactive == SAMPLED_INACTIVE_NONE ? 3u : 7u));
     StringBuilder source; sb_init(&source);
     HLSLExpressionSourceMap map;
     HLSLSourceQualityResult quality;
@@ -8838,6 +8879,11 @@ static bool check_sampled_fragment_positive(unsigned model, HLSLSampledTextureKi
         kind == HLSL_SAMPLED_TEXTURE_CUBE ? "TextureCube<float4> _Texture" : "Texture2DArray<float4> _Texture") &&
         strstr(source.buf, level ? "_Texture.SampleLevel(" : "_Texture.Sample(") &&
         !strstr(source.buf, ".xyzw") && !strstr(source.buf, "asfloat"));
+    if (inactive != SAMPLED_INACTIVE_NONE) {
+        CHECK(strstr(source.buf, inactive == SAMPLED_INACTIVE_FRONT_FACE ? "bool frontFace" :
+            inactive == SAMPLED_INACTIVE_ARRAY_INDEX ? "uint renderTargetArrayIndex" :
+            inactive == SAMPLED_INACTIVE_SINT ? "int texcoord1" : "uint texcoord1"));
+    }
     for (unsigned requested = 0; requested < 4; ++requested) {
         StringBuilder repeated; sb_init(&repeated);
         HLSLExpressionSourceMap repeated_map;
@@ -8867,13 +8913,16 @@ static bool check_sampled_fragment_positive(unsigned model, HLSLSampledTextureKi
     return true;
 }
 
-static bool check_sampled_fragment_callbacks(HLSLSampledTextureKind kind, bool level) {
+static bool check_sampled_fragment_callbacks(HLSLSampledTextureKind kind, bool level, bool inactive) {
     SampledFragmentFixture fixture;
-    CHECK(sampled_fragment_fixture(&fixture, 5, kind, level));
+    CHECK(sampled_fragment_fixture_with_inactive(&fixture, 5, kind, level,
+        inactive ? SAMPLED_INACTIVE_ARRAY_INDEX : SAMPLED_INACTIVE_NONE));
     USILProgram *program = &fixture.decoded.program;
     const USILProgram parent = *program;
     const USILInstruction sample = program->instructions[0];
     const DXBCSignatureElement input = program->inputs[1];
+    const DXBCSignatureElement inactive_field = inactive ? program->inputs[2] : (DXBCSignatureElement){0};
+    const SerializedResourceParam binding = fixture.texture;
     const USILSignatureDeclaration declaration = program->signature_declarations[0];
     const USILTexture texture = program->textures[0];
     const USILSampler sampler = program->samplers[0];
@@ -8885,13 +8934,14 @@ static bool check_sampled_fragment_callbacks(HLSLSampledTextureKind kind, bool l
     CHECK(sampled_fragment_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic) && packed_output_clean(&quality));
     const unsigned events = observer.base.observations;
     CHECK(events > 2);
-    for (unsigned mutation = 1; mutation <= 26; ++mutation) for (unsigned event = 1; event <= events; ++event) {
+    for (unsigned mutation = 1; mutation <= (inactive ? 36u : 26u); ++mutation) for (unsigned event = 1; event <= events; ++event) {
         StringBuilder changed; sb_init(&changed); sb_append(&changed, "// caller prefix\n");
         SampledFragmentObserver drift = {.base = {.mutation = mutation, .mutate_at = event}};
         const bool emitted = sampled_fragment_emit(&fixture, &changed, &map, &quality, &drift, &diagnostic);
         *program = parent; program->instructions[0] = sample; program->inputs[1] = input;
         program->signature_declarations[0] = declaration; program->textures[0] = texture; program->samplers[0] = sampler;
-        fixture.parameters.resources = &fixture.texture; fixture.texture.dimension = kind == HLSL_SAMPLED_TEXTURE_CUBE ? 4 : 5;
+        if (inactive) program->inputs[2] = inactive_field;
+        fixture.parameters.resources = &fixture.texture; fixture.texture = binding;
         memcpy(fixture.texture_name, "_Texture", sizeof("_Texture"));
         if (emitted || !drift.base.mutated) fprintf(stderr, "Sampled callback level=%d action=%u event=%u emitted=%d mutated=%d\n",
             level, mutation, event, emitted, drift.base.mutated);
@@ -9004,15 +9054,86 @@ static bool check_sampled_fragment_boundaries(HLSLSampledTextureKind kind) {
     return true;
 }
 
+static bool check_sampled_fragment_inactive_boundaries(void) {
+    SampledFragmentFixture fixture;
+    CHECK(sampled_fragment_fixture_with_inactive(&fixture, 5, HLSL_SAMPLED_TEXTURE_2D, true,
+        SAMPLED_INACTIVE_ARRAY_INDEX));
+    USILProgram *program = &fixture.decoded.program;
+    const DXBCSignatureElement coordinate = program->inputs[1], inactive = program->inputs[2];
+    HLSLSampledFragmentPlan plan;
+    CHECK(hlsl_sampled_fragment_plan_prepare(program, &plan) && plan.inactive_typed_inputs &&
+        hlsl_natural_float_program_contract(program) != HLSL_EMIT_REASON_NONE);
+    HLSLEmitterContext context = {.program = program, .params = &fixture.parameters};
+    CHECK(hlsl_sampled_fragment_admission(&context));
+    StringBuilder baseline; sb_init(&baseline);
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    HLSLEmitDiagnostic diagnostic;
+    CHECK(sampled_fragment_emit(&fixture, &baseline, &map, &quality, NULL, &diagnostic) && packed_output_clean(&quality));
+    for (unsigned mutation = 0; mutation < 12; ++mutation) {
+        switch (mutation) {
+        case 0: program->inputs[1].component_type = 1; break;
+        case 1: program->inputs[2].rw_mask = 1; break;
+        case 2: program->inputs[2].interpolation_mode = 1; break;
+        case 3: program->inputs[2].component_type = 2; break;
+        case 4: memset(program->inputs[2].semantic_name, 0, sizeof(program->inputs[2].semantic_name));
+            memcpy(program->inputs[2].semantic_name, "SV_Depth", sizeof("SV_Depth")); break;
+        case 5: program->inputs[2].register_id = 1; break;
+        case 6: program->inputs[2].mask = 2; break;
+        case 7: program->inputs[2].min_precision = 1; break;
+        case 8: program->inputs[2].stream_index = 1; break;
+        case 9: program->inputs[2].register_id = HLSL_SM5_IO_REGISTER_COUNT; break;
+        case 10: program->inputs[2].component_type = 0; break;
+        case 11: program->inputs[2].system_value = 0; break;
+        }
+        CHECK(!hlsl_sampled_fragment_plan_prepare(program, &plan) && !plan.present &&
+            !hlsl_sampled_fragment_admission(&context));
+        StringBuilder changed; sb_init(&changed);
+        CHECK(!sampled_fragment_emit(&fixture, &changed, &map, &quality, NULL, &diagnostic) &&
+            quality.classification != HLSL_SOURCE_QUALITY_CLEAN && !map.complete && !map.count);
+        program->inputs[1] = coordinate; program->inputs[2] = inactive;
+        sb_free(&changed); sb_init(&changed);
+        CHECK(sampled_fragment_emit(&fixture, &changed, &map, &quality, NULL, &diagnostic) &&
+            packed_output_clean(&quality) && changed.len == baseline.len &&
+            !memcmp(changed.buf, baseline.buf, baseline.len) &&
+            hlsl_expression_source_map_matches(&map, program, changed.buf));
+        sb_free(&changed);
+    }
+    const SerializedResourceParam binding = fixture.texture;
+    for (unsigned dimension = 4; dimension <= 5; ++dimension) {
+        fixture.texture.dimension = dimension;
+        CHECK(!hlsl_sampled_fragment_admission(&context));
+        StringBuilder changed; sb_init(&changed);
+        CHECK(!sampled_fragment_emit(&fixture, &changed, &map, &quality, NULL, &diagnostic) &&
+            quality.classification != HLSL_SOURCE_QUALITY_CLEAN && !map.complete && !map.count);
+        sb_free(&changed);
+    }
+    fixture.texture = binding;
+    CHECK(hlsl_sampled_fragment_admission(&context));
+    sb_free(&baseline); natural_if_fixture_dispose(&fixture.decoded);
+    return true;
+}
+
 static bool check_sampled_fragment_emission(void) {
     for (unsigned model = 4; model <= 5; ++model) {
-        CHECK(check_sampled_fragment_positive(model, HLSL_SAMPLED_TEXTURE_2D, false));
+        CHECK(check_sampled_fragment_positive(model, HLSL_SAMPLED_TEXTURE_2D, false, SAMPLED_INACTIVE_NONE));
         for (HLSLSampledTextureKind kind = HLSL_SAMPLED_TEXTURE_CUBE; kind <= HLSL_SAMPLED_TEXTURE_2D_ARRAY; ++kind)
-            CHECK(check_sampled_fragment_positive(model, kind, false) && check_sampled_fragment_positive(model, kind, true));
+            CHECK(check_sampled_fragment_positive(model, kind, false, SAMPLED_INACTIVE_NONE) && check_sampled_fragment_positive(model, kind, true, SAMPLED_INACTIVE_NONE));
     }
     for (HLSLSampledTextureKind kind = HLSL_SAMPLED_TEXTURE_CUBE; kind <= HLSL_SAMPLED_TEXTURE_2D_ARRAY; ++kind)
-        CHECK(check_sampled_fragment_boundaries(kind) && check_sampled_fragment_callbacks(kind, false) &&
-            check_sampled_fragment_callbacks(kind, true));
+        CHECK(check_sampled_fragment_boundaries(kind) && check_sampled_fragment_callbacks(kind, false, false) &&
+            check_sampled_fragment_callbacks(kind, true, false));
+    for (unsigned model = 4; model <= 5; ++model) {
+        for (SampledInactiveKind inactive = SAMPLED_INACTIVE_ARRAY_INDEX; inactive <= SAMPLED_INACTIVE_SINT; ++inactive)
+            CHECK(check_sampled_fragment_positive(model, HLSL_SAMPLED_TEXTURE_2D, false, inactive) &&
+                check_sampled_fragment_positive(model, HLSL_SAMPLED_TEXTURE_2D, true, inactive));
+        for (HLSLSampledTextureKind kind = HLSL_SAMPLED_TEXTURE_CUBE; kind <= HLSL_SAMPLED_TEXTURE_2D_ARRAY; ++kind)
+            CHECK(check_sampled_fragment_positive(model, kind, false, SAMPLED_INACTIVE_ARRAY_INDEX) &&
+                check_sampled_fragment_positive(model, kind, true, SAMPLED_INACTIVE_ARRAY_INDEX));
+    }
+    CHECK(check_sampled_fragment_inactive_boundaries());
+    CHECK(check_sampled_fragment_callbacks(HLSL_SAMPLED_TEXTURE_2D, false, true) &&
+        check_sampled_fragment_callbacks(HLSL_SAMPLED_TEXTURE_2D, true, true));
     return true;
 }
 

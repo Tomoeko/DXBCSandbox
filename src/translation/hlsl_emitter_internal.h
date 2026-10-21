@@ -313,6 +313,7 @@ typedef struct HLSLEmitterContext {
     bool high_level_packed_inputs;
     bool high_level_inactive_inputs;
     bool high_level_sampled_fragment;
+    bool high_level_inactive_sample_inputs;
     uint32_t high_level_input_fields_emitted;
     /* A separate straight-line proof binds packed output signature ordinals,
      * while the established register bitmaps retain their original meaning. */
@@ -511,6 +512,8 @@ typedef struct {
 } HLSLInactiveInputPlan;
 bool hlsl_inactive_input_plan_prepare(const USILProgram *program, HLSLInactiveInputPlan *plan);
 bool hlsl_inactive_input_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+/* The caller separately validates signature storage, types, masks and use. */
+bool hlsl_inactive_input_semantic_supported(const DXBCSignatureElement *field);
 typedef enum {
     HLSL_SAMPLED_TEXTURE_2D,
     HLSL_SAMPLED_TEXTURE_CUBE,
@@ -520,7 +523,9 @@ typedef struct {
     bool present;
     HLSLSampledTextureKind texture_kind;
     bool explicit_level;
+    bool inactive_typed_inputs;
     int coordinate_field;
+    uint32_t input_registers;
     uint32_t texture_register, sampler_register;
 } HLSLSampledFragmentPlan;
 bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan);

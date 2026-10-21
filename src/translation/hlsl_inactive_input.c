@@ -8,7 +8,7 @@
 /* Unused fields still belong to the released interface. Retain their types,
  * semantics and order; only the actual MOV source may supply an expression.
  * This proof deliberately grants no integer or packed-input dataflow. */
-static bool input_semantic_supported(const DXBCSignatureElement *field) {
+bool hlsl_inactive_input_semantic_supported(const DXBCSignatureElement *field) {
     const char *semantic = dxbc_signature_semantic_name(field);
     switch (field->system_value) {
     case 0:
@@ -110,7 +110,7 @@ bool hlsl_inactive_input_plan_prepare(const USILProgram *program, HLSLInactiveIn
         const DXBCSignatureElement *input = &program->inputs[field];
         if (input->component_type < 1 || input->component_type > 3 || !input->mask || input->mask > 15 ||
             input->register_id >= HLSL_SM5_IO_REGISTER_COUNT || input->stream_index || input->min_precision ||
-            !input_semantic_supported(input) || (occupied[input->register_id] & input->mask)) return false;
+            !hlsl_inactive_input_semantic_supported(input) || (occupied[input->register_id] & input->mask)) return false;
         for (int previous = 0; previous < field; ++previous)
             if (program->inputs[previous].semantic_index == input->semantic_index &&
                 !dxbc_ascii_strcasecmp(dxbc_signature_semantic_name(&program->inputs[previous]),
