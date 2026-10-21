@@ -352,7 +352,7 @@ static const BuiltinVariable *find_unity_include_builtin(
  * target byte offset is deliberately not compared: flattening is the operation
  * which changed it.  A known name with a conflicting shape is malformed for
  * this compile environment and must fail closed instead of being redeclared. */
-static int unity_include_global_alias_status(const TempVariable *variable) {
+int hlsl_unity_include_global_alias_status(const TempVariable *variable) {
   if (!variable || !variable->name) return 0;
   const BuiltinVariable *contract = NULL;
   for (size_t index = 0; index < G_BUILTINS_COUNT; ++index) {
@@ -1394,6 +1394,9 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
     if (!layout->compact_global_layout && hlsl_global_tail_supported(ctx, index)) {
       layout->compact_global_layout = true;
       layout->compact_global_tail = true;
+    } else if (!layout->compact_global_layout && hlsl_global_packing_supported(ctx, index, NULL, NULL)) {
+      layout->compact_global_layout = true;
+      layout->compact_global_packing = true;
     }
     if (layout->projection_status == DXBC_CBUFFER_PROJECTION_INVALID) {
       fail_cbuffer_location(
@@ -1718,20 +1721,36 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
       continue;
     }
 
+    uint32_t prefix_rows = 0, suffix_rows = 0;
+    int field_order[HLSL_GLOBAL_FIELD_LIMIT];
+    if (layout->compact_global_packing) {
+      if (!hlsl_global_packing_supported(ctx, i, &prefix_rows, &suffix_rows) ||
+          !hlsl_global_field_order(layout, field_order)) {
+        fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
+            HLSL_EMIT_PHASE_CBUFFER_EMISSION, HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY, i, -1);
+        return;
+      }
+      if (prefix_rows) {
+        sb_appendf(sb, "    // Preserve the first field offset.\n    float4 %s[%u];\n",
+            HLSL_GLOBAL_PREFIX_IDENTIFIER, prefix_rows);
+        hlsl_source_quality_emission(ctx, 0, false, -1);
+      }
+    }
     uint32_t current_byte_offset = 0;
     for (int k = 0; k < layout->variable_count; k++) {
-        const TempVariable *var = &layout->variables[k];
+        const int field_index = layout->compact_global_packing ? field_order[k] : k;
+        const TempVariable *var = &layout->variables[field_index];
         uint32_t target_byte_offset = var->byte_offset;
         const size_t field_begin = sb->len;
 
         if (ctx->omit_unity_builtin_declarations && layout->is_globals) {
           const int global_alias =
-              unity_include_global_alias_status(var);
+              hlsl_unity_include_global_alias_status(var);
           if (global_alias < 0) {
             fail_cbuffer_location(
                 ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
                 HLSL_EMIT_PHASE_CBUFFER_EMISSION,
-                HLSL_EMIT_REASON_BUILTIN_CONTRACT_MISMATCH, i, k);
+                HLSL_EMIT_REASON_BUILTIN_CONTRACT_MISMATCH, i, field_index);
             return;
           }
           if (global_alias > 0 ||
@@ -1774,12 +1793,12 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
 
         // Compute packoffset string
         char packoffset_str[32] = "";
-        if (layout->compact_global_layout) {
+        if (layout->compact_global_layout && !layout->compact_global_packing) {
           if (!hlsl_format_checked(ctx, packoffset_str, sizeof(packoffset_str),
                                    " : register(c%u)", target_byte_offset / 16U)) {
             fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INTERNAL_INVARIANT,
                                   HLSL_EMIT_PHASE_CBUFFER_EMISSION,
-                                  HLSL_EMIT_REASON_FIXED_BUFFER_OVERFLOW, i, k);
+                                  HLSL_EMIT_REASON_FIXED_BUFFER_OVERFLOW, i, field_index);
             return;
           }
         } else if (use_packoffset) {
@@ -1793,7 +1812,7 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
             fail_cbuffer_location(
                 ctx, HLSL_EMIT_STATUS_INTERNAL_INVARIANT,
                 HLSL_EMIT_PHASE_CBUFFER_EMISSION,
-                HLSL_EMIT_REASON_FIXED_BUFFER_OVERFLOW, i, k);
+                HLSL_EMIT_REASON_FIXED_BUFFER_OVERFLOW, i, field_index);
             return;
           }
         }
@@ -1833,7 +1852,7 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
         }
         current_byte_offset = target_byte_offset + var->byte_size;
         if (named_inventory && sb_ok(sb) && sb->len > field_begin) {
-          if (!hlsl_source_quality_cbuffer_syntax(ctx, i, HLSL_SOURCE_CBUFFER_FIELD, k,
+          if (!hlsl_source_quality_cbuffer_syntax(ctx, i, HLSL_SOURCE_CBUFFER_FIELD, field_index,
                                                 var->authority)) return;
           ++layout->source_quality_fields_emitted;
         }
@@ -1879,6 +1898,20 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
         sb_appendf(sb, "    // Preserve the constant buffer size.\n"
             "    float4 %s : register(c%u);\n", HLSL_GLOBAL_TAIL_IDENTIFIER, layout->reflection_size_bytes / 16u - 1u);
         hlsl_source_quality_emission(ctx, 0, false, -1);
+      }
+      if (layout->compact_global_packing) {
+        uint32_t current_prefix = 0, current_suffix = 0;
+        if (!hlsl_global_packing_supported(ctx, i, &current_prefix, &current_suffix) ||
+            current_prefix != prefix_rows || current_suffix != suffix_rows) {
+          fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
+              HLSL_EMIT_PHASE_CBUFFER_EMISSION, HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY, i, -1);
+          return;
+        }
+        if (suffix_rows) {
+          sb_appendf(sb, "    // Preserve the constant buffer size.\n    float4 %s[%u];\n",
+              HLSL_GLOBAL_SUFFIX_IDENTIFIER, suffix_rows);
+          hlsl_source_quality_emission(ctx, 0, false, -1);
+        }
       }
       uint32_t total_size_bytes = layout->reflection_size_bytes;
       if (current_byte_offset < total_size_bytes && !layout->compact_global_layout &&

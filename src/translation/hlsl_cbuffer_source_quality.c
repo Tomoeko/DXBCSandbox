@@ -51,7 +51,25 @@ bool hlsl_cbuffer_field_matches(const TempVariable *field, const SerializedVaria
         parameter_layout_byte_size(decoded) == field->byte_size;
 }
 
-bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index) {
+/* Order declarations without moving fields or their parallel use records.
+ * Stage-specific fields may precede common fields at lower byte offsets. */
+bool hlsl_global_field_order(const HLSLCBufferLayout *layout, int order[HLSL_GLOBAL_FIELD_LIMIT]) {
+    if (!layout || !order || layout->variable_count < 1 || layout->variable_count > HLSL_GLOBAL_FIELD_LIMIT ||
+        layout->variable_alloc < layout->variable_count || !layout->variables) return false;
+    for (int field = 0; field < layout->variable_count; ++field) {
+        const uint32_t offset = layout->variables[field].byte_offset;
+        int place = field;
+        while (place && layout->variables[order[place - 1]].byte_offset > offset) {
+            order[place] = order[place - 1]; --place;
+        }
+        if (place && layout->variables[order[place - 1]].byte_offset == offset) return false;
+        order[place] = field;
+    }
+    return true;
+}
+
+static bool global_fields_supported(const HLSLEmitterContext *ctx, int index, bool packed,
+    uint32_t *prefix_rows, uint32_t *suffix_rows) {
     if (!ctx || !ctx->program || index != 0 || ctx->program->cbuffer_count != 1 ||
         ctx->cbuffer_layout_count != 1 || !ctx->high_level_packed_outputs ||
         ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
@@ -67,7 +85,8 @@ bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index) {
         layout->raw_storage || layout->row_struct_storage || layout->omit_declaration ||
         layout->row_count < 1 || layout->row_count >= CBUFFER_INVENTORY_ROW_LIMIT ||
         (layout->reflection_size_bytes & 15u) ||
-        layout->reflection_size_bytes <= (uint32_t)layout->row_count * 16u ||
+        (packed ? layout->reflection_size_bytes < (uint32_t)layout->row_count * 16u :
+            layout->reflection_size_bytes <= (uint32_t)layout->row_count * 16u) ||
         layout->reflection_size_bytes > CBUFFER_INVENTORY_ROW_LIMIT * 16u ||
         layout->variable_count < 1 || layout->variable_count > 128 ||
         layout->variable_alloc < layout->variable_count || !layout->variables ||
@@ -75,20 +94,39 @@ bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index) {
         layout->projection_status != DXBC_CBUFFER_PROJECTION_EXACT ||
         !layout->projection.saw_access || layout->projection.saw_dynamic_access ||
         layout->projection.saw_padding_access ||
-        !name_available(ctx, layout, NULL, HLSL_GLOBAL_TAIL_IDENTIFIER)) return false;
-    uint32_t last_named_row = 0;
+        (packed ? !name_available(ctx, layout, NULL, HLSL_GLOBAL_PREFIX_IDENTIFIER) ||
+            !name_available(ctx, layout, NULL, HLSL_GLOBAL_SUFFIX_IDENTIFIER) :
+            !name_available(ctx, layout, NULL, HLSL_GLOBAL_TAIL_IDENTIFIER))) return false;
+    int order[HLSL_GLOBAL_FIELD_LIMIT];
+    if (packed && !hlsl_global_field_order(layout, order)) return false;
+    uint32_t last_named_row = 0, cursor = layout->variables[packed ? order[0] : 0].byte_offset;
+    const uint32_t first_offset = cursor;
+    if (packed && (first_offset & 15u)) return false;
+    bool saw_packed = false;
     for (int variable = 0; variable < layout->variable_count; ++variable) {
-        const TempVariable *field = &layout->variables[variable];
-        if ((field->authority != 1 && field->authority != 2) || !layout->uses[variable].referenced ||
+        const int index = packed ? order[variable] : variable;
+        const TempVariable *field = &layout->variables[index];
+        if ((field->authority != 1 && field->authority != 2) || !layout->uses[index].referenced ||
             field->type || field->is_matrix || field->matrix_array_size || field->row_major ||
             field->rows != 1 || (field->dim != 1 && field->dim != 4) || field->byte_size != field->dim * 4u ||
-            (field->byte_offset & 15u) || field->byte_offset >= (uint32_t)layout->row_count * 16u ||
+            (field->byte_offset & (packed ? 3u : 15u)) ||
+            field->byte_offset >= (uint32_t)layout->row_count * 16u ||
             field->reg_offset != field->byte_offset / 16u ||
             !name_available(ctx, layout, field, field->name) ||
             !hlsl_material_metadata_unique(ctx, layout, field)) return false;
+        if (packed) {
+            if (ctx->omit_unity_builtin_declarations &&
+                (hlsl_unity_include_global_alias_status(field) != 0 ||
+                 is_unity_builtin_variable_ex(field->name, ctx->common_params))) return false;
+            const uint32_t aligned = field->dim == 4 ? (cursor + 15u) / 16u * 16u : cursor;
+            if (field->byte_offset != aligned) return false;
+            saw_packed |= (field->byte_offset & 15u) != 0;
+            cursor = aligned + field->byte_size;
+        }
         if (field->reg_offset > last_named_row) last_named_row = field->reg_offset;
     }
-    if (last_named_row != (uint32_t)layout->row_count - 1u) return false;
+    if (last_named_row != (uint32_t)layout->row_count - 1u ||
+        (packed && (!saw_packed || (cursor + 15u) / 16u != (uint32_t)layout->row_count))) return false;
     bool shell = false;
     const SerializedProgramParameters *sources[2] = {ctx->params, ctx->common_params};
     for (unsigned source = 0; source < 2; ++source) {
@@ -133,7 +171,18 @@ bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index) {
             if (!found) return false;
         }
     }
+    if (prefix_rows) *prefix_rows = first_offset / 16u;
+    if (suffix_rows) *suffix_rows = layout->reflection_size_bytes / 16u - (uint32_t)layout->row_count;
     return true;
+}
+
+bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index) {
+    return global_fields_supported(ctx, index, false, NULL, NULL);
+}
+
+bool hlsl_global_packing_supported(const HLSLEmitterContext *ctx, int index,
+    uint32_t *prefix_rows, uint32_t *suffix_rows) {
+    return global_fields_supported(ctx, index, true, prefix_rows, suffix_rows);
 }
 
 static bool layout_has_matrix_field(const HLSLCBufferLayout *layout) {
@@ -247,7 +296,9 @@ bool hlsl_source_quality_local_cbuffer_supported(const HLSLEmitterContext *ctx, 
     return (layout->compact_global_layout && !layout->omit_declaration && !layout->raw_storage &&
             !layout->row_struct_storage && !layout->is_unity_builtin &&
             (!layout->compact_global_tail || (hlsl_source_quality_packed_output_guard_active(ctx) &&
-                hlsl_global_tail_supported(ctx, index)))) ||
+                hlsl_global_tail_supported(ctx, index))) &&
+            (!layout->compact_global_packing || (hlsl_source_quality_packed_output_guard_active(ctx) &&
+                hlsl_global_packing_supported(ctx, index, NULL, NULL)))) ||
         hlsl_source_quality_named_cbuffer_supported(ctx, index, NULL);
 }
 

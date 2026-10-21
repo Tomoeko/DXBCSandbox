@@ -546,8 +546,9 @@ static bool native_global_parameters(const UnityCompilerBinaryResponse *response
             declared_variables = record->values[1]; have_shell = true;
         } else if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT) {
             if (!have_shell || have_binding || buffer.var_count == 3 || record->value_count != 6 ||
-                record->values[0] < 0 || (record->values[0] & 15) || record->values[1] || record->values[2] ||
+                record->values[0] < 0 || (record->values[0] & 3) || record->values[1] || record->values[2] ||
                 record->values[3] != 1 || (record->values[4] != 1 && record->values[4] != 4) || record->values[5] ||
+                (record->values[4] == 4 && (record->values[0] & 15)) ||
                 !hlsl_source_identifier_valid(record->name) || (uint32_t)record->values[0] > buffer.size ||
                 (uint32_t)record->values[4] * 4u > buffer.size - (uint32_t)record->values[0]) return false;
             fields[buffer.var_count++] = (SerializedVariable){.name = record->name,

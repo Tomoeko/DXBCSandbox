@@ -1326,6 +1326,8 @@ bool hlsl_high_level_name_available(const HLSLEmitterContext *ctx, const char *n
   for (int buffer = 0; buffer < ctx->cbuffer_layout_count; ++buffer) {
     const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[buffer];
     if (layout->compact_global_tail && !strcmp(name, HLSL_GLOBAL_TAIL_IDENTIFIER)) return false;
+    if (layout->compact_global_packing && (!strcmp(name, HLSL_GLOBAL_PREFIX_IDENTIFIER) ||
+        !strcmp(name, HLSL_GLOBAL_SUFFIX_IDENTIFIER))) return false;
     if (layout->declaration_name && strcmp(layout->declaration_name, name) == 0) return false;
     for (int variable = 0; variable < layout->variable_count; ++variable)
       if (layout->variables[variable].name &&

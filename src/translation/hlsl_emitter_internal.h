@@ -71,9 +71,10 @@ typedef struct {
     char* declaration_name;
     bool is_globals;
     /* Named, row-aligned fields cover the captured implicit-global shell.
-     * Explicit constant bindings avoid anonymous padding declarations. */
+     * Explicit bindings or proven natural packing preserve the full layout. */
     bool compact_global_layout;
     bool compact_global_tail;
+    bool compact_global_packing;
     /* Derived only after the strict high-level HULL scalar preparation and
      * named declaration authority both pass: b0 has one 4-byte float at
      * offset zero in one 16-byte row. Implicit cbuffer rounding preserves
@@ -668,7 +669,16 @@ bool hlsl_source_quality_packed_output_guard_active(const HLSLEmitterContext *ct
 /* One declaration at the final reflected register preserves an unread tail
  * within the 64 KiB $Globals shell. Complete source replay supplies coverage. */
 #define HLSL_GLOBAL_TAIL_IDENTIFIER "_GlobalsLayoutEnd"
+#define HLSL_GLOBAL_FIELD_LIMIT 128
+bool hlsl_global_field_order(const HLSLCBufferLayout *layout, int order[HLSL_GLOBAL_FIELD_LIMIT]);
+#define HLSL_GLOBAL_PREFIX_IDENTIFIER "_GlobalsLayoutPrefix"
+#define HLSL_GLOBAL_SUFFIX_IDENTIFIER "_GlobalsLayoutSuffix"
 bool hlsl_global_tail_supported(const HLSLEmitterContext *ctx, int index);
+/* Adjacent typed fields retain implicit HLSL packing. Unread float4 arrays
+ * preserve prefix/suffix rows; the exact projection excludes reads of either. */
+bool hlsl_global_packing_supported(const HLSLEmitterContext *ctx, int index,
+    uint32_t *prefix_rows, uint32_t *suffix_rows);
+int hlsl_unity_include_global_alias_status(const TempVariable *variable);
 bool hlsl_cbuffer_field_matches(const TempVariable *field, const SerializedVariable *variable,
     const DecodedVariableLayout *decoded);
 bool hlsl_material_metadata_unique(const HLSLEmitterContext *ctx,
