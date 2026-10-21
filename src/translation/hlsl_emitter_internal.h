@@ -871,6 +871,12 @@ bool resolve_variable_layout_ctx(const HLSLEmitterContext* ctx,
                                  DecodedVariableLayout* out_layout);
 /* Shared metadata-backed material atoms. Stage scopes retain their own operand,
  * phase and scalar-width admission; these helpers never grant stage authority. */
+/* Scoped serialized-field proofs; these inspect existing layouts and allocate
+ * neither source nor AST nodes. They never grant declaration-quality coverage. */
+bool hlsl_packed_uint_material_supported(HLSLEmitterContext *ctx,
+    const HLSLPackedUIntOutputPlan *plan);
+bool hlsl_position_output_material_supported(HLSLEmitterContext *ctx,
+    const HLSLPositionOutputPlan *plan);
 bool hlsl_material_source_supported(HLSLEmitterContext *ctx,
                                     const DXBCOperand *source, uint8_t lanes);
 ASTExpr *hlsl_material_source_expression(HLSLEmitterContext *ctx, int instruction,
