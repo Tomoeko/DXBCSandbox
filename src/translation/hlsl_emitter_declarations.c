@@ -1391,6 +1391,10 @@ bool build_cbuffer_emission_layouts(HLSLEmitterContext *ctx) {
         (size_t)layout->variable_count, layout->uses,
         &layout->projection);
     free(ranges);
+    if (!layout->compact_global_layout && hlsl_global_scalar_tail_supported(ctx, index)) {
+      layout->compact_global_layout = true;
+      layout->compact_global_tail = true;
+    }
     if (layout->projection_status == DXBC_CBUFFER_PROJECTION_INVALID) {
       fail_cbuffer_location(
           ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
@@ -1866,6 +1870,16 @@ void emit_cbuffers(HLSLEmitterContext* ctx) {
       /* Extend only the source/reflection shell. The executable access model
        * continues to use row_count from stripped DXBC. D3DCompiler retains
        * this unused tail in reflection while trimming it from dcl_constantbuffer. */
+      if (layout->compact_global_tail) {
+        if (!hlsl_global_scalar_tail_supported(ctx, i)) {
+          fail_cbuffer_location(ctx, HLSL_EMIT_STATUS_INVALID_METADATA,
+              HLSL_EMIT_PHASE_CBUFFER_EMISSION, HLSL_EMIT_REASON_CONFLICTING_METADATA_AUTHORITY, i, -1);
+          return;
+        }
+        sb_appendf(sb, "    // Preserve the constant buffer size.\n"
+            "    float4 %s : register(c%u);\n", HLSL_GLOBAL_TAIL_IDENTIFIER, (uint32_t)layout->row_count);
+        hlsl_source_quality_emission(ctx, 0, false, -1);
+      }
       uint32_t total_size_bytes = layout->reflection_size_bytes;
       if (current_byte_offset < total_size_bytes && !layout->compact_global_layout &&
           !natural_hull_scalar) {

@@ -73,6 +73,7 @@ typedef struct {
     /* Named, row-aligned fields cover the captured implicit-global shell.
      * Explicit constant bindings avoid anonymous padding declarations. */
     bool compact_global_layout;
+    bool compact_global_tail;
     /* Derived only after the strict high-level HULL scalar preparation and
      * named declaration authority both pass: b0 has one 4-byte float at
      * offset zero in one 16-byte row. Implicit cbuffer rounding preserves
@@ -664,6 +665,12 @@ bool hlsl_source_quality_cbuffer_inventory_complete(const HLSLEmitterContext *ct
 bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
     int layout_index, uint8_t *shell_authority);
 bool hlsl_source_quality_packed_output_guard_active(const HLSLEmitterContext *ctx);
+/* One unread final row preserves the serialized $Globals shell without a
+ * bank of anonymous declarations. Complete source replay supplies coverage. */
+#define HLSL_GLOBAL_TAIL_IDENTIFIER "_GlobalsLayoutEnd"
+bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index);
+bool hlsl_scalar_material_metadata_unique(const HLSLEmitterContext *ctx,
+    const HLSLCBufferLayout *buffer, const TempVariable *field);
 bool hlsl_source_quality_cbuffer_syntax(HLSLEmitterContext *ctx, int layout_index,
     HLSLSourceQualityCBufferDeclarationKind kind, int field_index, uint8_t authority);
 void emit_cbuffer_helpers(HLSLEmitterContext* ctx);

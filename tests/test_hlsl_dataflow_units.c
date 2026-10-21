@@ -6003,10 +6003,12 @@ typedef struct {
  * document/signature/declaration/USIL decoder chain above. */
 typedef struct { unsigned row; bool different_rows, second_buffer; } PackedPositionMADConfig;
 typedef struct { unsigned placement; } PackedMatrixReceiptConfig;
+typedef struct { unsigned row; } PackedScalarGlobalConfig;
 
 static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fixture, unsigned arithmetic,
     bool reversed, bool union_declaration, unsigned boundary, unsigned cbuffer, unsigned position_width,
-    const PackedPositionMADConfig *mad, const PackedMatrixReceiptConfig *matrix) {
+    const PackedPositionMADConfig *mad, const PackedMatrixReceiptConfig *matrix,
+    const PackedScalarGlobalConfig *scalar) {
     memset(fixture, 0, sizeof(*fixture));
     dxbc_document_init(&fixture->decoded.document);
     dxbc_stage_contract_init(&fixture->decoded.contract);
@@ -6014,6 +6016,7 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
     CHECK(!position_width || (position_width >= 2 && position_width <= 4 && !boundary && !cbuffer));
     CHECK(!mad || (position_width && mad->row < 2 && arithmetic == 1 && !reversed));
     CHECK(!matrix || (matrix->placement < 3 && cbuffer == 2 && arithmetic == 1 && !mad));
+    CHECK(!scalar || (scalar->row < 4095 && cbuffer == 1 && !mad && !matrix));
     uint32_t words[96]; size_t count = 0;
 #define PACKED_WORD(value) do { CHECK(count < sizeof(words) / sizeof(words[0])); words[count++] = (value); } while (0)
 #define PACKED_INST(opcode, length) ((uint32_t)(opcode) | (uint32_t)(length) << 24u)
@@ -6032,7 +6035,7 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
     if (cbuffer || mad) {
         PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(0);
         PACKED_WORD(mad ? mad->different_rows ? 2u : mad->row + 1u :
-            cbuffer == 2 ? matrix && matrix->placement ? 5u : 4u : 1u);
+            cbuffer == 2 ? matrix && matrix->placement ? 5u : 4u : scalar ? scalar->row + 1u : 1u);
     }
     if (mad && mad->second_buffer) {
         PACKED_WORD(PACKED_INST(89, 4)); PACKED_WORD(UINT32_C(0x00208000)); PACKED_WORD(1); PACKED_WORD(1);
@@ -6100,7 +6103,8 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
         PACKED_WORD(PACKED_INST(raw_opcode, length));
         PACKED_WORD(UINT32_C(0x00102002) | (uint32_t)mask << 4u); PACKED_WORD(1);
         if (cbuffer_source) {
-            PACKED_WORD(UINT32_C(0x00208046)); PACKED_WORD(0); PACKED_WORD(0);
+            PACKED_WORD(scalar ? UINT32_C(0x00208006) : UINT32_C(0x00208046));
+            PACKED_WORD(0); PACKED_WORD(scalar ? scalar->row : 0);
         } else {
             PACKED_WORD(natural_if_source_token(OPERAND_TYPE_INPUT, selection)); PACKED_WORD(is_xy ? 1 : 2);
         }
@@ -6152,7 +6156,7 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
     CHECK(program->cbuffer_count == (mad && mad->second_buffer ? 2 : cbuffer || mad ? 1 : 0));
     if (cbuffer || mad) CHECK(program->cbuffers[0].reg_idx == 0 && program->cbuffers[0].size ==
         (mad ? (int)(mad->different_rows ? 2u : mad->row + 1u) :
-            cbuffer == 2 ? matrix && matrix->placement ? 5 : 4 : 1) && !program->cbuffers[0].dynamic_indexed);
+            cbuffer == 2 ? matrix && matrix->placement ? 5 : 4 : scalar ? (int)scalar->row + 1 : 1) && !program->cbuffers[0].dynamic_indexed);
     if (mad && mad->second_buffer) CHECK(program->cbuffers[1].reg_idx == 1 && program->cbuffers[1].size == 1 &&
         !program->cbuffers[1].dynamic_indexed);
     return true;
@@ -6161,7 +6165,7 @@ static bool packed_output_fixture_layout_position_config(PackedOutputFixture *fi
 static bool packed_output_fixture_layout_position(PackedOutputFixture *fixture, unsigned arithmetic,
     bool reversed, bool union_declaration, unsigned boundary, unsigned cbuffer, unsigned position_width) {
     return packed_output_fixture_layout_position_config(fixture, arithmetic, reversed, union_declaration,
-        boundary, cbuffer, position_width, NULL, NULL);
+        boundary, cbuffer, position_width, NULL, NULL, NULL);
 }
 
 static bool packed_output_fixture_layout(PackedOutputFixture *fixture, unsigned arithmetic,
@@ -6792,6 +6796,112 @@ static bool check_packed_output_cbuffer(void) {
     return true;
 }
 
+/* An unread reflection tail is source layout, not another executable CB row.
+ * Exercise the same parsed instruction and ownership path as the vector cases. */
+static bool check_packed_scalar_global_tail(unsigned row, bool split) {
+    const PackedScalarGlobalConfig config = {.row = row};
+    PackedOutputFixture fixture;
+    CHECK(packed_output_fixture_layout_position_config(&fixture, 0, false, false, 0, 1, 0, NULL, NULL, &config));
+    PackedOutputCBufferMetadata metadata; packed_output_cbuffer_metadata(&metadata);
+    for (unsigned authority = 0; authority < 2; ++authority) {
+        strcpy(metadata.buffer_names[authority], "$Globals");
+        metadata.fields[authority].layout[0] = row * 16u;
+        metadata.fields[authority].layout[3] = 1;
+        metadata.buffers[authority].size = (row + 2u) * 16u;
+    }
+    SerializedConstantBuffer selected_buffers[2] = {
+        {.name = "$Globals", .role = SERIALIZED_CBUFFER_LOOSE_PARAMETERS},
+        {.name = "$Globals", .role = SERIALIZED_CBUFFER_NAMED, .size = (row + 2u) * 16u}};
+    SerializedProgramParameters selected = {.is_binary = true, .constant_buffers = selected_buffers, .cb_count = 2};
+    if (split) {
+        metadata.buffers[1].has_is_partial = true; metadata.buffers[1].is_partial = true;
+        fixture.parameters = &selected; fixture.common_parameters = &metadata.parameters[1];
+    } else fixture.parameters = &metadata.parameters[0];
+    const unsigned authority = split ? 1u : 0u;
+    StringBuilder baseline, changed; sb_init(&baseline); sb_init(&changed);
+    const char prefix[] = "// caller prefix\n"; sb_append(&baseline, prefix);
+    HLSLExpressionSourceMap map, changed_map;
+    HLSLSourceQualityResult quality, changed_quality;
+    HLSLEmitDiagnostic diagnostic;
+    PackedOutputObservations observer = {0};
+    CHECK(packed_output_emit(&fixture, &baseline, &map, &quality, &observer, &diagnostic) &&
+        packed_output_clean(&quality) && !observer.wrong_owner && !observer.cbuffer_events &&
+        !quality.counts.cbuffer_fields && map.complete &&
+        hlsl_expression_source_map_matches(&map, &fixture.decoded.program, baseline.buf));
+    char declaration[96]; snprintf(declaration, sizeof(declaration), "float _Scale : register(c%u);", row);
+    CHECK(strstr(baseline.buf, declaration));
+    snprintf(declaration, sizeof(declaration), "float4 _GlobalsLayoutEnd : register(c%u);", row + 1u);
+    CHECK(strstr(baseline.buf, declaration) && !strstr(baseline.buf, "cb0_"));
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+        CHECK(packed_output_emit(&fixture, &changed, outputs & 1u ? &changed_map : NULL,
+            outputs & 2u ? &changed_quality : NULL, NULL, &diagnostic) &&
+            changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len));
+        if (outputs & 1u) CHECK(natural_if_maps_equal(&map, &changed_map));
+        if (outputs & 2u) CHECK(hlsl_source_quality_results_equal(&quality, &changed_quality));
+    }
+    /* Every public observation is synchronous. Vetoes and metadata drift must
+     * roll back the source and map, including during the declaration itself. */
+    if (row == 26) for (unsigned mutation = 0; mutation < 2; ++mutation)
+        for (size_t at = 1; at <= observer.observations; ++at) {
+            PackedOutputObservations drift = {.reject_at = mutation ? 0 : at, .mutate_at = at, .mutation = mutation ? 10u : 0u,
+                .mutable_field_name = metadata.field_names[authority]};
+            sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+            CHECK(!packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, &drift, &diagnostic) &&
+                (!mutation || drift.mutated) && !changed_map.complete && !changed_map.count &&
+                changed_quality.classification == HLSL_SOURCE_QUALITY_FAILED && changed.len == sizeof(prefix) - 1u &&
+                changed.buf && !strcmp(changed.buf, prefix));
+            strcpy(metadata.field_names[authority], "_Scale");
+        }
+    /* Known fields, shell identity and the exact single-row extent are never
+     * discarded to qualify a compact declaration. Some are valid fallbacks. */
+    for (unsigned failure = 0; failure < 11; ++failure) {
+        const SerializedConstantBuffer saved = metadata.buffers[authority];
+        const SerializedVariable saved_field = metadata.fields[authority];
+        SerializedVariable extra[2] = {saved_field, {"_Unused", {(row + 1u) * 16u, 0, 0, 4, 0, 0}}};
+        SerializedConstantBuffer owners[2] = {saved, saved}; owners[1].name = "UnusedInputs";
+        const SerializedProgramParameters saved_parameters = metadata.parameters[authority];
+        DXBCOperand *read = &fixture.decoded.program.instructions[fixture.xy_writer].operands[1];
+        const DXBCOperand saved_read = *read;
+        const HLSLEmitNames collision = {.entry_point = "_GlobalsLayoutEnd"};
+        PackedOutputObservations names = {.names = &collision};
+        switch (failure) {
+        case 0: metadata.buffers[authority].size += 16; if (split) selected_buffers[1].size += 16; break;
+        case 1: metadata.buffers[authority].variables = extra; metadata.buffers[authority].var_count = 2; break;
+        case 2: strcpy(metadata.field_names[authority], "_GlobalsLayoutEnd"); break;
+        case 3: strcpy(metadata.buffer_names[authority], "MaterialInputs"); break;
+        case 4: metadata.fields[authority].layout[3] = 2; break;
+        case 5: fixture.decoded.program.cbuffers[0].dynamic_indexed = true; break;
+        case 6: metadata.fields[authority].layout[0] += 4; break;
+        case 7: metadata.buffers[authority].has_is_partial = true; metadata.buffers[authority].is_partial = true;
+            if (split) selected_buffers[1].has_is_partial = selected_buffers[1].is_partial = true;
+            break;
+        case 8: read->swizzle[1] = 1; read->raw_token |= UINT32_C(1) << 6u; break;
+        case 9: break; /* The caller entry name occupies the reserved tail identifier. */
+        case 10: metadata.parameters[authority].constant_buffers = owners;
+            metadata.parameters[authority].cb_count = 2; break;
+        }
+        sb_free(&changed); sb_init(&changed);
+        const bool emitted = packed_output_emit(&fixture, &changed, &changed_map, &changed_quality,
+            failure == 9 ? &names : NULL, &diagnostic);
+        CHECK(!emitted || !strstr(changed.buf, "float4 _GlobalsLayoutEnd : register("));
+        if (emitted && failure == 0)
+            CHECK(changed_quality.classification != HLSL_SOURCE_QUALITY_CLEAN);
+        metadata.buffers[authority] = saved; metadata.fields[authority] = saved_field;
+        metadata.parameters[authority] = saved_parameters; *read = saved_read;
+        strcpy(metadata.buffer_names[authority], "$Globals"); strcpy(metadata.field_names[authority], "_Scale");
+        selected_buffers[1].size = (row + 2u) * 16u;
+        selected_buffers[1].has_is_partial = selected_buffers[1].is_partial = false;
+        fixture.decoded.program.cbuffers[0].dynamic_indexed = false;
+    }
+    sb_free(&changed); sb_init(&changed); sb_append(&changed, prefix);
+    CHECK(packed_output_emit(&fixture, &changed, &changed_map, &changed_quality, NULL, &diagnostic) &&
+        changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len) &&
+        natural_if_maps_equal(&map, &changed_map) && hlsl_source_quality_results_equal(&quality, &changed_quality));
+    sb_free(&baseline); sb_free(&changed); natural_if_fixture_dispose(&fixture.decoded);
+    return true;
+}
+
 static bool packed_output_owned_matrix(PackedOutputFixture *fixture, ASTExpr **owned) {
     HLSLEmitterContext ctx; StringBuilder scratch; HLSLEmitDiagnostic diagnostic;
     CHECK(packed_output_prepare_context(fixture, &ctx, &scratch, &diagnostic));
@@ -7025,7 +7135,7 @@ static bool packed_matrix_receipt_metadata(PackedMatrixReceiptMetadata *metadata
 
 static bool packed_matrix_receipt_fixture(PackedOutputFixture *fixture, unsigned placement) {
     const PackedMatrixReceiptConfig config = {.placement = placement};
-    CHECK(packed_output_fixture_layout_position_config(fixture, 1, false, false, 0, 2, 0, NULL, &config));
+    CHECK(packed_output_fixture_layout_position_config(fixture, 1, false, false, 0, 2, 0, NULL, &config, NULL));
     const USILProgram *program = &fixture->decoded.program;
     CHECK(program->instruction_count == 7 && program->temp_count == 1 &&
         program->instructions[0].source_instruction_index == 9 && fixture->xy_writer == 4 && fixture->zw_writer == 5);
@@ -7546,7 +7656,7 @@ static bool packed_position_mad_metadata(PackedPositionMADMetadata *metadata, un
 
 static bool packed_position_mad_fixture(PackedOutputFixture *fixture, unsigned row, bool different_rows) {
     const PackedPositionMADConfig config = {.row = row, .different_rows = different_rows};
-    return packed_output_fixture_layout_position_config(fixture, 1, false, false, 0, 0, 3, &config, NULL);
+    return packed_output_fixture_layout_position_config(fixture, 1, false, false, 0, 0, 3, &config, NULL, NULL);
 }
 
 static bool packed_position_material_leaf(const ASTExpr *leaf, const USILProgram *program, int operand,
@@ -7800,7 +7910,7 @@ static bool check_packed_position_mad_rejections(void) {
 
 static bool check_packed_position_mad_duplicate_field(void) {
     PackedOutputFixture fixture; const PackedPositionMADConfig config = {.second_buffer = true};
-    CHECK(packed_output_fixture_layout_position_config(&fixture, 1, false, false, 0, 0, 3, &config, NULL));
+    CHECK(packed_output_fixture_layout_position_config(&fixture, 1, false, false, 0, 0, 3, &config, NULL, NULL));
     PackedPositionMADMetadata metadata; CHECK(packed_position_mad_metadata(&metadata, 1));
     char other_name[32] = "_PositionScaleOffset";
     SerializedVariable other = {.name = other_name, .layout = {0, 1, 4, 0, 0, 0}};
@@ -8407,6 +8517,10 @@ static bool check_packed_output_emission(void) {
         CHECK(check_packed_position_mad_positive(row, authority));
     CHECK(check_packed_position_mad_positive(1, 3) && check_packed_position_mad_rejections() &&
         check_packed_position_mad_duplicate_field() && check_packed_position_mad_callbacks());
+    const unsigned scalar_rows[] = {0, 3, 26, 31, 4094};
+    for (unsigned row = 0; row < sizeof(scalar_rows) / sizeof(scalar_rows[0]); ++row)
+        CHECK(check_packed_scalar_global_tail(scalar_rows[row], false) &&
+            check_packed_scalar_global_tail(scalar_rows[row], true));
     CHECK(check_packed_uint_output());
     return true;
 }

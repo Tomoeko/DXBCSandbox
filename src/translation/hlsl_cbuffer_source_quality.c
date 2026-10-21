@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/hlsl_global_declarations.h"
 #include "io/parameter_layout.h"
 #include "hlsl_source_identifier.h"
 
@@ -48,6 +49,67 @@ static bool field_matches(const TempVariable *field, const SerializedVariable *v
         decoded->is_matrix == (field->is_matrix != 0) &&
         decoded->array_size == field->matrix_array_size &&
         parameter_layout_byte_size(decoded) == field->byte_size;
+}
+
+bool hlsl_global_scalar_tail_supported(const HLSLEmitterContext *ctx, int index) {
+    if (!ctx || !ctx->program || index != 0 || ctx->program->cbuffer_count != 1 ||
+        ctx->cbuffer_layout_count != 1 || !ctx->high_level_packed_outputs ||
+        ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
+        ctx->program->program_type != DXBC_PROGRAM_TYPE_VERTEX ||
+        !hlsl_packed_output_candidate(ctx->program)) return false;
+    const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[0];
+    if (!ctx->program->cbuffers || ctx->program->cbuffers[0].reg_idx ||
+        ctx->program->cbuffers[0].size != layout->row_count || ctx->program->cbuffers[0].dynamic_indexed ||
+        !layout->is_globals || layout->is_unity_builtin || layout->reg ||
+        !layout->serialized_name || strcmp(layout->serialized_name, "$Globals") ||
+        !layout->declaration_name || strcmp(layout->declaration_name, "_Globals") ||
+        !layout->has_serialized_authority || !layout->has_reflection_size_authority ||
+        layout->raw_storage || layout->row_struct_storage || layout->omit_declaration ||
+        layout->row_count < 1 || layout->row_count >= CBUFFER_INVENTORY_ROW_LIMIT ||
+        layout->reflection_size_bytes != ((uint32_t)layout->row_count + 1u) * 16u ||
+        layout->variable_count != 1 || layout->variable_alloc < 1 || !layout->variables ||
+        layout->use_alloc < 1 || !layout->uses || !layout->uses[0].referenced ||
+        layout->projection_status != DXBC_CBUFFER_PROJECTION_EXACT ||
+        !layout->projection.saw_access || layout->projection.saw_dynamic_access ||
+        layout->projection.saw_padding_access) return false;
+    const TempVariable *field = &layout->variables[0];
+    if ((field->authority != 1 && field->authority != 2) || field->type || field->is_matrix ||
+        field->matrix_array_size || field->row_major || field->rows != 1 || field->dim != 1 ||
+        field->byte_size != 4 || field->byte_offset != ((uint32_t)layout->row_count - 1u) * 16u ||
+        field->reg_offset != (uint32_t)layout->row_count - 1u ||
+        !name_available(ctx, layout, field, field->name) ||
+        !name_available(ctx, layout, NULL, HLSL_GLOBAL_TAIL_IDENTIFIER) ||
+        !hlsl_scalar_material_metadata_unique(ctx, layout, field)) return false;
+    bool shell = false;
+    const SerializedProgramParameters *sources[2] = {ctx->params, ctx->common_params};
+    for (unsigned source = 0; source < 2; ++source) {
+        const SerializedProgramParameters *parameters = sources[source];
+        if (!parameters) continue;
+        for (int buffer = 0; buffer < parameters->cb_count; ++buffer) {
+            const SerializedConstantBuffer *metadata = &parameters->constant_buffers[buffer];
+            if (strcmp(metadata->name, "$Globals")) continue;
+            if (metadata->struct_count) return false;
+            if (metadata->role == SERIALIZED_CBUFFER_NAMED &&
+                (!metadata->has_is_partial || !metadata->is_partial)) {
+                if (metadata->size != layout->reflection_size_bytes) return false;
+                shell = true;
+            }
+            for (int variable = 0; variable < metadata->var_count; ++variable) {
+                DecodedVariableLayout decoded;
+                if (!parameter_layout_decode(parameters, &metadata->variables[variable], &decoded) ||
+                    !field_matches(field, &metadata->variables[variable], &decoded)) return false;
+            }
+        }
+    }
+    if (!shell) return false;
+    if (ctx->global_declarations) {
+        size_t count = 0;
+        const HLSLGlobalDeclarationField *fields =
+            hlsl_global_declarations_fields(ctx->global_declarations, &count);
+        if (count != 1 || !fields || !fields[0].current_authority ||
+            strcmp(fields[0].name, field->name)) return false;
+    }
+    return true;
 }
 
 static bool layout_has_matrix_field(const HLSLCBufferLayout *layout) {
@@ -159,7 +221,9 @@ bool hlsl_source_quality_local_cbuffer_supported(const HLSLEmitterContext *ctx, 
         return false;
     const HLSLCBufferLayout *layout = &ctx->cbuffer_layouts[index];
     return (layout->compact_global_layout && !layout->omit_declaration && !layout->raw_storage &&
-            !layout->row_struct_storage && !layout->is_unity_builtin) ||
+            !layout->row_struct_storage && !layout->is_unity_builtin &&
+            (!layout->compact_global_tail || (hlsl_source_quality_packed_output_guard_active(ctx) &&
+                hlsl_global_scalar_tail_supported(ctx, index)))) ||
         hlsl_source_quality_named_cbuffer_supported(ctx, index, NULL);
 }
 

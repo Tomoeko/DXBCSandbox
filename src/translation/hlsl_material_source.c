@@ -61,7 +61,7 @@ static bool bounded_material_name(const char *name) {
  * both inventories, so another buffer's matching identifier cannot own this
  * scalar even when its layout coincides. The two authorities may agree on one
  * exact field; role and buffer identity remain part of that agreement. */
-static bool packed_uint_metadata_unique(const HLSLEmitterContext *ctx,
+bool hlsl_scalar_material_metadata_unique(const HLSLEmitterContext *ctx,
     const HLSLCBufferLayout *buffer, const TempVariable *field) {
     const SerializedProgramParameters *sources[] = {ctx->params, ctx->common_params};
     bool found = false;
@@ -152,7 +152,7 @@ bool hlsl_packed_uint_material_supported(HLSLEmitterContext *ctx,
         for (int variable = 0; variable < owner->variable_count; ++variable)
             if (!bounded_material_name(owner->variables[variable].name)) return false;
     }
-    if (!material_field_name_unique(ctx, field) || !packed_uint_metadata_unique(ctx, buffer, field)) return false;
+    if (!material_field_name_unique(ctx, field) || !hlsl_scalar_material_metadata_unique(ctx, buffer, field)) return false;
     int field_offset = -1;
     const char *name = resolve_cb_variable_ctx(ctx, current.cbuffer_binding, (int)current.row,
         current.physical_component, &field_offset);

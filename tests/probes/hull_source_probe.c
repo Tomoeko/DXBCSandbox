@@ -3,6 +3,7 @@
 #include "common/file_io.h"
 #include "common/sha256.h"
 #include "compiler/unity_compiler_client.h"
+#include "compiler/unity_reflection_certificate.h"
 #include "dxbc/dxbc_compare.h"
 #include "dxbc/dxbc_stage_contract.h"
 #include "translation/hlsl_emitter.h"
@@ -514,6 +515,56 @@ static bool native_named_parameters(const UnityCompilerBinaryResponse *response,
     return true;
 }
 
+/* OnConstantBuffer includes unused source declarations, but OnConstant lists
+ * used fields only. Keep their counts distinct; certify the projected CB scope
+ * with the shared verifier, whose COMPATIBLE result explicitly discards count.
+ * Input callbacks are outside this projection and remain independently decoded. */
+static bool native_scalar_global_parameters(const UnityCompilerBinaryResponse *response,
+    SerializedProgramParameters *parameters, const char *role) {
+    if (!response || !parameters || response->reflection_record_count > PROBE_NATIVE_CB_RECORD_LIMIT ||
+        (response->reflection_record_count && !response->reflection_records)) return false;
+    UnityCompilerReflectionRecord records[3];
+    size_t count = 0;
+    for (size_t index = 0; index < response->reflection_record_count; ++index) {
+        const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
+        if (!native_reflection_record_canonical(record)) return false;
+        if (record->kind == UNITY_COMPILER_REFLECTION_INPUT || record->kind == UNITY_COMPILER_REFLECTION_STATS) continue;
+        if (count == 3) return false;
+        records[count++] = *record;
+    }
+    if (count != 3 || records[0].kind != UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER ||
+        records[1].kind != UNITY_COMPILER_REFLECTION_CONSTANT ||
+        records[2].kind != UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) return false;
+    const UnityCompilerReflectionRecord *shell = &records[0], *constant = &records[1], *binding_record = &records[2];
+    if (!shell->name || !constant->name || !binding_record->name ||
+        shell->value_count != 2 || shell->values[0] < 16 || shell->values[0] > 65536 ||
+        (shell->values[0] & 15) || shell->values[1] < 1 || shell->values[1] > 4096 ||
+        (!hlsl_source_identifier_valid(shell->name) && strcmp(shell->name, "$Globals")) ||
+        constant->value_count != 6 || constant->values[0] < 0 || (constant->values[0] & 15) ||
+        (constant->values[0] != shell->values[0] - 16 && constant->values[0] != shell->values[0] - 32) ||
+        constant->values[1] || constant->values[2] || constant->values[3] != 1 ||
+        constant->values[4] != 1 || constant->values[5] || !hlsl_source_identifier_valid(constant->name) ||
+        binding_record->value_count != 1 || binding_record->values[0] != 0 ||
+        strcmp(binding_record->name, shell->name)) return false;
+    SerializedVariable field = {.name = constant->name,
+        .layout = {(uint32_t)constant->values[0], 0, 0, 1, 0, 0}};
+    SerializedConstantBuffer buffer = {.name = shell->name, .size = (uint32_t)shell->values[0],
+        .role = SERIALIZED_CBUFFER_NAMED, .variables = &field, .var_count = 1};
+    SerializedResourceParam binding = {.name = shell->name, .bind_type = SERIALIZED_RESOURCE_CONSTANT_BUFFER,
+        .array_size = 1, .extra = {1}};
+    const SerializedProgramParameters projected = {.constant_buffers = &buffer, .cb_count = 1,
+        .resources = &binding, .res_count = 1};
+    const PlayerSubProgramMetadata empty_player = {0};
+    UnityReflectionCertificateReport report;
+    const UnityReflectionCertificateStatus status = unity_reflection_certify_d3d11_bindings(
+        &empty_player, &projected, NULL, records, count, &report);
+    printf("native_scalar_projection role=%s scope=CB-only status=%s declared_variables=%d used_fields=1 "
+           "variable_count_authority=unavailable input_binding_certificate=not-run\n", role,
+        unity_reflection_certificate_status_name(status), shell->values[1]);
+    return status == UNITY_REFLECTION_CERTIFICATE_COMPATIBLE &&
+        serialized_program_parameters_copy(parameters, &projected);
+}
+
 static bool native_sampled_parameters(const UnityCompilerBinaryResponse *response,
     SerializedProgramParameters *parameters, const char *role) {
     if (!response || !parameters || response->reflection_record_count > 32 ||
@@ -551,11 +602,12 @@ static bool native_sampled_parameters_equal(const UnityCompilerBinaryResponse *r
     return equal;
 }
 
-static bool native_named_parameters_equal(const UnityCompilerBinaryResponse *response,
-    const SerializedProgramParameters *original, const char *role) {
+static bool native_cb_parameters_equal(const UnityCompilerBinaryResponse *response,
+    const SerializedProgramParameters *original, bool scalar_globals, const char *role) {
     SerializedProgramParameters current;
     serialized_program_parameters_init(&current);
-    const bool equal = native_named_parameters(response, &current, role) &&
+    const bool equal = (scalar_globals ? native_scalar_global_parameters(response, &current, role) :
+        native_named_parameters(response, &current, role)) &&
         serialized_program_parameters_equal(original, &current);
     serialized_program_parameters_free(&current);
     printf("native_cb_projection_equal role=%s original_tuples_equal=%d\n", role, equal);
@@ -563,7 +615,7 @@ static bool native_named_parameters_equal(const UnityCompilerBinaryResponse *res
 }
 
 static bool native_named_program_matches(const USILProgram *program,
-    const SerializedProgramParameters *parameters) {
+    const SerializedProgramParameters *parameters, bool scalar_globals) {
     if (!parameters) return true;
     return program && parameters->cb_count == 1 && parameters->constant_buffers &&
         parameters->res_count == 1 && parameters->resources &&
@@ -571,7 +623,12 @@ static bool native_named_program_matches(const USILProgram *program,
         !program->cbuffers[0].dynamic_indexed && program->cbuffers[0].reg_idx >= 0 &&
         (uint32_t)program->cbuffers[0].reg_idx == parameters->resources[0].bind_index &&
         program->cbuffers[0].size > 0 &&
-        (uint32_t)program->cbuffers[0].size == parameters->constant_buffers[0].size / 16u &&
+        (scalar_globals ? parameters->constant_buffers[0].var_count == 1 &&
+            parameters->constant_buffers[0].variables &&
+            parameters->constant_buffers[0].variables[0].layout[0] == ((uint32_t)program->cbuffers[0].size - 1u) * 16u &&
+            (parameters->constant_buffers[0].size == (uint32_t)program->cbuffers[0].size * 16u ||
+             parameters->constant_buffers[0].size == ((uint32_t)program->cbuffers[0].size + 1u) * 16u) :
+            (uint32_t)program->cbuffers[0].size == parameters->constant_buffers[0].size / 16u) &&
         !program->texture_count && !program->sampler_count && !program->uav_count;
 }
 
@@ -959,13 +1016,14 @@ static bool packed_output_vertex_shape(const USILProgram *program,
 /* Reuse the decoded source-use demand and component selection. Both retained
  * immediate representations must agree; no float conversion or token rewrite
  * participates in selecting the actual warm counterexample. */
-static bool packed_output_mul_literal(const USILProgram *program,
-    const USILInstruction *instruction, int operand_index, int packed_register,
+static bool packed_output_literal(const USILProgram *program,
+    const USILInstruction *instruction, int operand_index, int packed_register, bool scalar_globals,
     uint8_t *component_mask, uint8_t *demanded_lanes) {
     if (!program || !instruction || !component_mask || !demanded_lanes ||
-        instruction->opcode != USIL_OP_MUL || instruction->operand_count != 3 ||
+        (scalar_globals ? instruction->opcode != USIL_OP_MAD || instruction->operand_count != 4 || operand_index != 3 :
+            instruction->opcode != USIL_OP_MUL || instruction->operand_count != 3 || operand_index > 2) ||
         instruction->saturate || instruction->precise_mask ||
-        operand_index < 1 || operand_index > 2) return false;
+        operand_index < 1 || operand_index > 3) return false;
     const DXBCOperand *destination = &instruction->operands[0];
     const uint8_t lanes = usil_operand_destination_lane_mask(destination);
     if ((lanes != 3 && lanes != 12 && lanes != 15) ||
@@ -991,8 +1049,8 @@ static bool packed_output_mul_literal(const USILProgram *program,
             usil_operand_source_component(operand, lane);
         if (selected < 0 || selected >= operand->imm_value_count ||
             selected >= operand->immediate_word_count ||
-            operand->imm_values[selected] != UINT32_C(0x3ec00000) ||
-            operand->immediate_words[selected] != UINT32_C(0x3ec00000)) return false;
+            operand->imm_values[selected] != (scalar_globals ? UINT32_C(0x3f000000) : UINT32_C(0x3ec00000)) ||
+            operand->immediate_words[selected] != operand->imm_values[selected]) return false;
         captured |= (uint8_t)(1u << selected);
     }
     if (!captured) return false;
@@ -1007,7 +1065,7 @@ static bool packed_output_mul_literal(const USILProgram *program,
 static bool reconstruct_structured(const DXBCContainerView *target,
     StringBuilder *source, ProbeDecodedLiteral *literal_owner, bool change_literal,
     bool vertex_fixture, bool packed_output_fixture,
-    const SerializedProgramParameters *parameters, bool inspect_only) {
+    const SerializedProgramParameters *parameters, bool scalar_globals, bool inspect_only) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -1026,7 +1084,7 @@ static bool reconstruct_structured(const DXBCContainerView *target,
         program.program_type != (vertex_fixture ? DXBC_PROGRAM_TYPE_VERTEX : DXBC_PROGRAM_TYPE_PIXEL) ||
         program.instruction_count > PROBE_DOMAIN_INSTRUCTION_LIMIT ||
         program.input_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
-        !native_named_program_matches(&program, parameters) ||
+        !native_named_program_matches(&program, parameters, scalar_globals) ||
         (packed_output_fixture
             ? program.output_count < 1 || program.output_count > PROBE_DOMAIN_SIGNATURE_LIMIT ||
               program.output_alloc < program.output_count
@@ -1157,13 +1215,13 @@ static bool reconstruct_structured(const DXBCContainerView *target,
             if (!packed_shape) continue;
             for (int operand_index = 1; operand_index < instruction->operand_count; ++operand_index) {
                 uint8_t component_mask = 0, demanded_lanes = 0;
-                if (!packed_output_mul_literal(&program, instruction, operand_index,
-                        packed_register, &component_mask, &demanded_lanes)) continue;
+                if (!packed_output_literal(&program, instruction, operand_index,
+                        packed_register, scalar_globals, &component_mask, &demanded_lanes)) continue;
                 ++packed_literal_count;
                 captured = (ProbeDecodedLiteral){.instruction = index, .operand = operand_index,
                     .component_mask = component_mask,
                     .raw_instruction = instruction->source_instruction_index,
-                    .original_bits = UINT32_C(0x3ec00000), .opcode = instruction->opcode,
+                    .original_bits = scalar_globals ? UINT32_C(0x3f000000) : UINT32_C(0x3ec00000), .opcode = instruction->opcode,
                     .demanded_lanes = demanded_lanes,
                     .destination_lanes = usil_operand_destination_lane_mask(&instruction->operands[0]),
                     .valid = true};
@@ -2449,7 +2507,7 @@ static void usage(const char *name) {
         stderr,
         "usage: %s SOURCE.shader PROJECT_ROOT INCLUDES_DIR [--icb-fixture | "
         "--scalar-fixture [--static-factor-calibration | --explicit-packoffset-calibration | "
-        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture | --inactive-input-fixture | --sampled-fragment-fixture]\n"
+        "--inner-factor-brace-calibration]] [--domain-fixture | --linked-fixture | --structured-fixture | --structured-vertex-fixture | --packed-output-vertex-fixture | --inactive-input-fixture | --sampled-fragment-fixture | --scalar-global-fixture]\n"
         "Use '-' for no additional includes. Selected-native isolated stage comparison "
         "only; no source or binary files exported.\n"
         "--scalar-fixture supplies a controlled FactorInputs/_Factor API layout,\n"
@@ -2483,7 +2541,10 @@ static void usage(const char *name) {
         "with unread typed/packed signature fields. Cold exact comparison enables "
         "an actual MOV literal or active input interpolation change and exact warm restoration.\n"
         "--sampled-fragment-fixture uses actual native texture-binding callbacks and "
-        "the decoded one-sample fragment. Its warm change owns a scalar level or active input interpolation.\n"
+        "the decoded sampled fragment. Its warm change owns a level, selection color, or active input interpolation.\n"
+        "--scalar-global-fixture projects one actual native F32 scalar and a full CB shell. "
+        "It reuses the packed vertex flow, a decoded MAD 0.5 literal, and a CB-only COMPATIBLE "
+        "reflection certificate; declared-variable count and input bindings remain uncertified.\n"
         "Static-factor calibration is a separate cold compiler experiment; it "
         "does not repair the normal inverse-source comparison.\n"
         "Explicit-packoffset and inner-factor-brace calibrations each change only one "
@@ -2499,7 +2560,9 @@ int main(int argc, char **argv) {
     }
     const bool sampled_fragment_fixture = argc == 5 && !strcmp(argv[4], "--sampled-fragment-fixture");
     const bool inactive_input_fixture = argc == 5 && !strcmp(argv[4], "--inactive-input-fixture");
-    const bool packed_output_vertex_fixture = argc == 5 && !strcmp(argv[4], "--packed-output-vertex-fixture");
+    const bool scalar_globals_fixture = argc == 5 && !strcmp(argv[4], "--scalar-global-fixture");
+    const bool packed_output_vertex_fixture = scalar_globals_fixture ||
+        (argc == 5 && !strcmp(argv[4], "--packed-output-vertex-fixture"));
     const bool structured_vertex_fixture = packed_output_vertex_fixture ||
         (argc == 5 && !strcmp(argv[4], "--structured-vertex-fixture"));
     const bool structured_fixture = sampled_fragment_fixture || inactive_input_fixture || structured_vertex_fixture ||
@@ -2528,7 +2591,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     CommonFileBytes authored = {0};
-    const char *shader_name = sampled_fragment_fixture ? "Fixture/HighLevel/SampledFloatTexture" :
+    const char *shader_name = scalar_globals_fixture ? "Fixture/HighLevel/SparseGlobals" : sampled_fragment_fixture ? "Fixture/HighLevel/SampledFloatTexture" :
         inactive_input_fixture ? "Fixture/HighLevel/InactiveFragmentInputs" :
         packed_output_vertex_fixture ? "Fixture/HighLevel/PackedFloat2VertexOutput" :
         structured_vertex_fixture ? "Fixture/HighLevel/StructuredFloat3VertexBranch" :
@@ -2611,10 +2674,11 @@ int main(int argc, char **argv) {
             goto done;
         }
         if (packed_output_vertex_fixture &&
-            !native_named_parameters(&compiled[0], &native_parameters, "original")) {
+            !(scalar_globals_fixture ? native_scalar_global_parameters(&compiled[0], &native_parameters, "original") :
+                native_named_parameters(&compiled[0], &native_parameters, "original"))) {
             puts("native_cb_projection=unavailable actual_metadata_not_substituted=1");
             (void)reconstruct_structured(&target, &hull, &structured_literal, false,
-                structured_vertex_fixture, packed_output_vertex_fixture, NULL, true);
+                structured_vertex_fixture, packed_output_vertex_fixture, NULL, scalar_globals_fixture, true);
             puts("packed_output_source=not-attempted reason=unavailable-projected-metadata "
                  "packed_output_candidate=not-run packed_output_warm_mutation=not-run "
                  "packed_output_warm_restore=not-run");
@@ -2631,7 +2695,7 @@ int main(int argc, char **argv) {
                 sampled_fragment_fixture ? PROBE_FRAGMENT_SAMPLED : PROBE_FRAGMENT_INACTIVE) :
                 reconstruct_structured(&target, &hull, &structured_literal, false,
                     structured_vertex_fixture, packed_output_vertex_fixture,
-                    native_parameters.cb_count ? &native_parameters : NULL, false)) ||
+                    native_parameters.cb_count ? &native_parameters : NULL, scalar_globals_fixture, false)) ||
             !structured_wrapper(&hull, &wrapper, shader_name, structured_vertex_fixture, structured_literal.shader_model_major)) {
             if (packed_output_vertex_fixture)
                 puts("packed_output_candidate=not-run packed_output_warm_mutation=not-run "
@@ -2694,7 +2758,7 @@ int main(int argc, char **argv) {
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
     if (native_parameters.cb_count &&
-        !native_named_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
+        !native_cb_parameters_equal(&compiled[1], &native_parameters, scalar_globals_fixture, "cold-candidate")) goto done;
     if (sampled_fragment_fixture &&
         !native_sampled_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
     const bool controls_equal =
@@ -2751,7 +2815,7 @@ int main(int argc, char **argv) {
                 sampled_fragment_fixture ? PROBE_FRAGMENT_SAMPLED : PROBE_FRAGMENT_INACTIVE) :
                 reconstruct_structured(&target, &mutated_fragment, &structured_literal, true,
                     structured_vertex_fixture, packed_output_vertex_fixture,
-                    native_parameters.cb_count ? &native_parameters : NULL, false)) &&
+                    native_parameters.cb_count ? &native_parameters : NULL, scalar_globals_fixture, false)) &&
             structured_wrapper(&mutated_fragment, &changed_wrapper, shader_name, structured_vertex_fixture, structured_literal.shader_model_major);
         sb_free(&mutated_fragment);
     } else {
@@ -2769,7 +2833,7 @@ int main(int argc, char **argv) {
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
     if (native_parameters.cb_count &&
-        !native_named_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
+        !native_cb_parameters_equal(&compiled[2], &native_parameters, scalar_globals_fixture, "warm-mutated")) goto done;
     if (sampled_fragment_fixture &&
         !native_sampled_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
     const DXBCCompareStatus mutation_status = dxbc_compare_exact(
@@ -2803,7 +2867,7 @@ int main(int argc, char **argv) {
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
     if (native_parameters.cb_count &&
-        !native_named_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;
+        !native_cb_parameters_equal(&compiled[3], &native_parameters, scalar_globals_fixture, "warm-restored")) goto done;
     if (sampled_fragment_fixture &&
         !native_sampled_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;
     const DXBCCompareStatus repeated_status = dxbc_compare_exact(
@@ -2844,7 +2908,12 @@ int main(int argc, char **argv) {
                "decoded_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
                !result, mutation_diff && mutation_authority ? "different" : "failed",
                !result ? "exact" : "failed");
-    if (packed_output_vertex_fixture)
+    if (scalar_globals_fixture)
+        printf("scalar_global_isolated_stage_qualified=%d original_target_reference=1 "
+               "actual_mad_literal_mutation=%s warm_restore=%s scope=CB-only "
+               "import=not-run runtime=not-run semantic_certificate=not-run\n",
+               !result, mutation_diff && mutation_authority ? "different" : "failed", !result ? "exact" : "failed");
+    if (packed_output_vertex_fixture && !scalar_globals_fixture)
         printf("packed_output_isolated_stage_qualified=%d original_target_reference=1 "
                "actual_mul_literal_mutation=%s warm_restore=%s source_quality=not-promoted\n",
                !result, mutation_diff && mutation_authority ? "different" : "failed",
