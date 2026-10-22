@@ -22,12 +22,15 @@ typedef struct {
     const char *digest;
     bool literal_first;
     unsigned model;
+    USILOpcode comparison_opcode;
 } DiscardFixtureCase;
 
+static bool check_variant_emission(USILProgram *program);
+
 static bool plan_empty(const HLSLSampledDiscardPlan *plan) {
-    return !plan->present && !plan->color_register && !plan->predicate_register &&
-           !plan->color_component && !plan->predicate_component && !plan->literal_first &&
-           !plan->discard_on_zero && !plan->threshold_bits;
+    return !plan->present && plan->comparison_opcode == USIL_OP_NOP && !plan->color_register &&
+           !plan->predicate_register && !plan->color_component && !plan->predicate_component &&
+           !plan->literal_first && !plan->discard_on_zero && !plan->threshold_bits;
 }
 
 static void set_temp_register(DXBCOperand *operand, int index) {
@@ -111,14 +114,15 @@ static bool check_variants(USILProgram *program, bool literal_first) {
                         zero ? DXBC_INSTRUCTION_TEST_ZERO : DXBC_INSTRUCTION_TEST_NONZERO;
                     HLSLSampledDiscardPlan plan;
                     REQUIRE(hlsl_sampled_discard_plan_prepare(program, &plan));
-                    REQUIRE(plan.present && plan.color_register == color_register &&
+                    REQUIRE(plan.present && plan.comparison_opcode == original[1].opcode &&
+                            plan.color_register == color_register &&
                             plan.predicate_register == predicate_register &&
                             plan.color_component == color_component &&
                             plan.predicate_component == predicate_component &&
                             plan.literal_first == literal_first &&
                             plan.discard_on_zero == (zero != 0) &&
                             plan.threshold_bits == UINT32_C(0x3ec00000));
-                    REQUIRE(check_analysis(program));
+                    REQUIRE(check_analysis(program) && check_variant_emission(program));
                 }
             }
         }
@@ -145,7 +149,7 @@ static bool check_variants(USILProgram *program, bool literal_first) {
         HLSLSampledDiscardPlan plan;
         REQUIRE(hlsl_sampled_discard_plan_prepare(program, &plan) &&
                 plan.threshold_bits == bits[index]);
-        REQUIRE(check_analysis(program));
+        REQUIRE(check_analysis(program) && check_variant_emission(program));
     }
     passed = true;
 
@@ -164,7 +168,7 @@ static bool check_boundaries(USILProgram *program, bool literal_first) {
         DXBCOperand *literal = &instructions[1].operands[literal_first ? 1 : 2];
         switch (mutation) {
             case 0:
-                instructions[1].opcode = USIL_OP_GE;
+                instructions[1].opcode = USIL_OP_EQ;
                 break;
             case 1:
                 instructions[1].precise_mask = 1;
@@ -244,6 +248,220 @@ cleanup:
     return passed;
 }
 
+typedef struct {
+    USILProgram *program;
+    SerializedResourceParam *texture;
+    HLSLEmitOptions *options;
+    HLSLEmitNames *names;
+    StringBuilder *source;
+    HLSLExpressionSourceMap *map;
+    unsigned observations;
+    unsigned mutate_at;
+    unsigned mutation;
+    unsigned statements;
+    bool mutated;
+} DiscardObserver;
+
+static bool observe_discard(void *context, const HLSLSourceQualityObservation *observation) {
+    DiscardObserver *state = context;
+    ++state->observations;
+    if (observation->kind == HLSL_SOURCE_OBSERVATION_STATEMENT) {
+        ++state->statements;
+    }
+    if (state->observations != state->mutate_at) {
+        return true;
+    }
+    state->mutated = true;
+    switch (state->mutation) {
+        case 0:
+            return false;
+        case 1:
+            state->program->instructions[1].opcode = USIL_OP_EQ;
+            break;
+        case 2:
+            state->program->instructions[2].condition_test ^= 3;
+            break;
+        case 3:
+            state->texture->bind_index = 1;
+            break;
+        case 4:
+            state->map->count = 0;
+            state->map->complete = true;
+            break;
+        case 5:
+            state->options->source_quality_entry_point_index = 1;
+            break;
+        case 6:
+            state->names->entry_point = "changed";
+            break;
+        case 7:
+            state->source->buf[0] = '!';
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
+static bool emit_discard(USILProgram *program,
+    SerializedResourceParam *texture,
+    StringBuilder *source,
+    HLSLExpressionSourceMap *map,
+    HLSLSourceQualityResult *quality,
+    DiscardObserver *observer,
+    const char *reserved) {
+    SerializedProgramParameters parameters = {.res_count = 1, .resources = texture};
+    HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
+    HLSLEmitNames names = {.entry_point = "frag"};
+    HLSLEmitDiagnostic diagnostic;
+    options.expression_source_map = map;
+    options.source_quality = quality;
+    options.reserved_preprocessor_identifiers = reserved ? &reserved : NULL;
+    options.reserved_preprocessor_identifier_count = reserved ? 1 : 0;
+    if (observer) {
+        observer->program = program;
+        observer->texture = texture;
+        observer->source = source;
+        observer->map = map;
+        observer->options = &options;
+        observer->names = &names;
+        options.source_quality_observer = observe_discard;
+        options.source_quality_observer_context = observer;
+    }
+    return hlsl_emit_with_options_diagnostic(
+        program, source, &parameters, NULL, &names, &options, &diagnostic);
+}
+
+/* Decoded mutations test the lift's contract; only the separate native probe
+ * can establish complete-container compiler equality. */
+static bool check_variant_emission(USILProgram *program) {
+    SerializedResourceParam texture = {.name = "_CoverageTexture",
+        .bind_type = SERIALIZED_RESOURCE_TEXTURE,
+        .bind_index = 0,
+        .sampler_index = 0,
+        .dimension = 2,
+        .extra = {0, 0}};
+    StringBuilder source;
+    sb_init(&source);
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    const bool emitted = emit_discard(program, &texture, &source, &map, &quality, NULL, NULL);
+    const bool passed = emitted && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                        !quality.reasons && map.complete && map.count == 5 &&
+                        hlsl_expression_source_map_matches(&map, program, source.buf);
+    sb_free(&source);
+    return passed;
+}
+
+static bool check_emission(USILProgram *program) {
+    SerializedResourceParam texture = {.name = "_CoverageTexture",
+        .bind_type = SERIALIZED_RESOURCE_TEXTURE,
+        .bind_index = 0,
+        .sampler_index = 0,
+        .dimension = 2,
+        .extra = {0, 0}};
+    StringBuilder baseline;
+    sb_init(&baseline);
+    StringBuilder changed;
+    sb_init(&changed);
+    const char *prefix = "// caller prefix\n";
+    HLSLExpressionSourceMap map;
+    HLSLSourceQualityResult quality;
+    DiscardObserver observer = {0};
+    const USILInstruction comparison = program->instructions[1];
+    const USILInstruction discard = program->instructions[2];
+    bool passed = false;
+    sb_append(&baseline, prefix);
+    REQUIRE(emit_discard(program, &texture, &baseline, &map, &quality, &observer, NULL));
+    REQUIRE(quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.reasons &&
+            quality.counts.ast_statements == 3 && observer.statements == 3 && map.complete &&
+            map.count == 5 && hlsl_expression_source_map_matches(&map, program, baseline.buf));
+    REQUIRE(strstr(baseline.buf, "const float4 sampledValue = _CoverageTexture.Sample(") &&
+            strstr(baseline.buf, "const bool discardFragment = ") &&
+            strstr(baseline.buf, "if (discardFragment)\n") && strstr(baseline.buf, "discard;\n") &&
+            strstr(baseline.buf, "return sampledValue;"));
+    REQUIRE(
+        map.origins[2].kind == HLSL_EXPRESSION_ORIGIN_EFFECT && !map.origins[2].destination_lanes);
+    map.origins[2].kind = HLSL_EXPRESSION_ORIGIN_EXPRESSION;
+    REQUIRE(!hlsl_expression_source_map_matches(&map, program, baseline.buf));
+    map.origins[2].kind = HLSL_EXPRESSION_ORIGIN_EFFECT;
+    map.origins[1].kind = HLSL_EXPRESSION_ORIGIN_EFFECT;
+    REQUIRE(!hlsl_expression_source_map_matches(&map, program, baseline.buf));
+
+    for (unsigned outputs = 0; outputs < 4; ++outputs) {
+        sb_append(&changed, prefix);
+        REQUIRE(emit_discard(program,
+            &texture,
+            &changed,
+            outputs & 1 ? &map : NULL,
+            outputs & 2 ? &quality : NULL,
+            NULL,
+            NULL));
+        REQUIRE(changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len));
+        sb_free(&changed);
+        sb_init(&changed);
+    }
+    program->instructions[2].condition_test = DXBC_INSTRUCTION_TEST_ZERO;
+    REQUIRE(emit_discard(program, &texture, &changed, &map, &quality, NULL, NULL));
+    REQUIRE(quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+            strstr(changed.buf, "if (!(discardFragment))\n") &&
+            hlsl_expression_source_map_matches(&map, program, changed.buf));
+    program->instructions[2] = discard;
+    sb_free(&changed);
+    sb_init(&changed);
+
+    static const char *const reserved[] = {"sampledValue", "discardFragment"};
+    for (unsigned name = 0; name < 2; ++name) {
+        sb_append(&changed, prefix);
+        REQUIRE(!emit_discard(program, &texture, &changed, &map, &quality, NULL, reserved[name]));
+        REQUIRE(changed.failed && !map.complete && !map.count && !strcmp(changed.buf, prefix));
+        sb_free(&changed);
+        sb_init(&changed);
+    }
+    for (unsigned mutation = 0; mutation < 8; ++mutation) {
+        for (unsigned event = 1; event <= observer.observations; ++event) {
+            DiscardObserver drift = {.mutation = mutation, .mutate_at = event};
+            sb_append(&changed, prefix);
+            const bool emitted =
+                emit_discard(program, &texture, &changed, &map, &quality, &drift, NULL);
+            program->instructions[1] = comparison;
+            program->instructions[2] = discard;
+            texture.bind_index = 0;
+            if (emitted || !drift.mutated || !changed.failed || map.complete || map.count ||
+                quality.classification != HLSL_SOURCE_QUALITY_FAILED ||
+                strcmp(changed.buf, prefix)) {
+                fprintf(stderr,
+                    "Discard callback mutation=%u event=%u emitted=%d mutated=%d failed=%d map=%d/%zu quality=%d prefix=%d\n",
+                    mutation,
+                    event,
+                    emitted,
+                    drift.mutated,
+                    changed.failed,
+                    map.complete,
+                    map.count,
+                    quality.classification,
+                    strcmp(changed.buf, prefix));
+            }
+            REQUIRE(!emitted && drift.mutated && changed.failed && !map.complete && !map.count &&
+                    quality.classification == HLSL_SOURCE_QUALITY_FAILED &&
+                    !strcmp(changed.buf, prefix));
+            sb_free(&changed);
+            sb_init(&changed);
+        }
+    }
+    sb_append(&changed, prefix);
+    REQUIRE(emit_discard(program, &texture, &changed, &map, &quality, NULL, NULL));
+    REQUIRE(changed.len == baseline.len && !memcmp(changed.buf, baseline.buf, baseline.len));
+    passed = true;
+
+cleanup:
+    program->instructions[1] = comparison;
+    program->instructions[2] = discard;
+    sb_free(&changed);
+    sb_free(&baseline);
+    return passed;
+}
+
 static bool check_fixture(const DiscardFixtureCase *fixture) {
     uint8_t *bytes = NULL;
     size_t size = 0;
@@ -269,13 +487,14 @@ static bool check_fixture(const DiscardFixtureCase *fixture) {
     REQUIRE(program.program_type == DXBC_PROGRAM_TYPE_PIXEL && program.instruction_count == 5 &&
             program.shader_model_major == fixture->model);
     REQUIRE(hlsl_sampled_discard_plan_prepare(&program, &plan) && plan.present &&
-            plan.color_register == 0 && plan.predicate_register == 1 && plan.color_component == 3 &&
+            plan.comparison_opcode == fixture->comparison_opcode && plan.color_register == 0 &&
+            plan.predicate_register == 1 && plan.color_component == 3 &&
             plan.predicate_component == 0 && plan.literal_first == fixture->literal_first &&
             !plan.discard_on_zero && plan.threshold_bits == UINT32_C(0x3ec00000));
-    /* This planner supplies no source or coverage admission. */
-    REQUIRE(!hlsl_sampled_fragment_plan_prepare(&program, &existing) && !existing.present);
+    REQUIRE(hlsl_sampled_fragment_plan_prepare(&program, &existing) && existing.present &&
+            existing.discard && !existing.nan_guard);
     REQUIRE(check_variants(&program, fixture->literal_first) &&
-            check_boundaries(&program, fixture->literal_first));
+            check_boundaries(&program, fixture->literal_first) && check_emission(&program));
     plan = (HLSLSampledDiscardPlan){.present = true, .threshold_bits = UINT32_MAX};
     REQUIRE(!hlsl_sampled_discard_plan_prepare(NULL, &plan) && plan_empty(&plan));
     REQUIRE(!hlsl_sampled_discard_plan_prepare(&program, NULL));
@@ -298,19 +517,43 @@ int main(void) {
         {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/below_sm4.dxbc.b64",
             "fc17a830da91a82a00da2b2321e68f4e6ffc29d9e8cacc5295d7745f4d7fc277",
             false,
-            4},
+            4,
+            USIL_OP_LT},
         {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/above_sm4.dxbc.b64",
             "c8735a3055755febc54663f936d36edace69241e605dbfb0a2743d6adb204e78",
             true,
-            4},
+            4,
+            USIL_OP_LT},
         {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/below_sm5.dxbc.b64",
             "5b49a8fabb0930153dc1d0ee954e2236bcc845a0ffef5d4028b2fecf22f9f866",
             false,
-            5},
+            5,
+            USIL_OP_LT},
         {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/above_sm5.dxbc.b64",
             "5eebc871ffec60fdc6226122b6ea37171682a3669a1c2fd056aa1173251fb95f",
             true,
-            5}};
+            5,
+            USIL_OP_LT},
+        {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/negated_below_sm4.dxbc.b64",
+            "d09afb9ed5826e3d0bf9563f68829d21b2471da00a1a85a56af52a8f369dbfec",
+            false,
+            4,
+            USIL_OP_GE},
+        {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/negated_above_sm4.dxbc.b64",
+            "845263803fd9b2c422d384bf1b9d8c33a29d7b99ce12f4c9a11893a29bcf88d7",
+            true,
+            4,
+            USIL_OP_GE},
+        {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/negated_below_sm5.dxbc.b64",
+            "72b927e5cff5c4e5b83b3b2d1b88e421cb92d5859f0c743ca6b2be4271aece82",
+            false,
+            5,
+            USIL_OP_GE},
+        {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/negated_above_sm5.dxbc.b64",
+            "d205172f5066e5414a061c3fa2a335bc10ab36203745225529ecf51e327960e4",
+            true,
+            5,
+            USIL_OP_GE}};
     for (size_t index = 0; index < sizeof(fixtures) / sizeof(*fixtures); ++index) {
         if (!check_fixture(&fixtures[index])) {
             return 1;

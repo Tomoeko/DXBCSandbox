@@ -1454,6 +1454,7 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     USILProgram program = {0};
     HLSLInactiveInputPlan plan = {0};
     HLSLSampledFragmentPlan sampled = {0};
+    HLSLSampledDiscardPlan discard = {0};
     const bool texture_sample = family == PROBE_FRAGMENT_SAMPLED;
     const char *prefix = texture_sample ? "sampled" : "inactive";
     bool accepted = false;
@@ -1467,9 +1468,14 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
         !print_domain_signature(texture_sample ? "sampled-fragment-input" : "inactive-fragment-input", program.inputs, program.input_count) ||
         !print_domain_signature(texture_sample ? "sampled-fragment-output" : "inactive-fragment-output", program.outputs, program.output_count)) goto done;
     const int active_field = texture_sample ? sampled.coordinate_field : plan.active_input_field;
-    const bool literal = texture_sample ? sampled.explicit_level || sampled.nan_guard : active_field < 0;
-    const int literal_instruction = texture_sample && sampled.nan_guard ? 10 : 0;
-    const int literal_operand = texture_sample ? sampled.nan_guard ? 2 : 4 : 1;
+    if (sampled.discard && !hlsl_sampled_discard_plan_prepare(&program, &discard)) {
+        goto done;
+    }
+    const bool literal = texture_sample
+        ? sampled.explicit_level || sampled.nan_guard || sampled.discard : active_field < 0;
+    const int literal_instruction = sampled.discard ? 1 : texture_sample && sampled.nan_guard ? 10 : 0;
+    const int literal_operand = sampled.discard ? discard.literal_first ? 1 : 2
+        : texture_sample ? sampled.nan_guard ? 2 : 4 : 1;
     ProbeDecodedLiteral captured = {.instruction = literal ? literal_instruction : -1,
         .operand = literal ? literal_operand : active_field,
         .raw_instruction = program.instructions[literal_instruction].source_instruction_index,
@@ -1505,7 +1511,7 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     } else *owner = captured;
     printf("%s_counterexample_owner=%s instruction=%d raw_instruction=%u field_or_operand=%d "
         "original=0x%08" PRIx32 " changed=%d model=%u.0\n",
-        prefix, literal ? texture_sample ? sampled.nan_guard ? "decoded-selection-literal" : "decoded-level-literal" : "decoded-mov-literal" :
+        prefix, literal ? texture_sample ? sampled.discard ? "decoded-discard-literal" : sampled.nan_guard ? "decoded-selection-literal" : "decoded-level-literal" : "decoded-mov-literal" :
             "decoded-input-declaration-interpolation", captured.instruction,
         captured.raw_instruction, captured.operand, captured.original_bits, changed, program.shader_model_major);
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;

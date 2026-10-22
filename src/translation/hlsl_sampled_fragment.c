@@ -215,8 +215,9 @@ bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDi
     const USILInstruction *instructions = program->instructions;
     for (unsigned index = 0; index < 5; ++index) {
         const USILInstruction *instruction = &instructions[index];
-        if (instruction->opcode != operations[index] ||
-            instruction->operand_count != operand_counts[index] ||
+        const bool opcode_matches = instruction->opcode == operations[index] ||
+                                    (index == 1 && instruction->opcode == USIL_OP_GE);
+        if (!opcode_matches || instruction->operand_count != operand_counts[index] ||
             instruction->source_instruction_index !=
                 instructions[0].source_instruction_index + index ||
             (index != 2 && instruction->condition_test)) {
@@ -262,6 +263,7 @@ bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDi
         return false;
     }
     *plan = (HLSLSampledDiscardPlan){.present = true,
+        .comparison_opcode = comparison->opcode,
         .color_register = color_register,
         .predicate_register = predicate_register,
         .color_component = (uint8_t)color_component,
@@ -316,6 +318,15 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
     memset(plan, 0, sizeof(*plan));
     HLSLSampledFragmentPlan layout = {0};
     if (!sample_layout_prepare(program, &layout)) return false;
+    if (program->instruction_count == 5) {
+        HLSLSampledDiscardPlan discard;
+        if (!hlsl_sampled_discard_plan_prepare(program, &discard)) {
+            return false;
+        }
+        layout.discard = true;
+        *plan = layout;
+        return true;
+    }
     for (int index = 0; index < program->instruction_count; ++index) {
         if (program->instructions[index].condition_test) {
             return false;
@@ -341,7 +352,8 @@ bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx) {
     HLSLSampledFragmentPlan plan;
     const char *name = NULL;
     if (!ctx || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) ||
-        (plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !plan.inactive_typed_inputs && !plan.packed_inputs && !plan.nan_guard)) return false;
+        (plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !plan.inactive_typed_inputs &&
+            !plan.packed_inputs && !plan.nan_guard && !plan.discard)) return false;
     const uint32_t metadata_dimension = plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D ? 2 :
         plan.texture_kind == HLSL_SAMPLED_TEXTURE_CUBE ? 4 : 5;
     const SerializedProgramParameters *parameters[2] = {ctx->params, ctx->common_params};

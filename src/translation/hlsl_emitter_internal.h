@@ -316,6 +316,7 @@ typedef struct HLSLEmitterContext {
     bool high_level_inactive_inputs;
     bool high_level_sampled_fragment;
     bool high_level_sampled_nan_guard;
+    bool high_level_sampled_discard;
     bool high_level_inactive_sample_inputs;
     bool high_level_packed_sample_inputs;
     uint32_t high_level_input_fields_emitted;
@@ -325,6 +326,7 @@ typedef struct HLSLEmitterContext {
     uint32_t high_level_output_field_declarations;
     uint32_t high_level_output_field_statements;
     struct HLSLStraightLineGuard *straightline_guard;
+    struct HLSLSampledDiscardTree *sampled_discard_tree; /* Borrowed during body emission. */
     /* Every frozen natural structured route retains this callback-free
      * interface replay. Disposal shares the natural body inventory lifecycle. */
     StringBuilder natural_structured_header_source;
@@ -530,6 +532,7 @@ typedef struct {
     bool inactive_typed_inputs;
     bool packed_inputs;
     bool nan_guard;
+    bool discard;
     int coordinate_field;
     uint32_t input_registers;
     uint32_t texture_register, sampler_register;
@@ -539,6 +542,7 @@ bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_fragment_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
 typedef struct {
     bool present;
+    USILOpcode comparison_opcode;
     int color_register;
     int predicate_register;
     uint8_t color_component;
@@ -552,10 +556,16 @@ typedef struct {
 bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDiscardPlan *plan);
 /* Requires prepared CFG, dominance, SSA and use/def graphs; grants no source coverage. */
 bool hlsl_sampled_discard_preflight(const HLSLEmitterContext *ctx);
+bool hlsl_sampled_discard_tree_matches(const HLSLEmitterContext *ctx);
+bool hlsl_sampled_discard_statement_facts(void *context, uint32_t unit_id,
+    const ASTStmt *statement, HLSLSourceQualityFacts *facts);
+bool hlsl_emit_sampled_discard(HLSLEmitterContext *ctx);
 bool hlsl_sampled_nan_guard_preflight(const HLSLEmitterContext *ctx);
 bool hlsl_emit_sampled_nan_guard(HLSLEmitterContext *ctx);
 bool hlsl_format_owned_expression(HLSLEmitterContext *ctx, const ASTExpr *expression,
     ASTExpr **roots, const HLSLInstructionOwners *owners, bool function);
+bool hlsl_format_owned_statement(HLSLEmitterContext *ctx, const ASTStmt *statement,
+    ASTExpr **roots, const HLSLInstructionOwners *owners, int indent);
 
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);
