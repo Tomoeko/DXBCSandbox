@@ -291,6 +291,17 @@ static bool layout_has_matrix_field(const HLSLCBufferLayout *layout) {
     return false;
 }
 
+/* The sampled material body proves every actual static read through CFG/SSA
+ * and current field metadata. Its callback-free source/map replay also owns
+ * the emitted packoffset declarations. Unread whole-row gaps need no invented
+ * fields; anonymous tails and matrices retain their separate coverage gaps. */
+static bool material_cbuffer_inventory(const HLSLEmitterContext *ctx) {
+    HLSLSampledDiscardPlan plan;
+    return hlsl_source_quality_sampled_discard_guard_active(ctx) &&
+           hlsl_sampled_discard_plan_prepare(ctx->program, &plan) && plan.material &&
+           hlsl_sampled_discard_preflight(ctx);
+}
+
 /* Require every serialized field to survive in the actual emitted inventory,
  * including unused fields. A filtered field or anonymous tail remains a gap.
  * Scalar/vector row alignment is supplied by actual packoffset qualifiers,
@@ -324,8 +335,9 @@ bool hlsl_source_quality_named_cbuffer_supported(
         return false;
     }
     const bool matrix_inventory = layout_has_matrix_field(layout);
+    const bool sparse_material = !matrix_inventory && material_cbuffer_inventory(ctx);
     if (matrix_inventory ? !hlsl_source_quality_packed_output_guard_active(ctx)
-                         : layout->variable_count != layout->row_count) {
+                         : !sparse_material && layout->variable_count != layout->row_count) {
         return false;
     }
     uint32_t cursor = 0;
@@ -333,8 +345,11 @@ bool hlsl_source_quality_named_cbuffer_supported(
         const TempVariable *field = &layout->variables[variable];
         if ((field->authority != 1 && field->authority != 2) ||
             !name_available(ctx, layout, field, field->name) || field->type ||
-            field->matrix_array_size || field->row_major || field->byte_offset != cursor ||
-            field->reg_offset != cursor / 16u) {
+            field->matrix_array_size || field->row_major ||
+            (sparse_material ? (field->byte_offset < cursor || (field->byte_offset & 15u))
+                             : field->byte_offset != cursor) ||
+            field->reg_offset != field->byte_offset / 16u ||
+            (sparse_material && !hlsl_material_metadata_unique(ctx, layout, field))) {
             return false;
         }
         const uint32_t extent = field->is_matrix ? 64u : 16u;
@@ -343,11 +358,11 @@ bool hlsl_source_quality_named_cbuffer_supported(
                                    field->byte_size != field->dim * 4u) {
             return false;
         }
-        if (cursor > layout->reflection_size_bytes ||
-            extent > layout->reflection_size_bytes - cursor) {
+        if (field->byte_offset > layout->reflection_size_bytes ||
+            extent > layout->reflection_size_bytes - field->byte_offset) {
             return false;
         }
-        cursor += extent;
+        cursor = field->byte_offset + extent;
     }
     if (cursor != layout->reflection_size_bytes) {
         return false;
@@ -386,7 +401,7 @@ bool hlsl_source_quality_named_cbuffer_supported(
                     return false;
                 }
                 uint32_t field = decoded.byte_offset / 16u;
-                if (matrix_inventory) {
+                if (matrix_inventory || sparse_material) {
                     field = UINT32_MAX;
                     for (int candidate = 0; candidate < layout->variable_count; ++candidate) {
                         if (!hlsl_cbuffer_field_matches(
@@ -513,7 +528,7 @@ bool hlsl_source_quality_cbuffer_syntax(HLSLEmitterContext *ctx,
         facts.cbuffer_field_index = (uint32_t)field_index;
         facts.cbuffer_byte_offset = field->byte_offset;
         facts.cbuffer_byte_size = field->byte_size;
-        if (layout_has_matrix_field(layout)) {
+        if (layout_has_matrix_field(layout) || material_cbuffer_inventory(ctx)) {
             if (!hlsl_source_quality_named_cbuffer_supported(ctx, index, NULL)) {
                 hlsl_emit_fail(ctx,
                     HLSL_EMIT_STATUS_ANALYSIS_FAILED,

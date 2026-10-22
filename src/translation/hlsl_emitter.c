@@ -1667,6 +1667,11 @@ bool hlsl_source_quality_packed_output_guard_active(const HLSLEmitterContext *ct
       ctx->straightline_guard->ready;
 }
 
+bool hlsl_source_quality_sampled_discard_guard_active(const HLSLEmitterContext *ctx) {
+  return ctx && ctx->high_level_sampled_discard && ctx->straightline_guard &&
+      ctx->straightline_guard->ready;
+}
+
 static bool straightline_lease(HLSLStraightLineGuard *guard, const void *source, size_t size) {
   if (!size) return true;
   if (!source || guard->lease_count == (size_t)STRAIGHTLINE_LEASE_LIMIT ||

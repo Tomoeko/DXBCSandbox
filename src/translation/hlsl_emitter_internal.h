@@ -508,7 +508,8 @@ bool hlsl_high_level_output_projection(const USILProgram *program,
 typedef enum {
     HLSL_GRAPHICS_OWNER_PURE,
     HLSL_GRAPHICS_OWNER_CONSTANT_BUFFERS,
-    HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT
+    HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT,
+    HLSL_GRAPHICS_OWNER_SAMPLED_MATERIAL
 } HLSLGraphicsOwnerStorage;
 bool hlsl_decoded_graphics_owner_storage_valid(const USILProgram *program, HLSLGraphicsOwnerStorage storage);
 typedef struct {
@@ -533,6 +534,7 @@ typedef struct {
     bool packed_inputs;
     bool nan_guard;
     bool discard;
+    bool material_discard;
     int coordinate_field;
     uint32_t input_registers;
     uint32_t texture_register, sampler_register;
@@ -542,6 +544,14 @@ bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_fragment_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
 typedef struct {
     bool present;
+    bool material;
+    USILOpcode arithmetic_opcode;
+    uint8_t arithmetic_component;
+    uint8_t sampled_component;
+    bool scalar_sample;
+    int comparison_index;
+    int discard_index;
+    int output_index;
     USILOpcode comparison_opcode;
     int color_register;
     int predicate_register;
@@ -554,7 +564,8 @@ typedef struct {
 /* Decoded shape only; does not grant source, SSA, effect or quality coverage.
  * A non-NULL output is reset on entry and populated only on success. */
 bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDiscardPlan *plan);
-/* Requires prepared CFG, dominance, SSA and use/def graphs; grants no source coverage. */
+/* Requires prepared CFG, dominance, SSA and use/def graphs; grants no source coverage.
+ * Material fields must also agree with the current serialized authority. */
 bool hlsl_sampled_discard_preflight(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_discard_tree_matches(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_discard_statement_facts(
@@ -694,6 +705,7 @@ bool hlsl_source_quality_cbuffer_inventory_complete(const HLSLEmitterContext *ct
 bool hlsl_source_quality_named_cbuffer_supported(const HLSLEmitterContext *ctx,
     int layout_index, uint8_t *shell_authority);
 bool hlsl_source_quality_packed_output_guard_active(const HLSLEmitterContext *ctx);
+bool hlsl_source_quality_sampled_discard_guard_active(const HLSLEmitterContext *ctx);
 /* One declaration at the final reflected register preserves an unread tail
  * within the 64 KiB $Globals shell. Complete source replay supplies coverage. */
 #define HLSL_GLOBAL_TAIL_IDENTIFIER "_GlobalsLayoutEnd"
@@ -845,6 +857,7 @@ ASTExpr *hlsl_natural_source_atom(HLSLEmitterContext *ctx, int instruction,
 bool hlsl_natural_float_source_view(const DXBCOperand *original, DXBCOperand *plain_view);
 /* Consumes the unmodified FLOAT32 child on every outcome. Natural arithmetic
  * sources apply ABS then NEG exactly once after actual input/TEMP projection;
+ * static FLOAT32 material reads also require current serialized field agreement.
  * IF controls, comparisons and BOOL values do not gain modifier admission.
  * hlsl_natural_source_atom applies this wrapper to its own returned atom. */
 ASTExpr *hlsl_natural_float_source_modifiers(HLSLEmitterContext *ctx,
@@ -910,6 +923,9 @@ bool hlsl_emit_high_level_hull_stage(HLSLEmitterContext *ctx);
 ASTExpr *hlsl_texture_sample_expression(HLSLEmitterContext *ctx, int instruction,
                                        ASTExpr *coordinates, ASTExpr *parameter,
                                        ASTExpr *second_parameter);
+/* A proved material-discard sample's semantic component; always consumes coordinates. */
+ASTExpr *hlsl_texture_sample_component_expression(HLSLEmitterContext *ctx, int instruction,
+    ASTExpr *coordinates);
 void free_sampler_name_map(HLSLEmitterContext* ctx);
 void get_sampler_usage(const USILProgram *program, int sampler_reg,
                        bool *uses_regular, bool *uses_comparison);
@@ -972,8 +988,11 @@ bool hlsl_packed_uint_material_supported(HLSLEmitterContext *ctx,
     const HLSLPackedUIntOutputPlan *plan);
 bool hlsl_position_output_material_supported(HLSLEmitterContext *ctx,
     const HLSLPositionOutputPlan *plan);
-bool hlsl_material_source_supported(HLSLEmitterContext *ctx,
+bool hlsl_material_source_supported(const HLSLEmitterContext *ctx,
                                     const DXBCOperand *source, uint8_t lanes);
+/* Adds current serialized field identity/type agreement to the prepared lookup. */
+bool hlsl_material_source_metadata_matches(const HLSLEmitterContext *ctx,
+    const DXBCOperand *source, uint8_t lanes);
 ASTExpr *hlsl_material_source_expression(HLSLEmitterContext *ctx, int instruction,
                                          int operand, uint8_t lanes);
 int resolve_variable_type(const HLSLEmitterContext* ctx, const char* var_name);

@@ -945,11 +945,13 @@ ASTExpr *hlsl_natural_float_source_modifiers(HLSLEmitterContext *ctx,
                 expression->operand_provenance.bitcast_role == AST_OPERAND_BITCAST_NONE &&
                 !expression->operand_provenance.raw_buffer_reconstruction &&
                 !expression->operand_provenance.synthetic_interface;
+    const bool material = original->type == OPERAND_TYPE_CONSTANT_BUFFER &&
+        hlsl_material_source_metadata_matches(ctx, original, lanes);
     if ((ctx->program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
          ctx->program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
         !natural_float_operation_opcode(owner->opcode) || operand == 0 || !width || width > 4 || !floating ||
         (original->type != OPERAND_TYPE_INPUT && original->type != OPERAND_TYPE_TEMP &&
-         original->type != OPERAND_TYPE_IMMEDIATE32) ||
+         original->type != OPERAND_TYPE_IMMEDIATE32 && !material) ||
         !hlsl_natural_float_instruction_supported(ctx, instruction)) {
         ast_free_expr(expression);
         return NULL;
@@ -2055,7 +2057,8 @@ bool hlsl_expression_source_map_matches(const HLSLExpressionSourceMap *map,
                 return false;
             break;
         case HLSL_EXPRESSION_ORIGIN_EFFECT:
-            if (sampled_discard && index == 2 && inst->opcode == USIL_OP_DISCARD && !lanes) {
+            if (sampled_discard && index == (size_t)discard.discard_index &&
+                inst->opcode == USIL_OP_DISCARD && !lanes) {
                 break;
             }
             if (lanes || !hlsl_high_level_geometry_interface_supported(

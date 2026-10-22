@@ -51,13 +51,27 @@ static bool sample_scalar_literal(const DXBCOperand *operand) {
 
 /* The layout belongs to the actual sample and released signatures. Result
  * consumers have separate complete instruction-graph proofs below. */
-static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan) {
+typedef enum {
+    SAMPLE_LAYOUT_ORDINARY,
+    SAMPLE_LAYOUT_MATERIAL_DISCARD
+} SampleLayoutMode;
+
+static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan,
+    SampleLayoutMode mode) {
     if (!plan) return false;
     memset(plan, 0, sizeof(*plan));
-    if (!hlsl_decoded_graphics_owner_storage_valid(program, HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT) ||
+    const bool material = mode == SAMPLE_LAYOUT_MATERIAL_DISCARD;
+    if ((mode != SAMPLE_LAYOUT_ORDINARY && !material) ||
+        !hlsl_decoded_graphics_owner_storage_valid(program, material
+            ? HLSL_GRAPHICS_OWNER_SAMPLED_MATERIAL : HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT) ||
         program->program_type != DXBC_PROGRAM_TYPE_PIXEL || program->shader_model_minor ||
         !program->input_count || program->output_count != 1 ||
         (program->has_global_flags && program->global_flags != 1u)) return false;
+    if (material && (program->instruction_count != 6 ||
+        program->instructions[4].opcode != USIL_OP_MOV ||
+        program->instructions[4].operand_count != 2)) {
+        return false;
+    }
     const USILTexture *texture = &program->textures[0];
     const USILSampler *sampler = &program->samplers[0];
     HLSLSampledTextureKind kind;
@@ -79,6 +93,8 @@ static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmen
     const USILInstruction *sample = &program->instructions[0];
     const bool level = sample->opcode == USIL_OP_SAMPLE_L;
     if ((!level && sample->opcode != USIL_OP_SAMPLE) || sample->operand_count != (level ? 5 : 4)) return false;
+    const bool scalar_sample = material && program->shader_model_major == 5 &&
+        usil_operand_destination_lane_mask(&sample->operands[0]) == 1;
     for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *instruction = &program->instructions[index];
         if (instruction->saturate || instruction->precise_mask ||
@@ -88,20 +104,23 @@ static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmen
                 strcmp(instruction->resource_dimension, texture->dimension) != 0)) return false;
     }
     static const uint8_t identity[4] = {0, 1, 2, 3}, xy[4] = {0, 1, 0, 0},
-        xyz[4] = {0, 1, 2, 0}, zw[4] = {2, 3, 2, 2};
+        xyz[4] = {0, 1, 2, 0}, zw[4] = {2, 3, 2, 2}, alpha[4] = {3, 0, 1, 2};
     const bool tail_coordinates = kind == HLSL_SAMPLED_TEXTURE_2D &&
         sample->operands[1].raw_token == UINT32_C(0x00101ae6);
     if (!sample_register(&sample->operands[1], OPERAND_TYPE_INPUT,
             three_coordinates ? UINT32_C(0x00101246) : tail_coordinates ? UINT32_C(0x00101ae6) : UINT32_C(0x00101046),
             three_coordinates ? xyz : tail_coordinates ? zw : xy) ||
         sample->operands[1].register_index >= HLSL_SM5_IO_REGISTER_COUNT ||
-        !sample_register(&sample->operands[2], OPERAND_TYPE_RESOURCE, UINT32_C(0x00107e46), identity) ||
+        !sample_register(&sample->operands[2], OPERAND_TYPE_RESOURCE,
+            scalar_sample ? UINT32_C(0x00107936) : UINT32_C(0x00107e46),
+            scalar_sample ? alpha : identity) ||
         sample->operands[2].register_index != texture->reg_idx ||
         !sample_register(&sample->operands[3], OPERAND_TYPE_SAMPLER, UINT32_C(0x00106000), identity) ||
         sample->operands[3].register_index != sampler->reg_idx || (level && !sample_scalar_literal(&sample->operands[4])))
         return false;
     const uint8_t coordinate_mask = three_coordinates ? 7 : tail_coordinates ? 12 : 3;
     int coordinate = -1;
+    int returned_input = -1;
     bool inactive_typed_inputs = false;
     uint8_t occupied[HLSL_SM5_IO_REGISTER_COUNT] = {0};
     unsigned register_fields[HLSL_SM5_IO_REGISTER_COUNT] = {0};
@@ -123,8 +142,19 @@ static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmen
                 field->interpolation_mode < 2 || field->interpolation_mode > 7) return false;
             coordinate = index;
         } else {
-            if (field->rw_mask || field->interpolation_mode) return false;
-            inactive_typed_inputs |= field->component_type != 3;
+            const DXBCOperand *result = material ? &program->instructions[4].operands[1] : NULL;
+            if (result && result->type == OPERAND_TYPE_INPUT &&
+                result->register_index == (int)field->register_id) {
+                if (returned_input >= 0 || field->system_value || field->component_type != 3 ||
+                    field->mask != 15 || field->rw_mask != 15 ||
+                    field->interpolation_mode < 2 || field->interpolation_mode > 7) {
+                    return false;
+                }
+                returned_input = index;
+            } else {
+                if (field->rw_mask || field->interpolation_mode) return false;
+                inactive_typed_inputs |= field->component_type != 3;
+            }
         }
         occupied[field->register_id] |= field->mask;
         registers |= UINT32_C(1) << field->register_id;
@@ -142,9 +172,17 @@ static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmen
     }
     if (packed_registers && (inactive_typed_inputs || (packed_registers & (packed_registers - 1u)) ||
         packed_registers != (UINT32_C(1) << (unsigned)sample->operands[1].register_index))) return false;
-    if (coordinate < 0 || program->signature_declaration_count != 2) return false;
-    bool input_seen = false, output_seen = false;
-    for (int index = 0; index < 2; ++index) {
+    if (material && (kind != HLSL_SAMPLED_TEXTURE_2D || level || packed_registers ||
+        inactive_typed_inputs || (program->instructions[4].operands[1].type == OPERAND_TYPE_INPUT &&
+            returned_input < 0))) {
+        return false;
+    }
+    const int declaration_count = returned_input >= 0 ? 3 : 2;
+    if (coordinate < 0 || program->signature_declaration_count != declaration_count) return false;
+    bool input_seen = false;
+    bool output_seen = false;
+    bool returned_input_seen = false;
+    for (int index = 0; index < declaration_count; ++index) {
         const USILSignatureDeclaration *declaration = &program->signature_declarations[index];
         if (!declaration->has_signature_register || declaration->stream_index ||
             declaration->has_array_element_count || declaration->array_element_count ||
@@ -154,12 +192,20 @@ static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmen
             declaration->register_id == program->inputs[coordinate].register_id && declaration->mask == coordinate_mask &&
             declaration->has_interpolation && declaration->interpolation_mode == program->inputs[coordinate].interpolation_mode &&
             !input_seen) input_seen = true;
+        else if (returned_input >= 0 && !returned_input_seen &&
+            declaration->kind == USIL_SIGNATURE_DECL_INPUT_PS &&
+            declaration->operand_type == OPERAND_TYPE_INPUT &&
+            declaration->register_id == program->inputs[returned_input].register_id &&
+            declaration->mask == 15 && declaration->has_interpolation &&
+            declaration->interpolation_mode == program->inputs[returned_input].interpolation_mode) {
+            returned_input_seen = true;
+        }
         else if (declaration->kind == USIL_SIGNATURE_DECL_OUTPUT && declaration->operand_type == OPERAND_TYPE_OUTPUT &&
             !declaration->register_id && declaration->mask == 15 && !declaration->has_interpolation &&
             !declaration->interpolation_mode && !output_seen) output_seen = true;
         else return false;
     }
-    if (!input_seen || !output_seen) return false;
+    if (!input_seen || !output_seen || (returned_input >= 0 && !returned_input_seen)) return false;
     *plan = (HLSLSampledFragmentPlan){.present = true, .texture_kind = kind, .explicit_level = level,
         .inactive_typed_inputs = inactive_typed_inputs, .packed_inputs = packed_registers != 0,
         .coordinate_field = coordinate, .input_registers = registers,
@@ -196,13 +242,159 @@ static bool guard_temp(const DXBCOperand *operand, unsigned reg, uint32_t token)
         operand->register_index == (int)reg;
 }
 
+/* Decoded static storage only. Current/common material metadata must separately
+ * prove the scalar type, field extent, identifier and declaration ownership. */
+static bool sample_material_operand(const USILProgram *program, const DXBCOperand *operand,
+    bool vector) {
+    DXBCOperand plain;
+    if (!hlsl_natural_float_source_view(operand, &plain) ||
+        operand->type != OPERAND_TYPE_CONSTANT_BUFFER || operand->register_index_dim != 2 ||
+        operand->register_index != program->cbuffers[0].reg_idx ||
+        operand->rel_offset0 < 0 || operand->rel_offset0 >= program->cbuffers[0].size ||
+        operand->rel_offset1 != operand->register_index || operand->rel_offset2 ||
+        operand->destination_mask || operand->imm_value_count || operand->immediate_word_count ||
+        operand->index_representations[0] || operand->index_representations[1] ||
+        !operand->index_has_immediate[0] || !operand->index_has_immediate[1] ||
+        operand->index_value_exceeds_int[0] || operand->index_value_exceeds_int[1] ||
+        operand->index_values[0] != (uint32_t)operand->register_index ||
+        operand->index_values[1] != (uint32_t)operand->rel_offset0 ||
+        operand->index_has_immediate[2] || operand->index_representations[2] ||
+        operand->index_value_exceeds_int[2] || operand->index_values[2]) {
+        return false;
+    }
+    const unsigned component = operand->swizzle[0];
+    const uint32_t token = vector ? UINT32_C(0x00208e46)
+        : UINT32_C(0x0020800a) | (uint32_t)component << 4u;
+    if (component > 3 || (operand->raw_token & UINT32_C(0x7fffffff)) != token ||
+        operand->swizzle_mode != (vector ? 1 : 2) ||
+        (vector && (operand->has_abs || operand->has_neg))) {
+        return false;
+    }
+    for (unsigned lane = 0; lane < 4; ++lane) {
+        if (operand->swizzle[lane] != (vector ? lane : component) ||
+            operand->imm_values[lane] || operand->imm64_values[lane]) {
+            return false;
+        }
+    }
+    for (unsigned word = 0; word < 8; ++word) {
+        if (operand->immediate_words[word]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool sampled_material_discard_shape(const USILProgram *program,
+    HLSLSampledDiscardPlan *plan) {
+    HLSLSampledFragmentPlan layout;
+    if (!sample_layout_prepare(program, &layout, SAMPLE_LAYOUT_MATERIAL_DISCARD) ||
+        program->temp_count < 1 || program->temp_count > 3) {
+        return false;
+    }
+    const USILInstruction *instructions = program->instructions;
+    const USILInstruction *arithmetic = &instructions[1];
+    const USILInstruction *comparison = &instructions[2];
+    const USILInstruction *discard = &instructions[3];
+    const USILOpcode arithmetic_opcode = arithmetic->opcode;
+    static const USILOpcode operations[6] = {
+        USIL_OP_SAMPLE, USIL_OP_ADD, USIL_OP_LT, USIL_OP_DISCARD, USIL_OP_MOV, USIL_OP_RET};
+    static const int counts[6] = {4, 3, 3, 1, 2, 0};
+    for (unsigned index = 0; index < 6; ++index) {
+        const bool arithmetic_mad = index == 1 && arithmetic_opcode == USIL_OP_MAD;
+        const bool comparison_ge = index == 2 && comparison->opcode == USIL_OP_GE;
+        if ((!arithmetic_mad && !comparison_ge && instructions[index].opcode != operations[index]) ||
+            instructions[index].operand_count != counts[index] + (arithmetic_mad ? 1 : 0) ||
+            instructions[index].source_instruction_index !=
+                instructions[0].source_instruction_index + index ||
+            (index != 3 && instructions[index].condition_test)) {
+            return false;
+        }
+    }
+    const int color_register = instructions[0].operands[0].register_index;
+    const bool scalar_sample = program->shader_model_major == 5 &&
+        usil_operand_destination_lane_mask(&instructions[0].operands[0]) == 1;
+    const int value_register = arithmetic->operands[0].register_index;
+    const int predicate_register = comparison->operands[0].register_index;
+    const uint8_t value_mask = usil_operand_destination_lane_mask(&arithmetic->operands[0]);
+    const uint8_t predicate_mask = usil_operand_destination_lane_mask(&comparison->operands[0]);
+    if (color_register < 0 || color_register >= program->temp_count || value_register < 0 ||
+        value_register >= program->temp_count || predicate_register < 0 ||
+        predicate_register >= program->temp_count || !value_mask || value_mask > 15 ||
+        (value_mask & (value_mask - 1u)) || !predicate_mask || predicate_mask > 15 ||
+        (predicate_mask & (predicate_mask - 1u)) ||
+        !guard_temp(&instructions[0].operands[0], (unsigned)color_register,
+            scalar_sample ? UINT32_C(0x00100012) : UINT32_C(0x001000f2)) ||
+        !guard_temp(&arithmetic->operands[0], (unsigned)value_register,
+            UINT32_C(0x00100002) | (uint32_t)value_mask << 4u) ||
+        !guard_temp(&comparison->operands[0], (unsigned)predicate_register,
+            UINT32_C(0x00100002) | (uint32_t)predicate_mask << 4u) ||
+        (discard->condition_test != DXBC_INSTRUCTION_TEST_ZERO &&
+            discard->condition_test != DXBC_INSTRUCTION_TEST_NONZERO)) {
+        return false;
+    }
+    const unsigned color_component = arithmetic->operands[1].swizzle[0];
+    unsigned value_component = 0;
+    unsigned predicate_component = 0;
+    while (!(value_mask & (1u << value_component))) {
+        ++value_component;
+    }
+    while (!(predicate_mask & (1u << predicate_component))) {
+        ++predicate_component;
+    }
+    const bool literal_first = comparison->operands[1].type == OPERAND_TYPE_IMMEDIATE32;
+    const DXBCOperand *literal = &comparison->operands[literal_first ? 1 : 2];
+    const DXBCOperand *value = &comparison->operands[literal_first ? 2 : 1];
+    const DXBCOperand *result = &instructions[4].operands[1];
+    static const uint8_t identity[4] = {0, 1, 2, 3};
+    if (color_component > 3 || (scalar_sample && color_component != 0) ||
+        !guard_temp(&arithmetic->operands[1], (unsigned)color_register,
+            UINT32_C(0x0010000a) | (uint32_t)color_component << 4u) ||
+        !sample_material_operand(program, &arithmetic->operands[2], false) ||
+        (arithmetic_opcode == USIL_OP_MAD &&
+            !sample_material_operand(program, &arithmetic->operands[3], false)) ||
+        !sample_scalar_literal(literal) ||
+        !guard_temp(value, (unsigned)value_register,
+            UINT32_C(0x0010000a) | (uint32_t)value_component << 4u) ||
+        !guard_temp(&discard->operands[0], (unsigned)predicate_register,
+            UINT32_C(0x0010000a) | (uint32_t)predicate_component << 4u) ||
+        !sample_register(&instructions[4].operands[0],
+            OPERAND_TYPE_OUTPUT, UINT32_C(0x001020f2), identity) ||
+        instructions[4].operands[0].register_index ||
+        (result->type == OPERAND_TYPE_INPUT
+            ? !sample_register(result, OPERAND_TYPE_INPUT, UINT32_C(0x00101e46), identity)
+            : !sample_material_operand(program, result, true))) {
+        return false;
+    }
+    *plan = (HLSLSampledDiscardPlan){.present = true,
+        .material = true,
+        .arithmetic_opcode = arithmetic_opcode,
+        .arithmetic_component = (uint8_t)value_component,
+        .sampled_component = scalar_sample ? 3 : (uint8_t)color_component,
+        .scalar_sample = scalar_sample,
+        .comparison_index = 2,
+        .discard_index = 3,
+        .output_index = 4,
+        .comparison_opcode = comparison->opcode,
+        .color_register = color_register,
+        .predicate_register = predicate_register,
+        .color_component = (uint8_t)color_component,
+        .predicate_component = (uint8_t)predicate_component,
+        .literal_first = literal_first,
+        .discard_on_zero = discard->condition_test == DXBC_INSTRUCTION_TEST_ZERO,
+        .threshold_bits = literal->immediate_words[0]};
+    return true;
+}
+
 bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDiscardPlan *plan) {
     if (!plan) {
         return false;
     }
     memset(plan, 0, sizeof(*plan));
+    if (program && program->instruction_count == 6) {
+        return sampled_material_discard_shape(program, plan);
+    }
     HLSLSampledFragmentPlan layout = {0};
-    if (!sample_layout_prepare(program, &layout) ||
+    if (!sample_layout_prepare(program, &layout, SAMPLE_LAYOUT_ORDINARY) ||
         layout.texture_kind != HLSL_SAMPLED_TEXTURE_2D || layout.explicit_level ||
         layout.inactive_typed_inputs || layout.packed_inputs || program->instruction_count != 5 ||
         program->temp_count != 2) {
@@ -263,6 +455,10 @@ bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDi
         return false;
     }
     *plan = (HLSLSampledDiscardPlan){.present = true,
+        .sampled_component = (uint8_t)color_component,
+        .comparison_index = 1,
+        .discard_index = 2,
+        .output_index = 3,
         .comparison_opcode = comparison->opcode,
         .color_register = color_register,
         .predicate_register = predicate_register,
@@ -317,13 +513,16 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
     if (!plan) return false;
     memset(plan, 0, sizeof(*plan));
     HLSLSampledFragmentPlan layout = {0};
-    if (!sample_layout_prepare(program, &layout)) return false;
-    if (program->instruction_count == 5) {
+    const SampleLayoutMode mode = program && program->instruction_count == 6
+        ? SAMPLE_LAYOUT_MATERIAL_DISCARD : SAMPLE_LAYOUT_ORDINARY;
+    if (!sample_layout_prepare(program, &layout, mode)) return false;
+    if (program->instruction_count == 5 || program->instruction_count == 6) {
         HLSLSampledDiscardPlan discard;
         if (!hlsl_sampled_discard_plan_prepare(program, &discard)) {
             return false;
         }
         layout.discard = true;
+        layout.material_discard = discard.material;
         *plan = layout;
         return true;
     }

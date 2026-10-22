@@ -396,8 +396,9 @@ typedef enum {
 /* Storage and decoded-shape safety only. The structured producer separately
  * proves the complete IF/phi/value contract over the prepared CFG and SSA. */
 bool hlsl_decoded_graphics_owner_storage_valid(const USILProgram *program, HLSLGraphicsOwnerStorage storage) {
-    const bool constant_buffers = storage == HLSL_GRAPHICS_OWNER_CONSTANT_BUFFERS;
-    const bool sampled = storage == HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT;
+    const bool material = storage == HLSL_GRAPHICS_OWNER_SAMPLED_MATERIAL;
+    const bool constant_buffers = storage == HLSL_GRAPHICS_OWNER_CONSTANT_BUFFERS || material;
+    const bool sampled = storage == HLSL_GRAPHICS_OWNER_SAMPLED_FRAGMENT || material;
     if ((storage != HLSL_GRAPHICS_OWNER_PURE && !constant_buffers && !sampled) ||
         !program || !program->has_stage_contract || !program->has_parsed_signature_authority ||
         (program->program_type != DXBC_PROGRAM_TYPE_VERTEX && program->program_type != DXBC_PROGRAM_TYPE_PIXEL) ||
@@ -424,6 +425,13 @@ bool hlsl_decoded_graphics_owner_storage_valid(const USILProgram *program, HLSLG
     if (sampled && (program->texture_count != 1 || program->texture_alloc < 1 || !program->textures ||
         program->sampler_count != 1 || program->sampler_alloc < 1 || !program->samplers ||
         !hlsl_texture_declaration_supported(&program->textures[0]) || program->samplers[0].mode)) return false;
+    if (material && (program->cbuffer_count != 1 || program->cbuffer_alloc < 1 ||
+        !program->cbuffers || program->cbuffers[0].reg_idx < 0 ||
+        program->cbuffers[0].reg_idx >= HLSL_SM5_CBUFFER_REGISTER_COUNT ||
+        program->cbuffers[0].size < 1 || program->cbuffers[0].size > 4096 ||
+        program->cbuffers[0].dynamic_indexed)) {
+        return false;
+    }
     const DXBCSignatureElement *signatures[] = {program->inputs, program->outputs};
     const int counts[] = {program->input_count, program->output_count};
     for (unsigned role = 0; role < 2; ++role)
@@ -491,8 +499,11 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     static const char packed_sample[] = "dxbc-packed-sample-owner-v1";
     static const char sampled_nan_guard[] = "dxbc-sampled-nan-guard-owner-v1";
     static const char sampled_discard[] = "dxbc-sampled-discard-owner-v1";
+    static const char material_discard[] = "dxbc-sampled-material-discard-owner-v1";
     if (stage == DECODED_OWNER_SAMPLED_FRAGMENT) {
-        if (sampled.discard) {
+        if (sampled.material_discard) {
+            common_sha256_update(&hash, material_discard, sizeof(material_discard));
+        } else if (sampled.discard) {
             common_sha256_update(&hash, sampled_discard, sizeof(sampled_discard));
         } else if (sampled.nan_guard)
             common_sha256_update(&hash, sampled_nan_guard, sizeof(sampled_nan_guard));

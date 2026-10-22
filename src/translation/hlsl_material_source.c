@@ -7,7 +7,7 @@
 
 /* Material-field authority is shared by the expression and packed-output
  * planners. Formatting and AST construction remain with their consumers. */
-bool hlsl_material_source_supported(HLSLEmitterContext *ctx, const DXBCOperand *source,
+bool hlsl_material_source_supported(const HLSLEmitterContext *ctx, const DXBCOperand *source,
                                     uint8_t mask) {
     if (!ctx || !ctx->program || !source || source->type != OPERAND_TYPE_CONSTANT_BUFFER ||
         !mask || (mask & ~15u)) return false;
@@ -111,6 +111,36 @@ bool hlsl_material_metadata_unique(const HLSLEmitterContext *ctx,
         }
     }
     return found;
+}
+
+bool hlsl_material_source_metadata_matches(const HLSLEmitterContext *ctx,
+    const DXBCOperand *source, uint8_t mask) {
+    if (!hlsl_material_source_supported(ctx, source, mask)) {
+        return false;
+    }
+    const HLSLCBufferLayout *layout = get_cbuffer_emission_layout(ctx, source->register_index);
+    if (!layout || layout->raw_storage || layout->row_struct_storage ||
+        !layout->has_serialized_authority || layout->variable_count < 1 ||
+        layout->variable_alloc < layout->variable_count || !layout->variables) {
+        return false;
+    }
+    unsigned lane = 0;
+    while (!(mask & (1u << lane))) {
+        ++lane;
+    }
+    int offset = 0;
+    const char *name = resolve_cb_variable_ctx(ctx, source->register_index, source->rel_offset0,
+        usil_operand_source_component(source, (int)lane), &offset);
+    if (!name) {
+        return false;
+    }
+    for (int index = 0; index < layout->variable_count; ++index) {
+        const TempVariable *field = &layout->variables[index];
+        if (field->name && !strcmp(field->name, name)) {
+            return hlsl_material_metadata_unique(ctx, layout, field);
+        }
+    }
+    return false;
 }
 
 bool hlsl_packed_uint_material_supported(HLSLEmitterContext *ctx,

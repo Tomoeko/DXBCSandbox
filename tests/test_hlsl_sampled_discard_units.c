@@ -28,7 +28,10 @@ typedef struct {
 static bool check_variant_emission(USILProgram *program);
 
 static bool plan_empty(const HLSLSampledDiscardPlan *plan) {
-    return !plan->present && plan->comparison_opcode == USIL_OP_NOP && !plan->color_register &&
+    return !plan->present && !plan->material && plan->arithmetic_opcode == USIL_OP_NOP &&
+           !plan->arithmetic_component && !plan->sampled_component && !plan->scalar_sample &&
+           !plan->comparison_index && !plan->discard_index && !plan->output_index &&
+           plan->comparison_opcode == USIL_OP_NOP && !plan->color_register &&
            !plan->predicate_register && !plan->color_component && !plan->predicate_component &&
            !plan->literal_first && !plan->discard_on_zero && !plan->threshold_bits;
 }

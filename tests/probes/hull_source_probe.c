@@ -578,11 +578,22 @@ static bool native_sampled_parameters(const UnityCompilerBinaryResponse *respons
     if (!response || !parameters || response->reflection_record_count > 32 ||
         (response->reflection_record_count && !response->reflection_records)) return false;
     SerializedResourceParam texture = {0};
+    UnityCompilerReflectionRecord cb_records[5];
+    size_t cb_count = 0;
     bool found = false;
     for (size_t index = 0; index < response->reflection_record_count; ++index) {
         const UnityCompilerReflectionRecord *record = &response->reflection_records[index];
         if (!native_reflection_record_canonical(record)) return false;
         if (record->kind == UNITY_COMPILER_REFLECTION_INPUT || record->kind == UNITY_COMPILER_REFLECTION_STATS) continue;
+        if (record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER ||
+            record->kind == UNITY_COMPILER_REFLECTION_CONSTANT ||
+            record->kind == UNITY_COMPILER_REFLECTION_CONSTANT_BUFFER_BINDING) {
+            if (cb_count == sizeof(cb_records) / sizeof(*cb_records)) {
+                return false;
+            }
+            cb_records[cb_count++] = *record;
+            continue;
+        }
         if (record->kind != UNITY_COMPILER_REFLECTION_TEXTURE_BINDING || found || record->value_count != 4 ||
             !hlsl_source_identifier_valid(record->name) || record->values[0] < 0 ||
             record->values[0] >= HLSL_SM5_RESOURCE_REGISTER_COUNT || record->values[1] < 0 ||
@@ -595,8 +606,32 @@ static bool native_sampled_parameters(const UnityCompilerBinaryResponse *respons
             role, texture.name, texture.bind_index, texture.sampler_index, texture.dimension);
         found = true;
     }
-    const SerializedProgramParameters projected = {.resources = &texture, .res_count = 1};
-    return found && serialized_program_parameters_copy(parameters, &projected);
+    if (!found) {
+        return false;
+    }
+    if (!cb_count) {
+        const SerializedProgramParameters projected = {.resources = &texture, .res_count = 1};
+        return serialized_program_parameters_copy(parameters, &projected);
+    }
+    /* Keep the existing CB-only certificate's COMPATIBLE scope, including its
+     * unavailable dormant-variable count and excluded input-binding claims. */
+    UnityCompilerBinaryResponse cb_view = *response;
+    cb_view.reflection_records = cb_records;
+    cb_view.reflection_record_count = cb_count;
+    SerializedProgramParameters cb_parameters;
+    serialized_program_parameters_init(&cb_parameters);
+    bool copied = false;
+    if (!native_global_parameters(&cb_view, &cb_parameters, NULL, role)) {
+        goto cleanup;
+    }
+    SerializedResourceParam resources[2] = {cb_parameters.resources[0], texture};
+    const SerializedProgramParameters projected = {.cb_count = cb_parameters.cb_count,
+        .constant_buffers = cb_parameters.constant_buffers, .resources = resources, .res_count = 2};
+    copied = serialized_program_parameters_copy(parameters, &projected);
+
+cleanup:
+    serialized_program_parameters_free(&cb_parameters);
+    return copied;
 }
 
 static bool native_sampled_parameters_equal(const UnityCompilerBinaryResponse *response,
@@ -1497,7 +1532,7 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
             literal_operand = 2;
             counterexample_owner = "decoded-selection-literal";
         } else if (sampled.discard) {
-            literal_instruction = 1;
+            literal_instruction = discard.comparison_index;
             literal_operand = discard.literal_first ? 1 : 2;
             counterexample_owner = "decoded-discard-literal";
         }
@@ -2867,7 +2902,7 @@ int main(int argc, char **argv) {
                                    &candidate))
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[1])) goto done;
-    if (native_parameters.cb_count &&
+    if (native_parameters.cb_count && !sampled_fragment_fixture &&
         !native_cb_parameters_equal(&compiled[1], &native_parameters, scalar_globals_fixture, "cold-candidate")) goto done;
     if (sampled_fragment_fixture &&
         !native_sampled_parameters_equal(&compiled[1], &native_parameters, "cold-candidate")) goto done;
@@ -2942,7 +2977,7 @@ int main(int argc, char **argv) {
                                    &changed))
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[2])) goto done;
-    if (native_parameters.cb_count &&
+    if (native_parameters.cb_count && !sampled_fragment_fixture &&
         !native_cb_parameters_equal(&compiled[2], &native_parameters, scalar_globals_fixture, "warm-mutated")) goto done;
     if (sampled_fragment_fixture &&
         !native_sampled_parameters_equal(&compiled[2], &native_parameters, "warm-mutated")) goto done;
@@ -2976,7 +3011,7 @@ int main(int argc, char **argv) {
                                    &repeated))
         goto done;
     if (!domain_fixture && scalar_fixture && !scalar_fixture_reflection(&compiled[3])) goto done;
-    if (native_parameters.cb_count &&
+    if (native_parameters.cb_count && !sampled_fragment_fixture &&
         !native_cb_parameters_equal(&compiled[3], &native_parameters, scalar_globals_fixture, "warm-restored")) goto done;
     if (sampled_fragment_fixture &&
         !native_sampled_parameters_equal(&compiled[3], &native_parameters, "warm-restored")) goto done;

@@ -5,8 +5,10 @@
 #include "translation/usil_validation.h"
 
 typedef struct HLSLSampledDiscardTree {
-    ASTExpr *values[4];
-    ASTExpr *recorded[4];
+    ASTExpr *values[5];
+    ASTExpr *recorded[5];
+    int value_count;
+    int condition_index;
     ASTStmt *statement;
     ASTStmt *body;
     ASTStmt *discard;
@@ -20,16 +22,19 @@ bool hlsl_sampled_discard_tree_matches(const HLSLEmitterContext *ctx) {
     if (!tree) {
         return true;
     }
-    if (!ctx->high_level_sampled_discard || !tree->statement || !tree->body || !tree->discard ||
-        tree->statement->kind != AST_STMT_IF ||
-        tree->statement->u.if_stmt.cond != tree->values[2] ||
+    if (!ctx->high_level_sampled_discard || !ctx->program ||
+        (tree->value_count != 4 && tree->value_count != 5) ||
+        tree->condition_index != tree->value_count - 2 ||
+        ctx->program->instruction_count != tree->value_count + 1 || !tree->statement ||
+        !tree->body || !tree->discard || tree->statement->kind != AST_STMT_IF ||
+        tree->statement->u.if_stmt.cond != tree->values[tree->condition_index] ||
         tree->statement->u.if_stmt.true_body != tree->body ||
         tree->statement->u.if_stmt.false_body || tree->body->kind != AST_STMT_BLOCK ||
         tree->body->u.block.stmt_count != 1 || !tree->body->u.block.stmts ||
         tree->body->u.block.stmts[0] != tree->discard || tree->discard->kind != AST_STMT_DISCARD) {
         return false;
     }
-    for (unsigned index = 0; index < 4; ++index) {
+    for (int index = 0; index < tree->value_count; ++index) {
         if (!tree->values[index] || !tree->recorded[index] ||
             !hlsl_matrix_uses_trees_equal(tree->values[index], tree->recorded[index])) {
             return false;
@@ -51,20 +56,23 @@ bool hlsl_sampled_discard_statement_facts(
     }
     hlsl_source_quality_facts_init(facts);
     facts->known = true;
-    facts->instruction_index = 2;
-    facts->source_instruction_index = ctx->program->instructions[2].source_instruction_index;
+    facts->instruction_index = tree->condition_index;
+    facts->source_instruction_index =
+        ctx->program->instructions[tree->condition_index].source_instruction_index;
     facts->logical_operation = statement == tree->discard;
     return true;
 }
 
-static bool discard_cfg_matches(const HLSLEmitterContext *ctx) {
+static bool discard_cfg_matches(const HLSLEmitterContext *ctx, const HLSLSampledDiscardPlan *plan) {
     const HLSLControlFlowGraph *cfg = &ctx->cfg;
-    if (cfg->instruction_count != 5 || cfg->block_count != 4 || !cfg->blocks ||
+    const int instruction_count = plan->output_index + 2;
+    if (cfg->instruction_count != instruction_count || cfg->block_count != 4 || !cfg->blocks ||
         !cfg->instruction_block || !cfg->idom || !cfg->nesting) {
         return false;
     }
-    static const int first[4] = {0, 2, 3, 4};
-    static const int last[4] = {1, 2, 3, 4};
+    const int first[4] = {0, plan->discard_index, plan->output_index, instruction_count - 1};
+    const int last[4] = {
+        plan->comparison_index, plan->discard_index, plan->output_index, instruction_count - 1};
     for (int index = 0; index < 4; ++index) {
         const HLSLBasicBlock *block = &cfg->blocks[index];
         if (block->first_instruction != first[index] || block->last_instruction != last[index] ||
@@ -92,30 +100,47 @@ bool hlsl_sampled_discard_preflight(const HLSLEmitterContext *ctx) {
     HLSLSampledDiscardPlan plan;
     if (!ctx || ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
         !hlsl_sampled_discard_plan_prepare(ctx->program, &plan) ||
-        ctx->compiler_model.replacement_count || !discard_cfg_matches(ctx) ||
-        ctx->ssa.instruction_count != 5 || ctx->ssa.ssa_var_count < 1 ||
-        !ctx->ssa.operand_ssa_vars || !ctx->ssa.relative_operand_ssa_vars ||
-        !ctx->ssa.ssa_var_defs || !ctx->ssa.block_phis || ctx->use_def.instruction_count != 5 ||
+        ctx->compiler_model.replacement_count || !discard_cfg_matches(ctx, &plan) ||
+        ctx->ssa.instruction_count != ctx->program->instruction_count ||
+        ctx->ssa.ssa_var_count < 1 || !ctx->ssa.operand_ssa_vars ||
+        !ctx->ssa.relative_operand_ssa_vars || !ctx->ssa.ssa_var_defs || !ctx->ssa.block_phis ||
+        ctx->use_def.instruction_count != ctx->program->instruction_count ||
         !ctx->use_def.operand_definitions || !ctx->use_def.definition_use_counts) {
         return false;
+    }
+    if (plan.material) {
+        const USILInstruction *arithmetic = &ctx->program->instructions[1];
+        const DXBCOperand *result = &ctx->program->instructions[plan.output_index].operands[1];
+        const uint8_t mask = usil_operand_destination_lane_mask(&arithmetic->operands[0]);
+        if (!ctx->cbuffer_layouts_built ||
+            !hlsl_material_source_metadata_matches(ctx, &arithmetic->operands[2], mask) ||
+            (plan.arithmetic_opcode == USIL_OP_MAD &&
+                !hlsl_material_source_metadata_matches(ctx, &arithmetic->operands[3], mask)) ||
+            (result->type == OPERAND_TYPE_CONSTANT_BUFFER &&
+                !hlsl_material_source_metadata_matches(ctx, result, 15))) {
+            return false;
+        }
     }
     for (int block = 0; block < 4; ++block) {
         if (ctx->ssa.block_phis[block].phi_count) {
             return false;
         }
     }
-    static const USILEffectFlags effects[5] = {USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_QUAD_CONTEXT,
-        USIL_EFFECT_NONE,
-        USIL_EFFECT_CONTROL | USIL_EFFECT_QUAD_CONTEXT,
-        USIL_EFFECT_NONE,
-        USIL_EFFECT_CONTROL};
-    static const int source_definitions[5] = {-1, 0, 1, 0, -1};
-    unsigned uses[5][4] = {{0}};
-    for (int index = 0; index < 5; ++index) {
+    const int instruction_count = ctx->program->instruction_count;
+    unsigned uses[6][4] = {{0}};
+    for (int index = 0; index < instruction_count; ++index) {
         const USILInstruction *instruction = &ctx->program->instructions[index];
+        USILEffectFlags expected_effects = USIL_EFFECT_NONE;
+        if (index == 0) {
+            expected_effects = USIL_EFFECT_RESOURCE_READ | USIL_EFFECT_QUAD_CONTEXT;
+        } else if (index == plan.discard_index) {
+            expected_effects = USIL_EFFECT_CONTROL | USIL_EFFECT_QUAD_CONTEXT;
+        } else if (index == instruction_count - 1) {
+            expected_effects = USIL_EFFECT_CONTROL;
+        }
         USILEffectFlags observed;
         if (!usil_instruction_effects(ctx->program, instruction, &observed) ||
-            observed != effects[index]) {
+            observed != expected_effects) {
             return false;
         }
         for (int operand = 0; operand < instruction->operand_count; ++operand) {
@@ -140,7 +165,13 @@ bool hlsl_sampled_discard_preflight(const HLSLEmitterContext *ctx) {
                     continue;
                 }
                 const int variable = ctx->ssa.operand_ssa_vars[offset];
-                const int expected = destination ? index : source_definitions[index];
+                int source_definition = 0;
+                if (index == plan.discard_index) {
+                    source_definition = plan.comparison_index;
+                } else if (plan.material && index == plan.comparison_index) {
+                    source_definition = 1;
+                }
+                const int expected = destination ? index : source_definition;
                 if (expected < 0 || variable < 0 || variable >= ctx->ssa.ssa_var_count ||
                     ctx->ssa.ssa_var_defs[variable] != expected ||
                     hlsl_operand_definition(ctx, index, operand, lane) != expected) {
@@ -157,7 +188,7 @@ bool hlsl_sampled_discard_preflight(const HLSLEmitterContext *ctx) {
             }
         }
     }
-    for (int instruction = 0; instruction < 5; ++instruction) {
+    for (int instruction = 0; instruction < instruction_count; ++instruction) {
         for (int lane = 0; lane < 4; ++lane) {
             if (hlsl_definition_use_count(ctx, instruction, lane) != uses[instruction][lane]) {
                 return false;
@@ -188,8 +219,9 @@ static ASTExpr *discard_value_origin(const HLSLEmitterContext *ctx,
     origin.logical_value_id = value_id;
     origin.instruction_index = instruction;
     origin.source_instruction_index = owner->source_instruction_index;
-    origin.destination_lanes =
-        instruction == 2 ? 0 : usil_operand_destination_lane_mask(&owner->operands[0]);
+    origin.destination_lanes = owner->opcode == USIL_OP_DISCARD
+                                   ? 0
+                                   : usil_operand_destination_lane_mask(&owner->operands[0]);
     origin.semantic_projection = projection;
     if (!ast_set_logical_value_origin(expression, &origin)) {
         ast_free_expr(expression);
@@ -213,8 +245,11 @@ static ASTExpr *discard_named_value(const HLSLEmitterContext *ctx,
         false);
 }
 
-static ASTExpr *discard_comparison(
+static ASTExpr *discard_compared_value(
     const HLSLEmitterContext *ctx, const HLSLSampledDiscardPlan *plan) {
+    if (plan->material) {
+        return discard_named_value(ctx, "coverageValue", 1, 1, AST_SCALAR_FLOAT32, 1);
+    }
     ASTExpr *color = discard_named_value(ctx, "sampledValue", 0, 0, AST_SCALAR_FLOAT32, 4);
     const int component = plan->color_component;
     ASTExpr *projection = color ? ast_create_swizzle(color, &component, 1) : NULL;
@@ -222,7 +257,13 @@ static ASTExpr *discard_comparison(
         ast_free_expr(color);
         return NULL;
     }
-    projection = discard_value_origin(ctx, projection, 1, 0, AST_SCALAR_FLOAT32, 1, true);
+    return discard_value_origin(
+        ctx, projection, plan->comparison_index, 0, AST_SCALAR_FLOAT32, 1, true);
+}
+
+static ASTExpr *discard_comparison(
+    const HLSLEmitterContext *ctx, const HLSLSampledDiscardPlan *plan) {
+    ASTExpr *projection = discard_compared_value(ctx, plan);
     ASTExpr *literal = ast_create_literal_bits(&plan->threshold_bits, 1, AST_SCALAR_FLOAT32);
     ASTExpr *comparison = projection && literal ? ast_create_comparison(plan->comparison_opcode,
                                                       plan->literal_first ? literal : projection,
@@ -233,12 +274,23 @@ static ASTExpr *discard_comparison(
         ast_free_expr(projection);
         return NULL;
     }
-    return discard_value_origin(ctx, comparison, 1, 1, AST_SCALAR_BOOL, 1, false);
+    return discard_value_origin(ctx,
+        comparison,
+        plan->comparison_index,
+        (uint64_t)plan->comparison_index,
+        AST_SCALAR_BOOL,
+        1,
+        false);
 }
 
 static ASTExpr *discard_condition(
     const HLSLEmitterContext *ctx, const HLSLSampledDiscardPlan *plan) {
-    ASTExpr *value = discard_named_value(ctx, "discardFragment", 2, 1, AST_SCALAR_BOOL, 1);
+    ASTExpr *value = discard_named_value(ctx,
+        "discardFragment",
+        plan->discard_index,
+        (uint64_t)plan->comparison_index,
+        AST_SCALAR_BOOL,
+        1);
     if (!value || !plan->discard_on_zero) {
         return value;
     }
@@ -249,22 +301,28 @@ static ASTExpr *discard_condition(
         ast_free_expr(value);
         return NULL;
     }
-    return discard_value_origin(ctx, condition, 2, 2, AST_SCALAR_BOOL, 1, false);
+    return discard_value_origin(ctx,
+        condition,
+        plan->discard_index,
+        (uint64_t)plan->discard_index,
+        AST_SCALAR_BOOL,
+        1,
+        false);
 }
 
 static void discard_tree_dispose(HLSLSampledDiscardTree *tree) {
     if (tree->statement) {
         ast_free_stmt(tree->statement);
     } else {
-        ast_free_expr(tree->values[2]);
+        ast_free_expr(tree->values[tree->condition_index]);
         if (tree->body) {
             ast_free_stmt(tree->body);
         } else {
             ast_free_stmt(tree->discard);
         }
     }
-    for (unsigned index = 0; index < 4; ++index) {
-        if (index != 2) {
+    for (int index = 0; index < tree->value_count; ++index) {
+        if (index != tree->condition_index) {
             ast_free_expr(tree->values[index]);
         }
         ast_free_expr(tree->recorded[index]);
@@ -274,13 +332,36 @@ static void discard_tree_dispose(HLSLSampledDiscardTree *tree) {
 
 static bool discard_tree_prepare(
     HLSLEmitterContext *ctx, const HLSLSampledDiscardPlan *plan, HLSLSampledDiscardTree *tree) {
+    tree->value_count = plan->output_index + 1;
+    tree->condition_index = plan->discard_index;
     ctx->current_instruction_index = 0;
-    tree->values[0] =
-        hlsl_texture_sample_expression(ctx, 0, hlsl_natural_source_atom(ctx, 0, 1, 3), NULL, NULL);
-    tree->values[1] = discard_comparison(ctx, plan);
-    tree->values[2] = discard_condition(ctx, plan);
-    tree->values[3] = discard_named_value(ctx, "sampledValue", 3, 3, AST_SCALAR_FLOAT32, 4);
-    for (unsigned index = 0; index < 4; ++index) {
+    ASTExpr *coordinates = hlsl_natural_source_atom(ctx, 0, 1, 3);
+    tree->values[0] = plan->material
+                          ? hlsl_texture_sample_component_expression(ctx, 0, coordinates)
+                          : hlsl_texture_sample_expression(ctx, 0, coordinates, NULL, NULL);
+    if (plan->material) {
+        ctx->current_instruction_index = 1;
+        const uint8_t mask =
+            usil_operand_destination_lane_mask(&ctx->program->instructions[1].operands[0]);
+        ASTExpr *left = discard_named_value(ctx, "sampledValue", 0, 0, AST_SCALAR_FLOAT32, 1);
+        ASTExpr *right = hlsl_natural_source_atom(ctx, 1, 2, mask);
+        ASTExpr *third = plan->arithmetic_opcode == USIL_OP_MAD
+                             ? hlsl_natural_source_atom(ctx, 1, 3, mask)
+                             : NULL;
+        tree->values[1] = hlsl_natural_float_operation(ctx, 1, left, right, third);
+    }
+    tree->values[plan->comparison_index] = discard_comparison(ctx, plan);
+    tree->values[plan->discard_index] = discard_condition(ctx, plan);
+    ctx->current_instruction_index = plan->output_index;
+    tree->values[plan->output_index] =
+        plan->material ? hlsl_natural_source_atom(ctx, plan->output_index, 1, 15)
+                       : discard_named_value(ctx,
+                             "sampledValue",
+                             plan->output_index,
+                             (uint64_t)plan->output_index,
+                             AST_SCALAR_FLOAT32,
+                             4);
+    for (int index = 0; index < tree->value_count; ++index) {
         if (!tree->values[index]) {
             return false;
         }
@@ -303,7 +384,7 @@ static bool discard_tree_prepare(
         tree->discard = NULL;
         return false;
     }
-    tree->statement = ast_create_if(tree->values[2], tree->body, NULL);
+    tree->statement = ast_create_if(tree->values[tree->condition_index], tree->body, NULL);
     return tree->statement != NULL;
 }
 
@@ -311,11 +392,12 @@ static bool observe_discard_statement(HLSLEmitterContext *ctx, const HLSLSampled
     if (!ctx->source_quality_analysis) {
         return true;
     }
-    if (!hlsl_stage_coverage_root(ctx, tree->values[2], 2)) {
+    if (!hlsl_stage_coverage_root(
+            ctx, tree->values[tree->condition_index], tree->condition_index)) {
         return false;
     }
-    ctx->source_quality_root = tree->values[2];
-    ctx->source_quality_instruction = 2;
+    ctx->source_quality_root = tree->values[tree->condition_index];
+    ctx->source_quality_instruction = tree->condition_index;
     const bool observed =
         hlsl_source_quality_analysis_statement(ctx->source_quality_analysis, tree->statement);
     ctx->source_quality_root = NULL;
@@ -334,8 +416,9 @@ bool hlsl_emit_sampled_discard(HLSLEmitterContext *ctx) {
     if (!hlsl_sampled_discard_preflight(ctx) ||
         !hlsl_sampled_discard_plan_prepare(ctx->program, &plan) || ctx->sampled_discard_tree ||
         !hlsl_high_level_name_available(ctx, "sampledValue") ||
-        !hlsl_high_level_name_available(ctx, "discardFragment") || ctx->indent < 0 ||
-        ctx->indent % 2 != 0) {
+        !hlsl_high_level_name_available(ctx, "discardFragment") ||
+        (plan.material && !hlsl_high_level_name_available(ctx, "coverageValue")) ||
+        ctx->indent < 0 || ctx->indent % 2 != 0) {
         return false;
     }
     HLSLSampledDiscardTree tree = {0};
@@ -345,19 +428,17 @@ bool hlsl_emit_sampled_discard(HLSLEmitterContext *ctx) {
         goto cleanup;
     }
     ctx->sampled_discard_tree = &tree;
-    for (unsigned index = 0; index < 4; ++index) {
+    for (int index = 0; index < tree.value_count; ++index) {
         roots[index] = tree.values[index];
     }
     hlsl_expression_source_map_begin(ctx);
-    static const char *const declarations[4] = {
-        "const float4 sampledValue = ", "const bool discardFragment = ", NULL, "return "};
-    for (int instruction = 0; instruction < 4; ++instruction) {
+    for (int instruction = 0; instruction < tree.value_count; ++instruction) {
         ctx->current_instruction_index = instruction;
         HLSLInstructionOwners owners = {0};
         if (!hlsl_instruction_owners_add(&owners, instruction)) {
             goto cleanup;
         }
-        if (instruction == 2) {
+        if (instruction == plan.discard_index) {
             const size_t begin = ctx->sb->len;
             if (!observe_discard_statement(ctx, &tree) ||
                 !hlsl_format_owned_statement(
@@ -365,14 +446,24 @@ bool hlsl_emit_sampled_discard(HLSLEmitterContext *ctx) {
                 goto cleanup;
             }
             if (ctx->expression_source_map) {
-                HLSLExpressionOrigin *origin = &ctx->expression_source_map->origins[2];
+                HLSLExpressionOrigin *origin =
+                    &ctx->expression_source_map->origins[plan.discard_index];
                 origin->kind = HLSL_EXPRESSION_ORIGIN_EFFECT;
                 origin->source_begin = begin;
                 origin->source_end = ctx->sb->len;
             }
         } else {
             sb_append_spaces(ctx->sb, ctx->indent);
-            sb_append(ctx->sb, declarations[instruction]);
+            const char *declaration = "return ";
+            if (instruction == 0) {
+                declaration =
+                    plan.material ? "const float sampledValue = " : "const float4 sampledValue = ";
+            } else if (instruction == plan.comparison_index) {
+                declaration = "const bool discardFragment = ";
+            } else if (plan.material && instruction == 1) {
+                declaration = "const float coverageValue = ";
+            }
+            sb_append(ctx->sb, declaration);
             if (!hlsl_source_quality_observe_expression(
                     ctx, tree.values[instruction], instruction) ||
                 !hlsl_format_owned_expression(
