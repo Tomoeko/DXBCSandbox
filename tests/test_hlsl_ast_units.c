@@ -206,6 +206,70 @@ static bool check_expression_spans(void) {
     return true;
 }
 
+static bool check_statement_expression_spans(void) {
+    ASTExpr *left = ast_create_literal_float(0.0f);
+    ASTExpr *right = ast_create_literal_float(1.0f);
+    ASTExpr *condition = NULL;
+    ASTStmt *body = ast_create_block();
+    ASTStmt *discard = ast_create_flow(AST_STMT_DISCARD);
+    ASTStmt *statement = NULL;
+    StringBuilder plain;
+    StringBuilder traced;
+    sb_init(&plain);
+    sb_init(&traced);
+    SpanFixture fixture = {0};
+    const ASTExpr *observed_left = left;
+    const ASTExpr *observed_right = right;
+    const ASTExpr *observed_condition = NULL;
+    bool passed = false;
+    if (!left || !right || !body || !discard) {
+        goto cleanup;
+    }
+    condition = ast_create_comparison(USIL_OP_LT, left, right);
+    if (!condition) {
+        goto cleanup;
+    }
+    left = NULL;
+    right = NULL;
+    observed_condition = condition;
+    if (!ast_block_add(body, discard)) {
+        goto cleanup;
+    }
+    discard = NULL;
+    statement = ast_create_if(condition, body, NULL);
+    if (!statement) {
+        goto cleanup;
+    }
+    condition = NULL;
+    body = NULL;
+    sb_append(&plain, "prefix\n");
+    sb_append(&traced, "prefix\n");
+    ast_format_stmt(statement, &plain, 0);
+    ast_format_stmt_traced(statement, &traced, 0, capture_span, &fixture);
+    passed = sb_ok(&plain) && sb_ok(&traced) && strcmp(plain.buf, traced.buf) == 0 &&
+             strcmp(traced.buf, "prefix\nif ((0.0f < 1.0f))\n{\n  discard;\n}\n") == 0 &&
+             fixture.count == 3 && fixture.nodes[0] == observed_left &&
+             fixture.nodes[1] == observed_right && fixture.nodes[2] == observed_condition &&
+             fixture.begins[0] == 12 && fixture.ends[0] == 16 && fixture.begins[1] == 19 &&
+             fixture.ends[1] == 23 && fixture.begins[2] == 11 && fixture.ends[2] == 24;
+    fixture.count = 0;
+    fixture.reject = true;
+    sb_clear(&traced);
+    ast_format_stmt_traced(statement, &traced, 0, capture_span, &fixture);
+    passed = passed && !sb_ok(&traced);
+
+cleanup:
+    sb_free(&plain);
+    sb_free(&traced);
+    ast_free_stmt(statement);
+    ast_free_stmt(body);
+    ast_free_stmt(discard);
+    ast_free_expr(condition);
+    ast_free_expr(left);
+    ast_free_expr(right);
+    return passed;
+}
+
 static bool check_invalid_trees_and_ownership(void) {
     ASTStmt *block = ast_create_block();
     ASTStmt *flow = ast_create_flow(AST_STMT_RETURN);
@@ -246,7 +310,8 @@ static bool check_invalid_trees_and_ownership(void) {
 
 int main(void) {
     if (!check_literal_bits() || !check_operators_and_casts() || !check_boolean_expressions() ||
-        !check_invalid_trees_and_ownership() || !check_expression_spans())
+        !check_invalid_trees_and_ownership() || !check_expression_spans() ||
+        !check_statement_expression_spans())
         return 1;
     puts("HLSL AST bits, operators and ownership passed");
     return 0;

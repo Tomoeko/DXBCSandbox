@@ -740,79 +740,94 @@ static void append_indent(StringBuilder *sb, int indent) {
     }
 }
 
-static void format_stmt(const ASTStmt *stmt, StringBuilder *sb, int indent, unsigned depth) {
-    if (!sb || !sb_ok(sb))
+static void format_stmt(const ASTStmt *stmt,
+    StringBuilder *sb,
+    int indent,
+    unsigned depth,
+    ASTExprSpanObserver observer,
+    void *context) {
+    if (!sb || !sb_ok(sb)) {
         return;
+    }
     if (!stmt || indent < 0 || indent > 256 || depth > 256u) {
         sb->failed = true;
         return;
     }
     switch (stmt->kind) {
-    case AST_STMT_BLOCK:
-        if (stmt->u.block.stmt_count < 0 || (stmt->u.block.stmt_count && !stmt->u.block.stmts)) {
+        case AST_STMT_BLOCK:
+            if (stmt->u.block.stmt_count < 0 ||
+                (stmt->u.block.stmt_count && !stmt->u.block.stmts)) {
+                sb->failed = true;
+                break;
+            }
+            append_indent(sb, indent);
+            sb_append(sb, "{\n");
+            for (int i = 0; i < stmt->u.block.stmt_count; i++) {
+                format_stmt(stmt->u.block.stmts[i], sb, indent + 1, depth + 1u, observer, context);
+            }
+            append_indent(sb, indent);
+            sb_append(sb, "}\n");
+            break;
+        case AST_STMT_ASSIGN:
+            append_indent(sb, indent);
+            ast_format_expr_traced(stmt->u.assign.dest, sb, observer, context);
+            sb_append(sb, " = ");
+            ast_format_expr_traced(stmt->u.assign.src, sb, observer, context);
+            sb_append(sb, ";\n");
+            break;
+        case AST_STMT_IF:
+            append_indent(sb, indent);
+            sb_append(sb, "if (");
+            ast_format_expr_traced(stmt->u.if_stmt.cond, sb, observer, context);
+            sb_append(sb, ")\n");
+            format_stmt(stmt->u.if_stmt.true_body, sb, indent, depth + 1u, observer, context);
+            if (stmt->u.if_stmt.false_body) {
+                append_indent(sb, indent);
+                sb_append(sb, "else\n");
+                format_stmt(stmt->u.if_stmt.false_body, sb, indent, depth + 1u, observer, context);
+            }
+            break;
+        case AST_STMT_LOOP:
+            append_indent(sb, indent);
+            if (stmt->u.loop.cond) {
+                sb_append(sb, "while (");
+                ast_format_expr_traced(stmt->u.loop.cond, sb, observer, context);
+                sb_append(sb, ")\n");
+            } else {
+                sb_append(sb, "while (true)\n");
+            }
+            format_stmt(stmt->u.loop.body, sb, indent, depth + 1u, observer, context);
+            break;
+        case AST_STMT_BREAK:
+            append_indent(sb, indent);
+            sb_append(sb, "break;\n");
+            break;
+        case AST_STMT_CONTINUE:
+            append_indent(sb, indent);
+            sb_append(sb, "continue;\n");
+            break;
+        case AST_STMT_RETURN:
+            append_indent(sb, indent);
+            sb_append(sb, "return;\n");
+            break;
+        case AST_STMT_DISCARD:
+            append_indent(sb, indent);
+            sb_append(sb, "discard;\n");
+            break;
+        default:
             sb->failed = true;
             break;
-        }
-        append_indent(sb, indent);
-        sb_append(sb, "{\n");
-        for (int i = 0; i < stmt->u.block.stmt_count; i++) {
-            format_stmt(stmt->u.block.stmts[i], sb, indent + 1, depth + 1u);
-        }
-        append_indent(sb, indent);
-        sb_append(sb, "}\n");
-        break;
-    case AST_STMT_ASSIGN:
-        append_indent(sb, indent);
-        ast_format_expr(stmt->u.assign.dest, sb);
-        sb_append(sb, " = ");
-        ast_format_expr(stmt->u.assign.src, sb);
-        sb_append(sb, ";\n");
-        break;
-    case AST_STMT_IF:
-        append_indent(sb, indent);
-        sb_append(sb, "if (");
-        ast_format_expr(stmt->u.if_stmt.cond, sb);
-        sb_append(sb, ")\n");
-        format_stmt(stmt->u.if_stmt.true_body, sb, indent, depth + 1u);
-        if (stmt->u.if_stmt.false_body) {
-            append_indent(sb, indent);
-            sb_append(sb, "else\n");
-            format_stmt(stmt->u.if_stmt.false_body, sb, indent, depth + 1u);
-        }
-        break;
-    case AST_STMT_LOOP:
-        append_indent(sb, indent);
-        if (stmt->u.loop.cond) {
-            sb_append(sb, "while (");
-            ast_format_expr(stmt->u.loop.cond, sb);
-            sb_append(sb, ")\n");
-        } else {
-            sb_append(sb, "while (true)\n");
-        }
-        format_stmt(stmt->u.loop.body, sb, indent, depth + 1u);
-        break;
-    case AST_STMT_BREAK:
-        append_indent(sb, indent);
-        sb_append(sb, "break;\n");
-        break;
-    case AST_STMT_CONTINUE:
-        append_indent(sb, indent);
-        sb_append(sb, "continue;\n");
-        break;
-    case AST_STMT_RETURN:
-        append_indent(sb, indent);
-        sb_append(sb, "return;\n");
-        break;
-    case AST_STMT_DISCARD:
-        append_indent(sb, indent);
-        sb_append(sb, "discard;\n");
-        break;
-    default:
-        sb->failed = true;
-        break;
     }
 }
 
+void ast_format_stmt_traced(const ASTStmt *stmt,
+    StringBuilder *sb,
+    int indent,
+    ASTExprSpanObserver observer,
+    void *context) {
+    format_stmt(stmt, sb, indent, 0u, observer, context);
+}
+
 void ast_format_stmt(const ASTStmt *stmt, StringBuilder *sb, int indent) {
-    format_stmt(stmt, sb, indent, 0u);
+    ast_format_stmt_traced(stmt, sb, indent, NULL, NULL);
 }

@@ -267,6 +267,10 @@ typedef bool (*ASTExprSpanObserver)(void *context, const ASTExpr *expression, si
 void ast_format_expr_traced(const ASTExpr *expr, StringBuilder *sb, ASTExprSpanObserver observer,
                             void *context);
 void ast_format_expr(const ASTExpr *expr, StringBuilder *sb);
+/* Traces expressions inside the existing statement formatter. The same
+ * immutable-tree, rejection and absolute-offset rules apply. */
+void ast_format_stmt_traced(const ASTStmt *stmt, StringBuilder *sb, int indent,
+    ASTExprSpanObserver observer, void *context);
 void ast_format_stmt(const ASTStmt *stmt, StringBuilder *sb, int indent);
 
 #endif // HLSL_AST_H
