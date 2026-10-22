@@ -1582,10 +1582,9 @@ bool hlsl_source_quality_body_inventory_supported(HLSLEmitterContext *ctx) {
       !hlsl_source_quality_interface_inventory_supported(ctx) ||
       !ctx->high_level_functions_prepared ||
       (program->program_type != DXBC_PROGRAM_TYPE_VERTEX &&
-       program->program_type != DXBC_PROGRAM_TYPE_PIXEL &&
-       !ctx->high_level_geometry && !ctx->high_level_domain) ||
-      ctx->unity_uv_helper ||
-      ctx->readable_screen_pos_helper ||
+          program->program_type != DXBC_PROGRAM_TYPE_PIXEL && !ctx->high_level_geometry &&
+          !ctx->high_level_domain) ||
+      ctx->unity_uv_helper || ctx->readable_screen_pos_helper ||
       /* This body consumes only the proved flow plan, never legacy compiler
        * replacement plans discovered by the common analysis passes. */
       (ctx->compiler_model.replacement_count && !bounded_flow) ||
@@ -1593,10 +1592,9 @@ bool hlsl_source_quality_body_inventory_supported(HLSLEmitterContext *ctx) {
           !ctx->high_level_sampled_discard) ||
       ctx->indexed_face_basis.valid || ctx->surface_tangent_frame.valid ||
       !hlsl_source_quality_resource_inventory_complete(ctx) || program->uav_count ||
-      program->icb_value_count || program->indexable_temp_count ||
-      program->index_range_count ||
+      program->icb_value_count || program->indexable_temp_count || program->index_range_count ||
       (program->patch_constant_count && !ctx->high_level_domain))
-    return false;
+      return false;
   for (int group = 0; group < 2; ++group)
     if (ctx->float4_functions.use_count[group] >= 2)
       return false;
@@ -1871,16 +1869,18 @@ static bool straightline_quality_observer(HLSLEmitterContext *ctx,
   HLSLStraightLineGuard *guard = ctx->straightline_guard;
   if (!guard || !guard->ready || !straightline_model_matches(ctx) ||
       !straightline_source_matches(ctx, false) || !ctx->expression_source_map ||
-      !hlsl_sampled_discard_tree_matches(ctx)) return false;
+      !hlsl_sampled_discard_tree_matches(ctx)) {
+      return false;
+  }
   const size_t length = ctx->sb->len;
   guard->callback_map = *ctx->expression_source_map;
   const bool observed = hlsl_stage_coverage_observation(ctx, observation) &&
       (!ctx->source_quality_forward_observer ||
        ctx->source_quality_forward_observer(ctx->source_quality_forward_observer_context, observation));
   return observed && straightline_model_matches(ctx) && ctx->sb->len == length &&
-      straightline_source_matches(ctx, false) &&
-      straightline_maps_equal(ctx->expression_source_map, &guard->callback_map) &&
-      hlsl_sampled_discard_tree_matches(ctx);
+         straightline_source_matches(ctx, false) &&
+         straightline_maps_equal(ctx->expression_source_map, &guard->callback_map) &&
+         hlsl_sampled_discard_tree_matches(ctx);
 }
 
 void hlsl_source_quality_emission(HLSLEmitterContext *ctx, uint32_t artifacts,
@@ -1947,14 +1947,13 @@ bool hlsl_source_quality_initialize(HLSLEmitterContext *ctx, const HLSLEmitOptio
   ctx->source_quality_forward_observer_context = options->source_quality_observer_context;
   const bool owned_observer = ctx->stage_coverage || ctx->matrix_use_capture ||
       ctx->high_level_packed_outputs || ctx->high_level_inactive_inputs || ctx->high_level_sampled_fragment;
-  const HLSLSourceQualityRequest quality_request = {
-      .stage = ctx->program->program_type,
+  const HLSLSourceQualityRequest quality_request = {.stage = ctx->program->program_type,
       .pass_index = options->source_quality_pass_index,
       .entry_point_index = options->source_quality_entry_point_index,
       .emission_status = HLSL_EMIT_STATUS_OK,
       .expression_facts = emitter_source_quality_expression_facts,
-      .statement_facts = ctx->high_level_sampled_discard
-          ? hlsl_sampled_discard_statement_facts : NULL,
+      .statement_facts =
+          ctx->high_level_sampled_discard ? hlsl_sampled_discard_statement_facts : NULL,
       .facts_context = ctx,
       .observer = owned_observer ? owned_stage_quality_observer : options->source_quality_observer,
       .observer_context = owned_observer ? ctx : options->source_quality_observer_context};
@@ -2341,8 +2340,8 @@ static bool hlsl_emit_with_options_impl(
   ctx.high_level_sampled_nan_guard = sampled_inputs_ready && sampled_inputs.nan_guard;
   ctx.high_level_sampled_discard = sampled_inputs_ready && sampled_inputs.discard;
   if (ctx.high_level_sampled_nan_guard || ctx.high_level_sampled_discard) {
-    ctx.high_level_direct_return = true;
-    ctx.high_level_interface = true;
+      ctx.high_level_direct_return = true;
+      ctx.high_level_interface = true;
   }
   ctx.preferred_output_struct_name = output_struct;
   ctx.preferred_input_struct_name = input_struct;
@@ -2485,11 +2484,13 @@ static bool hlsl_emit_with_options_impl(
     return false;
   }
   if (ctx.high_level_sampled_discard && !hlsl_sampled_discard_preflight(&ctx)) {
-    hlsl_emit_fail(&ctx, HLSL_EMIT_STATUS_UNSUPPORTED, HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS,
-        HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
-    free_emitter_context(&ctx);
-    free(ctx_ptr);
-    return false;
+      hlsl_emit_fail(&ctx,
+          HLSL_EMIT_STATUS_UNSUPPORTED,
+          HLSL_EMIT_PHASE_COMPILER_MODEL_ANALYSIS,
+          HLSL_EMIT_REASON_ANALYSIS_CONFLICT);
+      free_emitter_context(&ctx);
+      free(ctx_ptr);
+      return false;
   }
   if ((ctx.high_level_packed_outputs && !packed_output) ||
       (defer_multi_output_interface && !natural_structured && !packed_output)) {

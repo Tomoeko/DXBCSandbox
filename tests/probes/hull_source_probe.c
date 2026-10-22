@@ -1444,8 +1444,11 @@ typedef enum { PROBE_FRAGMENT_INACTIVE, PROBE_FRAGMENT_SAMPLED } ProbeSimpleFrag
 /* Both closed fragment proofs use the ordinary emitter. Counterexamples
  * change an actual literal or the actual active input declaration. */
 static bool reconstruct_simple_fragment(const DXBCContainerView *target,
-    StringBuilder *source, ProbeDecodedLiteral *owner, bool changed,
-    const SerializedProgramParameters *parameters, ProbeSimpleFragment family) {
+    StringBuilder *source,
+    ProbeDecodedLiteral *owner,
+    bool changed,
+    const SerializedProgramParameters *parameters,
+    ProbeSimpleFragment family) {
     DXBCDocument document;
     dxbc_document_init(&document);
     DXBCContainer semantic = {0};
@@ -1463,10 +1466,18 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
         !dxbc_document_decode_semantic(&document, &semantic) ||
         !dxbc_stage_contract_decode(&document, &semantic, &contract, NULL) ||
         !usil_translate_with_stage_contract(&program, &semantic, &contract) ||
-        !(texture_sample ? hlsl_sampled_fragment_plan_prepare(&program, &sampled) :
-            hlsl_inactive_input_plan_prepare(&program, &plan)) ||
-        !print_domain_signature(texture_sample ? "sampled-fragment-input" : "inactive-fragment-input", program.inputs, program.input_count) ||
-        !print_domain_signature(texture_sample ? "sampled-fragment-output" : "inactive-fragment-output", program.outputs, program.output_count)) goto done;
+        !(texture_sample ? hlsl_sampled_fragment_plan_prepare(&program, &sampled)
+                         : hlsl_inactive_input_plan_prepare(&program, &plan)) ||
+        !print_domain_signature(
+            texture_sample ? "sampled-fragment-input" : "inactive-fragment-input",
+            program.inputs,
+            program.input_count) ||
+        !print_domain_signature(
+            texture_sample ? "sampled-fragment-output" : "inactive-fragment-output",
+            program.outputs,
+            program.output_count)) {
+        goto done;
+    }
     const int active_field = texture_sample ? sampled.coordinate_field : plan.active_input_field;
     if (sampled.discard && !hlsl_sampled_discard_plan_prepare(&program, &discard)) {
         goto done;
@@ -1474,13 +1485,13 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     bool literal = active_field < 0;
     int literal_instruction = 0;
     int literal_operand = 1;
-    const char *counterexample_owner = literal
-        ? "decoded-mov-literal" : "decoded-input-declaration-interpolation";
+    const char *counterexample_owner =
+        literal ? "decoded-mov-literal" : "decoded-input-declaration-interpolation";
     if (texture_sample) {
         literal = sampled.explicit_level || sampled.nan_guard || sampled.discard;
         literal_operand = 4;
-        counterexample_owner = literal
-            ? "decoded-level-literal" : "decoded-input-declaration-interpolation";
+        counterexample_owner =
+            literal ? "decoded-level-literal" : "decoded-input-declaration-interpolation";
         if (sampled.nan_guard) {
             literal_instruction = 10;
             literal_operand = 2;
@@ -1494,40 +1505,70 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     ProbeDecodedLiteral captured = {.instruction = literal ? literal_instruction : -1,
         .operand = literal ? literal_operand : active_field,
         .raw_instruction = program.instructions[literal_instruction].source_instruction_index,
-        .original_bits = literal ? program.instructions[literal_instruction].operands[literal_operand].imm_values[0] :
-            program.inputs[active_field].interpolation_mode,
-        .opcode = program.instructions[literal_instruction].opcode, .shader_model_major = program.shader_model_major, .valid = true};
+        .original_bits =
+            literal
+                ? program.instructions[literal_instruction].operands[literal_operand].imm_values[0]
+                : program.inputs[active_field].interpolation_mode,
+        .opcode = program.instructions[literal_instruction].opcode,
+        .shader_model_major = program.shader_model_major,
+        .valid = true};
     int declaration_index = -1;
     if (!literal) {
-        for (int index = 0; index < program.signature_declaration_count; ++index)
-            if (program.signature_declarations[index].kind == USIL_SIGNATURE_DECL_INPUT_PS) declaration_index = index;
-        if (declaration_index < 0) goto done;
-        captured.raw_instruction = program.signature_declarations[declaration_index].source_instruction_index;
+        for (int index = 0; index < program.signature_declaration_count; ++index) {
+            if (program.signature_declarations[index].kind == USIL_SIGNATURE_DECL_INPUT_PS) {
+                declaration_index = index;
+            }
+        }
+        if (declaration_index < 0) {
+            goto done;
+        }
+        captured.raw_instruction =
+            program.signature_declarations[declaration_index].source_instruction_index;
     }
     if (changed) {
-        if (!owner->valid || owner->instruction != captured.instruction || owner->operand != captured.operand ||
-            owner->raw_instruction != captured.raw_instruction || owner->original_bits != captured.original_bits ||
-            owner->shader_model_major != captured.shader_model_major || owner->opcode != captured.opcode) goto done;
+        if (!owner->valid || owner->instruction != captured.instruction ||
+            owner->operand != captured.operand ||
+            owner->raw_instruction != captured.raw_instruction ||
+            owner->original_bits != captured.original_bits ||
+            owner->shader_model_major != captured.shader_model_major ||
+            owner->opcode != captured.opcode) {
+            goto done;
+        }
         if (literal) {
             const uint32_t replacement = captured.original_bits == UINT32_C(0x3f400000)
-                ? UINT32_C(0x3f000000) : UINT32_C(0x3f400000);
-            DXBCOperand *operand = &program.instructions[literal_instruction].operands[literal_operand];
+                                             ? UINT32_C(0x3f000000)
+                                             : UINT32_C(0x3f400000);
+            DXBCOperand *operand =
+                &program.instructions[literal_instruction].operands[literal_operand];
             operand->imm_values[0] = replacement;
             operand->immediate_words[0] = replacement;
-            if (texture_sample && !sampled.nan_guard)
-                for (unsigned lane = 1; lane < 4; ++lane) operand->imm_values[lane] = replacement;
+            if (texture_sample && !sampled.nan_guard) {
+                for (unsigned lane = 1; lane < 4; ++lane) {
+                    operand->imm_values[lane] = replacement;
+                }
+            }
         } else {
             const uint8_t replacement = captured.original_bits == 3u ? 2u : 3u;
             program.inputs[active_field].interpolation_mode = replacement;
             program.signature_declarations[declaration_index].interpolation_mode = replacement;
         }
-        if (!(texture_sample ? hlsl_sampled_fragment_plan_prepare(&program, &sampled) :
-            hlsl_inactive_input_plan_prepare(&program, &plan))) goto done;
-    } else *owner = captured;
+        if (!(texture_sample ? hlsl_sampled_fragment_plan_prepare(&program, &sampled)
+                             : hlsl_inactive_input_plan_prepare(&program, &plan))) {
+            goto done;
+        }
+    } else {
+        *owner = captured;
+    }
     printf("%s_counterexample_owner=%s instruction=%d raw_instruction=%u field_or_operand=%d "
-        "original=0x%08" PRIx32 " changed=%d model=%u.0\n",
-        prefix, counterexample_owner, captured.instruction,
-        captured.raw_instruction, captured.operand, captured.original_bits, changed, program.shader_model_major);
+           "original=0x%08" PRIx32 " changed=%d model=%u.0\n",
+        prefix,
+        counterexample_owner,
+        captured.instruction,
+        captured.raw_instruction,
+        captured.operand,
+        captured.original_bits,
+        changed,
+        program.shader_model_major);
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
     HLSLExpressionSourceMap map;
     HLSLSourceQualityResult quality;
@@ -1535,20 +1576,40 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     options.expression_source_map = &map;
     options.source_quality = &quality;
     const HLSLEmitNames names = {.entry_point = "frag"};
-    const bool emitted = hlsl_emit_with_options_diagnostic(&program, source, parameters, NULL, &names, &options, &diagnostic);
-    const bool mapped = emitted && map.complete && hlsl_expression_source_map_matches(&map, &program, source->buf);
+    const bool emitted = hlsl_emit_with_options_diagnostic(
+        &program, source, parameters, NULL, &names, &options, &diagnostic);
+    const bool mapped =
+        emitted && map.complete && hlsl_expression_source_map_matches(&map, &program, source->buf);
     printf("%s_source_result=%s status=%s phase=%s reason=%s bytes=%zu quality=%s reasons=0x%x "
-        "incomplete=%zu residual=%zu unknown=%zu map_complete=%d map_count=%zu map_valid=%d\n",
-        prefix, emitted ? "generated" : "unavailable", hlsl_emit_status_name(diagnostic.status),
-        hlsl_emit_phase_name(diagnostic.phase), hlsl_emit_reason_name(diagnostic.reason), source->len,
-        hlsl_source_quality_class_name(quality.classification), quality.reasons, quality.counts.incomplete_units,
-        quality.counts.residual_total, quality.counts.unknown_provenance, map.complete, map.count, mapped);
-    if (texture_sample)
-        printf("sampled_resource_declarations=%zu actual_metadata_supplied=%d\n", quality.counts.resource_declarations, parameters != NULL);
-    if (emitted) print_hash(changed ? "mutated_fragment_sha256" : "reconstructed_fragment_sha256", source->buf, source->len);
-    accepted = mapped && map.count == (size_t)program.instruction_count && quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
-        !quality.reasons && !quality.counts.incomplete_units && !quality.counts.residual_total &&
-        !quality.counts.unknown_provenance;
+           "incomplete=%zu residual=%zu unknown=%zu map_complete=%d map_count=%zu map_valid=%d\n",
+        prefix,
+        emitted ? "generated" : "unavailable",
+        hlsl_emit_status_name(diagnostic.status),
+        hlsl_emit_phase_name(diagnostic.phase),
+        hlsl_emit_reason_name(diagnostic.reason),
+        source->len,
+        hlsl_source_quality_class_name(quality.classification),
+        quality.reasons,
+        quality.counts.incomplete_units,
+        quality.counts.residual_total,
+        quality.counts.unknown_provenance,
+        map.complete,
+        map.count,
+        mapped);
+    if (texture_sample) {
+        printf("sampled_resource_declarations=%zu actual_metadata_supplied=%d\n",
+            quality.counts.resource_declarations,
+            parameters != NULL);
+    }
+    if (emitted) {
+        print_hash(changed ? "mutated_fragment_sha256" : "reconstructed_fragment_sha256",
+            source->buf,
+            source->len);
+    }
+    accepted = mapped && map.count == (size_t)program.instruction_count &&
+               quality.classification == HLSL_SOURCE_QUALITY_CLEAN && !quality.reasons &&
+               !quality.counts.incomplete_units && !quality.counts.residual_total &&
+               !quality.counts.unknown_provenance;
 done:
     usil_free(&program);
     dxbc_stage_contract_free(&contract);

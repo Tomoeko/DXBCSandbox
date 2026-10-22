@@ -1439,12 +1439,19 @@ bool hlsl_format_owned_expression(HLSLEmitterContext *ctx, const ASTExpr *expres
     return finish_expression_origins(&trace, false) && sb_ok(ctx->sb);
 }
 
-bool hlsl_format_owned_statement(HLSLEmitterContext *ctx, const ASTStmt *statement,
-    ASTExpr **roots, const HLSLInstructionOwners *owners, int indent) {
-    ExpressionSpanContext trace = {.map = ctx->expression_source_map, .roots = roots,
-        .owners = *owners, .matrix_capture = ctx->matrix_use_capture,
+bool hlsl_format_owned_statement(HLSLEmitterContext *ctx,
+    const ASTStmt *statement,
+    ASTExpr **roots,
+    const HLSLInstructionOwners *owners,
+    int indent) {
+    ExpressionSpanContext trace = {.map = ctx->expression_source_map,
+        .roots = roots,
+        .owners = *owners,
+        .matrix_capture = ctx->matrix_use_capture,
         .stage_coverage = ctx->stage_coverage};
-    ast_format_stmt_traced(statement, ctx->sb, indent,
+    ast_format_stmt_traced(statement,
+        ctx->sb,
+        indent,
         trace.map || trace.matrix_capture || trace.stage_coverage ? record_expression_span : NULL,
         &trace);
     return finish_expression_origins(&trace, false) && sb_ok(ctx->sb);
@@ -1972,15 +1979,21 @@ bool hlsl_emit_pure_expression_scope(HLSLEmitterContext *ctx,
 }
 
 bool emit_high_level_expressions(HLSLEmitterContext *ctx) {
-    if (ctx->unity_uv_helper) return emit_unity_uv_lift(ctx);
-    if (ctx->high_level_sampled_nan_guard) return hlsl_emit_sampled_nan_guard(ctx);
+    if (ctx->unity_uv_helper) {
+        return emit_unity_uv_lift(ctx);
+    }
+    if (ctx->high_level_sampled_nan_guard) {
+        return hlsl_emit_sampled_nan_guard(ctx);
+    }
     if (ctx->high_level_sampled_discard) {
         return hlsl_emit_sampled_discard(ctx);
     }
-    for (int index = 0; index < ctx->program->instruction_count; ++index)
+    for (int index = 0; index < ctx->program->instruction_count; ++index) {
         if (ctx->program->instructions[index].opcode == USIL_OP_IF ||
-            ctx->program->instructions[index].opcode == USIL_OP_LOOP)
+            ctx->program->instructions[index].opcode == USIL_OP_LOOP) {
             return emit_high_level_structured(ctx);
+        }
+    }
     return emit_straightline_expressions(ctx, NULL);
 }
 

@@ -353,7 +353,9 @@ bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx) {
     const char *name = NULL;
     if (!ctx || !hlsl_sampled_fragment_plan_prepare(ctx->program, &plan) ||
         (plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !plan.inactive_typed_inputs &&
-            !plan.packed_inputs && !plan.nan_guard && !plan.discard)) return false;
+            !plan.packed_inputs && !plan.nan_guard && !plan.discard)) {
+        return false;
+    }
     const uint32_t metadata_dimension = plan.texture_kind == HLSL_SAMPLED_TEXTURE_2D ? 2 :
         plan.texture_kind == HLSL_SAMPLED_TEXTURE_CUBE ? 4 : 5;
     const SerializedProgramParameters *parameters[2] = {ctx->params, ctx->common_params};

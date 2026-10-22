@@ -557,15 +557,18 @@ bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDi
 /* Requires prepared CFG, dominance, SSA and use/def graphs; grants no source coverage. */
 bool hlsl_sampled_discard_preflight(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_discard_tree_matches(const HLSLEmitterContext *ctx);
-bool hlsl_sampled_discard_statement_facts(void *context, uint32_t unit_id,
-    const ASTStmt *statement, HLSLSourceQualityFacts *facts);
+bool hlsl_sampled_discard_statement_facts(
+    void *context, uint32_t unit_id, const ASTStmt *statement, HLSLSourceQualityFacts *facts);
 bool hlsl_emit_sampled_discard(HLSLEmitterContext *ctx);
 bool hlsl_sampled_nan_guard_preflight(const HLSLEmitterContext *ctx);
 bool hlsl_emit_sampled_nan_guard(HLSLEmitterContext *ctx);
 bool hlsl_format_owned_expression(HLSLEmitterContext *ctx, const ASTExpr *expression,
     ASTExpr **roots, const HLSLInstructionOwners *owners, bool function);
-bool hlsl_format_owned_statement(HLSLEmitterContext *ctx, const ASTStmt *statement,
-    ASTExpr **roots, const HLSLInstructionOwners *owners, int indent);
+bool hlsl_format_owned_statement(HLSLEmitterContext *ctx,
+    const ASTStmt *statement,
+    ASTExpr **roots,
+    const HLSLInstructionOwners *owners,
+    int indent);
 
 bool hlsl_packed_output_candidate(const USILProgram *program);
 bool hlsl_packed_output_preflight(HLSLEmitterContext *ctx);

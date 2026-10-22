@@ -471,7 +471,9 @@ static bool decoded_stage_owner_digest(const USILProgram *program,
     case DECODED_OWNER_SAMPLED_FRAGMENT:
         if (!hlsl_sampled_fragment_plan_prepare(program, &sampled) ||
             (sampled.texture_kind == HLSL_SAMPLED_TEXTURE_2D && !sampled.inactive_typed_inputs &&
-                !sampled.packed_inputs && !sampled.nan_guard && !sampled.discard)) return false;
+                !sampled.packed_inputs && !sampled.nan_guard && !sampled.discard)) {
+            return false;
+        }
         break;
     default:
         return false;
