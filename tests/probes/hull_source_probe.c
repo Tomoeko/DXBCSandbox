@@ -1471,11 +1471,26 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     if (sampled.discard && !hlsl_sampled_discard_plan_prepare(&program, &discard)) {
         goto done;
     }
-    const bool literal = texture_sample
-        ? sampled.explicit_level || sampled.nan_guard || sampled.discard : active_field < 0;
-    const int literal_instruction = sampled.discard ? 1 : texture_sample && sampled.nan_guard ? 10 : 0;
-    const int literal_operand = sampled.discard ? discard.literal_first ? 1 : 2
-        : texture_sample ? sampled.nan_guard ? 2 : 4 : 1;
+    bool literal = active_field < 0;
+    int literal_instruction = 0;
+    int literal_operand = 1;
+    const char *counterexample_owner = literal
+        ? "decoded-mov-literal" : "decoded-input-declaration-interpolation";
+    if (texture_sample) {
+        literal = sampled.explicit_level || sampled.nan_guard || sampled.discard;
+        literal_operand = 4;
+        counterexample_owner = literal
+            ? "decoded-level-literal" : "decoded-input-declaration-interpolation";
+        if (sampled.nan_guard) {
+            literal_instruction = 10;
+            literal_operand = 2;
+            counterexample_owner = "decoded-selection-literal";
+        } else if (sampled.discard) {
+            literal_instruction = 1;
+            literal_operand = discard.literal_first ? 1 : 2;
+            counterexample_owner = "decoded-discard-literal";
+        }
+    }
     ProbeDecodedLiteral captured = {.instruction = literal ? literal_instruction : -1,
         .operand = literal ? literal_operand : active_field,
         .raw_instruction = program.instructions[literal_instruction].source_instruction_index,
@@ -1511,8 +1526,7 @@ static bool reconstruct_simple_fragment(const DXBCContainerView *target,
     } else *owner = captured;
     printf("%s_counterexample_owner=%s instruction=%d raw_instruction=%u field_or_operand=%d "
         "original=0x%08" PRIx32 " changed=%d model=%u.0\n",
-        prefix, literal ? texture_sample ? sampled.discard ? "decoded-discard-literal" : sampled.nan_guard ? "decoded-selection-literal" : "decoded-level-literal" : "decoded-mov-literal" :
-            "decoded-input-declaration-interpolation", captured.instruction,
+        prefix, counterexample_owner, captured.instruction,
         captured.raw_instruction, captured.operand, captured.original_bits, changed, program.shader_model_major);
     HLSLEmitOptions options = HLSL_EMIT_HIGH_LEVEL_OPTIONS_INIT;
     HLSLExpressionSourceMap map;
