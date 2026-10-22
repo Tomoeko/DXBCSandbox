@@ -19,9 +19,17 @@ static ASTExpr *copy_tree(const ASTExpr *source, unsigned depth, size_t *nodes) 
     case AST_EXPR_VAR:
         copy = ast_create_var(source->u.var.ssa_var, source->u.var.register_index, source->u.var.operand_type, source->u.var.name);
         break;
-    case AST_EXPR_UNARY: {
+    case AST_EXPR_UNARY:
+    case AST_EXPR_LOGICAL_NOT: {
+        if (source->kind == AST_EXPR_LOGICAL_NOT && source->u.unary.op != USIL_OP_NOT) {
+            return NULL;
+        }
         ASTExpr *child = copy_tree(source->u.unary.sub, depth + 1, nodes);
-        if (child) copy = ast_create_unary(source->u.unary.op, child);
+        if (child) {
+            copy = source->kind == AST_EXPR_LOGICAL_NOT
+                ? ast_create_logical_not(child)
+                : ast_create_unary(source->u.unary.op, child);
+        }
         if (!copy) ast_free_expr(child);
         break;
     }
@@ -192,8 +200,9 @@ static bool trees_equal(const ASTExpr *a, const ASTExpr *b, unsigned depth, size
     if (a->kind == AST_EXPR_VAR)
         return a->u.var.ssa_var == b->u.var.ssa_var && a->u.var.register_index == b->u.var.register_index &&
             a->u.var.operand_type == b->u.var.operand_type && a->u.var.name && b->u.var.name && !strcmp(a->u.var.name, b->u.var.name);
-    if (a->kind == AST_EXPR_UNARY)
+    if (a->kind == AST_EXPR_UNARY || a->kind == AST_EXPR_LOGICAL_NOT) {
         return a->u.unary.op == b->u.unary.op && trees_equal(a->u.unary.sub, b->u.unary.sub, depth + 1, nodes);
+    }
     if (a->kind == AST_EXPR_BINARY || a->kind == AST_EXPR_COMPARISON ||
         a->kind == AST_EXPR_VECTOR_COMPARISON || a->kind == AST_EXPR_LOGICAL_BINARY)
         return a->u.binary.op == b->u.binary.op &&

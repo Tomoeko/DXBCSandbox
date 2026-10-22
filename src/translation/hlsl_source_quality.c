@@ -297,6 +297,11 @@ static bool typed_boolean_value_valid(const ASTExpr *expression,
         origin->components != width || !width || width > 4 ||
         facts->value_kind != HLSL_SOURCE_VALUE_LOGICAL ||
         (expression->kind == AST_EXPR_VECTOR_COMPARISON && width < 2)) return false;
+    if (expression->kind == AST_EXPR_LOGICAL_NOT) {
+        return !children[0].logical ||
+               (children[0].type_known && children[0].scalar_type == AST_SCALAR_BOOL &&
+                   children[0].components == width);
+    }
     if (!children[0].logical || !children[1].logical) return true;
     if (!children[0].type_known || !children[1].type_known ||
         children[0].scalar_type != children[1].scalar_type ||
@@ -342,6 +347,18 @@ static bool visit_expression(QualityAnalysis *analysis, const ASTExpr *expressio
     case AST_EXPR_EMITTER_OPERAND:
         if (!expression->u.emitter_operand || !expression->u.emitter_operand[0])
             return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
+        break;
+    case AST_EXPR_LOGICAL_NOT:
+        if (expression->u.unary.op != USIL_OP_NOT) {
+            return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
+        }
+        if (!visit_expression(analysis, expression->u.unary.sub, depth + 1, &children[0])) {
+            return false;
+        }
+        children_logical = children[0].logical;
+        if (facts.known && !typed_boolean_value_valid(expression, &facts, children)) {
+            return fail_analysis(analysis, HLSL_SOURCE_QUALITY_REASON_INVALID_INPUT);
+        }
         break;
     case AST_EXPR_UNARY:
         if (!unary_valid(expression->u.unary.op))

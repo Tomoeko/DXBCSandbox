@@ -110,6 +110,9 @@ static bool check_operators_and_casts(void) {
 }
 
 static bool check_boolean_expressions(void) {
+    CHECK(!ast_create_logical_not(NULL));
+    CHECK(expect_expression(ast_create_logical_not(ast_create_literal_bool(true)), "!(true)"));
+    CHECK(expect_expression(ast_create_unary(USIL_OP_NOT, ast_create_literal_int(1)), "~(1)"));
     CHECK(expect_expression(ast_create_literal_bool(true), "true"));
     CHECK(expect_expression(ast_create_literal_bool(false), "false"));
     CHECK(expect_expression(ast_create_logical_binary(USIL_OP_OR, ast_create_literal_bool(true),

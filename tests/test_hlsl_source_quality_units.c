@@ -599,6 +599,48 @@ static bool analyze_boolean_ast(const ASTExpr *root, HLSLSourceQualityResult *qu
     return hlsl_source_quality_analyze(&request, quality);
 }
 
+static bool check_typed_logical_not(void) {
+    static const ASTScalarType rejected_types[] = {
+        AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32};
+    for (unsigned width = 1; width <= 4; ++width) {
+        ASTExpr *value = ast_create_var(-1, 0, OPERAND_TYPE_TEMP, "predicate");
+        ASTExpr *root = ast_create_logical_not(value);
+        if (!root) {
+            ast_free_expr(value);
+            return false;
+        }
+        HLSLSourceQualityResult quality;
+        bool passed = boolean_ast_origin(value, AST_SCALAR_BOOL, width, 1) &&
+                      boolean_ast_origin(root, AST_SCALAR_BOOL, width, 2) &&
+                      analyze_boolean_ast(root, &quality) &&
+                      quality.classification == HLSL_SOURCE_QUALITY_CLEAN &&
+                      !quality.counts.residual_total && !quality.counts.unknown_provenance;
+        for (size_t index = 0; index < sizeof(rejected_types) / sizeof(*rejected_types); ++index) {
+            value->logical_origin.scalar_type = rejected_types[index];
+            passed = passed && !analyze_boolean_ast(root, &quality);
+        }
+        value->logical_origin.scalar_type = AST_SCALAR_BOOL;
+        value->logical_origin.components = width == 4 ? 3 : 4;
+        passed = passed && !analyze_boolean_ast(root, &quality);
+        value->logical_origin.components = (uint8_t)width;
+        root->u.unary.op = USIL_OP_INEG;
+        passed = passed && !analyze_boolean_ast(root, &quality);
+        root->u.unary.op = USIL_OP_NOT;
+        passed = passed && !boolean_ast_origin(root, AST_SCALAR_FLOAT32, width, 2) &&
+                 analyze_boolean_ast(root, &quality) &&
+                 quality.classification == HLSL_SOURCE_QUALITY_CLEAN;
+        root->logical_origin.complete = false;
+        passed = passed && analyze_boolean_ast(root, &quality) &&
+                 quality.classification != HLSL_SOURCE_QUALITY_CLEAN;
+        ast_free_expr(root);
+        if (!passed) {
+            fprintf(stderr, "Logical Boolean negation contract failed at width %u\n", width);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool check_typed_boolean_ast(void) {
     const ASTScalarType types[] = {AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32, AST_SCALAR_BOOL};
     const int operations[] = {USIL_OP_LT, USIL_OP_ILT, USIL_OP_ULT, USIL_OP_IEQ};
@@ -1063,7 +1105,7 @@ int main(void) {
         !check_hidden_helpers_and_categories() || !check_statements_and_emission_outcomes() ||
         !check_invalid_and_bounded_analysis() || !check_streaming_matches_batch() ||
         !check_real_emitter_quality_is_independent() || !check_owned_ast_logical_origins() ||
-        !check_typed_boolean_ast() ||
+        !check_typed_boolean_ast() || !check_typed_logical_not() ||
         !check_natural_interfaces_and_residual_projections() || !check_multiple_entry_inventory() ||
         !check_cbuffer_shape_facts())
         return 1;

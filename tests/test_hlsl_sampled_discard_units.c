@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "translation/hlsl_emitter_internal.h"
+#include "translation/hlsl_emitted_matrix_uses_internal.h"
 #include "common/sha256.h"
 #include "test_fixture.h"
 
@@ -218,6 +219,31 @@ cleanup:
     return passed;
 }
 
+static bool check_boolean_snapshot(void) {
+    ASTExpr *value = ast_create_literal_bool(true);
+    ASTExpr *root = ast_create_logical_not(value);
+    ASTExpr *copy = NULL;
+    size_t nodes = 0;
+    bool passed = false;
+    if (!root) {
+        ast_free_expr(value);
+        return false;
+    }
+    copy = hlsl_owned_expression_copy(root, &nodes);
+    REQUIRE(copy && nodes == 2 && copy != root && copy->u.unary.sub != value &&
+            hlsl_matrix_uses_trees_equal(root, copy));
+    value->u.literal.val[0] = 0;
+    REQUIRE(!hlsl_matrix_uses_trees_equal(root, copy));
+    value->u.literal.val[0] = 1;
+    REQUIRE(hlsl_matrix_uses_trees_equal(root, copy));
+    passed = true;
+
+cleanup:
+    ast_free_expr(copy);
+    ast_free_expr(root);
+    return passed;
+}
+
 static bool check_fixture(const DiscardFixtureCase *fixture) {
     uint8_t *bytes = NULL;
     size_t size = 0;
@@ -265,6 +291,9 @@ cleanup:
 }
 
 int main(void) {
+    if (!check_boolean_snapshot()) {
+        return 1;
+    }
     static const DiscardFixtureCase fixtures[] = {
         {DXBC_SAMPLED_DISCARD_FIXTURE_ROOT "/below_sm4.dxbc.b64",
             "fc17a830da91a82a00da2b2321e68f4e6ffc29d9e8cacc5295d7745f4d7fc277",

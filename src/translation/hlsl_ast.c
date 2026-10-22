@@ -143,6 +143,14 @@ ASTExpr *ast_create_unary(int op, ASTExpr *sub) {
     return expr;
 }
 
+ASTExpr *ast_create_logical_not(ASTExpr *sub) {
+    ASTExpr *expression = ast_create_unary(USIL_OP_NOT, sub);
+    if (expression) {
+        expression->kind = AST_EXPR_LOGICAL_NOT;
+    }
+    return expression;
+}
+
 static ASTExpr *create_binary_expression(ASTExprKind kind, int op, ASTExpr *left, ASTExpr *right) {
     if (!left || !right || left == right)
         return NULL;
@@ -343,7 +351,7 @@ ASTExpr *ast_create_emitter_operand_with_provenance(
 bool ast_set_logical_value_origin(ASTExpr *expression,
                                   const ASTLogicalValueOrigin *origin) {
     if (!expression || !origin || expression->kind < AST_EXPR_VAR ||
-        (expression->kind == AST_EXPR_EMITTER_OPERAND || expression->kind > AST_EXPR_LOGICAL_BINARY) ||
+        (expression->kind == AST_EXPR_EMITTER_OPERAND || expression->kind > AST_EXPR_LOGICAL_NOT) ||
         (!scalar_type_valid(origin->scalar_type) && origin->scalar_type != AST_SCALAR_BOOL) || origin->components > 4 ||
         origin->instruction_index < -1 || (origin->destination_lanes & ~15u) ||
         (origin->instruction_index < 0 &&
@@ -361,8 +369,10 @@ bool ast_set_logical_value_origin(ASTExpr *expression,
         if (expression->kind == AST_EXPR_VECTOR_COMPARISON &&
             (origin->scalar_type != AST_SCALAR_BOOL || origin->components < 2))
             return false;
-        if (expression->kind == AST_EXPR_LOGICAL_BINARY && origin->scalar_type != AST_SCALAR_BOOL)
+        if ((expression->kind == AST_EXPR_LOGICAL_BINARY || expression->kind == AST_EXPR_LOGICAL_NOT) &&
+            origin->scalar_type != AST_SCALAR_BOOL) {
             return false;
+        }
         if (expression->kind == AST_EXPR_LITERAL &&
             (origin->components != expression->u.literal.components ||
              origin->scalar_type != expression->u.literal.scalar_type))
@@ -389,6 +399,7 @@ void ast_free_expr(ASTExpr *expr) {
         free(expr->u.var.name);
         break;
     case AST_EXPR_UNARY:
+    case AST_EXPR_LOGICAL_NOT:
         ast_free_expr(expr->u.unary.sub);
         break;
     case AST_EXPR_COMPARISON:
@@ -609,11 +620,13 @@ static void format_expr(const ASTExpr *expr, StringBuilder *sb, unsigned depth,
         break;
     }
     case AST_EXPR_UNARY:
-        if (!unary_operator(expr->u.unary.op)) {
+    case AST_EXPR_LOGICAL_NOT:
+        if (expr->kind == AST_EXPR_LOGICAL_NOT ? expr->u.unary.op != USIL_OP_NOT
+                                             : !unary_operator(expr->u.unary.op)) {
             sb->failed = true;
             break;
         }
-        sb_append(sb, unary_operator(expr->u.unary.op));
+        sb_append(sb, expr->kind == AST_EXPR_LOGICAL_NOT ? "!" : unary_operator(expr->u.unary.op));
         sb_append(sb, "(");
         format_expr(expr->u.unary.sub, sb, depth + 1u, observer, context);
         sb_append(sb, ")");

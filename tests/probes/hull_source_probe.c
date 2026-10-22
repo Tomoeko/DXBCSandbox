@@ -1415,11 +1415,16 @@ static bool reconstruct_structured(const DXBCContainerView *target,
                 if (position_owned) {
                     for (unsigned piece = 0; piece < (unsigned)HLSL_DOMAIN_OUTPUT_PIECE_COUNT; ++piece) {
                         const HLSLDomainOutputPiece *owner = &position_output.plan.assembly.pieces[piece];
-                        const HLSLExpressionOrigin *origin = &map.origins[owner->instruction_index];
+                        const HLSLExpressionOrigin *child_origin =
+                            &map.origins[owner->instruction_index];
                         printf("packed_output_position_child_span index=%u instruction=%d "
                                "raw_instruction=%u destination_lanes=%u begin=%zu end=%zu\n",
-                               piece, origin->instruction_index, origin->source_instruction_index,
-                               (unsigned)origin->destination_lanes, origin->source_begin, origin->source_end);
+                            piece,
+                            child_origin->instruction_index,
+                            child_origin->source_instruction_index,
+                            (unsigned)child_origin->destination_lanes,
+                            child_origin->source_begin,
+                            child_origin->source_end);
                     }
                 }
                 accepted = accepted && position_owned;

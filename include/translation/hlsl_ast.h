@@ -20,7 +20,8 @@ typedef enum {
     AST_EXPR_EMITTER_OPERAND,
     AST_EXPR_COMPARISON,
     AST_EXPR_VECTOR_COMPARISON,
-    AST_EXPR_LOGICAL_BINARY
+    AST_EXPR_LOGICAL_BINARY,
+    AST_EXPR_LOGICAL_NOT
 } ASTExprKind;
 
 typedef enum { AST_SCALAR_FLOAT32, AST_SCALAR_SINT32, AST_SCALAR_UINT32, AST_SCALAR_BOOL } ASTScalarType;
@@ -220,6 +221,9 @@ ASTExpr *ast_create_literal_bool(bool value);
  * Callers must supply the correct HLSL operand types, including unsigned USHR
  * inputs; this syntax layer is not a DXBC type/provenance analysis. */
 ASTExpr *ast_create_unary(int op, ASTExpr *sub);
+/* Logical Boolean negation. The producer must prove a Boolean value;
+ * this constructor does not convert arbitrary DXBC mask bits. */
+ASTExpr *ast_create_logical_not(ASTExpr *sub);
 ASTExpr *ast_create_binary(int op, ASTExpr *left, ASTExpr *right);
 /* Scalar logical predicate only. DXBC mask values need separate lowering. */
 ASTExpr *ast_create_comparison(int op, ASTExpr *left, ASTExpr *right);
