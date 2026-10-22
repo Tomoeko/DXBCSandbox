@@ -68,8 +68,91 @@ bool hlsl_global_field_order(const HLSLCBufferLayout *layout, int order[HLSL_GLO
     return true;
 }
 
-static bool global_fields_supported(const HLSLEmitterContext *ctx, int index, bool packed,
-    uint32_t *prefix_rows, uint32_t *suffix_rows) {
+static bool global_metadata_complete(
+    const HLSLEmitterContext *ctx, const HLSLCBufferLayout *layout) {
+    bool shell = false;
+    const SerializedProgramParameters *sources[2] = {ctx->params, ctx->common_params};
+    for (unsigned source = 0; source < 2; ++source) {
+        const SerializedProgramParameters *parameters = sources[source];
+        if (!parameters) {
+            continue;
+        }
+        for (int buffer = 0; buffer < parameters->cb_count; ++buffer) {
+            const SerializedConstantBuffer *metadata = &parameters->constant_buffers[buffer];
+            if (strcmp(metadata->name, "$Globals")) {
+                continue;
+            }
+            if (metadata->struct_count) {
+                return false;
+            }
+            if (metadata->role == SERIALIZED_CBUFFER_NAMED &&
+                (!metadata->has_is_partial || !metadata->is_partial)) {
+                if (metadata->size != layout->reflection_size_bytes) {
+                    return false;
+                }
+                shell = true;
+            }
+            for (int variable = 0; variable < metadata->var_count; ++variable) {
+                DecodedVariableLayout decoded;
+                if (!parameter_layout_decode(
+                        parameters, &metadata->variables[variable], &decoded)) {
+                    return false;
+                }
+                bool found = false;
+                for (int field = 0; field < layout->variable_count; ++field) {
+                    if (hlsl_cbuffer_field_matches(
+                            &layout->variables[field], &metadata->variables[variable], &decoded)) {
+                        if (found) {
+                            return false;
+                        }
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    return false;
+                }
+            }
+        }
+    }
+    return shell;
+}
+
+static bool global_declarations_complete(
+    const HLSLEmitterContext *ctx, const HLSLCBufferLayout *layout) {
+    if (!ctx->global_declarations) {
+        return true;
+    }
+    size_t count = 0;
+    const HLSLGlobalDeclarationField *fields =
+        hlsl_global_declarations_fields(ctx->global_declarations, &count);
+    if (count != (size_t)layout->variable_count || !fields) {
+        return false;
+    }
+    for (size_t declaration = 0; declaration < count; ++declaration) {
+        if (!fields[declaration].current_authority) {
+            return false;
+        }
+        bool found = false;
+        for (int field = 0; field < layout->variable_count; ++field) {
+            if (!strcmp(fields[declaration].name, layout->variables[field].name)) {
+                if (found) {
+                    return false;
+                }
+                found = true;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool global_fields_supported(const HLSLEmitterContext *ctx,
+    int index,
+    bool packed,
+    uint32_t *prefix_rows,
+    uint32_t *suffix_rows) {
     if (!ctx || !ctx->program || index != 0 || ctx->program->cbuffer_count != 1 ||
         ctx->cbuffer_layout_count != 1 || !ctx->high_level_packed_outputs ||
         ctx->emit_mode != HLSL_EMIT_MODE_HIGH_LEVEL_CANDIDATE ||
@@ -127,49 +210,8 @@ static bool global_fields_supported(const HLSLEmitterContext *ctx, int index, bo
     }
     if (last_named_row != (uint32_t)layout->row_count - 1u ||
         (packed && (!saw_packed || (cursor + 15u) / 16u != (uint32_t)layout->row_count))) return false;
-    bool shell = false;
-    const SerializedProgramParameters *sources[2] = {ctx->params, ctx->common_params};
-    for (unsigned source = 0; source < 2; ++source) {
-        const SerializedProgramParameters *parameters = sources[source];
-        if (!parameters) continue;
-        for (int buffer = 0; buffer < parameters->cb_count; ++buffer) {
-            const SerializedConstantBuffer *metadata = &parameters->constant_buffers[buffer];
-            if (strcmp(metadata->name, "$Globals")) continue;
-            if (metadata->struct_count) return false;
-            if (metadata->role == SERIALIZED_CBUFFER_NAMED &&
-                (!metadata->has_is_partial || !metadata->is_partial)) {
-                if (metadata->size != layout->reflection_size_bytes) return false;
-                shell = true;
-            }
-            for (int variable = 0; variable < metadata->var_count; ++variable) {
-                DecodedVariableLayout decoded;
-                if (!parameter_layout_decode(parameters, &metadata->variables[variable], &decoded)) return false;
-                bool found = false;
-                for (int field = 0; field < layout->variable_count; ++field)
-                    if (hlsl_cbuffer_field_matches(&layout->variables[field], &metadata->variables[variable], &decoded)) {
-                        if (found) return false;
-                        found = true;
-                    }
-                if (!found) return false;
-            }
-        }
-    }
-    if (!shell) return false;
-    if (ctx->global_declarations) {
-        size_t count = 0;
-        const HLSLGlobalDeclarationField *fields =
-            hlsl_global_declarations_fields(ctx->global_declarations, &count);
-        if (count != (size_t)layout->variable_count || !fields) return false;
-        for (size_t declaration = 0; declaration < count; ++declaration) {
-            if (!fields[declaration].current_authority) return false;
-            bool found = false;
-            for (int field = 0; field < layout->variable_count; ++field)
-                if (!strcmp(fields[declaration].name, layout->variables[field].name)) {
-                    if (found) return false;
-                    found = true;
-                }
-            if (!found) return false;
-        }
+    if (!global_metadata_complete(ctx, layout) || !global_declarations_complete(ctx, layout)) {
+        return false;
     }
     if (prefix_rows) *prefix_rows = first_offset / 16u;
     if (suffix_rows) *suffix_rows = layout->reflection_size_bytes / 16u - (uint32_t)layout->row_count;
