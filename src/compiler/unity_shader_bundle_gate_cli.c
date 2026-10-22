@@ -25,7 +25,7 @@ typedef struct {
     bool backend_seen;
 } BundleCommandLine;
 
-static void print_usage(FILE* stream, const char* executable) {
+static void print_usage(FILE *stream, const char *executable) {
     fprintf(stream,
         "Usage: %s --unity PATH --unity-version VERSION --target TARGET \\\n"
         "          --backend BACKEND --bundle PATH --report PATH --log PATH \\\n"
@@ -60,8 +60,7 @@ static void print_usage(FILE* stream, const char* executable) {
         executable);
 }
 
-static const char* option_value(int argc, char** argv, int* index,
-                                const char* option) {
+static const char *option_value(int argc, char **argv, int *index, const char *option) {
     if (*index + 1 >= argc) {
         fprintf(stderr, "%s requires a value\n", option);
         return NULL;
@@ -70,7 +69,7 @@ static const char* option_value(int argc, char** argv, int* index,
     return argv[*index];
 }
 
-static bool parse_target(const char* value, UnityShaderBundleTarget* target) {
+static bool parse_target(const char *value, UnityShaderBundleTarget *target) {
     if (strcmp(value, "macos") == 0) {
         *target = UNITY_SHADER_BUNDLE_TARGET_MACOS;
         return true;

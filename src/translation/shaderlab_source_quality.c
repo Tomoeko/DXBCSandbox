@@ -505,16 +505,24 @@ static bool entries_equal(const ShaderLabExpressionSourceRecord *a, const Shader
 
 bool shaderlab_source_quality_results_equal(
     const ShaderLabSourceQualityResult *a, const ShaderLabSourceQualityResult *b) {
-    if (!a || !b) return false;
+    if (!a || !b) {
+        return false;
+    }
     if (a->classification != b->classification || a->reasons != b->reasons || a->gaps != b->gaps ||
-        a->wrapper_complete != b->wrapper_complete || a->wrapper_receipt_count != b->wrapper_receipt_count ||
+        a->wrapper_complete != b->wrapper_complete ||
+        a->wrapper_receipt_count != b->wrapper_receipt_count ||
         a->linked_entry_count != b->linked_entry_count ||
         a->observed_stage_residual_total != b->observed_stage_residual_total ||
         a->observed_stage_unknown_provenance != b->observed_stage_unknown_provenance ||
         a->observed_stage_incomplete_units != b->observed_stage_incomplete_units ||
-        a->required_external_include_root_count != b->required_external_include_root_count) return false;
-    for (unsigned index = 0; index < 5; ++index)
-        if (a->stage_class_counts[index] != b->stage_class_counts[index]) return false;
+        a->required_external_include_root_count != b->required_external_include_root_count) {
+        return false;
+    }
+    for (unsigned index = 0; index < 5; ++index) {
+        if (a->stage_class_counts[index] != b->stage_class_counts[index]) {
+            return false;
+        }
+    }
     return true;
 }
 

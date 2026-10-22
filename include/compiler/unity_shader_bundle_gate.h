@@ -139,8 +139,7 @@ UnityShaderBundleGateStatus unity_shader_bundle_gate_run(
 const char* unity_shader_bundle_target_name(UnityShaderBundleTarget target);
 const char* unity_shader_bundle_backend_name(UnityShaderBundleBackend backend);
 /* Canonical names only. Failure preserves the output. */
-bool unity_shader_bundle_backend_parse(
-    const char* value, UnityShaderBundleBackend* backend);
+bool unity_shader_bundle_backend_parse(const char *value, UnityShaderBundleBackend *backend);
 const char* unity_shader_bundle_gate_status_name(
     UnityShaderBundleGateStatus status);
 

@@ -79,6 +79,8 @@ Focused functions and descriptive cleanup labels are also recommended in the
   binary fields. Check narrowing conversions and arithmetic before using results
   as lengths, allocation sizes, offsets, or shift counts. See
   [CERT INT30-C](https://cmu-sei.github.io/secure-coding-standards/sei-cert-c-coding-standard/rules/integers-int/int30-c/).
+- Include `<stdlib.h>` and use allocation results without casts in C. Size
+  allocations from the pointed-to object, using `sizeof(*items)`.
 - Check `count > SIZE_MAX / sizeof(*items)` before multiplying allocation sizes;
   reuse the project's checked-size helpers in production code. Impose documented
   input or analysis limits as well as arithmetic limits. See

@@ -954,9 +954,10 @@ const char* unity_shader_bundle_backend_name(UnityShaderBundleBackend backend) {
     }
 }
 
-bool unity_shader_bundle_backend_parse(
-    const char* value, UnityShaderBundleBackend* backend) {
-    if (!value || !backend) return false;
+bool unity_shader_bundle_backend_parse(const char *value, UnityShaderBundleBackend *backend) {
+    if (!value || !backend) {
+        return false;
+    }
     if (strcmp(value, "metal") == 0) {
         *backend = UNITY_SHADER_BUNDLE_BACKEND_METAL;
         return true;
