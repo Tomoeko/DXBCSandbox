@@ -31,7 +31,7 @@ static bool sample_register(const DXBCOperand *operand, DXBCOperandType type,
     return true;
 }
 
-static bool sample_level(const DXBCOperand *operand) {
+static bool sample_scalar_literal(const DXBCOperand *operand) {
     if (!hlsl_lift_operand_is_plain(operand) || operand->extended_tokens ||
         operand->type != OPERAND_TYPE_IMMEDIATE32 || operand->raw_token != UINT32_C(0x00004001) ||
         operand->swizzle_mode || operand->destination_mask || operand->register_index_dim || operand->register_index ||
@@ -81,7 +81,7 @@ static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmen
     if ((!level && sample->opcode != USIL_OP_SAMPLE) || sample->operand_count != (level ? 5 : 4)) return false;
     for (int index = 0; index < program->instruction_count; ++index) {
         const USILInstruction *instruction = &program->instructions[index];
-        if (instruction->saturate || instruction->precise_mask || instruction->condition_test ||
+        if (instruction->saturate || instruction->precise_mask ||
             instruction->has_texel_offset || instruction->resource_stride || instruction->geometry_effect || instruction->geometry_stream_id ||
             instruction->geometry_stream_explicit || instruction->sync_flags ||
             (index ? instruction->resource_dimension[0] != 0 :
@@ -98,7 +98,7 @@ static bool sample_layout_prepare(const USILProgram *program, HLSLSampledFragmen
         !sample_register(&sample->operands[2], OPERAND_TYPE_RESOURCE, UINT32_C(0x00107e46), identity) ||
         sample->operands[2].register_index != texture->reg_idx ||
         !sample_register(&sample->operands[3], OPERAND_TYPE_SAMPLER, UINT32_C(0x00106000), identity) ||
-        sample->operands[3].register_index != sampler->reg_idx || (level && !sample_level(&sample->operands[4])))
+        sample->operands[3].register_index != sampler->reg_idx || (level && !sample_scalar_literal(&sample->operands[4])))
         return false;
     const uint8_t coordinate_mask = three_coordinates ? 7 : tail_coordinates ? 12 : 3;
     int coordinate = -1;
@@ -196,6 +196,82 @@ static bool guard_temp(const DXBCOperand *operand, unsigned reg, uint32_t token)
         operand->register_index == (int)reg;
 }
 
+bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDiscardPlan *plan) {
+    if (!plan) {
+        return false;
+    }
+    memset(plan, 0, sizeof(*plan));
+    HLSLSampledFragmentPlan layout = {0};
+    if (!sample_layout_prepare(program, &layout) ||
+        layout.texture_kind != HLSL_SAMPLED_TEXTURE_2D || layout.explicit_level ||
+        layout.inactive_typed_inputs || layout.packed_inputs || program->instruction_count != 5 ||
+        program->temp_count != 2) {
+        return false;
+    }
+
+    static const USILOpcode operations[5] = {
+        USIL_OP_SAMPLE, USIL_OP_LT, USIL_OP_DISCARD, USIL_OP_MOV, USIL_OP_RET};
+    static const int operand_counts[5] = {4, 3, 1, 2, 0};
+    const USILInstruction *instructions = program->instructions;
+    for (unsigned index = 0; index < 5; ++index) {
+        const USILInstruction *instruction = &instructions[index];
+        if (instruction->opcode != operations[index] ||
+            instruction->operand_count != operand_counts[index] ||
+            instruction->source_instruction_index !=
+                instructions[0].source_instruction_index + index ||
+            (index != 2 && instruction->condition_test)) {
+            return false;
+        }
+    }
+    const USILInstruction *comparison = &instructions[1];
+    const USILInstruction *discard = &instructions[2];
+    const int color_register = instructions[0].operands[0].register_index;
+    const int predicate_register = comparison->operands[0].register_index;
+    const uint8_t predicate_mask = usil_operand_destination_lane_mask(&comparison->operands[0]);
+    if (color_register < 0 || color_register >= program->temp_count || predicate_register < 0 ||
+        predicate_register >= program->temp_count || color_register == predicate_register ||
+        !predicate_mask || predicate_mask > 15 || (predicate_mask & (predicate_mask - 1u)) ||
+        !guard_temp(&instructions[0].operands[0], (unsigned)color_register, UINT32_C(0x001000f2)) ||
+        !guard_temp(&comparison->operands[0],
+            (unsigned)predicate_register,
+            UINT32_C(0x00100002) | (uint32_t)predicate_mask << 4u) ||
+        (discard->condition_test != DXBC_INSTRUCTION_TEST_ZERO &&
+            discard->condition_test != DXBC_INSTRUCTION_TEST_NONZERO)) {
+        return false;
+    }
+    const bool literal_first = comparison->operands[1].type == OPERAND_TYPE_IMMEDIATE32;
+    const DXBCOperand *literal = &comparison->operands[literal_first ? 1 : 2];
+    const DXBCOperand *color = &comparison->operands[literal_first ? 2 : 1];
+    const unsigned color_component = color->swizzle[0];
+    unsigned predicate_component = 0;
+    while (!(predicate_mask & (1u << predicate_component))) {
+        ++predicate_component;
+    }
+    static const uint8_t identity[4] = {0, 1, 2, 3};
+    if (!sample_scalar_literal(literal) || color_component > 3 ||
+        !guard_temp(color,
+            (unsigned)color_register,
+            UINT32_C(0x0010000a) | (uint32_t)color_component << 4u) ||
+        !guard_temp(&discard->operands[0],
+            (unsigned)predicate_register,
+            UINT32_C(0x0010000a) | (uint32_t)predicate_component << 4u) ||
+        !sample_register(
+            &instructions[3].operands[0], OPERAND_TYPE_OUTPUT, UINT32_C(0x001020f2), identity) ||
+        instructions[3].operands[0].register_index ||
+        !guard_temp(&instructions[3].operands[1], (unsigned)color_register, UINT32_C(0x00100e46))) {
+        return false;
+    }
+    *plan = (HLSLSampledDiscardPlan){.present = true,
+        .color_register = color_register,
+        .predicate_register = predicate_register,
+        .color_component = (uint8_t)color_component,
+        .predicate_component = (uint8_t)predicate_component,
+        .literal_first = literal_first,
+        .discard_on_zero = discard->condition_test == DXBC_INSTRUCTION_TEST_ZERO,
+        .threshold_bits = literal->immediate_words[0]};
+    return true;
+}
+
 /* Canonical masks come from these actual comparisons, then OR and IEQ.
  * Arbitrary nonzero MOVC conditions and Boolean usage facts supply no proof. */
 static bool sampled_nan_guard_shape(const USILProgram *program) {
@@ -240,6 +316,11 @@ bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledF
     memset(plan, 0, sizeof(*plan));
     HLSLSampledFragmentPlan layout = {0};
     if (!sample_layout_prepare(program, &layout)) return false;
+    for (int index = 0; index < program->instruction_count; ++index) {
+        if (program->instructions[index].condition_test) {
+            return false;
+        }
+    }
     static const uint8_t identity[4] = {0, 1, 2, 3};
     if (program->instruction_count == 2 && !program->temp_count &&
         program->instructions[1].opcode == USIL_OP_RET && !program->instructions[1].operand_count &&

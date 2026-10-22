@@ -280,6 +280,11 @@ if(BUILD_TESTING)
         DXBC_PREVIEW3D_SLICED_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/preview3d_sliced_ps.dxbc.b64")
     dxbc_add_core_test(test_hlsl_dataflow_units
         tests/test_hlsl_dataflow_units.c hlsl_dataflow_units)
+    dxbc_add_core_test(test_hlsl_sampled_discard_units
+        tests/test_hlsl_sampled_discard_units.c hlsl_sampled_discard_units)
+    target_sources(test_hlsl_sampled_discard_units PRIVATE tests/test_fixture.c)
+    target_compile_definitions(test_hlsl_sampled_discard_units PRIVATE
+        DXBC_SAMPLED_DISCARD_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/high_level/sampled_discard")
     dxbc_add_core_test(test_hlsl_ast_units
         tests/test_hlsl_ast_units.c hlsl_ast_units)
     dxbc_add_core_test(test_hlsl_vector_lift_units

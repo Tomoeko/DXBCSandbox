@@ -537,6 +537,21 @@ typedef struct {
 bool hlsl_sampled_fragment_plan_prepare(const USILProgram *program, HLSLSampledFragmentPlan *plan);
 bool hlsl_sampled_fragment_admission(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_fragment_owned_contract_digest(const USILProgram *program, uint8_t digest[32]);
+typedef struct {
+    bool present;
+    int color_register;
+    int predicate_register;
+    uint8_t color_component;
+    uint8_t predicate_component;
+    bool literal_first;
+    bool discard_on_zero;
+    uint32_t threshold_bits;
+} HLSLSampledDiscardPlan;
+/* Decoded shape only; does not grant source, SSA, effect or quality coverage.
+ * A non-NULL output is reset on entry and populated only on success. */
+bool hlsl_sampled_discard_plan_prepare(const USILProgram *program, HLSLSampledDiscardPlan *plan);
+/* Requires prepared CFG, dominance, SSA and use/def graphs; grants no source coverage. */
+bool hlsl_sampled_discard_preflight(const HLSLEmitterContext *ctx);
 bool hlsl_sampled_nan_guard_preflight(const HLSLEmitterContext *ctx);
 bool hlsl_emit_sampled_nan_guard(HLSLEmitterContext *ctx);
 bool hlsl_format_owned_expression(HLSLEmitterContext *ctx, const ASTExpr *expression,
